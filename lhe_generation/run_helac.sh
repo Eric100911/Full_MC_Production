@@ -53,6 +53,11 @@ TEST_MODE="false"
 UNWEVT_OVERRIDE=0
 COMPRESS_LHE="false"
 LHE_COMPRESSION_LEVEL=1
+LHE_SHUFFLE_SPLIT="false"
+LHE_EVENTS_PER_BLOCK=1000
+LHE_SHUFFLE_MODE="stratified"
+LHE_N_STRATA="auto"
+LHE_DROP_INCOMPLETE_LAST_BLOCK="false"
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
 HELAC_SRC_TAR=""
@@ -882,6 +887,26 @@ while [[ $# -gt 0 ]]; do
             LHE_COMPRESSION_LEVEL="$2"
             shift 2
             ;;
+        --lhe-shuffle-split)
+            LHE_SHUFFLE_SPLIT="true"
+            shift 1
+            ;;
+        --lhe-events-per-block)
+            LHE_EVENTS_PER_BLOCK="$2"
+            shift 2
+            ;;
+        --lhe-shuffle-mode)
+            LHE_SHUFFLE_MODE="$2"
+            shift 2
+            ;;
+        --lhe-n-strata)
+            LHE_N_STRATA="$2"
+            shift 2
+            ;;
+        --lhe-drop-incomplete-last-block)
+            LHE_DROP_INCOMPLETE_LAST_BLOCK="true"
+            shift 1
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -1253,6 +1278,39 @@ fi
 
 verify_lhe_octet_codes "${FINAL_LHE_FILE}"
 
+# ---- LHE Stratified Shuffle-Split ----
+SHUFFLE_SPLIT_DIR="${WORKDIR}/lhe_blocks"
+if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split"
+    mkdir -p "${SHUFFLE_SPLIT_DIR}"
+    # Derive a deterministic shuffle seed from the generation seed with an offset
+    # so shuffles are reproducible but distinct from HELAC's internal RNG.
+    RESOLVED_SHUFFLE_SEED=$(( MY_SEED * 1000 + 37 ))
+    msg_info "Running LHE shuffle-split (seed=${RESOLVED_SHUFFLE_SEED}, mode=${LHE_SHUFFLE_MODE})..."
+    SHUFFLE_SPLIT_ARGS=(
+        --input "${FINAL_LHE_FILE}"
+        --output-dir "${SHUFFLE_SPLIT_DIR}"
+        --seed "${RESOLVED_SHUFFLE_SEED}"
+        --events-per-block "${LHE_EVENTS_PER_BLOCK}"
+        --mode "${LHE_SHUFFLE_MODE}"
+        --n-strata "${LHE_N_STRATA}"
+        --write-provenance
+    )
+    if bool_is_true "${LHE_DROP_INCOMPLETE_LAST_BLOCK}"; then
+        SHUFFLE_SPLIT_ARGS+=(--drop-incomplete-last-block)
+    fi
+    if ! run_logged "lhe_shuffle_split" "${SHUFFLE_SPLIT_BINARY}" "${SHUFFLE_SPLIT_ARGS[@]}"; then
+        echo "[ERROR] LHE shuffle-split failed"
+        exit 1
+    fi
+    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}"/block_*.lhe 2>/dev/null | wc -l)
+    if (( BLOCK_COUNT == 0 )); then
+        echo "[ERROR] Shuffle-split produced no block files"
+        exit 1
+    fi
+    msg_ok "Shuffle-split: ${BLOCK_COUNT} blocks in ${SHUFFLE_SPLIT_DIR}"
+fi
+
 # Optionally compress LHE output before stageout (atomic: write .tmp then rename).
 STAGEOUT_FILE="${FINAL_LHE_FILE}"
 LHE_EXT="lhe"
@@ -1284,6 +1342,13 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
         echo "[ERROR] Failed to stage out LHE file locally"
         exit 1
     fi
+    # Stage out shuffle-split blocks if enabled
+    if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+        BLOCK_LOCAL_DIR="${LOCAL_DIR}/lhe_blocks"
+        mkdir -p "${BLOCK_LOCAL_DIR}"
+        cp "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
+        msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
+    fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
     stage_out_helac_output_archive "${RUN_DIR}"
     echo "HELAC output generation complete!"
@@ -1304,6 +1369,18 @@ else
     }
     echo "LHE generation complete!"
     echo "Output: $OUTPUT_FILE"
+    # Stage out shuffle-split blocks if enabled
+    if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+        BLOCK_REMOTE_DIR="${OUTPUT_DIR}/lhe_blocks"
+        make_remote_dir "${BLOCK_REMOTE_DIR}" || true
+        for bf in "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
+            bname=$(basename "$bf")
+            BLOCK_OUTPUT=$(remote_url_for_spec "$(join_remote_spec "${BLOCK_REMOTE_DIR}" "${bname}")")
+            xrdcp --nopbar --force "$bf" "${BLOCK_OUTPUT}" || \
+                echo "[WARN] Failed to stage block: ${bname}" >&2
+        done
+        msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_REMOTE_DIR}"
+    fi
 fi
 echo "=============================================="
 

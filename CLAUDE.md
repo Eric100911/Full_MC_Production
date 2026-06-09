@@ -24,7 +24,8 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`hepjob_workflow.py`** — IHEP/lxlogin HepJob backend adapter. Reuses campaign/pool definitions and bundle-building utilities from `dag_generator.py`. Generates bash job scripts instead of HTCondor submit files.
 - **`common/setup.sh`** — Environment setup for local debugging (CMSSW 12/15, HELAC, Pythia, XRootD). Not used by worker nodes at runtime; they self-configure via bundled tarballs.
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter: translates between old `9900xxxx` codes and Pythia8 `99nqnsnrnLnJ` encoding. Also provides a `scan` subcommand for auditing LHE files.
-- **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Unpacks `helac_package.tar.gz`, builds HepMC/HELAC, generates LHE, stages out to XRootD.
+- **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Unpacks `helac_package.tar.gz`, builds HepMC/HELAC, generates LHE, optionally shuffle-splits into blocks, stages out to XRootD.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++17 tool for stratified LHE shuffle and 1000-event block splitting. Built inline by `run_helac.sh`; no external dependencies.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker to avoid glibc/ABI mismatches.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type. Templates use wrapper scripts rather than inline bash.
@@ -58,6 +59,20 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Pool scan results are cached via the `DAG_GENERATOR_POOL_SCAN_CACHE` environment variable.
 - Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS.
 - LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC intermediates always remain plain text for CMSSW compatibility.
+- LHE shuffle-split (`--lhe-shuffle-split`) produces `block_NNNNNN.lhe` files and a `shuffle_split_manifest.json` in a `lhe_blocks/` subdirectory. The original single LHE is always preserved for backward-compatible processing.
+
+## Runtime Environments
+
+### Worker container (lxplus_t2_ihep)
+- **Image**: `cmssw/el7:x86_64` (CentOS 7, glibc 2.17)
+- **Compiler toolchain**: LCG_88b (`/cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh`) — GCC 6.2 for gfortran and C++14 builds
+- **C++ standard**: C++14 (`-std=c++14`) — GCC 6.2 predates the `-std=c++17` flag
+- Bundled C++ binaries (`lhe_shuffle_split`) are compiled inside this container at bundle-prep time and run with LCG_88b sourced
+- Python tools run on the host system (EL9, Python 3)
+
+### Test environment
+- Local tests (`tests/test_lhe_shuffle_split.sh`) compile and run inside the same `cmssw/el7` + LCG_88b container via `singularity exec`
+- Synthetic LHE generation (`tests/generate_synthetic_lhe.py`) runs on the host Python
 
 ## Common Commands
 
@@ -112,6 +127,18 @@ python3 dag_generator.py generate \
 # Backfill compress existing LHE pool
 python3 tools/compress_existing_lhe.py --pool-dir /path/to/lhe_pool --dry-run
 python3 tools/compress_existing_lhe.py --pool-dir /path/to/lhe_pool --keep --level 3
+
+# With LHE shuffle-split (1000-event blocks)
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
+  --jobs 20 --output-dir generated/jjp_dps1 --output jjp_dps1.dag \
+  --lhe-shuffle-split --lhe-events-per-block 1000
+
+# Smoke test with shuffle-split
+python3 dag_generator.py generate-test \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS \
+  --output-dir tests/generated/shuffle_smoke --output smoke.dag \
+  --lhe-shuffle-split --lhe-events-per-block 100
 ```
 
 ### Running tests

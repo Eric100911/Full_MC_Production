@@ -208,6 +208,10 @@ COMPRESS_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_compress.sh"
 )
 COMPRESS_WRAPPER_NAME = "run_compress.sh"
+TRANSFER_COMPRESS_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_transfer_compress.sh"
+)
+TRANSFER_COMPRESS_WRAPPER_NAME = "run_transfer_compress.sh"
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -391,6 +395,11 @@ class WorkflowOptions:
         strict_vtx_smearing_check: bool = False,
         compress_lhe: bool = False,
         lhe_compression_level: int = 1,
+        lhe_shuffle_split: bool = False,
+        lhe_events_per_block: int = 1000,
+        lhe_shuffle_mode: str = "stratified",
+        lhe_n_strata: str = "auto",
+        lhe_drop_incomplete_last_block: bool = False,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -401,6 +410,11 @@ class WorkflowOptions:
         self.test_mode = test_mode
         self.compress_lhe = compress_lhe
         self.lhe_compression_level = lhe_compression_level
+        self.lhe_shuffle_split = lhe_shuffle_split
+        self.lhe_events_per_block = lhe_events_per_block
+        self.lhe_shuffle_mode = lhe_shuffle_mode
+        self.lhe_n_strata = lhe_n_strata
+        self.lhe_drop_incomplete_last_block = lhe_drop_incomplete_last_block
         self.scan_existing = scan_existing
         self.force_generate_lhe = force_generate_lhe
         self.proxy_path = proxy_path
@@ -1459,12 +1473,34 @@ def prepare_runtime_assets(
     ensure_dir(output_dir)
     assets: Dict[str, str] = OrderedDict()
 
+    # Compile lhe_shuffle_split inside the worker container to match runtime glibc.
+    shuffle_split_src = os.path.join(BASE_DIR, "lhe_generation", "lhe_shuffle_split.cc")
+    shuffle_split_bin = os.path.join(output_dir, "lhe_shuffle_split")
+    print("  [lhe-bundle] Compiling lhe_shuffle_split inside cmssw/el7 with LCG_88b...")
+    subprocess.run(
+        [
+            "singularity", "exec",
+            "--bind", f"{BASE_DIR}:{BASE_DIR}:ro",
+            "--bind", f"{output_dir}:{output_dir}",
+            "--bind", "/cvmfs:/cvmfs",
+            "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86_64",
+            "bash", "-c",
+            "source /cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh && "
+            f"g++ -std=c++14 -O2 -Wall -o {shlex.quote(shuffle_split_bin)} "
+            f"{shlex.quote(shuffle_split_src)}",
+        ],
+        check=True,
+        timeout=120,
+    )
+    print(f"  [lhe-bundle] Compiled: {shuffle_split_bin}")
+
     lhe_bundle_name = BUNDLE_NAMES["lhe"]
     lhe_bundle_path = os.path.join(output_dir, lhe_bundle_name)
     build_bundle(
         lhe_bundle_path,
         (
             (os.path.join(BASE_DIR, "lhe_generation", "run_helac.sh"), "runtime/lhe_generation/run_helac.sh"),
+            (shuffle_split_bin, "runtime/lhe_generation/lhe_shuffle_split"),
             (
                 os.path.join(BASE_DIR, "lhe_generation", "input_templates", "user.inp"),
                 "runtime/lhe_generation/input_templates/user.inp",
@@ -1478,6 +1514,10 @@ def prepare_runtime_assets(
                 "runtime/lhe_generation/helac_package.tar.gz",
             ),
             (os.path.join(BASE_DIR, "common", "octet_pdg.py"), "runtime/common/octet_pdg.py"),
+            (
+                os.path.join(BASE_DIR, "common", "compression_helpers.sh"),
+                "runtime/common/compression_helpers.sh",
+            ),
         ),
     )
     assets["lhe_bundle_path"] = lhe_bundle_path
@@ -1738,6 +1778,9 @@ class DAGBuilder:
                 "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
                 "log_root=\"{log_root}\" compress_lhe=\"{compress_lhe}\" lhe_compression_level=\"{lhe_compression_level}\" "
+                "lhe_shuffle_split=\"{lhe_shuffle_split}\" lhe_events_per_block=\"{lhe_events_per_block}\" "
+                "lhe_shuffle_mode=\"{lhe_shuffle_mode}\" lhe_n_strata=\"{lhe_n_strata}\" "
+                "lhe_drop_incomplete_last_block=\"{lhe_drop_incomplete_last_block}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
@@ -1758,6 +1801,11 @@ class DAGBuilder:
                     local_output_base=dag_escape(self.options.local_output_base),
                     compress_lhe=dag_escape(bool_string(self.options.compress_lhe)),
                     lhe_compression_level=dag_escape(self.options.lhe_compression_level),
+                    lhe_shuffle_split=dag_escape(bool_string(self.options.lhe_shuffle_split)),
+                    lhe_events_per_block=dag_escape(self.options.lhe_events_per_block),
+                    lhe_shuffle_mode=dag_escape(self.options.lhe_shuffle_mode),
+                    lhe_n_strata=dag_escape(self.options.lhe_n_strata),
+                    lhe_drop_incomplete_last_block=dag_escape(bool_string(self.options.lhe_drop_incomplete_last_block)),
                     lhe_wrapper_path=dag_escape(
                         os.path.join(BASE_DIR, "lhe_generation", "condor_wrappers", "run_lhe_gen.sh")
                     ),
@@ -2886,6 +2934,35 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="gzip 压缩级别，默认 1（快速）。",
     )
     parser.add_argument(
+        "--lhe-shuffle-split",
+        action="store_true",
+        default=False,
+        help="启用 LHE 分层 shuffle 并按 events-per-block 分块。",
+    )
+    parser.add_argument(
+        "--lhe-events-per-block",
+        type=int,
+        default=1000,
+        help="每个 block 的事件数，默认 1000。",
+    )
+    parser.add_argument(
+        "--lhe-shuffle-mode",
+        default="stratified",
+        choices=("stratified", "original-order"),
+        help="LHE shuffle 模式，默认 stratified。",
+    )
+    parser.add_argument(
+        "--lhe-n-strata",
+        default="auto",
+        help="分层数，auto 或正整数。",
+    )
+    parser.add_argument(
+        "--lhe-drop-incomplete-last-block",
+        action="store_true",
+        default=False,
+        help="丢弃不完整的最末 block。",
+    )
+    parser.add_argument(
         "--enable-ntuple",
         dest="enable_ntuple",
         action="store_true",
@@ -3439,6 +3516,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
             compress_lhe=args.compress_lhe,
             lhe_compression_level=args.lhe_compression_level,
+            lhe_shuffle_split=args.lhe_shuffle_split,
+            lhe_events_per_block=args.lhe_events_per_block,
+            lhe_shuffle_mode=args.lhe_shuffle_mode,
+            lhe_n_strata=args.lhe_n_strata,
+            lhe_drop_incomplete_last_block=args.lhe_drop_incomplete_last_block,
         )
         return execute_generation(
             campaign_names=campaign_names,
@@ -3510,6 +3592,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
             compress_lhe=False,
             lhe_compression_level=1,
+            lhe_shuffle_split=False,
+            lhe_events_per_block=1000,
+            lhe_shuffle_mode="stratified",
+            lhe_n_strata="auto",
+            lhe_drop_incomplete_last_block=False,
         )
         return execute_ntuple_only_generation(
             campaign_names=campaign_names,

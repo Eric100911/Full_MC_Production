@@ -14,6 +14,11 @@ TEST_MODE="$9"
 LOCAL_OUTPUT_BASE="${10:-}"
 COMPRESS_LHE="${11:-false}"
 LHE_COMPRESSION_LEVEL="${12:-1}"
+LHE_SHUFFLE_SPLIT="${13:-false}"
+LHE_EVENTS_PER_BLOCK="${14:-1000}"
+LHE_SHUFFLE_MODE="${15:-stratified}"
+LHE_N_STRATA="${16:-auto}"
+LHE_DROP_INCOMPLETE_LAST_BLOCK="${17:-false}"
 
 export LOCAL_OUTPUT_BASE="${LOCAL_OUTPUT_BASE:-}"
 
@@ -64,7 +69,15 @@ COMPRESS_ARGS=()
 if [[ "${COMPRESS_LHE}" == "true" ]]; then
     COMPRESS_ARGS+=(--compress-lhe --lhe-compression-level "${LHE_COMPRESSION_LEVEL}")
 fi
-if ! bash run_helac.sh --pool "${POOL}" --seed "${SEED}" --min-pt-conia "${MIN_PT_CONIA}" --min-pt-bonia "${MIN_PT_BONIA}" --min-pt-q "${MIN_PT_Q}" --unwevt "${UNWEVT}" --test-mode "${TEST_MODE}" "${COMPRESS_ARGS[@]}"; then
+SHUFFLE_ARGS=()
+if [[ "${LHE_SHUFFLE_SPLIT}" == "true" ]]; then
+    SHUFFLE_ARGS+=(--lhe-shuffle-split --lhe-events-per-block "${LHE_EVENTS_PER_BLOCK}")
+    SHUFFLE_ARGS+=(--lhe-shuffle-mode "${LHE_SHUFFLE_MODE}" --lhe-n-strata "${LHE_N_STRATA}")
+    if [[ "${LHE_DROP_INCOMPLETE_LAST_BLOCK}" == "true" ]]; then
+        SHUFFLE_ARGS+=(--lhe-drop-incomplete-last-block)
+    fi
+fi
+if ! bash run_helac.sh --pool "${POOL}" --seed "${SEED}" --min-pt-conia "${MIN_PT_CONIA}" --min-pt-bonia "${MIN_PT_BONIA}" --min-pt-q "${MIN_PT_Q}" --unwevt "${UNWEVT}" --test-mode "${TEST_MODE}" "${COMPRESS_ARGS[@]}" "${SHUFFLE_ARGS[@]}"; then
     echo "ERROR: HELAC generation failed" >&2
     exit 1
 fi
