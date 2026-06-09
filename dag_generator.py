@@ -196,6 +196,7 @@ BUNDLE_NAMES = {
     "processing": "processing_runtime_bundle.tar.gz",
     "ntuple": "ntuple_runtime_bundle.tar.gz",
     "summary": "summary_runtime_bundle.tar.gz",
+    "compression": "compression_runtime_bundle.tar.gz",
     "proxy": "proxy_bundle.tar.gz",
 }
 
@@ -203,6 +204,10 @@ NTUPLE_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_ntuple_only.sh"
 )
 NTUPLE_WRAPPER_NAME = "run_ntuple_only.sh"
+COMPRESS_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_compress.sh"
+)
+COMPRESS_WRAPPER_NAME = "run_compress.sh"
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -1142,6 +1147,23 @@ def build_proxy_bundle(output_dir: str, proxy_path: str) -> Tuple[str, str]:
     bundle_name = BUNDLE_NAMES["proxy"]
     bundle_path = os.path.join(output_dir, bundle_name)
     build_bundle(bundle_path, ((proxy_path, os.path.join("credentials", "x509_user_proxy")),))
+    return bundle_path, bundle_name
+
+
+def build_compression_bundle(output_dir: str) -> Tuple[str, str]:
+    """打包压缩工具及其依赖，worker 解压后从 runtime/tools/ 运行。"""
+
+    bundle_name = BUNDLE_NAMES["compression"]
+    bundle_path = os.path.join(output_dir, bundle_name)
+    build_bundle(
+        bundle_path,
+        (
+            (os.path.join(BASE_DIR, "tools", "compress_existing_lhe.py"),
+             "runtime/tools/compress_existing_lhe.py"),
+            (os.path.join(BASE_DIR, "common", "compression_util.py"),
+             "runtime/common/compression_util.py"),
+        ),
+    )
     return bundle_path, bundle_name
 
 
