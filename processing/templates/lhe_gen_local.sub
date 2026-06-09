@@ -17,7 +17,7 @@ Universe = vanilla
 
 Executable = $(lhe_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(pool) $(seed) $(min_pt_conia) $(min_pt_bonia) $(min_pt_q) $(unwevt) $(test_mode) $(local_output_base)"
+arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(pool) $(seed) $(min_pt_conia) $(min_pt_bonia) $(min_pt_q) $(unwevt) $(test_mode) $(local_output_base) $(compress_lhe) $(lhe_compression_level)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

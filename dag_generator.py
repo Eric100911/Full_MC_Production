@@ -26,6 +26,9 @@ from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common.compression_util import accepts_lhe_ext  # noqa: E402
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "generated")
 TEST_OUTPUT_DIR = os.path.join(BASE_DIR, "tests", "generated")
@@ -381,6 +384,8 @@ class WorkflowOptions:
         cmssw15_runtime_tarball: Optional[str] = None,
         shuffle_mixing: bool = False,
         strict_vtx_smearing_check: bool = False,
+        compress_lhe: bool = False,
+        lhe_compression_level: int = 1,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -389,6 +394,8 @@ class WorkflowOptions:
         self.efficiency_ntuple = efficiency_ntuple
         self.cleanup = cleanup
         self.test_mode = test_mode
+        self.compress_lhe = compress_lhe
+        self.lhe_compression_level = lhe_compression_level
         self.scan_existing = scan_existing
         self.force_generate_lhe = force_generate_lhe
         self.proxy_path = proxy_path
@@ -887,7 +894,7 @@ def count_lhe_files_on_t2(pool_name: str, proxy_path: str) -> Tuple[int, Optiona
             return 0, None
         return 0, stderr or "xrdfs ls 返回非零"
 
-    count = sum(1 for line in result.stdout.splitlines() if line.strip().endswith(".lhe"))
+    count = sum(1 for line in result.stdout.splitlines() if accepts_lhe_ext(line.strip()))
     return count, None
 
 
@@ -904,7 +911,7 @@ def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, 
     try:
         if not os.path.exists(local_pool_dir):
             return 0, None
-        count = sum(1 for filename in os.listdir(local_pool_dir) if filename.endswith(".lhe"))
+        count = sum(1 for filename in os.listdir(local_pool_dir) if accepts_lhe_ext(filename))
         return count, None
     except Exception as exc:
         return 0, str(exc)
@@ -1708,7 +1715,7 @@ class DAGBuilder:
                 "lhe_bundle_path=\"{lhe_bundle_path}\" lhe_bundle_name=\"{lhe_bundle_name}\" "
                 "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
-                "log_root=\"{log_root}\" "
+                "log_root=\"{log_root}\" compress_lhe=\"{compress_lhe}\" lhe_compression_level=\"{lhe_compression_level}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
@@ -1727,6 +1734,8 @@ class DAGBuilder:
                     proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                     log_dir=dag_escape(self.options.local_log_dir),
                     local_output_base=dag_escape(self.options.local_output_base),
+                    compress_lhe=dag_escape(bool_string(self.options.compress_lhe)),
+                    lhe_compression_level=dag_escape(self.options.lhe_compression_level),
                     lhe_wrapper_path=dag_escape(
                         os.path.join(BASE_DIR, "lhe_generation", "condor_wrappers", "run_lhe_gen.sh")
                     ),
@@ -2841,6 +2850,20 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-events", type=int, default=-1, help="processing 节点的 max-events。")
     parser.add_argument(
+        "--compress-lhe",
+        action="store_true",
+        default=False,
+        help="压缩新生成的 LHE 输出为 .lhe.gz。",
+    )
+    parser.add_argument(
+        "--lhe-compression-level",
+        type=int,
+        default=1,
+        choices=range(1, 10),
+        metavar="[1-9]",
+        help="gzip 压缩级别，默认 1（快速）。",
+    )
+    parser.add_argument(
         "--enable-ntuple",
         dest="enable_ntuple",
         action="store_true",
@@ -3392,6 +3415,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
             shuffle_mixing=args.shuffle_mixing,
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
+            compress_lhe=args.compress_lhe,
+            lhe_compression_level=args.lhe_compression_level,
         )
         return execute_generation(
             campaign_names=campaign_names,
@@ -3461,6 +3486,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
             shuffle_mixing=False,
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
+            compress_lhe=False,
+            lhe_compression_level=1,
         )
         return execute_ntuple_only_generation(
             campaign_names=campaign_names,

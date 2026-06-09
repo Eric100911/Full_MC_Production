@@ -22,8 +22,8 @@ cleanup_on_exit() {
     local exit_code=$?
     if [[ "${CLEANUP}" == "true" ]] && [[ -n "${WORKDIR}" ]]; then
         echo "[INFO] Cleaning up intermediate files on exit (code=${exit_code})..."
-        rm -f "${WORKDIR}"/*.hepmc 2>/dev/null || true
-        rm -f "${WORKDIR}"/*.lhe 2>/dev/null || true
+        rm -f "${WORKDIR}"/*.hepmc "${WORKDIR}"/*.hepmc.gz 2>/dev/null || true
+        rm -f "${WORKDIR}"/*.lhe "${WORKDIR}"/*.lhe.gz 2>/dev/null || true
         rm -f "${WORKDIR}"/output_GENSIM.root 2>/dev/null || true
         rm -f "${WORKDIR}"/output_RAW.root 2>/dev/null || true
         rm -f "${WORKDIR}"/output_RECO.root 2>/dev/null || true
@@ -48,6 +48,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMMON_DIR="${BASE_DIR}/common"
 SHOWER_DIR="${SCRIPT_DIR}/pythia_shower"
+
+if [[ -f "${COMMON_DIR}/compression_helpers.sh" ]]; then
+    source "${COMMON_DIR}/compression_helpers.sh"
+fi
 CMSSW_CONFIGS_DIR="${COMMON_DIR}/cmssw_configs"
 PACKAGES_DIR="${COMMON_DIR}/packages"
 
@@ -306,12 +310,12 @@ list_lhe_files() {
             return 1
         fi
 
-        if ! file_list=$(find "${local_pool_dir}" -name "*.lhe" -type f | sort); then
+        if ! file_list=$(find "${local_pool_dir}" -type f \( -name "*.lhe" -o -name "*.lhe.gz" \) | sort); then
             msg_error "Failed to list LHE files from ${local_pool_dir}" >&2
             return 1
         fi
     else
-        if ! file_list=$(run_xrdfs "${EOS_XRDFS_TARGET}" ls "${EOS_PATH_BASE}/${pool_subpath}" 2>/dev/null | grep '\.lhe$' | sort); then
+        if ! file_list=$(run_xrdfs "${EOS_XRDFS_TARGET}" ls "${EOS_PATH_BASE}/${pool_subpath}" 2>/dev/null | grep -E '\.lhe(\.gz)?$' | sort); then
             msg_error "Failed to list LHE files via xrdfs at ${EOS_PATH_BASE}/${pool_subpath}" >&2
             return 1
         fi
@@ -1030,7 +1034,17 @@ run_shower() {
                 return 1
             fi
             msg_ok "Downloaded: ${local_lhe}"
-            lhe_file="${local_lhe}"
+            # Transparently decompress .lhe.gz files for C++ shower tools.
+            if is_gz_file "${lhe_file}"; then
+                local plain_lhe="${WORKDIR}/input_${i}.lhe"
+                msg_info "Decompressing ${local_lhe} -> ${plain_lhe}"
+                gunzip -c "${local_lhe}" > "${plain_lhe}.tmp" \
+                    && mv "${plain_lhe}.tmp" "${plain_lhe}" \
+                    || { msg_error "Failed to decompress ${local_lhe}"; return 1; }
+                lhe_file="${plain_lhe}"
+            else
+                lhe_file="${local_lhe}"
+            fi
         fi
 
         # Convert HELAC 9900xxxx octet codes to OniaShower 99nqnsnrnLnJ scheme
@@ -1376,7 +1390,7 @@ MANIFESTEOF
 
         if [[ "${CLEANUP}" == "true" ]]; then
             msg_info "Cleaning up intermediate files..."
-            rm -f "${WORKDIR}"/*.hepmc
+            rm -f "${WORKDIR}"/*.hepmc "${WORKDIR}"/*.hepmc.gz
             rm -f "${WORKDIR}"/output_GENSIM.root
             rm -f "${WORKDIR}"/output_RAW.root
             rm -f "${WORKDIR}"/output_RECO.root
@@ -1418,7 +1432,7 @@ MANIFESTEOF
     # Cleanup intermediate files
     if [[ "${CLEANUP}" == "true" ]]; then
         msg_info "Cleaning up intermediate files..."
-        rm -f "${WORKDIR}"/*.hepmc
+        rm -f "${WORKDIR}"/*.hepmc "${WORKDIR}"/*.hepmc.gz
         rm -f "${WORKDIR}"/output_GENSIM.root
         rm -f "${WORKDIR}"/output_RAW.root
         rm -f "${WORKDIR}"/output_RECO.root
@@ -1640,11 +1654,15 @@ else
             else
                 seed=$((100 + lhe_job_idx))
             fi
-            lhe_file="${EOS_LHE_POOL}/${pool_name}/sample_${pool_name}_${seed}.lhe"
+            # Try .lhe.gz first, then uncompressed .lhe, then fall back to pool listing.
+            lhe_file="${EOS_LHE_POOL}/${pool_name}/sample_${pool_name}_${seed}.lhe.gz"
             if ! check_remote_file "$lhe_file"; then
-                if ! lhe_file=$(get_lhe_file "$pool_name" "$lhe_job_idx"); then
-                    msg_error "Could not resolve LHE file for: $spec (pool: ${pool_name}, idx: ${lhe_job_idx})"
-                    exit 1
+                lhe_file="${EOS_LHE_POOL}/${pool_name}/sample_${pool_name}_${seed}.lhe"
+                if ! check_remote_file "$lhe_file"; then
+                    if ! lhe_file=$(get_lhe_file "$pool_name" "$lhe_job_idx"); then
+                        msg_error "Could not resolve LHE file for: $spec (pool: ${pool_name}, idx: ${lhe_job_idx})"
+                        exit 1
+                    fi
                 fi
             fi
         elif [[ "$spec" == EOS:* ]]; then

@@ -13,6 +13,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OCTET_PDG_TOOL="${BASE_DIR}/common/octet_pdg.py"
+COMMON_DIR="${BASE_DIR}/common"
+
+if [[ -f "${COMMON_DIR}/compression_helpers.sh" ]]; then
+    source "${COMMON_DIR}/compression_helpers.sh"
+fi
 
 # Default values
 POOL_NAME=""
@@ -46,6 +51,8 @@ NOPT_LIM=100000
 FAST_TEST=0
 TEST_MODE="false"
 UNWEVT_OVERRIDE=0
+COMPRESS_LHE="false"
+LHE_COMPRESSION_LEVEL=1
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
 HELAC_SRC_TAR=""
@@ -867,6 +874,14 @@ while [[ $# -gt 0 ]]; do
             TEST_MODE="$2"
             shift 2
             ;;
+        --compress-lhe)
+            COMPRESS_LHE="true"
+            shift 1
+            ;;
+        --lhe-compression-level)
+            LHE_COMPRESSION_LEVEL="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -1238,7 +1253,20 @@ fi
 
 verify_lhe_octet_codes "${FINAL_LHE_FILE}"
 
-# Create output directory and copy generated LHE.
+# Optionally compress LHE output before stageout (atomic: write .tmp then rename).
+STAGEOUT_FILE="${FINAL_LHE_FILE}"
+LHE_EXT="lhe"
+if bool_is_true "${COMPRESS_LHE}" && command -v gzip >/dev/null 2>&1; then
+    LHE_EXT="lhe.gz"
+    STAGEOUT_FILE="${WORKDIR}/sample_${POOL_NAME}_${MY_SEED}.lhe.gz"
+    echo "[INFO] Compressing LHE output (gzip level=${LHE_COMPRESSION_LEVEL})..."
+    gzip -${LHE_COMPRESSION_LEVEL} -c "${FINAL_LHE_FILE}" > "${STAGEOUT_FILE}.tmp" \
+        && mv "${STAGEOUT_FILE}.tmp" "${STAGEOUT_FILE}" \
+        || { echo "[ERROR] Failed to compress LHE file"; exit 1; }
+    echo "[INFO] Compressed: ${STAGEOUT_FILE}"
+fi
+
+# Create output directory and stage out LHE.
 if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
     echo "[INFO] Using local stageout to ${LOCAL_OUTPUT_BASE}"
     LOCAL_DIR="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}"
@@ -1247,9 +1275,9 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
         exit 1
     }
 
-    LOCAL_OUTPUT="${LOCAL_DIR}/sample_${POOL_NAME}_${MY_SEED}.lhe"
+    LOCAL_OUTPUT="${LOCAL_DIR}/sample_${POOL_NAME}_${MY_SEED}.${LHE_EXT}"
     echo "[INFO] Staging out LHE file to: ${LOCAL_OUTPUT}"
-    if cp "${FINAL_LHE_FILE}" "${LOCAL_OUTPUT}"; then
+    if cp "${STAGEOUT_FILE}" "${LOCAL_OUTPUT}"; then
         echo "[INFO] Local stageout successful"
         echo "Output: ${LOCAL_OUTPUT}"
     else
@@ -1268,9 +1296,9 @@ else
         echo "Warning: mkdir failed (directory may already exist)"
     }
 
-    OUTPUT_FILE=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "sample_${POOL_NAME}_${MY_SEED}.lhe")")
+    OUTPUT_FILE=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "sample_${POOL_NAME}_${MY_SEED}.${LHE_EXT}")")
     echo "Staging out LHE file to: ${OUTPUT_FILE}"
-    run_logged "xrdcp_lhe_stageout" xrdcp --nopbar --force "${FINAL_LHE_FILE}" "${OUTPUT_FILE}" || {
+    run_logged "xrdcp_lhe_stageout" xrdcp --nopbar --force "${STAGEOUT_FILE}" "${OUTPUT_FILE}" || {
         echo "Error: Failed to stage out LHE file"
         exit 1
     }

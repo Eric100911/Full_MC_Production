@@ -180,7 +180,7 @@ get_lhe_file() {
     
     # List files via xrdfs
     local file_list
-    file_list=$(xrdfs "${EOS_XRDFS_TARGET}" ls "${EOS_PATH_BASE}/${pool_subpath}" 2>/dev/null | grep '\.lhe$' | sort)
+    file_list=$(xrdfs "${EOS_XRDFS_TARGET}" ls "${EOS_PATH_BASE}/${pool_subpath}" 2>/dev/null | grep -E '\.lhe(\.gz)?$' | sort)
     
     if [[ -z "${file_list}" ]]; then
         msg_error "No LHE files found in ${EOS_PATH_BASE}/${pool_subpath}"

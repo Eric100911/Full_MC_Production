@@ -12,6 +12,8 @@ MIN_PT_Q="$7"
 UNWEVT="$8"
 TEST_MODE="$9"
 LOCAL_OUTPUT_BASE="${10:-}"
+COMPRESS_LHE="${11:-false}"
+LHE_COMPRESSION_LEVEL="${12:-1}"
 
 export LOCAL_OUTPUT_BASE="${LOCAL_OUTPUT_BASE:-}"
 
@@ -20,6 +22,7 @@ echo "Working directory: $(pwd)"
 echo "Pool: ${POOL}"
 echo "Seed: ${SEED}"
 echo "LOCAL_OUTPUT_BASE: ${LOCAL_OUTPUT_BASE:-NOT SET}"
+echo "COMPRESS_LHE: ${COMPRESS_LHE}"
 echo "PATH: ${PATH}"
 echo ""
 
@@ -57,7 +60,11 @@ fi
 
 echo "Running HELAC generation..."
 cd runtime/lhe_generation
-if ! bash run_helac.sh --pool "${POOL}" --seed "${SEED}" --min-pt-conia "${MIN_PT_CONIA}" --min-pt-bonia "${MIN_PT_BONIA}" --min-pt-q "${MIN_PT_Q}" --unwevt "${UNWEVT}" --test-mode "${TEST_MODE}"; then
+COMPRESS_ARGS=()
+if [[ "${COMPRESS_LHE}" == "true" ]]; then
+    COMPRESS_ARGS+=(--compress-lhe --lhe-compression-level "${LHE_COMPRESSION_LEVEL}")
+fi
+if ! bash run_helac.sh --pool "${POOL}" --seed "${SEED}" --min-pt-conia "${MIN_PT_CONIA}" --min-pt-bonia "${MIN_PT_BONIA}" --min-pt-q "${MIN_PT_Q}" --unwevt "${UNWEVT}" --test-mode "${TEST_MODE}" "${COMPRESS_ARGS[@]}"; then
     echo "ERROR: HELAC generation failed" >&2
     exit 1
 fi

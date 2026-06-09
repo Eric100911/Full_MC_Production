@@ -18,6 +18,7 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from common.compression_util import accepts_lhe_ext
 from dag_generator import (
     BASE_DIR,
     BUNDLE_NAMES,
@@ -83,6 +84,8 @@ def generate_lhe_job_script(
     bundle_dir: str,
     lhe_bundle_name: str,
     proxy_bundle_name: str,
+    compress_lhe: bool = False,
+    lhe_compression_level: int = 1,
 ) -> str:
     """生成单个 LHE 生成作业的 bash 脚本内容。
     使用 cmssw-el7 容器运行 HELAC-Onia（提供 gfortran + LCG 环境）。
@@ -92,6 +95,9 @@ def generate_lhe_job_script(
     test_str = bool_str(test_mode)
     work_dir = f"{bundle_dir}/lhe_{pool_name}_{index}"
     proxy_path = f"{work_dir}/credentials/x509_user_proxy"
+    compress_args = ""
+    if compress_lhe:
+        compress_args = f" --compress-lhe --lhe-compression-level {lhe_compression_level}"
 
     return _LHE_SCRIPT_TEMPLATE.format(
         pool_name=pool_name,
@@ -107,6 +113,7 @@ def generate_lhe_job_script(
         test_str=test_str,
         work_dir=work_dir,
         proxy_path=proxy_path,
+        compress_args=compress_args,
     )
 
 
@@ -147,7 +154,7 @@ bash run_helac.sh \\
     --min-pt-bonia {min_pt_bonia} \\
     --min-pt-q {min_pt_q} \\
     --unwevt {unwevt} \\
-    --test-mode {test_str}
+    --test-mode {test_str}{compress_args}
 INNER_EOF
 chmod +x "${{WORK_DIR}}/run_inside.sh"
 
