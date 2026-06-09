@@ -1,0 +1,40 @@
+# ==============================================================================
+# transfer_compress.sub - Per-chunk LHE compression + XRootD transfer.
+# ==============================================================================
+# Each job downloads, compresses, and uploads one 20-file chunk of LHE files
+# between IHEP EOS directories.
+# DAG VARS: compression_bundle_path, compression_bundle_name,
+#           proxy_bundle_path, proxy_bundle_name,
+#           transfer_compress_wrapper_path,
+#           source_prefix, target_subdir, input_list_path, input_list_name,
+#           level, clean_source, log_root
+# ==============================================================================
+
+Universe = vanilla
+
+Executable = $(transfer_compress_wrapper_path)
+transfer_executable = True
+Arguments = "$(compression_bundle_name) $(proxy_bundle_name) $(source_prefix) $(target_subdir) $(input_list_name) $(level) $(clean_source)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+Transfer_Input_Files = $(compression_bundle_path), $(proxy_bundle_path), $(input_list_path)
+
+Output = $(log_root)/transfer_$(cluster)_$(process).stdout
+Error  = $(log_root)/transfer_$(cluster)_$(process).stderr
+Log    = $(log_root)/transfer_$(cluster).log
+
+request_cpus   = 1
+request_memory = 2GB
+request_disk   = 5GB
+
++MaxRuntime = 86400
++JobFlavour = "microcenty"
+Environment = "HOME=/srv"
+
+OnExitHold = (ExitCode != 0)
+OnExitHoldReason = "LHE transfer-compress failed"
+OnExitHoldSubCode = 1
+PeriodicRelease = (JobRunCount < 2) && (HoldReasonCode == 3)
+
+Queue 1
