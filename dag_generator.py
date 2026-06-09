@@ -40,6 +40,51 @@ EOS_PATH_BASE = "/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
 EOS_BASE = f"root://{EOS_HOST}/{EOS_PATH_BASE}"
 EOS_OUTPUT = f"{EOS_BASE}/output"
 STORAGE_SITE = "T2_CN_Beijing"
+
+# Chi's output area for v3 reprocessing and ntuple-from-MiniAOD workflows.
+CHIW_EOS_OUTPUT_BASE = "root://cceos.ihep.ac.cn//store/user/chiw/MC_Production_v3"
+NTUPLE_VERSION = "v01_06"
+
+SUBPROCESS_MAP = OrderedDict([
+    ("JJP_SPS_CS",  "SPS-JpsiJpsiPhi-LO"),
+    ("JJP_SPS_G",   "SPS-JpsiJpsiPhi-NLOstar"),
+    ("JJP_DPS2_CS", "DPS-JpsiJpsi-Phi-LO"),
+    ("JJP_DPS2_G",  "SPS-JpsiJpsiPhi-NLOstar"),
+    ("JJP_DPS1",    "DPS-Jpsi-JpsiPhi"),
+])
+
+def parse_jobs_arg(jobs_str: str):
+    """Parse --jobs argument that accepts either a single integer (applied to all
+    campaigns) or comma-separated campaign=count pairs.
+
+    Returns:
+        int if the value is a bare integer.
+        Dict[str, int] if the value contains '=' signs (per-campaign mapping).
+        None if the value is empty.
+    """
+    if not jobs_str or not jobs_str.strip():
+        return None
+    jobs_str = jobs_str.strip()
+    if "=" in jobs_str:
+        result = OrderedDict()
+        for pair in jobs_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"Mixed --jobs format: expected all campaign=count pairs, got '{pair}'")
+            name, count = pair.split("=", 1)
+            result[name.strip()] = int(count.strip())
+        return result
+    try:
+        return int(jobs_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid --jobs value: '{jobs_str}'. "
+            "Use a bare integer (e.g. --jobs 100) or campaign=count pairs "
+            "(e.g. --jobs JJP_SPS_CS=999,JJP_DPS1=996)."
+        )
+
 DEFAULT_TEST_CAMPAIGNS = ("JJP_DPS2_CS", "JJP_DPS2_G", "JUP_DPS1")
 POOL_SCAN_CACHE_ENV = "DAG_GENERATOR_POOL_SCAN_CACHE"
 
@@ -198,6 +243,8 @@ BUNDLE_NAMES = {
     "summary": "summary_runtime_bundle.tar.gz",
     "compression": "compression_runtime_bundle.tar.gz",
     "proxy": "proxy_bundle.tar.gz",
+    "plan": "plan_runtime_bundle.tar.gz",
+    "coordinate": "coordinate_runtime_bundle.tar.gz",
 }
 
 NTUPLE_WRAPPER_PATH = os.path.join(
@@ -212,6 +259,14 @@ TRANSFER_COMPRESS_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_transfer_compress.sh"
 )
 TRANSFER_COMPRESS_WRAPPER_NAME = "run_transfer_compress.sh"
+PLAN_SUBMIT_TEMPLATE = "processing/templates/plan_lhe_blocks.sub"
+PLAN_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_plan_lhe_blocks.sh"
+)
+COORDINATE_SUBMIT_TEMPLATE = "processing/templates/coordinate_lhe_blocks.sub"
+COORDINATE_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_coordinate_lhe_blocks.sh"
+)
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -400,6 +455,15 @@ class WorkflowOptions:
         lhe_shuffle_mode: str = "stratified",
         lhe_n_strata: str = "auto",
         lhe_drop_incomplete_last_block: bool = False,
+        use_subprocess_naming: bool = False,
+        enable_lhe_block_subdags: bool = False,
+        keep_legacy_single_processing_path: bool = False,
+        lhe_shuffle_seed_base: Optional[int] = None,
+        max_block_subdag_jobs: int = 0,
+        target_base_url: str = "",
+        ntuple_version: str = "",
+        skip_lhe_generation: bool = False,
+        existing_lhe_base: str = "",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -415,8 +479,17 @@ class WorkflowOptions:
         self.lhe_shuffle_mode = lhe_shuffle_mode
         self.lhe_n_strata = lhe_n_strata
         self.lhe_drop_incomplete_last_block = lhe_drop_incomplete_last_block
+        self.use_subprocess_naming = use_subprocess_naming
+        self.enable_lhe_block_subdags = enable_lhe_block_subdags
+        self.keep_legacy_single_processing_path = keep_legacy_single_processing_path
+        self.lhe_shuffle_seed_base = lhe_shuffle_seed_base
+        self.max_block_subdag_jobs = max_block_subdag_jobs if max_block_subdag_jobs > 0 else maxjobs_processing
+        self.target_base_url = target_base_url
+        self.ntuple_version = ntuple_version
         self.scan_existing = scan_existing
         self.force_generate_lhe = force_generate_lhe
+        self.skip_lhe_generation = skip_lhe_generation
+        self.existing_lhe_base = existing_lhe_base or ""
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -460,6 +533,15 @@ class WorkflowOptions:
             "cmssw15_runtime_tarball": self.cmssw15_runtime_tarball,
             "shuffle_mixing": self.shuffle_mixing,
             "strict_vtx_smearing_check": self.strict_vtx_smearing_check,
+            "use_subprocess_naming": self.use_subprocess_naming,
+            "target_base_url": self.target_base_url,
+            "ntuple_version": self.ntuple_version,
+            "enable_lhe_block_subdags": self.enable_lhe_block_subdags,
+            "keep_legacy_single_processing_path": self.keep_legacy_single_processing_path,
+            "lhe_shuffle_seed_base": self.lhe_shuffle_seed_base,
+            "max_block_subdag_jobs": self.max_block_subdag_jobs,
+            "skip_lhe_generation": self.skip_lhe_generation,
+            "existing_lhe_base": self.existing_lhe_base,
         }
 
 
@@ -934,6 +1016,48 @@ def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, 
         return count, None
     except Exception as exc:
         return 0, str(exc)
+
+
+def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: str = "") -> List[str]:
+    """List existing .lhe/.lhe.gz files in a remote pool directory. Returns sorted filenames."""
+    storage_name = pool_storage_name(pool_name)
+    base = existing_lhe_base or EOS_BASE
+    local_proxy_path = ensure_local_xrootd_proxy(proxy_path)
+    env = os.environ.copy()
+    env["X509_USER_PROXY"] = local_proxy_path
+    remote_dir = f"{base}/lhe_pools/{storage_name}"
+    try:
+        result = subprocess.run(
+            ["xrdfs", EOS_XRDFS_TARGET, "ls", remote_dir.replace(f"root://{EOS_HOST}/", "")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    files = []
+    for line in result.stdout.splitlines():
+        fname = line.strip().rsplit("/", 1)[-1] if "/" in line.strip() else line.strip()
+        if accepts_lhe_ext(fname):
+            files.append(fname)
+    return sorted(files)
+
+
+def list_lhe_files_local(pool_name: str, local_output_base: str) -> List[str]:
+    """List existing .lhe/.lhe.gz files in a local pool directory. Returns sorted filenames."""
+    storage_name = pool_storage_name(pool_name)
+    local_pool_dir = os.path.join(local_output_base, "lhe_pools", storage_name)
+    try:
+        if not os.path.exists(local_pool_dir):
+            return []
+        return sorted(f for f in os.listdir(local_pool_dir) if accepts_lhe_ext(f))
+    except Exception:
+        return []
 
 
 def pool_remote_path(pool_name: str, local_output_base: str = "") -> str:
@@ -1627,6 +1751,36 @@ def prepare_runtime_assets(
     )
     assets["summary_bundle_path"] = summary_bundle_path
     assets["summary_bundle_name"] = summary_bundle_name
+
+    # Planner bundle (per-pool block planner)
+    plan_bundle_name = BUNDLE_NAMES["plan"]
+    plan_bundle_path = os.path.join(output_dir, plan_bundle_name)
+    plan_items: List[Tuple[str, str]] = [
+        (os.path.join(BASE_DIR, "tools", "plan_lhe_blocks.py"),
+         "runtime/tools/plan_lhe_blocks.py"),
+        (shuffle_split_bin, "runtime/tools/lhe_shuffle_split"),
+        (os.path.join(BASE_DIR, "common", "compression_util.py"),
+         "runtime/common/compression_util.py"),
+    ]
+    print("  [bundle] Building planner runtime bundle...")
+    build_bundle(plan_bundle_path, plan_items)
+    assets["plan_bundle_path"] = plan_bundle_path
+    assets["plan_bundle_name"] = plan_bundle_name
+
+    # Coordinator bundle (multi-source campaign-level coordinator)
+    coord_bundle_name = BUNDLE_NAMES["coordinate"]
+    coord_bundle_path = os.path.join(output_dir, coord_bundle_name)
+    coord_items: List[Tuple[str, str]] = [
+        (os.path.join(BASE_DIR, "tools", "coordinate_lhe_blocks.py"),
+         "runtime/tools/coordinate_lhe_blocks.py"),
+        (os.path.join(BASE_DIR, "common", "compression_util.py"),
+         "runtime/common/compression_util.py"),
+    ]
+    print("  [bundle] Building coordinator runtime bundle...")
+    build_bundle(coord_bundle_path, coord_items)
+    assets["coordinate_bundle_path"] = coord_bundle_path
+    assets["coordinate_bundle_name"] = coord_bundle_name
+
     return assets
 
 
@@ -1732,19 +1886,19 @@ class DAGBuilder:
 
     def processing_resource_request(self) -> Tuple[str, str, str]:
         if os.environ.get("PREMIX_INPUT_MODE") == "localcache":
-            return "4", "12GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
+            return "2", "12GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
         if self.options.test_mode:
-            return "4", "12GB", "20GB"
-        return "8", "20GB", "50GB"
+            return "2", "8GB", "4GB"
+        return "2", "12GB", "8GB"
 
     def ntuple_resource_request(self, is_ntuple_only: bool = False) -> Tuple[str, str, str]:
         if self.options.test_mode:
             if is_ntuple_only:
                 return "1", "2GB", "2GB"
-            return "4", "8GB", "10GB"
+            return "2", "6GB", "4GB"
         if is_ntuple_only:
             return "1", "2GB", "2GB"
-        return "4", "12GB", "20GB"
+        return "2", "12GB", "8GB"
 
     def ensure_lhe_jobs(self, pool_name: str, required_count: int) -> None:
         """全局共享同一个 pool 的生成节点，避免跨 campaign 重复生成。"""
@@ -1913,6 +2067,9 @@ class DAGBuilder:
         parent_job: Optional[str] = None,
         miniaod_input: Optional[str] = None,
         is_ntuple_only: bool = False,
+        target_eos_base: str = "",
+        custom_output_subpath: str = "",
+        custom_ntuple_basename: str = "",
     ) -> str:
         campaign = CAMPAIGNS[campaign_name]
         job_name = f"NTUPLE_{campaign_name}_{job_index}"
@@ -1934,7 +2091,10 @@ class DAGBuilder:
             "ntuple_bundle_path=\"{ntuple_bundle_path}\" ntuple_bundle_name=\"{ntuple_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
             "ntuple_wrapper_path=\"{ntuple_wrapper_path}\" ntuple_wrapper_name=\"{ntuple_wrapper_name}\" "
-            "log_root=\"{log_root}\"".format(
+            "log_root=\"{log_root}\" "
+            "target_eos_base=\"{target_eos_base}\" "
+            "custom_output_subpath=\"{custom_output_subpath}\" "
+            "custom_ntuple_basename=\"{custom_ntuple_basename}\"".format(
                 job=job_name,
                 campaign=dag_escape(campaign.name),
                 job_id=dag_escape(job_index),
@@ -1954,12 +2114,266 @@ class DAGBuilder:
                 ntuple_wrapper_path=dag_escape(NTUPLE_WRAPPER_PATH),
                 ntuple_wrapper_name=dag_escape(NTUPLE_WRAPPER_NAME),
                 log_root=dag_escape(self.options.log_root),
+                target_eos_base=dag_escape(target_eos_base),
+                custom_output_subpath=dag_escape(custom_output_subpath),
+                custom_ntuple_basename=dag_escape(custom_ntuple_basename),
             )
         )
         self.dag_lines.append(f"RETRY {job_name} 1")
         if parent_job is not None:
             self.dag_lines.append(f"PARENT {parent_job} CHILD {job_name}")
         return job_name
+
+    # ------------------------------------------------------------------
+    # Block SubDAG methods
+    # ------------------------------------------------------------------
+
+    def _resolve_lhe_path(self, pool_name: str, seed: int) -> str:
+        """Return the full path (EOS URL or local) to the HELAC LHE output."""
+        storage = pool_storage_name(pool_name)
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join(
+                self.options.local_output_base,
+                "lhe_pools", storage,
+                f"sample_{storage}_{seed}.lhe.gz",
+            )
+        return f"{EOS_BASE}/lhe_pools/{storage}/sample_{storage}_{seed}.lhe.gz"
+
+    def _resolve_block_output_dir(self, pool_name: str, seed: int) -> str:
+        """Return the directory where block .lhe.gz files should be stored."""
+        storage = pool_storage_name(pool_name)
+        base = self.options.existing_lhe_base or EOS_BASE
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join(
+                self.options.local_output_base,
+                "lhe_pools", storage, "lhe_blocks",
+            )
+        return f"{base}/lhe_pools/{storage}/lhe_blocks"
+
+    def _resolve_plan_manifest_path(self, pool_name: str, seed: int) -> str:
+        """Return the path where the plan manifest JSON will be written."""
+        subdir = os.path.join(
+            self.output_dir, "plan_subdags",
+            pool_dag_label(pool_name),
+            f"seed_{seed}",
+        )
+        return os.path.join(subdir, f"plan_manifest_{pool_name}_{seed}.json")
+
+    def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
+        """Discover and return the path to an existing LHE file for the given pool + job_index.
+
+        Attempts to list the remote/local pool directory. Falls back to the standard
+        naming convention (sample_{storage}_{seed}.lhe.gz) when listing fails or
+        returns fewer files than needed (e.g. dry-run without proxy).
+        """
+        storage = pool_storage_name(pool_name)
+        base = self.options.existing_lhe_base or EOS_BASE
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            files = list_lhe_files_local(pool_name, self.options.local_output_base)
+            pool_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
+        else:
+            files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
+            pool_dir = f"{base}/lhe_pools/{storage}"
+        if job_index < len(files):
+            return f"{pool_dir}/{files[job_index]}"
+        # Fallback: construct path from standard naming convention
+        return f"{pool_dir}/sample_{storage}_{seed}.lhe.gz"
+
+    def add_planning_job(self, pool_name: str, index: int, seed: int,
+                         lhe_path_override: str = "") -> str:
+        """Emit a per-pool LHE block planner DAG node."""
+        pool_label = pool_dag_label(pool_name)
+        job_name = f"PLAN_{pool_label}_{index}"
+        lhe_path = lhe_path_override or self._resolve_lhe_path(pool_name, seed)
+        block_output_dir = self._resolve_block_output_dir(pool_name, seed)
+        plan_manifest_path = self._resolve_plan_manifest_path(pool_name, seed)
+        output_dir = os.path.dirname(plan_manifest_path)
+        shuffle_seed = self.options.lhe_shuffle_seed_base or (seed * 1000 + 37)
+
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, PLAN_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_planning")
+        self.dag_lines.append(
+            "VARS {job} "
+            "plan_wrapper_path=\"{plan_wrapper_path}\" "
+            "plan_bundle_path=\"{plan_bundle_path}\" plan_bundle_name=\"{plan_bundle_name}\" "
+            "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
+            "pool=\"{pool}\" seed=\"{seed}\" "
+            "lhe_path=\"{lhe_path}\" output_dir=\"{output_dir}\" "
+            "events_per_block=\"{events_per_block}\" shuffle_seed=\"{shuffle_seed}\" "
+            "shuffle_mode=\"{shuffle_mode}\" n_strata=\"{n_strata}\" "
+            "drop_incomplete=\"{drop_incomplete}\" "
+            "block_output_dir=\"{block_output_dir}\" "
+            "local_output_base=\"{local_output_base}\" "
+            "reuse_blocks=\"False\" "
+            "manifest_output_path=\"{manifest_output_path}\" "
+            "log_root=\"{log_root}\"".format(
+                job=job_name,
+                plan_wrapper_path=dag_escape(PLAN_WRAPPER_PATH),
+                plan_bundle_path=dag_escape(self.runtime_assets["plan_bundle_path"]),
+                plan_bundle_name=dag_escape(self.runtime_assets["plan_bundle_name"]),
+                proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
+                proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
+                pool=dag_escape(pool_name),
+                seed=dag_escape(seed),
+                lhe_path=dag_escape(lhe_path),
+                output_dir=dag_escape(output_dir),
+                events_per_block=dag_escape(self.options.lhe_events_per_block),
+                shuffle_seed=dag_escape(shuffle_seed),
+                shuffle_mode=dag_escape(self.options.lhe_shuffle_mode),
+                n_strata=dag_escape(self.options.lhe_n_strata),
+                drop_incomplete=dag_escape(bool_string(self.options.lhe_drop_incomplete_last_block)),
+                block_output_dir=dag_escape(block_output_dir),
+                local_output_base=dag_escape(self.options.local_output_base),
+                manifest_output_path=dag_escape(plan_manifest_path),
+                log_root=dag_escape(self.options.log_root),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
+    def add_coordinator_job(
+        self,
+        campaign_name: str,
+        job_index: int,
+        source_infos: List[Tuple[str, int]],
+    ) -> str:
+        """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
+        campaign = CAMPAIGNS[campaign_name]
+        job_name = f"COORD_{campaign_name}_{job_index}"
+
+        # Build source_manifests JSON: list of {pool, seed, path}
+        source_manifest_entries = []
+        for pool_name, seed in source_infos:
+            source_manifest_entries.append({
+                "pool": pool_name,
+                "seed": seed,
+                "path": self._resolve_plan_manifest_path(pool_name, seed),
+            })
+        source_manifests_json = dag_escape(json.dumps(source_manifest_entries))
+
+        subdag_dir = os.path.join(
+            self.output_dir, "plan_subdags", campaign_name,
+            f"job_{job_index}",
+        )
+        subdag_output_path = os.path.join(subdag_dir, "blocks_processing.dag")
+
+        request_cpus, request_memory, request_disk = self.processing_resource_request()
+
+        ntuple_sub_template = ""
+        ntuple_bundle_path = ""
+        ntuple_bundle_name = ""
+        ntuple_wrapper_path = ""
+        if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
+            ntuple_sub_template = os.path.join(BASE_DIR, "processing/templates/ntuple.sub")
+            ntuple_bundle_path = self.runtime_assets.get("ntuple_bundle_path", "")
+            ntuple_bundle_name = self.runtime_assets.get("ntuple_bundle_name", "")
+            ntuple_wrapper_path = NTUPLE_WRAPPER_PATH
+
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, COORDINATE_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_coordination")
+        self.dag_lines.append(
+            "VARS {job} "
+            "coord_wrapper_path=\"{coord_wrapper}\" "
+            "coord_bundle_path=\"{coord_bundle_path}\" coord_bundle_name=\"{coord_bundle_name}\" "
+            "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
+            "campaign=\"{campaign}\" job_index=\"{job_index}\" "
+            "source_manifests=\"{source_manifests}\" "
+            "shower_modes=\"{shower_modes}\" analysis_type=\"{analysis_type}\" "
+            "n_sources=\"{n_sources}\" max_events=\"{max_events}\" "
+            "enable_ntuple=\"{enable_ntuple}\" efficiency_ntuple=\"{efficiency_ntuple}\" "
+            "cleanup=\"{cleanup}\" shuffle_mixing=\"{shuffle_mixing}\" "
+            "log_root=\"{log_root}\" "
+            "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" "
+            "request_disk=\"{request_disk}\" "
+            "target_machine=\"{target_machine}\" "
+            "output_dir=\"{output_dir}\" "
+            "processing_sub_template_path=\"{processing_sub_template_path}\" "
+            "processing_bundle_path=\"{processing_bundle_path}\" "
+            "processing_bundle_name=\"{processing_bundle_name}\" "
+            "proxy_bundle_path2=\"{proxy_bundle_path}\" "
+            "proxy_bundle_name2=\"{proxy_bundle_name}\" "
+            "processing_wrapper_path=\"{processing_wrapper_path}\" "
+            "ntuple_sub_template_path=\"{ntuple_sub_template_path}\" "
+            "ntuple_bundle_path=\"{ntuple_bundle_path}\" "
+            "ntuple_bundle_name=\"{ntuple_bundle_name}\" "
+            "ntuple_wrapper_path=\"{ntuple_wrapper_path}\" "
+            "subdag_output_path=\"{subdag_output_path}\" "
+            "max_block_subdag_jobs=\"{max_block_subdag_jobs}\" "
+            "local_output_base=\"{local_output_base}\"".format(
+                job=job_name,
+                coord_wrapper=dag_escape(COORDINATE_WRAPPER_PATH),
+                coord_bundle_path=dag_escape(self.runtime_assets["coordinate_bundle_path"]),
+                coord_bundle_name=dag_escape(self.runtime_assets["coordinate_bundle_name"]),
+                proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
+                proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
+                campaign=dag_escape(campaign_name),
+                job_index=dag_escape(job_index),
+                source_manifests=source_manifests_json,
+                shower_modes=dag_escape(",".join(campaign.shower_modes)),
+                analysis_type=dag_escape(campaign.analysis_type),
+                n_sources=dag_escape(campaign.n_sources),
+                max_events=dag_escape(self.options.max_events),
+                enable_ntuple=dag_escape(bool_string(
+                    self.options.enable_ntuple and not self.options.machine_env.uses_local_storage
+                )),
+                efficiency_ntuple=dag_escape(bool_string(self.options.efficiency_ntuple)),
+                cleanup=dag_escape(bool_string(self.options.cleanup)),
+                shuffle_mixing=dag_escape(bool_string(self.options.shuffle_mixing)),
+                log_root=dag_escape(self.options.log_root),
+                request_cpus=dag_escape(request_cpus),
+                request_memory=dag_escape(request_memory),
+                request_disk=dag_escape(request_disk),
+                target_machine=dag_escape(self.options.machine_env.target_machine),
+                output_dir=dag_escape(subdag_dir),
+                processing_sub_template_path=dag_escape(
+                    os.path.join(BASE_DIR, self.options.machine_env.processing_submit_template)
+                ),
+                processing_bundle_path=dag_escape(self.runtime_assets["processing_bundle_path"]),
+                processing_bundle_name=dag_escape(self.runtime_assets["processing_bundle_name"]),
+                processing_wrapper_path=dag_escape(
+                    os.path.join(BASE_DIR, "processing", "condor_wrappers", "run_processing.sh")
+                ),
+                ntuple_sub_template_path=dag_escape(ntuple_sub_template),
+                ntuple_bundle_path=dag_escape(ntuple_bundle_path),
+                ntuple_bundle_name=dag_escape(ntuple_bundle_name),
+                ntuple_wrapper_path=dag_escape(ntuple_wrapper_path),
+                subdag_output_path=dag_escape(subdag_output_path),
+                max_block_subdag_jobs=dag_escape(self.options.max_block_subdag_jobs),
+                local_output_base=dag_escape(self.options.local_output_base),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
+    def add_block_subdag_node(
+        self,
+        campaign_name: str,
+        job_index: int,
+        is_single_source: bool,
+        pool_name: str = "",
+    ) -> str:
+        """Emit a SUBDAG EXTERNAL node for a block processing SubDAG."""
+        if is_single_source:
+            pool_label = pool_dag_label(pool_name)
+            subdag_name = f"PROC_{campaign_name}_{pool_label}_{job_index}"
+        else:
+            subdag_name = f"MIX_{campaign_name}_{job_index}"
+
+        subdag_path = os.path.join(
+            self.output_dir, "plan_subdags", campaign_name,
+            f"job_{job_index}", "blocks_processing.dag",
+        )
+        # Pre-create the directory as a placeholder so DAGMan can validate the path
+        os.makedirs(os.path.dirname(subdag_path), exist_ok=True)
+
+        self.dag_lines.append(
+            f"SUBDAG EXTERNAL {subdag_name} {subdag_path}"
+        )
+        return subdag_name
 
     def build(self, campaign_names: Sequence[str], dag_filename: str) -> str:
         dagman_config_path = os.path.join(self.output_dir, "dagman.config")
@@ -1983,6 +2397,9 @@ class DAGBuilder:
             self.dag_lines.append(f"MAXJOBS processing {self.options.maxjobs_processing}")
         if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage and self.options.maxjobs_ntuple > 0:
             self.dag_lines.append(f"MAXJOBS ntuple {self.options.maxjobs_ntuple}")
+        if self.options.enable_lhe_block_subdags:
+            self.dag_lines.append(f"MAXJOBS lhe_planning {self.options.maxjobs_lhe}")
+            self.dag_lines.append(f"MAXJOBS lhe_coordination {self.options.maxjobs_lhe}")
         self.dag_lines.append("")
 
         for pool_name, required_count in self.pool_requirements.items():
@@ -1994,11 +2411,119 @@ class DAGBuilder:
             self.dag_lines.append(f"# {campaign.description}")
             if campaign.notes:
                 self.dag_lines.append(f"# 备注: {campaign.notes}")
-            for job_index in range(self.options.jobs_per_campaign):
-                processing_job = self.add_processing_job(campaign_name, job_index)
-                processing_jobs.append(processing_job)
-                if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
-                    self.add_ntuple_job(campaign_name, job_index, processing_job)
+
+            use_block_subdags = (
+                self.options.enable_lhe_block_subdags
+                and not self.options.keep_legacy_single_processing_path
+            )
+
+            # Block SubDAGs require freshly generated LHE; existing pools
+            # can't provide block files so fall back to legacy processing.
+            # When --skip-lhe-generation is set, existing files are expected
+            # (planners point at them directly), so skip this guard.
+            if use_block_subdags and not self.options.skip_lhe_generation:
+                any_existing = any(
+                    self.pool_uses_existing(pn) for pn in campaign.inputs
+                )
+                if any_existing:
+                    print(
+                        f"[WARNING] Campaign {campaign_name}: some pools use existing LHE. "
+                        f"Falling back to legacy flat DAG (block SubDAGs require fresh LHE generation).",
+                        file=sys.stderr,
+                    )
+                    use_block_subdags = False
+
+            if use_block_subdags and self.options.skip_lhe_generation:
+                # Short-circuit: skip HELAC generation, use existing LHE files.
+                # Planners download and shuffle-split existing files directly.
+                if campaign.n_sources == 1:
+                    pool_name = campaign.inputs[0]
+                    for job_index in range(self.options.jobs_per_campaign):
+                        seed = self.seed_for_pool_index(pool_name, job_index)
+                        lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
+                        plan_job = self.add_planning_job(
+                            pool_name, job_index, seed, lhe_path_override=lhe_path,
+                        )
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_index, is_single_source=True,
+                            pool_name=pool_name,
+                        )
+                        self.dag_lines.append(f"PARENT {plan_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                else:
+                    # Multi-source: planner per unique pool → coordinator → SubDAG
+                    for job_index in range(self.options.jobs_per_campaign):
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: set = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            seed = self.seed_for_pool_index(pool_name, job_index)
+                            lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
+                            plan_job = self.add_planning_job(
+                                pool_name, job_index, seed, lhe_path_override=lhe_path,
+                            )
+                            plan_jobs.append(plan_job)
+                            source_infos.append((pool_name, seed))
+                        coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos)
+                        for pj in plan_jobs:
+                            self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_index, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+
+            elif use_block_subdags and campaign.n_sources == 1:
+                # Single-source: planner writes SubDAG directly
+                pool_name = campaign.inputs[0]
+                for job_index in range(self.options.jobs_per_campaign):
+                    seed = self.seed_for_pool_index(pool_name, job_index)
+                    plan_job = self.add_planning_job(pool_name, job_index, seed)
+                    lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
+                    self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                    subdag_name = self.add_block_subdag_node(
+                        campaign_name, job_index, is_single_source=True,
+                        pool_name=pool_name,
+                    )
+                    self.dag_lines.append(f"PARENT {plan_job} CHILD {subdag_name}")
+                    processing_jobs.append(subdag_name)
+
+            elif use_block_subdags and campaign.n_sources >= 2:
+                # Multi-source: planner per source → coordinator → SubDAG
+                for job_index in range(self.options.jobs_per_campaign):
+                    plan_jobs = []
+                    source_infos = []
+                    seen_pools: set = set()
+                    for pool_name in campaign.inputs:
+                        if pool_name in seen_pools:
+                            continue
+                        seen_pools.add(pool_name)
+                        seed = self.seed_for_pool_index(pool_name, job_index)
+                        plan_job = self.add_planning_job(pool_name, job_index, seed)
+                        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
+                        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                        plan_jobs.append(plan_job)
+                        source_infos.append((pool_name, seed))
+                    coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos)
+                    for pj in plan_jobs:
+                        self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                    subdag_name = self.add_block_subdag_node(
+                        campaign_name, job_index, is_single_source=False,
+                    )
+                    self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                    processing_jobs.append(subdag_name)
+
+            else:
+                # Legacy flat DAG (current behavior)
+                for job_index in range(self.options.jobs_per_campaign):
+                    processing_job = self.add_processing_job(campaign_name, job_index)
+                    processing_jobs.append(processing_job)
+                    if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
+                        self.add_ntuple_job(campaign_name, job_index, processing_job)
+
             self.dag_lines.append("")
 
         if processing_jobs:
@@ -2085,11 +2610,24 @@ class DAGBuilder:
                 self.dag_lines.append(f"# 备注: {campaign.notes}")
             for job_index in job_indices:
                 miniaod_path = miniaod_input_fn(campaign_name, job_index)
+                target_eos_base = ""
+                custom_output_subpath = ""
+                custom_ntuple_basename = ""
+                if self.options.use_subprocess_naming:
+                    subprocess_id = SUBPROCESS_MAP.get(campaign_name, "")
+                    if subprocess_id:
+                        target_eos_base = self.options.target_base_url or CHIW_EOS_OUTPUT_BASE
+                        custom_output_subpath = subprocess_id
+                        version = self.options.ntuple_version or NTUPLE_VERSION
+                        custom_ntuple_basename = f"{subprocess_id}-Ntuple-{version}-{job_index}.root"
                 self.add_ntuple_job(
                     campaign_name, job_index,
                     parent_job=None,
                     miniaod_input=miniaod_path,
                     is_ntuple_only=True,
+                    target_eos_base=target_eos_base,
+                    custom_output_subpath=custom_output_subpath,
+                    custom_ntuple_basename=custom_ntuple_basename,
                 )
             self.dag_lines.append("")
 
@@ -2359,7 +2897,7 @@ def execute_ntuple_only_generation(
     output_dir: str,
     dag_filename: str,
     options: WorkflowOptions,
-    jobs: int,
+    jobs: object,  # int or Dict[str, int] from parse_jobs_arg()
     dry_run: bool,
 ) -> int:
     """生成仅含 ntuple 重跑节点的 DAG（从已有 MiniAOD 出发）。"""
@@ -2396,16 +2934,28 @@ def execute_ntuple_only_generation(
 
     # Resolve job indices
     if use_miniaod_dir:
+        max_jobs_int = jobs if isinstance(jobs, int) else 0
         campaign_jobs_map = discover_ntuple_jobs(
-            miniaod_dir, campaign_names, miniaod_filename, max_jobs=jobs,
+            miniaod_dir, campaign_names, miniaod_filename, max_jobs=max_jobs_int,
         )
     else:
-        if jobs <= 0:
+        if not jobs:
             print("错误: 使用 --miniaod-base-url 时必须提供 --jobs", file=sys.stderr)
             return 1
-        campaign_jobs_map = OrderedDict(
-            (name, list(range(jobs))) for name in campaign_names
-        )
+        if isinstance(jobs, dict):
+            campaign_jobs_map = OrderedDict()
+            for name in campaign_names:
+                count = jobs.get(name)
+                if count is None:
+                    print(f"警告: campaign {name} 未在 --jobs 中指定，跳过", file=sys.stderr)
+                    continue
+                if count <= 0:
+                    continue
+                campaign_jobs_map[name] = list(range(count))
+        else:
+            campaign_jobs_map = OrderedDict(
+                (name, list(range(jobs))) for name in campaign_names
+            )
 
     if not campaign_jobs_map:
         print("错误: 没有任何可用的 ntuple job（未找到 MiniAOD 文件）", file=sys.stderr)
@@ -2519,7 +3069,23 @@ def execute_generation(
         if options.log_root != options.local_log_dir:
             ensure_dir(options.log_root)
     pool_requirements = compute_pool_requirements(campaign_names, options.jobs_per_campaign)
-    if options.force_generate_lhe:
+    if options.skip_lhe_generation:
+        # Short-circuit: mark all pools as "existing" so ensure_lhe_jobs()
+        # is a no-op. Planners will be fed existing file paths directly.
+        existing_pools = OrderedDict(
+            (
+                pool_name,
+                {
+                    "required_count": required_count,
+                    "remote_count": 0,
+                    "use_existing": True,
+                    "error": None,
+                    "remote_path": pool_remote_path(pool_name, local_output_base),
+                },
+            )
+            for pool_name, required_count in pool_requirements.items()
+        )
+    elif options.force_generate_lhe:
         existing_pools = OrderedDict(
             (
                 pool_name,
@@ -2561,6 +3127,10 @@ def execute_generation(
             "summary_bundle_name": BUNDLE_NAMES["summary"],
             "proxy_bundle_path": "<dry-run>/proxy_bundle.tar.gz",
             "proxy_bundle_name": BUNDLE_NAMES["proxy"],
+            "plan_bundle_path": "<dry-run>/plan_runtime_bundle.tar.gz",
+            "plan_bundle_name": BUNDLE_NAMES["plan"],
+            "coordinate_bundle_path": "<dry-run>/coordinate_runtime_bundle.tar.gz",
+            "coordinate_bundle_name": BUNDLE_NAMES["coordinate"],
         }
         if split_ntuple:
             runtime_assets["ntuple_bundle_path"] = "<dry-run>/ntuple_runtime_bundle.tar.gz"
@@ -2963,6 +3533,42 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="丢弃不完整的最末 block。",
     )
     parser.add_argument(
+        "--enable-lhe-block-subdags",
+        action="store_true",
+        default=False,
+        help="启用 LHE block SubDAG 模式：每个 HELAC 作业生成 block 级处理子 DAG。",
+    )
+    parser.add_argument(
+        "--keep-legacy-single-processing-path",
+        action="store_true",
+        default=False,
+        help="强制使用旧版单文件处理路径（flat DAG），即使 --enable-lhe-block-subdags 已设置。",
+    )
+    parser.add_argument(
+        "--lhe-shuffle-seed-base",
+        type=int,
+        default=None,
+        help="LHE shuffle 种子基值；默认从 HELAC seed 派生 (seed * 1000 + 37)。",
+    )
+    parser.add_argument(
+        "--max-block-subdag-jobs",
+        type=int,
+        default=0,
+        help="block SubDAG 内部 MAXJOBS block_processing 节流值；默认与 --maxjobs-processing 相同。",
+    )
+    parser.add_argument(
+        "--skip-lhe-generation",
+        action="store_true",
+        default=False,
+        help="跳过 HELAC LHE 生成；使用池目录中已有的 LHE 文件，配合 --enable-lhe-block-subdags 使用。",
+    )
+    parser.add_argument(
+        "--existing-lhe-base",
+        type=str,
+        default="",
+        help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。与 --skip-lhe-generation 配合使用。",
+    )
+    parser.add_argument(
         "--enable-ntuple",
         dest="enable_ntuple",
         action="store_true",
@@ -3032,13 +3638,13 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dagman-max-jobs-submitted",
         type=int,
-        default=200,
+        default=2000,
         help="DAGMan 允许同时提交/运行的最大节点数。",
     )
     parser.add_argument(
         "--dagman-max-jobs-idle",
         type=int,
-        default=100,
+        default=2000,
         help="DAGMan 允许同时处于 idle 状态的最大节点数。",
     )
     parser.add_argument(
@@ -3069,19 +3675,19 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--maxjobs-lhe",
         type=int,
-        default=20,
+        default=2000,
         help="DAGMan LHE category throttle。",
     )
     parser.add_argument(
         "--maxjobs-processing",
         type=int,
-        default=50,
+        default=2000,
         help="DAGMan MiniAOD/processing category throttle。",
     )
     parser.add_argument(
         "--maxjobs-ntuple",
         type=int,
-        default=30,
+        default=2000,
         help="DAGMan ntuple category throttle。",
     )
     parser.add_argument(
@@ -3315,9 +3921,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ntuple_only_parser.add_argument(
         "--jobs",
-        type=int,
-        default=0,
-        help="每个 campaign 的 job 数；用于 --miniaod-base-url 时必填；用于 --miniaod-dir 时可限制发现数量。",
+        default="",
+        help="每个 campaign 的 job 数；用于 --miniaod-base-url 时必填。可指定单个整数（所有 campaign 统一）"
+             "或逗号分隔的 campaign=count 对（例如 JJP_SPS_CS=999,JJP_DPS1=996）。",
     )
     ntuple_only_parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录。")
     ntuple_only_parser.add_argument("--output", default="ntuple_only.dag", help="输出 DAG 文件名。")
@@ -3370,6 +3976,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-vtx-smearing-check",
         action="store_true",
         help="在生成 DAG 前运行 GEN-SIM vertex smearing 静态校验。",
+    )
+    ntuple_only_parser.add_argument(
+        "--use-subprocess-naming",
+        action="store_true",
+        help="使用 subprocess ID 命名输出目录和文件 (SPS-JpsiJpsiPhi-LO 等)。",
+    )
+    ntuple_only_parser.add_argument(
+        "--target-base-url",
+        default="",
+        help="自定义输出 EOS 基地址 (默认: chiw MC_Production_v3)。",
+    )
+    ntuple_only_parser.add_argument(
+        "--ntuple-version",
+        default="",
+        help="ntuple 文件名中的版本字符串 (默认: v01_06)。",
     )
     ntuple_only_parser.add_argument("--dry-run", action="store_true", help="只打印 DAG，不写文件。")
 
@@ -3521,6 +4142,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lhe_shuffle_mode=args.lhe_shuffle_mode,
             lhe_n_strata=args.lhe_n_strata,
             lhe_drop_incomplete_last_block=args.lhe_drop_incomplete_last_block,
+            enable_lhe_block_subdags=args.enable_lhe_block_subdags,
+            keep_legacy_single_processing_path=args.keep_legacy_single_processing_path,
+            lhe_shuffle_seed_base=args.lhe_shuffle_seed_base,
+            max_block_subdag_jobs=args.max_block_subdag_jobs,
+            skip_lhe_generation=args.skip_lhe_generation,
+            existing_lhe_base=args.existing_lhe_base,
         )
         return execute_generation(
             campaign_names=campaign_names,
@@ -3597,6 +4224,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lhe_shuffle_mode="stratified",
             lhe_n_strata="auto",
             lhe_drop_incomplete_last_block=False,
+            use_subprocess_naming=args.use_subprocess_naming,
+            target_base_url=args.target_base_url,
+            ntuple_version=args.ntuple_version,
+            enable_lhe_block_subdags=False,
+            keep_legacy_single_processing_path=False,
+            lhe_shuffle_seed_base=None,
+            max_block_subdag_jobs=0,
         )
         return execute_ntuple_only_generation(
             campaign_names=campaign_names,
@@ -3606,7 +4240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             dag_filename=args.output,
             options=options,
-            jobs=args.jobs,
+            jobs=parse_jobs_arg(args.jobs),
             dry_run=args.dry_run,
         )
 

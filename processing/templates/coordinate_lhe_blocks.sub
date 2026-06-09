@@ -1,0 +1,39 @@
+# ==============================================================================
+# coordinate_lhe_blocks.sub - Multi-source LHE block coordinator node
+#
+# Runs after all per-pool LHE planners complete for a campaign job index.
+# Reads plan manifests, matches blocks across sources with strict-min,
+# and generates a processing SubDAG.
+# ==============================================================================
+
+Universe = vanilla
+
+Executable = $(coord_wrapper_path)
+transfer_executable = True
+Arguments = "$(proxy_bundle_name) $(coord_bundle_name) $(campaign) $(job_index) $(source_manifests) $(shower_modes) $(analysis_type) $(n_sources) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(shuffle_mixing) $(log_root) $(request_cpus) $(request_memory) $(request_disk) $(target_machine) $(output_dir) $(processing_sub_template_path) $(processing_bundle_path) $(processing_bundle_name) $(proxy_bundle_path) $(proxy_bundle_name) $(processing_wrapper_path) $(ntuple_sub_template_path) $(ntuple_bundle_path) $(ntuple_bundle_name) $(ntuple_wrapper_path) $(subdag_output_path) $(max_block_subdag_jobs) $(local_output_base)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+Transfer_Input_Files = $(coord_bundle_path), $(proxy_bundle_path)
+
+transfer_output_files =
+
+Output = $(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/coord_$(campaign)_$(job_index)_$(Cluster).log
+
+request_cpus   = 1
+request_memory = 2GB
+request_disk   = 5GB
+
++MaxRuntime = 86400
+Environment = "HOME=/srv"
+
++SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86_64"
+
+OnExitHold = (ExitCode != 0)
+OnExitHoldReason = "LHE block coordination failed"
+OnExitHoldSubCode = 1
+PeriodicRelease = (JobRunCount < 2) && (HoldReasonCode == 3)
+
+Queue 1

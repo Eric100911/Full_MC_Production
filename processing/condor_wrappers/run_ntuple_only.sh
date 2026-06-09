@@ -13,6 +13,9 @@
 #   $8  cleanup              true|false
 #   $9  miniaod_input        file:/path/to/MINIAOD.root  or  root://...
 #   $10 local_output_base    output directory (may be empty)
+#   $11 target_eos_base       override EOS_BASE for XRootD output (may be empty)
+#   $12 custom_output_subpath override output subpath (may be empty)
+#   $13 custom_ntuple_basename override remote ntuple filename (may be empty)
 # ==============================================================================
 
 set -euo pipefail
@@ -28,7 +31,11 @@ CLEANUP="${8:-true}"
 MINIAOD_INPUT="${9:?}"
 LOCAL_OUTPUT_BASE="${10:-}"
 
-export LOCAL_OUTPUT_BASE
+TARGET_EOS_BASE="${11:-}"
+CUSTOM_OUTPUT_SUBPATH="${12:-}"
+CUSTOM_NTUPLE_BASENAME="${13:-}"
+
+export LOCAL_OUTPUT_BASE TARGET_EOS_BASE CUSTOM_OUTPUT_SUBPATH CUSTOM_NTUPLE_BASENAME
 
 echo "=== Ntuple-only Wrapper ==="
 echo "Host: $(hostname)"

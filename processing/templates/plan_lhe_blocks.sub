@@ -1,0 +1,38 @@
+# ==============================================================================
+# plan_lhe_blocks.sub - LHE block planner node
+#
+# Runs after a HELAC LHE generation job. Locates the LHE output,
+# shuffle-splits into blocks, compresses, and writes a plan manifest.
+# ==============================================================================
+
+Universe = vanilla
+
+Executable = $(plan_wrapper_path)
+transfer_executable = True
+Arguments = "$(proxy_bundle_name) $(plan_bundle_name) $(pool) $(seed) $(lhe_path) $(output_dir) $(events_per_block) $(shuffle_seed) $(shuffle_mode) $(n_strata) $(drop_incomplete) $(block_output_dir) $(local_output_base) $(reuse_blocks) $(manifest_output_path)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+Transfer_Input_Files = $(plan_bundle_path), $(proxy_bundle_path)
+
+transfer_output_files =
+
+Output = $(log_root)/plan_$(pool)_$(seed)_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/plan_$(pool)_$(seed)_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/plan_$(pool)_$(seed)_$(Cluster).log
+
+request_cpus   = 2
+request_memory = 4GB
+request_disk   = 10GB
+
++MaxRuntime = 86400
+Environment = "HOME=/srv"
+
++SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86_64"
+
+OnExitHold = (ExitCode != 0)
+OnExitHoldReason = "LHE block planning failed"
+OnExitHoldSubCode = 1
+PeriodicRelease = (JobRunCount < 2) && (HoldReasonCode == 3)
+
+Queue 1

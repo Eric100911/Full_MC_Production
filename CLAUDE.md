@@ -25,7 +25,9 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/setup.sh`** — Environment setup for local debugging (CMSSW 12/15, HELAC, Pythia, XRootD). Not used by worker nodes at runtime; they self-configure via bundled tarballs.
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter: translates between old `9900xxxx` codes and Pythia8 `99nqnsnrnLnJ` encoding. Also provides a `scan` subcommand for auditing LHE files.
 - **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Unpacks `helac_package.tar.gz`, builds HepMC/HELAC, generates LHE, optionally shuffle-splits into blocks, stages out to XRootD.
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++17 tool for stratified LHE shuffle and 1000-event block splitting. Built inline by `run_helac.sh`; no external dependencies.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 tool for stratified LHE shuffle and 1000-event block splitting. Supports `--filename-prefix` for seed-specific output naming. Pre-compiled inside cmssw/el7 container and bundled with both LHE and planner runtimes.
+- **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
+- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker to avoid glibc/ABI mismatches.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type. Templates use wrapper scripts rather than inline bash.
@@ -60,6 +62,11 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS.
 - LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC intermediates always remain plain text for CMSSW compatibility.
 - LHE shuffle-split (`--lhe-shuffle-split`) produces `block_NNNNNN.lhe` files and a `shuffle_split_manifest.json` in a `lhe_blocks/` subdirectory. The original single LHE is always preserved for backward-compatible processing.
+- Block SubDAG mode (`--enable-lhe-block-subdags`) introduces per-HELAC-job planners and campaign-level coordinators that generate `SUBDAG EXTERNAL` processing DAGs. Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness. Processing nodes consume blocks via `BLOCK:<pool>:<seed>:<idx>` input specs.
+- Planner: `tools/plan_lhe_blocks.py` runs after each HELAC job, compresses LHE, shuffle-splits, stages blocks, and writes `plan_manifest_<pool>_<seed>.json`.
+- Coordinator: `tools/coordinate_lhe_blocks.py` runs after all per-source planners for a multi-source campaign, matches blocks with strict-min policy, and generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+- New DAG categories: `lhe_planning` (planner jobs), `lhe_coordination` (coordinator jobs), `block_processing` (block-level processing inside SubDAGs).
+- The `--filename-prefix` option on `lhe_shuffle_split` allows seed-specific block filenames (e.g. `100_block_000000.lhe`).
 
 ## Runtime Environments
 
@@ -139,6 +146,39 @@ python3 dag_generator.py generate-test \
   --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS \
   --output-dir tests/generated/shuffle_smoke --output smoke.dag \
   --lhe-shuffle-split --lhe-events-per-block 100
+
+# Block SubDAG mode — single-source SPS
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --jobs 10 --enable-lhe-block-subdags --no-scan-existing \
+  --output-dir generated/jjp_sps_cs_subdag --output mc_sps_subdag.dag
+
+# Block SubDAG mode — multi-source DPS with coordinator
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS \
+  --jobs 10 --enable-lhe-block-subdags --no-scan-existing \
+  --output-dir generated/jjp_dps2_subdag --output mc_dps_subdag.dag
+
+# Legacy override (flat DAG even with block subdag flag)
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --jobs 10 --enable-lhe-block-subdags --keep-legacy-single-processing-path \
+  --output-dir generated/legacy --output mc_legacy.dag
+
+# Ntuple-only re-run from existing MiniAOD (XRootD remote)
+python3 dag_generator.py generate-ntuple-only \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_SPS_CS --campaign JJP_DPS1 \
+  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --jobs 50 --dry-run
+
+# Ntuple-only with subprocess-based output naming
+python3 dag_generator.py generate-ntuple-only \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
+  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --jobs 50 --use-subprocess-naming \
+  --output-dir generated/ntuple_from_v3_miniaod
 ```
 
 ### Running tests

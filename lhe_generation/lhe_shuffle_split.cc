@@ -58,6 +58,7 @@ struct ShuffleSplitConfig {
     bool drop_incomplete = false;
     bool write_provenance = true;
     bool no_init_check = false;
+    string filename_prefix = "";
 };
 
 // ---------------------------------------------------------------------------
@@ -352,6 +353,7 @@ Misc:
   --compression-level N   Accepted for CLI compatibility (default: 1)
   --write-provenance      Add provenance comment to output block headers
   --no-init-check         Skip <init> compatibility check across input files
+  --filename-prefix STR   Prefix for output block filenames (default: "")
   --help                  Print this message
 )";
 }
@@ -398,6 +400,8 @@ static ShuffleSplitConfig parse_args(int argc, char *argv[]) {
             cfg.write_provenance = true;
         } else if (arg == "--no-init-check") {
             cfg.no_init_check = true;
+        } else if (arg == "--filename-prefix" && i + 1 < argc) {
+            cfg.filename_prefix = argv[++i];
         } else if (arg.find("--") == 0) {
             cerr << "[ERROR] Unknown option: " << arg << endl;
             print_usage();
@@ -608,10 +612,11 @@ static bool write_lhe_block(
     bool write_provenance,
     uint64_t seed,
     const string &mode,
-    int n_strata)
+    int n_strata,
+    const string &filename_prefix)
 {
     char fname[64];
-    snprintf(fname, sizeof(fname), "block_%06d.lhe", block_index);
+    snprintf(fname, sizeof(fname), "%sblock_%06d.lhe", filename_prefix.c_str(), block_index);
     string path = output_dir + "/" + fname;
     string tmp = path + ".tmp";
 
@@ -736,7 +741,7 @@ static void write_manifest(
     ofs << "  \"blocks\": [" << endl;
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
         char fname[64];
-        snprintf(fname, sizeof(fname), "block_%06zu.lhe", bi);
+        snprintf(fname, sizeof(fname), "%sblock_%06zu.lhe", cfg.filename_prefix.c_str(), bi);
         ofs << "    {" << endl;
         ofs << "      \"index\": " << bi << "," << endl;
         ofs << "      \"filename\": \"" << fname << "\"," << endl;
@@ -902,7 +907,8 @@ int main(int argc, char *argv[]) {
         if (!write_lhe_block(cfg.output_dir, (int)bi,
                              first.prologue, first.init, first.events,
                              blocks[bi], first.epilogue,
-                             cfg.write_provenance, cfg.seed, cfg.mode, n_strata)) {
+                             cfg.write_provenance, cfg.seed, cfg.mode, n_strata,
+                             cfg.filename_prefix)) {
             return 1;
         }
         total_output += (int)blocks[bi].size();

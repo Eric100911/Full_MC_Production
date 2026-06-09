@@ -69,10 +69,11 @@ CMSSW_12_BASE="${CMSSW_12_BASE:-/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMS
 CMSSW_15_BASE="${CMSSW_15_BASE:-/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMSSW_15_0_15}"
 
 # T2_CN_Beijing XRootD storage paths
+# Override TARGET_EOS_BASE to redirect output to a different storage area.
 EOS_HOST="cceos.ihep.ac.cn"
 EOS_XRDFS_TARGET="${EOS_HOST}"
-EOS_PATH_BASE="/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
-EOS_BASE="root://${EOS_HOST}/${EOS_PATH_BASE}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_HOST}/eos/ihep/cms/store/user/xcheng/MC_Production_v3}"
+EOS_PATH_BASE="${EOS_BASE#root://${EOS_HOST}/}"
 EOS_LHE_POOL="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
 
@@ -1357,7 +1358,7 @@ run_ntuple() {
 
 # Step 8: Transfer output
 transfer_output() {
-    local output_subpath="output/${CAMPAIGN_NAME}/${JOB_ID}"
+    local output_subpath="${CUSTOM_OUTPUT_SUBPATH:-output/${CAMPAIGN_NAME}/${JOB_ID}}"
 
     if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
         msg_step "Step 8: Copy outputs to local storage"
@@ -1413,7 +1414,7 @@ MANIFESTEOF
     fi
     
     if [[ -f "${NTUPLE_OUTPUT:-}" ]]; then
-        local ntuple_basename=$(basename "${NTUPLE_OUTPUT}")
+        local ntuple_basename="${CUSTOM_NTUPLE_BASENAME:-$(basename "${NTUPLE_OUTPUT}")}"
         stage_out "${NTUPLE_OUTPUT}" "${output_subpath}/${ntuple_basename}" || return 1
 
         if [[ "${EFFICIENCY_NTUPLE}" == "true" ]]; then
@@ -1644,6 +1645,21 @@ else
         if [[ "$spec" == file:* ]]; then
             # Local file path (from test_full_chain or local runs)
             lhe_file="${spec#file:}"
+        elif [[ "$spec" == BLOCK:* ]]; then
+            # Format: BLOCK:pool_name:helac_seed:block_idx
+            IFS=':' read -ra parts <<< "$spec"
+            pool_name="${parts[1]}"
+            helac_seed="${parts[2]}"
+            block_idx="${parts[3]}"
+            # Try .lhe.gz first, then uncompressed .lhe
+            lhe_file="${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe.gz"
+            if ! check_remote_file "$lhe_file"; then
+                lhe_file="${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe"
+                if ! check_remote_file "$lhe_file"; then
+                    msg_error "Could not resolve LHE block file for: $spec (tried: ${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe.gz / .lhe)"
+                    exit 1
+                fi
+            fi
         elif [[ "$spec" == GEN:* ]]; then
             # Format: GEN:pool_name:lhe_job_idx[:seed]
             IFS=':' read -ra parts <<< "$spec"
