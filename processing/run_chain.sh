@@ -940,16 +940,6 @@ prepare_cmssw15_for_ntuple() {
 }
 
 ntuple_cfg_path() {
-    local efficiency_mode="${1:-false}"
-
-    if [[ "${efficiency_mode}" == "true" ]]; then
-        case "${ANALYSIS_TYPE}" in
-            "JJP") echo "${CMSSW_CONFIGS_DIR}/ntuple_jjp_efficiency_cfg.py" ;;
-            *) return 1 ;;
-        esac
-        return 0
-    fi
-
     case "${ANALYSIS_TYPE}" in
         "JJP") echo "${CMSSW_CONFIGS_DIR}/ntuple_jjp_cfg.py" ;;
         "JUP") echo "${CMSSW_CONFIGS_DIR}/ntuple_jup_cfg.py" ;;
@@ -1332,8 +1322,8 @@ run_ntuple() {
     prepare_cmssw15_for_ntuple "${ANALYSIS_TYPE}" || return 1
     setup_cmssw15
 
-    cfg_path=$(ntuple_cfg_path "${EFFICIENCY_NTUPLE}") || {
-        msg_error "No repo-owned ntuple config is available for ${ANALYSIS_TYPE} with efficiency_ntuple=${EFFICIENCY_NTUPLE}"
+    cfg_path=$(ntuple_cfg_path) || {
+        msg_error "No repo-owned ntuple config is available for ${ANALYSIS_TYPE}"
         return 1
     }
 
@@ -1495,7 +1485,7 @@ JOB_ID=""
 WORKDIR=""
 CLEANUP="true"
 ENABLE_NTUPLE="true"
-EFFICIENCY_NTUPLE="false"
+EFFICIENCY_NTUPLE="true"
 SHUFFLE_MIXING="false"
 SKIP_TO=""
 STOP_AT=""

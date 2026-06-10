@@ -1,227 +1,420 @@
-# ==============================================================================
-# ntuple_jjp_cfg.py - Ntuple configuration for JJP (J/psi + J/psi + phi) analysis
-# ==============================================================================
-# Repo-owned config used by the production wrapper for JpsiJpsiPhi ntuples.
-# Based on TPS-Onia2MuMu-Dev-J-J-P branch
-# Reads MiniAOD and produces flat ntuple for physics analysis
+###############################################################################
+# ConfFile_cfg.py - Default CMSSW config for MultiLepPAT EDAnalyzer
+#
+# Analysis Mode:
+#   "JpsiJpsiPhi" - J/psi + J/psi + phi (default)
+#   "JpsiJpsiUps" - J/psi + J/psi + Upsilon
+#   "JpsiUpsPhi"  - J/psi + Upsilon + phi
+#
+# All selection cuts externalized via StringCutObjectSelector syntax:
+#   MuonSelection  - String cut on pat::Muon
+#   TrackSelection - String cut on pat::PackedCandidate
 #
 # Usage:
-#   cmsRun ntuple_jjp_cfg.py inputFiles=file:input.root outputFile=output.root runOnMC=True
-# ==============================================================================
+#   cmsRun ConfFile_cfg.py
+#   cmsRun  ConfFile_cfg.py \
+#           inputFiles_load=myInputs.list \
+#           outputFile=output.root \
+#           maxEvents=10000 \
+#           analysisMode=JpsiJpsiUps \
+#           runOnMC=False \
+#           era=Run2023C \
+#           duplicateCheckMode=noDuplicateCheck
+###############################################################################
 
 import FWCore.ParameterSet.Config as cms
 import FWCore.ParameterSet.VarParsing as VarParsing
 
-# Command line options
+# --- Include input arguments ---
+
 ivars = VarParsing.VarParsing('analysis')
 
-ivars.inputFiles = (
-    'file:input_MINIAOD.root',
+# --- Register additional arguments ---
+
+ivars.register('analysisMode',
+    default='JpsiJpsiPhi',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='Analysis mode: JpsiJpsiPhi (default), JpsiJpsiUps, JpsiUpsPhi'
 )
-ivars.outputFile = 'ntuple_jjp.root'
-
-# Custom options
 ivars.register('runOnMC',
-               True,
-               VarParsing.VarParsing.multiplicity.singleton,
-               VarParsing.VarParsing.varType.bool,
-               "Run on MC (True) or Data (False)")
+    default=False,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Whether to run on MC (default: False)'
+)
+ivars.register('era',
+    default='Run2023C',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='Data-taking era (e.g. Run2023C, Run2023BPix). Required for GT selection.'
+)
+ivars.register('eventRange',
+    default='',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='Event range to process, preferably as "run:lumi:event-run:lumi:event" for single-event debugging'
+)
+ivars.register('lumiRange',
+    default='',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='Lumi range to process, in the format "run:lumi-run:lumi"'
+)
+ivars.register('debugOutput',
+    default=False,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable verbose candidate-level stdout debug (default: False)'
+)
+ivars.register('debugMask',
+    default=0,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.int,
+    info='Bitmask for staged stdout debug. Used together with debugOutput.'
+)
+ivars.register('reportEvery',
+    default=1,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.int,
+    info='Framework report frequency for processed events (default: 1)'
+)
+ivars.register('duplicateCheckMode',
+    default='',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='PoolSource duplicate check mode override, e.g. noDuplicateCheck'
+)
+ivars.register('requireAcceptedCandidatesForMonteCarloTree',
+    default=False,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='For MC, keep tree entries only when at least one candidate is stored (default: False)'
+)
+ivars.register('keepAllSingleObjectCandsInMC',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='For MC, store all object-level J/psi and phi candidates before final combination (default: True)'
+)
+ivars.register('skipCompositeCandBuildingWhenKeepingSingles',
+    default=False,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='For MC single-object ntuples, skip final composite candidate building after storing object candidates (default: False)'
+)
+ivars.register('doJpsiDecayVtxFit',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable J/psi decay-vertex kinematic fits (default: True)'
+)
+ivars.register('doUpsDecayVtxFit',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable Upsilon decay-vertex kinematic fits (default: True)'
+)
+ivars.register('doPhiDecayVtxFit',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable phi decay-vertex kinematic fits (default: True)'
+)
+ivars.register('doDiOniaVtxFit',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable DiOnia common-vertex kinematic fits (default: True)'
+)
+ivars.register('doPriVtxFit',
+    default=True,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.bool,
+    info='Enable final tri-particle common-vertex kinematic fits (default: True)'
+)
+# ------ Multi-threading options ------
+ivars.register('numThreads',
+    default=1,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.int,
+    info='Number of threads to use (default: 1). Note: Multi-threading must also be enabled in the JobType configuration when running with CRAB.'
+)
+ivars.register('numStreams',
+    default=0,
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.int,
+    info='Number of streams to use (default: 0, which means automatic). Note: Multi-threading must also be enabled in the JobType configuration when running with CRAB.'
+)
 
-ivars.maxEvents = -1
+# --- Default values ---
+
+ivars.inputFiles = ()
+ivars.outputFile = 'mymultilep.root'
+
+ivars.analysisMode = 'JpsiJpsiPhi'
+ivars.runOnMC = False
+ivars.era = 'Run2023C'
+
+# ------ Dictionary to Handle Global Tag selection based on era and MC/data ------
+globalTagDict = {
+    # Source: PdmV twiki 'CMS/PdmVRun3Analysis'
+    'data': {
+        # Data from 2022, eras C-G, E-G corresponding to the 'postEE' period.
+        "Run2022C": '124X_dataRun3_PromptAnalysis_v1',
+        "Run2022D": '124X_dataRun3_PromptAnalysis_v1',
+        "Run2022E": '124X_dataRun3_Prompt_v10',
+        "Run2022F": '124X_dataRun3_PromptAnalysis_v2',
+        "Run2022G": '124X_dataRun3_PromptAnalysis_v2',
+        # Data from 2023, eras C-D, D corresponding to the 'postBPix' period.
+        'Run2023C': '130X_dataRun3_PromptAnalysis_v1',
+        'Run2023D': '130X_dataRun3_PromptAnalysis_v1',
+        # Data from 2024, eras C-I. (Consistent run throughout the year. One GT.)
+        'Run2024C': '150X_dataRun3_v2',
+        'Run2024D': '150X_dataRun3_v2',
+        'Run2024E': '150X_dataRun3_v2',
+        'Run2024F': '150X_dataRun3_v2',
+        'Run2024G': '150X_dataRun3_v2',
+        'Run2024H': '150X_dataRun3_v2',
+        'Run2024I': '150X_dataRun3_v2',
+        # Data from 2025, eras C-G. (Consistent run throughout the year. One GT.)
+        'Run2025C': '150X_dataRun3_Prompt_v1',
+        'Run2025D': '150X_dataRun3_Prompt_v1',
+        'Run2025E': '150X_dataRun3_Prompt_v1',
+        'Run2025F': '150X_dataRun3_Prompt_v1',
+        'Run2025G': '150X_dataRun3_Prompt_v1',
+    },
+    'MC': {
+        # MC for 2022, with 'postEE' period.
+        "Run2022": '130X_mcRun3_2022_realistic_v5',
+        "Run2022EE": '130X_mcRun3_2022_realistic_postEE_v6',
+        # MC for 2023, with 'postBPix' period.
+        'Run2023': '130X_mcRun3_2023_realistic_v14',
+        'Run2023BPix': '130X_mcRun3_2023_realistic_postBPix_v2',
+        # MC for 2024, consistent run throughout the year. One GT.
+        'Run2024': '150X_mcRun3_2024_realistic_v2',
+        # MC for 2025, consistent run throughout the year. One GT.
+        'Run2025': '150X_mcRun3_2024_realistic_v2',
+    }
+}
+
+# --- Parse and check input arguments ---
+
 ivars.parseArguments()
 
-# Configuration flags
-ANALYSIS_MODE = 'JpsiJpsiPhi'
-DO_MONTE_CARLO_TREE = ivars.runOnMC
-REQUIRE_ACCEPTED_CANDIDATES_FOR_MONTE_CARLO_TREE = False
-AddCaloMuon = False
-runOnMC = ivars.runOnMC
-HIFormat = False
-UseGenPlusSim = False
-UsepatMuonsWithTrigger = False
-KEEP_ALL_SINGLE_OBJECT_CANDS_IN_MC = True
-SKIP_COMPOSITE_CAND_BUILDING_WHEN_KEEPING_SINGLES = False
+if ivars.runOnMC and ivars.era == 'Run2023C':
+    ivars.era = 'Run2022'
 
-# Process definition
+if ivars.analysisMode not in ['JpsiJpsiPhi', 'JpsiJpsiUps', 'JpsiUpsPhi']:
+    raise ValueError(f"Invalid analysis mode: {ivars.analysisMode}. "
+                     f"Valid options are: JpsiJpsiPhi, JpsiJpsiUps, JpsiUpsPhi")
+
+if ivars.runOnMC and ivars.era not in globalTagDict['MC']:
+    raise ValueError(f"Invalid era '{ivars.era}' for MC. Available options: {list(globalTagDict['MC'].keys())}")
+
+if not ivars.runOnMC and ivars.era not in globalTagDict['data']:
+    raise ValueError(f"Invalid era '{ivars.era}' for data. Available options: {list(globalTagDict['data'].keys())}")
+
+# --- Begin process configuration ---
+
 process = cms.Process("mkcands")
 
-# Message logger
+# ------ Multi-threading configuration ------
+process.options = cms.untracked.PSet(
+    numberOfThreads = cms.untracked.uint32(ivars.numThreads),
+    numberOfStreams = cms.untracked.uint32(ivars.numStreams),
+)
+
+# --- Message logger ---
 process.load("FWCore.MessageService.MessageLogger_cfi")
 process.MessageLogger.suppressInfo = cms.untracked.vstring("mkcands")
 process.MessageLogger.suppressWarning = cms.untracked.vstring("mkcands")
-process.MessageLogger.cerr.FwkReport.reportEvery = 100
+process.MessageLogger.cerr.FwkReport.reportEvery = ivars.reportEvery
 
-# Geometry and conditions
+# --- Geometry / B-field / TransientTrack ---
 process.load("TrackingTools/TransientTrack/TransientTrackBuilder_cfi")
 process.load('Configuration.StandardSequences.GeometryRecoDB_cff')
 process.load("Configuration.StandardSequences.Reconstruction_cff")
 process.load("Configuration.StandardSequences.MagneticField_AutoFromDBCurrent_cff")
 
-# Max events
-process.maxEvents = cms.untracked.PSet(
-    input = cms.untracked.int32(ivars.maxEvents)
-)
-
-# Global tag
+# --- Global Tag ---
 process.load('Configuration.StandardSequences.FrontierConditions_GlobalTag_cff')
 from Configuration.AlCa.GlobalTag import GlobalTag
 
-if runOnMC:
-    process.GlobalTag.globaltag = cms.string('124X_mcRun3_2022_realistic_v12')
-else:
-    process.GlobalTag = GlobalTag(process.GlobalTag, '124X_dataRun3_PromptAnalysis_v1', '')
 
-# Input source
+# Configure Global Tag based on era and MC/data.
+if ivars.runOnMC:
+    myGlobalTag = globalTagDict['MC'][ivars.era]
+else:
+    myGlobalTag = globalTagDict['data'][ivars.era]
+# Pass the selected Global Tag to the process configuration.
+process.GlobalTag = GlobalTag(process.GlobalTag, myGlobalTag, '')
+
+# --- Input ---
+process.maxEvents = cms.untracked.PSet(input=cms.untracked.int32(ivars.maxEvents))
 process.source = cms.Source("PoolSource",
     skipEvents = cms.untracked.uint32(0),
-    fileNames = cms.untracked.vstring(ivars.inputFiles),
+    fileNames  = cms.untracked.vstring(ivars.inputFiles),
 )
+if ivars.eventRange != '':
+    process.source.eventsToProcess = cms.untracked.VEventRange(ivars.eventRange)
+if ivars.lumiRange != '':
+    process.source.lumisToProcess = cms.untracked.VLuminosityBlockRange(ivars.lumiRange)
+if ivars.duplicateCheckMode != '':
+    process.source.duplicateCheckMode = cms.untracked.string(ivars.duplicateCheckMode)
 
-# Output module (for debugging, usually not used)
-process.out = cms.OutputModule("PoolOutputModule",
-    fileName = cms.untracked.string('test.root'),
-    SelectEvents = cms.untracked.PSet(SelectEvents = cms.vstring('p')),
-    outputCommands = cms.untracked.vstring('drop *')
-)
-
-# Filters
+# --- Primary vertex filter ---
 process.primaryVertexFilter = cms.EDFilter("GoodVertexFilter",
     vertexCollection = cms.InputTag('offlineSlimmedPrimaryVertices'),
     minimumNDOF = cms.uint32(4),
     maxAbsZ = cms.double(24),
-    maxd0 = cms.double(2)
+    maxd0 = cms.double(2),
 )
-
 process.noscraping = cms.EDFilter("FilterOutScraping",
     applyfilter = cms.untracked.bool(True),
     debugOn = cms.untracked.bool(False),
     numtrack = cms.untracked.uint32(10),
-    thresh = cms.untracked.double(0.25)
+    thresh = cms.untracked.double(0.25),
 )
+process.filter = cms.Sequence(process.primaryVertexFilter + process.noscraping)
 
-# PAT setup
-process.load("PhysicsTools.PatAlgos.patSequences_cff")
-process.load("PhysicsTools.PatAlgos.cleaningLayer1.genericTrackCleaner_cfi")
-process.cleanPatTracks.checkOverlaps.muons.requireNoOverlaps = cms.bool(False)
-process.cleanPatTracks.checkOverlaps.electrons.requireNoOverlaps = cms.bool(False)
-
-from PhysicsTools.PatAlgos.producersLayer1.muonProducer_cfi import *
-patMuons.embedTrack = cms.bool(True)
-patMuons.embedPickyMuon = cms.bool(False)
-patMuons.embedTpfmsMuon = cms.bool(False)
-
-# Filter sequence
-process.filter = cms.Sequence(process.primaryVertexFilter)
-
-# Gen particle producer for MC matching
-process.genParticlePlusGEANT = cms.EDProducer("GenPlusSimParticleProducer",
-    src = cms.InputTag("g4SimHits"),
-    setStatus = cms.int32(8),
-    filter = cms.vstring("pt > 0.0"),
-    genParticles = cms.InputTag("genParticles")
-)
-
-# MC matching configuration
-if HIFormat:
-    process.muonMatch.matched = cms.InputTag("hiGenParticles")
-    process.genParticlePlusGEANT.genParticles = cms.InputTag("hiGenParticles")
-
-if UseGenPlusSim:
-    process.muonMatch.matched = cms.InputTag("genParticlePlusGEANT")
-
-# Track tools for JJP analysis
-from PhysicsTools.PatAlgos.tools.trackTools import *
-
-# ==============================================================================
-# JJP-specific analyzer configuration
-# ==============================================================================
-
-# MultiLepPAT analyzer (J/psi + J/psi + phi) — v2.0 parameter set
+# --- MultiLepPAT analyzer ---
 process.mkcands = cms.EDAnalyzer('MultiLepPAT',
-        analysisMode = cms.untracked.string(ANALYSIS_MODE),
-        HLTriggerResults = cms.untracked.InputTag("TriggerResults","","HLT"),
-        inputGEN  = cms.untracked.InputTag("genParticles"),
-        MuonLabel = cms.untracked.InputTag("slimmedMuons"),
-        TrackLabel = cms.untracked.InputTag("packedPFCandidates"),
-        GenEventInfo = cms.untracked.InputTag("generator"),
-        ReadLHEWeights = cms.untracked.bool(False),
-        LHEEventInfo = cms.untracked.InputTag("externalLHEProducer"),
-        LHEEventInfoFallbacks = cms.untracked.VInputTag(
-            cms.InputTag("source"),
-            cms.InputTag("generator"),
-        ),
-        VtxSample   = cms.untracked.string('offlineSlimmedPrimaryVertices'),
-        DoJPsiMassConstraint = cms.untracked.bool(True),
-        DoMonteCarloTree = cms.untracked.bool(DO_MONTE_CARLO_TREE),
-        RequireAcceptedCandidatesForMonteCarloTree = cms.untracked.bool(REQUIRE_ACCEPTED_CANDIDATES_FOR_MONTE_CARLO_TREE),
-        KeepAllSingleObjectCandsInMC = cms.untracked.bool(KEEP_ALL_SINGLE_OBJECT_CANDS_IN_MC),
-        SkipCompositeCandBuildingWhenKeepingSingles = cms.untracked.bool(SKIP_COMPOSITE_CAND_BUILDING_WHEN_KEEPING_SINGLES),
-        MonteCarloParticleId = cms.untracked.int32(20443),
-        trackQualities = cms.untracked.vstring('loose','tight','highPurity'),
-        MinNumMuPixHits = cms.untracked.int32(1),
-        MinNumMuSiHits = cms.untracked.int32(3),
-        MaxMuNormChi2 = cms.untracked.double(99999),
-        MaxMuD0 = cms.untracked.double(10.0),
-        MaxJPsiMass = cms.untracked.double(3.4),
-        MinJPsiMass = cms.untracked.double(2.7),
-        MinNumTrSiHits = cms.untracked.int32(4),
-        MinMuPt = cms.untracked.double(1.95),
-        JPsiKKKMaxDR = cms.untracked.double(1.5),
-        XCandPiPiMaxDR = cms.untracked.double(1.5),
-        UseXDr = cms.untracked.bool(False),
-        JPsiKKKMaxMass = cms.untracked.double(5.6),
-        JPsiKKKMinMass = cms.untracked.double(5.0),
-        resolvePileUpAmbiguity = cms.untracked.bool(True),
-        addXlessPrimaryVertex = cms.untracked.bool(True),
-        Debug_Output = cms.untracked.bool(False),
-        StoreAllPVs = cms.untracked.bool(True),
-        StoreMuonMomentumErrors = cms.untracked.bool(True),
-        StoreMuonPVAssoc = cms.untracked.bool(True),
-        PVSelectionMode = cms.untracked.string("firstVertex"),
-        MinTrackFromPV = cms.untracked.int32(1),
-        MuTrkMatchMethod = cms.untracked.string("sourceCandidatePtr"),
-        doJpsiDecayVtxFit = cms.untracked.bool(True),
-        doUpsDecayVtxFit = cms.untracked.bool(True),
-        doPhiDecayVtxFit = cms.untracked.bool(True),
-        doDiOniaVtxFit = cms.untracked.bool(True),
-        doPriVtxFit = cms.untracked.bool(True),
+    HLTriggerResults = cms.untracked.InputTag("TriggerResults", "", "HLT"),
+    inputGEN = cms.untracked.InputTag("prunedGenParticles"),
+    MuonLabel = cms.untracked.InputTag("slimmedMuons"),
+    TrackLabel = cms.untracked.InputTag("packedPFCandidates"),
+    GenEventInfo = cms.untracked.InputTag("generator"),
+    ReadLHEWeights = cms.untracked.bool(False),
+    LHEEventInfo = cms.untracked.InputTag("externalLHEProducer"),
+    LHEEventInfoFallbacks = cms.untracked.VInputTag(
+        cms.InputTag("source"),
+        cms.InputTag("generator"),
+    ),
+    DebugGeneratorWeights = cms.untracked.bool(False),
 
-        TriggersForJpsi = cms.untracked.vstring(
-            "HLT_Dimuon0_Jpsi3p5_Muon2_v",
-            "HLT_DoubleMu4_3_LowMass_v"
-        ),
-        FiltersForJpsi = cms.untracked.vstring(
-            "hltVertexmumuFilterJpsiMuon3p5",
-            "hltDisplacedmumuFilterDoubleMu43LowMass"
-        ),
+    # ====== Analysis mode ======
+    # Options: "JpsiJpsiPhi", "JpsiJpsiUps", "JpsiUpsPhi"
+    AnalysisMode = cms.untracked.string(ivars.analysisMode),
 
-        TriggersForUpsilon = cms.untracked.vstring("HLT_Trimuon5_3p5_2_Upsilon_Muon_v"),
-        FiltersForUpsilon = cms.untracked.vstring("hltVertexmumuFilterUpsilonMuon"),
+    # ====== StringCutObjectSelector cuts (runtime-configurable) ======
+    MuonSelection  = cms.untracked.string("pt > 2.5 && abs(eta) < 2.4"),
+    TrackSelection = cms.untracked.string("pt > 1.0 && abs(eta) < 2.5"),
+    TrackQuality   = cms.untracked.string("normalizedChi2 < 8 && numberOfValidHits > 4"),
+    RequireRecoKaonTrackHighPurity = cms.untracked.bool(True),
 
-        Chi2NDF_Track =  cms.untracked.double(15.0),
-        OniaDecayVtxProbCut = cms.untracked.double(0.01)
+    # ====== Primary vertex cuts ======
+    PVNdofMin = cms.untracked.int32(5),
+    PVMaxAbsZ = cms.untracked.double(24.0),
+    PVMaxRho  = cms.untracked.double(2.0),
+
+    # ====== Onia mass windows (GeV) ======
+    JpsiMassMin = cms.untracked.double(2.8),
+    JpsiMassMax = cms.untracked.double(3.3),
+    UpsMassMin  = cms.untracked.double(8.0),
+    UpsMassMax  = cms.untracked.double(12.0),
+
+    # ====== Meson mass window (GeV) ======
+    PhiMassMin = cms.untracked.double(0.97),
+    PhiMassMax = cms.untracked.double(1.07),
+
+    # ====== Track kinematics ======
+    TrackPtMin = cms.untracked.double(1.0),
+    TrackDRMax = cms.untracked.double(999.0),
+
+    # ====== Vertex probability cuts ======
+    OniaDecayVtxProbCut = cms.untracked.double(5e-4),
+    JpsiDecayVtxProbCut = cms.untracked.double(5e-4),
+    UpsDecayVtxProbCut  = cms.untracked.double(5e-4),
+    PhiDecayVtxProbCut  = cms.untracked.double(5e-4),
+    DiOniaVtxProbCut    = cms.untracked.double(5e-3),
+    PriVtxProbCut       = cms.untracked.double(-1.0),
+    DoJpsiDecayVtxFit   = cms.untracked.bool(ivars.doJpsiDecayVtxFit),
+    DoUpsDecayVtxFit    = cms.untracked.bool(ivars.doUpsDecayVtxFit),
+    DoPhiDecayVtxFit    = cms.untracked.bool(ivars.doPhiDecayVtxFit),
+    DoDiOniaVtxFit      = cms.untracked.bool(ivars.doDiOniaVtxFit),
+    DoPriVtxFit         = cms.untracked.bool(ivars.doPriVtxFit),
+    PriRequireCommonAssocPV = cms.untracked.bool(True),
+    PriRequireTrackPVCompatibility = cms.untracked.bool(True),
+    PriTrackDzPVMax = cms.untracked.double(2.0),
+    PriTrackDxyPVMax = cms.untracked.double(0.1),
+
+    # ====== Per-resonance candidate pT/eta pre-cuts ======
+    JpsiCandPtMin  = cms.untracked.double(4.0),
+    JpsiCandEtaMax = cms.untracked.double(999.0),
+    UpsCandPtMin   = cms.untracked.double(4.0),
+    UpsCandEtaMax  = cms.untracked.double(999.0),
+    PhiCandPtMin   = cms.untracked.double(2.0),
+    PhiCandEtaMax  = cms.untracked.double(999.0),
+
+    # ====== PV selection mode ======
+    # Options: "firstVertex" (default), "mostTracks", "highestSumPt2"
+    PVSelectionMode = cms.untracked.string("firstVertex"),
+
+    # ====== Track fromPV requirement ======
+    # 0=none, 1=PVLoose, 2=PVTight, 3=PVUsedInFit
+    MinTrackFromPV = cms.untracked.int32(1),
+
+    # ====== Minimum muon count ======
+    MinMuonCount = cms.untracked.uint32(4),
+
+    # ====== MC toggle ======
+    # DoMonteCarloTree enables MC branches; the retention switch below controls
+    # whether MC events without kept candidates are still written to the tree.
+    DoMonteCarloTree = cms.untracked.bool(ivars.runOnMC),
+    RequireAcceptedCandidatesForMonteCarloTree = cms.untracked.bool(ivars.requireAcceptedCandidatesForMonteCarloTree),
+    KeepAllSingleObjectCandsInMC = cms.untracked.bool(ivars.keepAllSingleObjectCandsInMC),
+    SkipCompositeCandBuildingWhenKeepingSingles = cms.untracked.bool(ivars.skipCompositeCandBuildingWhenKeepingSingles),
+    DoJPsiMassConstraint = cms.untracked.bool(True),
+    Debug_Output = cms.untracked.bool(ivars.debugOutput),
+    DebugMask    = cms.untracked.uint32(max(ivars.debugMask, 0)),
+
+    # ====== Muon matching ======
+    MuonPackedMatchVectorRelPMax = cms.untracked.double(0.01),
+    MuonPackedMatchChi2Max = cms.untracked.double(25.0),
+    MuonPackedMatchDzPvChi2Max = cms.untracked.double(25.0),
+    MuonPackedMatchDzAssocChi2Max = cms.untracked.double(25.0),
+    RecoGenMuonMatchChi2Max = cms.untracked.double(25.0),
+    RecoGenKaonMatchChi2Max = cms.untracked.double(25.0),
+
+    # ====== Muon-track matching method ======
+    # Methods: "sourceCandidatePtr" (default), "vector", "chi2", "dzAssoc", "dzPv"
+    MuTrkMatchMethod = cms.untracked.string("sourceCandidatePtr"),
+    MuTrkMatchDebug = cms.untracked.bool(True),
+
+    # ====== Store all primary vertices and muon quantities ======
+    StoreAllPVs = cms.untracked.bool(True),
+    StoreMuonMomentumErrors = cms.untracked.bool(True),
+    StoreMuonPVAssoc = cms.untracked.bool(True),
+
+    # ====== Final fitted mass window check ======
+    CheckFinalMass = cms.untracked.bool(True),
+
+    # ====== Vertex ambiguity ======
+    resolvePileUpAmbiguity   = cms.untracked.bool(True),
+    addXlessPrimaryVertex    = cms.untracked.bool(True),
+
+    # ====== Trigger paths ======
+    TriggersForJpsi = cms.untracked.vstring(
+        "HLT_Dimuon0_Jpsi3p5_Muon2_v",
+        "HLT_DoubleMu4_3_LowMass_v",
+    ),
+    FiltersForJpsi = cms.untracked.vstring(
+        "hltJpsiMuonL3Filtered3p5",
+        "hltDoubleMu43LowMassL3Filtered",
+    ),
+    TriggersForUpsilon = cms.untracked.vstring(
+        "HLT_Trimuon5_3p5_2_Upsilon_Muon_v",
+    ),
+    FiltersForUpsilon = cms.untracked.vstring(
+        "hltVertexmumuFilterUpsilonMuon",
+    ),
 )
 
-if HIFormat:
-    process.mkcands.GenLabel = cms.InputTag('hiGenParticles')
-if UseGenPlusSim:
-    process.mkcands.GenLabel = cms.InputTag('genParticlePlusGEANT')
-
-# ==============================================================================
-# TFile Service for output
-# ==============================================================================
-
+# --- Output ---
 process.TFileService = cms.Service("TFileService",
-    fileName = cms.string(ivars.outputFile)
+    fileName = cms.string(ivars.outputFile),
 )
 
-# ==============================================================================
-# Path definition
-# ==============================================================================
-
-process.p = cms.Path(
-    process.filter *
-    process.mkcands
-)
-
+process.p = cms.Path(process.mkcands)
 process.schedule = cms.Schedule(process.p)
