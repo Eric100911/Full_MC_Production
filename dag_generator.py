@@ -49,7 +49,7 @@ SUBPROCESS_MAP = OrderedDict([
     ("JJP_SPS_CS",  "SPS-JpsiJpsiPhi-LO"),
     ("JJP_SPS_G",   "SPS-JpsiJpsiPhi-NLOstar"),
     ("JJP_DPS2_CS", "DPS-JpsiJpsi-Phi-LO"),
-    ("JJP_DPS2_G",  "SPS-JpsiJpsiPhi-NLOstar"),
+    ("JJP_DPS2_G",  "DPS-JpsiJpsi-Phi-NLOstar"),
     ("JJP_DPS1",    "DPS-Jpsi-JpsiPhi"),
 ])
 
@@ -118,7 +118,7 @@ PROCESSING_SUBMIT_TEMPLATE_HEPTHU = "processing/templates/processing_hepthu.sub"
 LHE_SUBMIT_TEMPLATE_LOCAL = "processing/templates/lhe_gen_local.sub"
 PROCESSING_SUBMIT_TEMPLATE_LOCAL = "processing/templates/processing_local.sub"
 SUMMARY_SUBMIT_TEMPLATE = "processing/templates/summary.sub"
-DEFAULT_LXPLUS_LOG_DIR = "/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/log"
+# Log and proxy paths are workspace-relative or user-provided; no hardcoded user paths.
 DEFAULT_HEPTHU_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
 DEFAULT_LOCAL_CONDOR_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
 
@@ -181,7 +181,7 @@ MACHINE_ENVS: "OrderedDict[str, MachineEnv]" = OrderedDict(
                 storage_description="IHEP T2_CN_Beijing XRootD storage",
                 storage_mode="t2_xrootd",
                 required_commands=REQUIRED_COMMANDS,
-                log_dir=DEFAULT_LXPLUS_LOG_DIR,
+                log_dir="",
             ),
         ),
         (
@@ -280,6 +280,8 @@ CMSSW15_RUNTIME_REQUIRED_MEMBERS = (
     "CMSSW_15_0_15/src",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/test/ConfFile_cfg.py",
+    "CMSSW_15_0_15/lib/el9_amd64_gcc12/pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so",
+    "CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache",
 )
 
 POOL_DAG_LABELS = {
@@ -825,22 +827,39 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
 
 
 def proxy_candidates_for_env(machine_env: Optional[MachineEnv] = None) -> List[str]:
+    """Return ordered proxy path candidates for the given machine environment.
+
+    Resolution order:
+      1. $X509_USER_PROXY  environment variable
+      2. voms-proxy-info --path  (system tool)
+
+    Hardcoded user paths are intentionally absent — every collaborator has
+    a different AFS home and directory layout.
+
+    Callers should warn when the resolved proxy lives under /tmp, since
+    Condor worker nodes cannot access a /tmp proxy that belongs to a
+    different host.
+    """
     machine_env = machine_env or resolve_machine_env("auto")
     candidates: List[str] = []
-
-    if machine_env.name == "lxplus_t2_ihep":
-        persistent_proxy = os.path.expanduser(f"~/x509up_u{os.getuid()}")
-        candidates.append(persistent_proxy)
 
     env_proxy = os.environ.get("X509_USER_PROXY")
     if env_proxy:
         candidates.append(env_proxy)
 
-    tmp_proxy = f"/tmp/x509up_u{os.getuid()}"
-    candidates.append(tmp_proxy)
-
-    workfs2_proxy = f"/workfs2/cms/chengxing/Full_MC_Production/x509up_u{os.getuid()}"
-    candidates.append(workfs2_proxy)
+    if command_exists("voms-proxy-info"):
+        try:
+            result = subprocess.run(
+                ["voms-proxy-info", "--path"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=10, check=False,
+            )
+            if result.returncode == 0:
+                voms_path = result.stdout.strip()
+                if voms_path and voms_path not in candidates:
+                    candidates.append(voms_path)
+        except Exception:
+            pass
 
     deduped: List[str] = []
     for candidate in candidates:
@@ -850,7 +869,13 @@ def proxy_candidates_for_env(machine_env: Optional[MachineEnv] = None) -> List[s
 
 
 def detect_proxy_path(machine_env_name: str = "auto") -> str:
-    """探测当前 profile 可用的代理路径。"""
+    """Resolve an available X509 proxy path for the current environment.
+
+    Candidates are ordered by ``proxy_candidates_for_env``.  Each candidate
+    under ``/tmp`` triggers a warning (Condor worker nodes cannot access a
+    submit-host ``/tmp`` directory).  A fatal error is emitted only when
+    *no* usable non-/tmp proxy is found.
+    """
 
     try:
         machine_env = resolve_machine_env(machine_env_name)
@@ -859,10 +884,41 @@ def detect_proxy_path(machine_env_name: str = "auto") -> str:
 
     candidates = proxy_candidates_for_env(machine_env)
 
+    found_any = False
+    good: List[str] = []
     for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return candidates[0]
+        if not candidate:
+            continue
+        if os.path.exists(candidate):
+            found_any = True
+            if candidate.startswith("/tmp/"):
+                print(
+                    f"[WARN] 代理 {candidate} 位于 /tmp 下；"
+                    f"HTCondor worker 节点无法访问。",
+                    file=sys.stderr,
+                )
+            else:
+                good.append(candidate)
+
+    if good:
+        return good[0]
+
+    if found_any:
+        print(
+            "[WARN] 所有存在的代理文件都位于 /tmp 下；"
+            "HTCondor worker 节点将无法访问。"
+            "请将 X509_USER_PROXY 设置为持久路径（例如 ~/x509up_u$(id -u)）。",
+            file=sys.stderr,
+        )
+        # Return the first /tmp candidate anyway so the caller can inspect it.
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+    # No proxy found — return first candidate for a clear downstream message.
+    if candidates:
+        return candidates[0]
+    return ""
 
 
 def ensure_local_xrootd_proxy(proxy_path: str) -> str:
@@ -1018,46 +1074,102 @@ def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, 
         return 0, str(exc)
 
 
-def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: str = "") -> List[str]:
-    """List existing .lhe/.lhe.gz files in a remote pool directory. Returns sorted filenames."""
-    storage_name = pool_storage_name(pool_name)
-    base = existing_lhe_base or EOS_BASE
+def _list_remote_dir(eos_path: str, proxy_path: str) -> List[str]:
+    """Run xrdfs ls on a remote directory. Returns list of full paths, or empty list."""
     local_proxy_path = ensure_local_xrootd_proxy(proxy_path)
     env = os.environ.copy()
     env["X509_USER_PROXY"] = local_proxy_path
-    remote_dir = f"{base}/lhe_pools/{storage_name}"
     try:
         result = subprocess.run(
-            ["xrdfs", EOS_XRDFS_TARGET, "ls", remote_dir.replace(f"root://{EOS_HOST}/", "")],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,
-            check=False,
-            env=env,
+            ["xrdfs", EOS_XRDFS_TARGET, "ls", eos_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=30, check=False, env=env,
         )
     except Exception:
         return []
     if result.returncode != 0:
         return []
-    files = []
-    for line in result.stdout.splitlines():
-        fname = line.strip().rsplit("/", 1)[-1] if "/" in line.strip() else line.strip()
-        if accepts_lhe_ext(fname):
-            files.append(fname)
-    return sorted(files)
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: str = "") -> List[str]:
+    """Discover existing LHE files for a pool by scanning the remote pool directory tree.
+
+    Tries multiple directory layouts:
+      1. {base}/lhe_pools/{storage_name}/  (standard production layout)
+      2. {base}/LHE_pool/<any_subdir>/     (user's subprocess-named layout)
+
+    Files are matched by the ``sample_{storage_name}_`` prefix.
+    Returns sorted list of full XRootD URLs.
+    """
+    storage_name = pool_storage_name(pool_name)
+    base = existing_lhe_base or EOS_BASE
+    eos_prefix = f"root://{EOS_HOST}/"
+
+    # Strategy 1: standard layout — single known subdirectory
+    for parent in ("lhe_pools", "LHE_pool"):
+        std_dir = f"{base}/{parent}/{storage_name}".replace(eos_prefix, "")
+        for line in _list_remote_dir(std_dir, proxy_path):
+            fname = line.rsplit("/", 1)[-1] if "/" in line else line
+            if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
+                return sorted([f"{eos_prefix}{l.strip()}" for l in [line]])
+
+    # Strategy 2: scan subdirectories of LHE_pool / lhe_pools
+    for parent in ("LHE_pool", "lhe_pools"):
+        parent_eos = f"{base}/{parent}".replace(eos_prefix, "")
+        subdirs = _list_remote_dir(parent_eos, proxy_path)
+        if not subdirs:
+            continue
+        all_files = []
+        for subdir in subdirs:
+            for line in _list_remote_dir(subdir, proxy_path):
+                fname = line.rsplit("/", 1)[-1] if "/" in line else line
+                if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
+                    all_files.append(f"{eos_prefix}{line.strip()}")
+        if all_files:
+            return sorted(all_files)
+
+    return []
 
 
 def list_lhe_files_local(pool_name: str, local_output_base: str) -> List[str]:
-    """List existing .lhe/.lhe.gz files in a local pool directory. Returns sorted filenames."""
+    """Discover existing LHE files for a pool in the local pool directory tree.
+
+    Tries the same layouts as the remote version.
+    Returns sorted list of full local paths.
+    """
     storage_name = pool_storage_name(pool_name)
-    local_pool_dir = os.path.join(local_output_base, "lhe_pools", storage_name)
-    try:
-        if not os.path.exists(local_pool_dir):
-            return []
-        return sorted(f for f in os.listdir(local_pool_dir) if accepts_lhe_ext(f))
-    except Exception:
-        return []
+    prefix = f"sample_{storage_name}_"
+
+    for parent in ("lhe_pools", "LHE_pool"):
+        parent_dir = os.path.join(local_output_base, parent)
+        if not os.path.isdir(parent_dir):
+            continue
+        # Strategy 1: standard layout — single known subdirectory
+        std_dir = os.path.join(parent_dir, storage_name)
+        if os.path.isdir(std_dir):
+            files = sorted(
+                os.path.join(std_dir, f) for f in os.listdir(std_dir)
+                if accepts_lhe_ext(f) and f.startswith(prefix)
+            )
+            if files:
+                return files
+        # Strategy 2: scan all subdirectories
+        try:
+            all_files = []
+            for subdir_name in sorted(os.listdir(parent_dir)):
+                subdir = os.path.join(parent_dir, subdir_name)
+                if not os.path.isdir(subdir):
+                    continue
+                for f in os.listdir(subdir):
+                    if accepts_lhe_ext(f) and f.startswith(prefix):
+                        all_files.append(os.path.join(subdir, f))
+            if all_files:
+                return sorted(all_files)
+        except Exception:
+            pass
+
+    return []
 
 
 def pool_remote_path(pool_name: str, local_output_base: str = "") -> str:
@@ -1402,8 +1514,6 @@ def build_cmssw15_runtime_tarball(output_dir: Optional[str] = None) -> str:
         shutil.copytree(submodule_dir, tps_target, symlinks=True, dirs_exist_ok=True)
         _clean_git_artifacts(tps_target)
 
-        _ensure_openssl_dev_symlinks(project_dir)
-
         print("  [cmssw15-runtime] 编译 HeavyFlavorAnalysis/TPS-Onia2MuMu ...")
         subprocess.run(
             [
@@ -1413,8 +1523,8 @@ def build_cmssw15_runtime_tarball(output_dir: Optional[str] = None) -> str:
                 f"export SCRAM_ARCH=el9_amd64_gcc12 && "
                 f"cd {shlex.quote(src_dir)} && "
                 "eval $(scramv1 runtime -sh) && "
-                f"export LIBRARY_PATH={shlex.quote(project_dir)}:$LIBRARY_PATH && "
-                "scram b -j 8 HeavyFlavorAnalysis/TPS-Onia2MuMu",
+                "scram b clean && "
+                "scram b -j 8",
             ],
             check=True,
             capture_output=True,
@@ -1597,22 +1707,12 @@ def prepare_runtime_assets(
     ensure_dir(output_dir)
     assets: Dict[str, str] = OrderedDict()
 
-    # Compile lhe_shuffle_split inside the worker container to match runtime glibc.
+    # Compile lhe_shuffle_split natively on el9 for planner/coordinator runtime.
     shuffle_split_src = os.path.join(BASE_DIR, "lhe_generation", "lhe_shuffle_split.cc")
     shuffle_split_bin = os.path.join(output_dir, "lhe_shuffle_split")
-    print("  [lhe-bundle] Compiling lhe_shuffle_split inside cmssw/el7 with LCG_88b...")
+    print("  [lhe-bundle] Compiling lhe_shuffle_split natively (el9)...")
     subprocess.run(
-        [
-            "singularity", "exec",
-            "--bind", f"{BASE_DIR}:{BASE_DIR}:ro",
-            "--bind", f"{output_dir}:{output_dir}",
-            "--bind", "/cvmfs:/cvmfs",
-            "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86_64",
-            "bash", "-c",
-            "source /cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh && "
-            f"g++ -std=c++14 -O2 -Wall -o {shlex.quote(shuffle_split_bin)} "
-            f"{shlex.quote(shuffle_split_src)}",
-        ],
+        ["g++", "-std=c++14", "-O2", "-Wall", "-o", shuffle_split_bin, shuffle_split_src],
         check=True,
         timeout=120,
     )
@@ -1864,9 +1964,11 @@ class DAGBuilder:
         self.runtime_assets = runtime_assets
         self.generated_jobs_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_specs_by_pool: Dict[str, List[str]] = OrderedDict()
+        self.generated_planners_by_pool: Dict[str, List[str]] = OrderedDict()
         self.allocations_by_pool: Dict[str, int] = OrderedDict()
         self.dag_lines: List[str] = []
         self.metadata: Dict[str, object] = OrderedDict()
+        self._existing_lhe_cache: Dict[str, List[str]] = {}
 
     def seed_for_pool_index(self, pool_name: str, index: int) -> int:
         pool = LHE_POOLS[pool_name]
@@ -2159,25 +2261,51 @@ class DAGBuilder:
         )
         return os.path.join(subdir, f"plan_manifest_{pool_name}_{seed}.json")
 
+    def _ensure_skip_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
+        """Get or create a planner node for skip-lhe-generation mode.
+
+        Deduplicates across campaigns: the same pool+job_index always maps
+        to the same planner node, even when the pool appears in multiple
+        campaigns.
+        """
+        planners = self.generated_planners_by_pool.setdefault(pool_name, [])
+        while len(planners) <= job_index:
+            planners.append("")
+        if planners[job_index]:
+            return planners[job_index]
+        seed = self.seed_for_pool_index(pool_name, job_index)
+        lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
+        plan_job = self.add_planning_job(
+            pool_name, job_index, seed, lhe_path_override=lhe_path,
+        )
+        planners[job_index] = plan_job
+        return plan_job
+
     def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
         """Discover and return the path to an existing LHE file for the given pool + job_index.
 
-        Attempts to list the remote/local pool directory. Falls back to the standard
-        naming convention (sample_{storage}_{seed}.lhe.gz) when listing fails or
-        returns fewer files than needed (e.g. dry-run without proxy).
+        Scans the remote/local pool directory tree (trying both ``lhe_pools/`` and
+        ``LHE_pool/`` layouts). Results are cached per pool to avoid redundant xrdfs
+        calls when generating many jobs.
+        Falls back to the standard naming convention when listing returns nothing
+        (e.g. dry-run without proxy).
         """
         storage = pool_storage_name(pool_name)
         base = self.options.existing_lhe_base or EOS_BASE
+        cache_key = f"{pool_name}::{base}"
+        if cache_key not in self._existing_lhe_cache:
+            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = list_lhe_files_local(pool_name, self.options.local_output_base)
+            else:
+                files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
+            self._existing_lhe_cache[cache_key] = files
+        files = self._existing_lhe_cache[cache_key]
+        fallback_dir = f"{base}/lhe_pools/{storage}"
         if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-            files = list_lhe_files_local(pool_name, self.options.local_output_base)
-            pool_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
-        else:
-            files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
-            pool_dir = f"{base}/lhe_pools/{storage}"
+            fallback_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
         if job_index < len(files):
-            return f"{pool_dir}/{files[job_index]}"
-        # Fallback: construct path from standard naming convention
-        return f"{pool_dir}/sample_{storage}_{seed}.lhe.gz"
+            return files[job_index]
+        return f"{fallback_dir}/sample_{storage}_{seed}.lhe.gz"
 
     def add_planning_job(self, pool_name: str, index: int, seed: int,
                          lhe_path_override: str = "") -> str:
@@ -2435,15 +2563,11 @@ class DAGBuilder:
 
             if use_block_subdags and self.options.skip_lhe_generation:
                 # Short-circuit: skip HELAC generation, use existing LHE files.
-                # Planners download and shuffle-split existing files directly.
+                # Planners are deduplicated across campaigns (same pool+index → one node).
                 if campaign.n_sources == 1:
                     pool_name = campaign.inputs[0]
                     for job_index in range(self.options.jobs_per_campaign):
-                        seed = self.seed_for_pool_index(pool_name, job_index)
-                        lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
-                        plan_job = self.add_planning_job(
-                            pool_name, job_index, seed, lhe_path_override=lhe_path,
-                        )
+                        plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
                         subdag_name = self.add_block_subdag_node(
                             campaign_name, job_index, is_single_source=True,
                             pool_name=pool_name,
@@ -2460,12 +2584,9 @@ class DAGBuilder:
                             if pool_name in seen_pools:
                                 continue
                             seen_pools.add(pool_name)
-                            seed = self.seed_for_pool_index(pool_name, job_index)
-                            lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
-                            plan_job = self.add_planning_job(
-                                pool_name, job_index, seed, lhe_path_override=lhe_path,
-                            )
+                            plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
                             plan_jobs.append(plan_job)
+                            seed = self.seed_for_pool_index(pool_name, job_index)
                             source_infos.append((pool_name, seed))
                         coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos)
                         for pj in plan_jobs:
@@ -2617,7 +2738,7 @@ class DAGBuilder:
                     subprocess_id = SUBPROCESS_MAP.get(campaign_name, "")
                     if subprocess_id:
                         target_eos_base = self.options.target_base_url or CHIW_EOS_OUTPUT_BASE
-                        custom_output_subpath = subprocess_id
+                        custom_output_subpath = f"JpsiJpsiPhi/Ntuple/{subprocess_id}"
                         version = self.options.ntuple_version or NTUPLE_VERSION
                         custom_ntuple_basename = f"{subprocess_id}-Ntuple-{version}-{job_index}.root"
                 self.add_ntuple_job(
@@ -2853,7 +2974,7 @@ def validate_environment(
 def discover_ntuple_jobs(
     miniaod_dir: str,
     campaign_names: Sequence[str],
-    filename: str = "MINIAOD.root",
+    filename: str = "output_MINIAOD.root",
     max_jobs: int = 0,
 ) -> Dict[str, List[int]]:
     """扫描本地目录结构，找到可用的 MiniAOD 文件及其 job index。
@@ -3916,7 +4037,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ntuple_only_parser.add_argument(
         "--miniaod-filename",
-        default="MINIAOD.root",
+        default="output_MINIAOD.root",
         help="MiniAOD 文件名（默认: MINIAOD.root）。",
     )
     ntuple_only_parser.add_argument(

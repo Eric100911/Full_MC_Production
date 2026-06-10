@@ -916,6 +916,7 @@ set -e
 source /cvmfs/cms.cern.ch/cmsset_default.sh
 export SCRAM_ARCH=el9_amd64_gcc12
 cd "${project_dir}/src"
+eval $(scramv1 runtime -sh)
 scram build ProjectRename
 RENAMEEOF
         chmod +x "${tmp_script}"

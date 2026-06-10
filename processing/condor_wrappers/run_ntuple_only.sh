@@ -12,10 +12,10 @@
 #   $7  efficiency_ntuple    true|false
 #   $8  cleanup              true|false
 #   $9  miniaod_input        file:/path/to/MINIAOD.root  or  root://...
-#   $10 local_output_base    output directory (may be empty)
-#   $11 target_eos_base       override EOS_BASE for XRootD output (may be empty)
-#   $12 custom_output_subpath override output subpath (may be empty)
-#   $13 custom_ntuple_basename override remote ntuple filename (may be empty)
+#   $10 target_eos_base       override EOS_BASE for XRootD output (may be empty)
+#   $11 custom_output_subpath override output subpath (may be empty)
+#   $12 custom_ntuple_basename override remote ntuple filename (may be empty)
+#   LOCAL_OUTPUT_BASE is read from the environment (injected by ntuple.sub).
 # ==============================================================================
 
 set -euo pipefail
@@ -29,11 +29,11 @@ MAX_EVENTS="${6:--1}"
 EFFICIENCY_NTUPLE="${7:-false}"
 CLEANUP="${8:-true}"
 MINIAOD_INPUT="${9:?}"
-LOCAL_OUTPUT_BASE="${10:-}"
+# LOCAL_OUTPUT_BASE is read from the environment (set by ntuple.sub Environment line).
 
-TARGET_EOS_BASE="${11:-}"
-CUSTOM_OUTPUT_SUBPATH="${12:-}"
-CUSTOM_NTUPLE_BASENAME="${13:-}"
+TARGET_EOS_BASE="${10:-}"
+CUSTOM_OUTPUT_SUBPATH="${11:-}"
+CUSTOM_NTUPLE_BASENAME="${12:-}"
 
 export LOCAL_OUTPUT_BASE TARGET_EOS_BASE CUSTOM_OUTPUT_SUBPATH CUSTOM_NTUPLE_BASENAME
 

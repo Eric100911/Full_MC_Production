@@ -35,7 +35,8 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/compression_util.py`** — Python gzip helpers: `accepts_lhe_ext()`, `gzip_file_atomic()`, `gunzip_file_atomic()`.
 - **`common/compression_helpers.sh`** — Bash equivalents: `is_gz_file()`, `decompress_if_needed()`, `accepts_lhe_ext()`. Source from worker scripts.
 - **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuple configs (JJP, JUP, JJP-efficiency).
-- **`external/TPS-Onia2MuMu`** — Git submodule: the ntuple analyzer source. Used as fallback when a prebuilt CMSSW15 runtime tarball is not available.
+- **`external/TPS-Onia2MuMu`** — Git submodule: the ntuple analyzer source (v2.0). Used as fallback when a prebuilt CMSSW15 runtime tarball is not available.
+- **`common/paths.sh`** — Centralized workspace-relative path definitions (proxy resolution, temp dir, log dir). Source from shell scripts that need user-local paths; no hardcoded usernames.
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred for ntuple).
 - **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus legacy component-level test scripts.
 - **`tools/`** — Utilities: `check_gensim_vtxsmeared_config.py`, `summarize_helac_finished.py`, `compress_existing_lhe.py` (backfill LHE compression), `run_compress_lhe.sh` (batch compression worker wrapper).
@@ -59,7 +60,9 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Shower mode names are normalized through `canonical_mode()` (dag_generator.py:247): aliases like `phi`, `sps`, `phi_mode1` all map to `phi_mpi_off`.
 - The `--efficiency-ntuple` flag only works for JJP campaigns and writes an `ntuple_manifest.json` consumable by the external `run-multileppat-efficiency` tool.
 - Pool scan results are cached via the `DAG_GENERATOR_POOL_SCAN_CACHE` environment variable.
-- Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS.
+- Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS. Proxy resolution (`detect_proxy_path`) uses `$X509_USER_PROXY` → `voms-proxy-info --path`; /tmp proxies trigger a warning (Condor workers cannot access them).
+- Ntuple output directory structure for `--use-subprocess-naming`: `JpsiJpsiPhi/Ntuple/{subprocess_id}/{subprocess_id}-Ntuple-{version}-{job_id}.root` under the target EOS base.
+- CMSSW15 runtime tarball: built with `scram b clean && scram b -j 8` (full project rebuild) to ensure `.edmplugincache` is regenerated. Validation checks for `pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so` and `.edmplugincache`.
 - LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC intermediates always remain plain text for CMSSW compatibility.
 - LHE shuffle-split (`--lhe-shuffle-split`) produces `block_NNNNNN.lhe` files and a `shuffle_split_manifest.json` in a `lhe_blocks/` subdirectory. The original single LHE is always preserved for backward-compatible processing.
 - Block SubDAG mode (`--enable-lhe-block-subdags`) introduces per-HELAC-job planners and campaign-level coordinators that generate `SUBDAG EXTERNAL` processing DAGs. Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness. Processing nodes consume blocks via `BLOCK:<pool>:<seed>:<idx>` input specs.

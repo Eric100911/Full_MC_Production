@@ -32,13 +32,15 @@ ivars.parseArguments()
 
 # Configuration flags
 ANALYSIS_MODE = 'JpsiJpsiPhi'
-DO_MONTE_CARLO_TREE = False
+DO_MONTE_CARLO_TREE = ivars.runOnMC
 REQUIRE_ACCEPTED_CANDIDATES_FOR_MONTE_CARLO_TREE = False
 AddCaloMuon = False
 runOnMC = ivars.runOnMC
 HIFormat = False
 UseGenPlusSim = False
 UsepatMuonsWithTrigger = False
+KEEP_ALL_SINGLE_OBJECT_CANDS_IN_MC = True
+SKIP_COMPOSITE_CAND_BUILDING_WHEN_KEEPING_SINGLES = False
 
 # Process definition
 process = cms.Process("mkcands")
@@ -134,15 +136,26 @@ from PhysicsTools.PatAlgos.tools.trackTools import *
 # JJP-specific analyzer configuration
 # ==============================================================================
 
-# MultiLepPAT analyzer (J/psi + J/psi + phi)
+# MultiLepPAT analyzer (J/psi + J/psi + phi) — v2.0 parameter set
 process.mkcands = cms.EDAnalyzer('MultiLepPAT',
         analysisMode = cms.untracked.string(ANALYSIS_MODE),
         HLTriggerResults = cms.untracked.InputTag("TriggerResults","","HLT"),
         inputGEN  = cms.untracked.InputTag("genParticles"),
+        MuonLabel = cms.untracked.InputTag("slimmedMuons"),
+        TrackLabel = cms.untracked.InputTag("packedPFCandidates"),
+        GenEventInfo = cms.untracked.InputTag("generator"),
+        ReadLHEWeights = cms.untracked.bool(False),
+        LHEEventInfo = cms.untracked.InputTag("externalLHEProducer"),
+        LHEEventInfoFallbacks = cms.untracked.VInputTag(
+            cms.InputTag("source"),
+            cms.InputTag("generator"),
+        ),
         VtxSample   = cms.untracked.string('offlineSlimmedPrimaryVertices'),
         DoJPsiMassConstraint = cms.untracked.bool(True),
         DoMonteCarloTree = cms.untracked.bool(DO_MONTE_CARLO_TREE),
         RequireAcceptedCandidatesForMonteCarloTree = cms.untracked.bool(REQUIRE_ACCEPTED_CANDIDATES_FOR_MONTE_CARLO_TREE),
+        KeepAllSingleObjectCandsInMC = cms.untracked.bool(KEEP_ALL_SINGLE_OBJECT_CANDS_IN_MC),
+        SkipCompositeCandBuildingWhenKeepingSingles = cms.untracked.bool(SKIP_COMPOSITE_CAND_BUILDING_WHEN_KEEPING_SINGLES),
         MonteCarloParticleId = cms.untracked.int32(20443),
         trackQualities = cms.untracked.vstring('loose','tight','highPurity'),
         MinNumMuPixHits = cms.untracked.int32(1),
@@ -161,6 +174,17 @@ process.mkcands = cms.EDAnalyzer('MultiLepPAT',
         resolvePileUpAmbiguity = cms.untracked.bool(True),
         addXlessPrimaryVertex = cms.untracked.bool(True),
         Debug_Output = cms.untracked.bool(False),
+        StoreAllPVs = cms.untracked.bool(True),
+        StoreMuonMomentumErrors = cms.untracked.bool(True),
+        StoreMuonPVAssoc = cms.untracked.bool(True),
+        PVSelectionMode = cms.untracked.string("firstVertex"),
+        MinTrackFromPV = cms.untracked.int32(1),
+        MuTrkMatchMethod = cms.untracked.string("sourceCandidatePtr"),
+        doJpsiDecayVtxFit = cms.untracked.bool(True),
+        doUpsDecayVtxFit = cms.untracked.bool(True),
+        doPhiDecayVtxFit = cms.untracked.bool(True),
+        doDiOniaVtxFit = cms.untracked.bool(True),
+        doPriVtxFit = cms.untracked.bool(True),
 
         TriggersForJpsi = cms.untracked.vstring(
             "HLT_Dimuon0_Jpsi3p5_Muon2_v",
@@ -173,7 +197,7 @@ process.mkcands = cms.EDAnalyzer('MultiLepPAT',
 
         TriggersForUpsilon = cms.untracked.vstring("HLT_Trimuon5_3p5_2_Upsilon_Muon_v"),
         FiltersForUpsilon = cms.untracked.vstring("hltVertexmumuFilterUpsilonMuon"),
- 
+
         Chi2NDF_Track =  cms.untracked.double(15.0),
         OniaDecayVtxProbCut = cms.untracked.double(0.01)
 )

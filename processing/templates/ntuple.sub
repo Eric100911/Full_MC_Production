@@ -15,7 +15,7 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "./$(ntuple_wrapper_name) $(ntuple_bundle_name) $(proxy_bundle_name) $(analysis) $(campaign) $(job_id) $(max_events) $(efficiency_ntuple) $(cleanup) $(miniaod_input) $(local_output_base) $(target_eos_base) $(custom_output_subpath) $(custom_ntuple_basename)"
+Arguments = "./$(ntuple_wrapper_name) $(ntuple_bundle_name) $(proxy_bundle_name) $(analysis) $(campaign) $(job_id) $(max_events) $(efficiency_ntuple) $(cleanup) $(miniaod_input) $(target_eos_base) $(custom_output_subpath) $(custom_ntuple_basename)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
