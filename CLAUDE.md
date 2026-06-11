@@ -34,9 +34,7 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`processing/condor_wrappers/`** — Lightweight bash wrappers (`run_processing.sh`, `run_ntuple_only.sh`) invoked by submit templates.
 - **`common/compression_util.py`** — Python gzip helpers: `accepts_lhe_ext()`, `gzip_file_atomic()`, `gunzip_file_atomic()`.
 - **`common/compression_helpers.sh`** — Bash equivalents: `is_gz_file()`, `decompress_if_needed()`, `accepts_lhe_ext()`. Source from worker scripts.
-- **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuple configs. The JJP ntuple config (`ntuple_jjp_cfg.py`) is rebuilt from the upstream TPS-Onia2MuMu reference (`v2.0_patch1` tag). Key production parameters:
-  - `inputGEN = prunedGenParticles` — MiniAOD uses `prunedGenParticles`, NOT `genParticles` (which is empty in MiniAOD, causing empty `MC_GenPart_*` branches).
-  - `FiltersForJpsi = ["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]` — these are the correct filter labels for the Dimuon0 and DoubleMu trigger paths respectively. The earlier incorrect labels (`hltVertexmumuFilterJpsiMuon3p5`, `hltDisplacedmumuFilterDoubleMu43LowMass`) matched no muons.
+- **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuple configs. The JJP ntuple config is a thin adaptation of the upstream reference; see **Ntuple Config** below for sync procedure and troubleshooting.
 - **`external/TPS-Onia2MuMu`** — Git submodule: the ntuple analyzer source (v2.0). Used as fallback when a prebuilt CMSSW15 runtime tarball is not available.
 - **`common/paths.sh`** — Centralized workspace-relative path definitions (proxy resolution, temp dir, log dir). Source from shell scripts that need user-local paths; no hardcoded usernames.
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred for ntuple).
@@ -73,9 +71,31 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - New DAG categories: `lhe_planning` (planner jobs), `lhe_coordination` (coordinator jobs), `block_processing` (block-level processing inside SubDAGs).
 - The `--filename-prefix` option on `lhe_shuffle_split` allows seed-specific block filenames (e.g. `100_block_000000.lhe`).
 
-## Runtime Environments
+## Ntuple Config
 
-### Worker container (lxplus_t2_ihep)
+The JJP ntuple config (`common/cmssw_configs/ntuple_jjp_cfg.py`) is a thin adaptation
+layer over the upstream TPS-Onia2MuMu reference. The submodule at
+`external/TPS-Onia2MuMu` pins the ntuple format version and defines the data contract.
+
+### Syncing with upstream
+
+When the submodule is updated to a new tag:
+
+1. Diff `external/TPS-Onia2MuMu/test/ConfFile_cfg.py` against
+   `common/cmssw_configs/ntuple_jjp_cfg.py`.
+2. Apply campaign-specific adjustments on top:
+   - `keepAllSingleObjectCandsInMC` default → `True`
+   - Verify the MC GlobalTag matches the MiniAOD production CMSSW version
+   - Remove or adjust VarParsing defaults not relevant to this workflow
+
+### Troubleshooting
+
+| Symptom | Check |
+|---------|-------|
+| `MC_GenPart_*` arrays all empty | `X_config` → `inputGEN` must be `prunedGenParticles`, not `genParticles`. MiniAOD drops the `genParticles` collection. |
+| Zero HLT-matched muons in efficiency | `X_config` → `FiltersForJpsi` must be `["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]`. The old labels (`hltVertexmumuFilterJpsiMuon3p5`, `hltDisplacedmumuFilterDoubleMu43LowMass`) match no trigger objects. |
+
+## Runtime Environments
 - **Image**: `cmssw/el7:x86_64` (CentOS 7, glibc 2.17)
 - **Compiler toolchain**: LCG_88b (`/cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh`) — GCC 6.2 for gfortran and C++14 builds
 - **C++ standard**: C++14 (`-std=c++14`) — GCC 6.2 predates the `-std=c++17` flag

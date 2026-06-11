@@ -15,5 +15,15 @@ Default smoke validation on this branch stops at MiniAOD unless `--enable-ntuple
 ## Commit & Pull Request Guidelines
 The history mixes brief descriptive subjects with `feat:`/`fix:` prefixes; gitmoji-style subjects are also acceptable when every commit-message line starts with a `:emoji_name:` token. Keep commit messages imperative and specific to the workflow stage you changed. PRs should state whether the change affects DAG generation, worker runtime, storage interaction, or ntuple packaging, and include the validation commands used. When changing remote paths, package contracts, log roots, DAG categories, or analysis modes, include representative log excerpts or generated DAG metadata.
 
+## Config Management
+
+- The canonical ntuple config is the upstream `ConfFile_cfg.py` in the
+  `external/TPS-Onia2MuMu` submodule. Do not add campaign-specific logic there.
+- Campaign adaptations (GT, defaults) live in `common/cmssw_configs/ntuple_jjp_cfg.py`.
+- When proposing config changes, diff against the upstream reference first to
+  confirm the change belongs in the campaign layer.
+- The submodule tag defines the ntuple format contract with downstream consumers
+  (NtupleAnalyzer). Document format-affecting tag changes in the PR.
+
 ## Security & Configuration Tips
 Do not commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Keep site-specific paths centralized in `common/setup.sh` or `dag_generator.py` constants, use generated `--log-root` paths instead of hardcoded submit-template logs, and document any new CVMFS, XRootD, or container requirement in the PR.
