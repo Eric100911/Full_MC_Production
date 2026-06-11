@@ -34,7 +34,9 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`processing/condor_wrappers/`** — Lightweight bash wrappers (`run_processing.sh`, `run_ntuple_only.sh`) invoked by submit templates.
 - **`common/compression_util.py`** — Python gzip helpers: `accepts_lhe_ext()`, `gzip_file_atomic()`, `gunzip_file_atomic()`.
 - **`common/compression_helpers.sh`** — Bash equivalents: `is_gz_file()`, `decompress_if_needed()`, `accepts_lhe_ext()`. Source from worker scripts.
-- **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuple configs (JJP, JUP, JJP-efficiency).
+- **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuple configs. The JJP ntuple config (`ntuple_jjp_cfg.py`) is rebuilt from the upstream TPS-Onia2MuMu reference (`v2.0_patch1` tag). Key production parameters:
+  - `inputGEN = prunedGenParticles` — MiniAOD uses `prunedGenParticles`, NOT `genParticles` (which is empty in MiniAOD, causing empty `MC_GenPart_*` branches).
+  - `FiltersForJpsi = ["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]` — these are the correct filter labels for the Dimuon0 and DoubleMu trigger paths respectively. The earlier incorrect labels (`hltVertexmumuFilterJpsiMuon3p5`, `hltDisplacedmumuFilterDoubleMu43LowMass`) matched no muons.
 - **`external/TPS-Onia2MuMu`** — Git submodule: the ntuple analyzer source (v2.0). Used as fallback when a prebuilt CMSSW15 runtime tarball is not available.
 - **`common/paths.sh`** — Centralized workspace-relative path definitions (proxy resolution, temp dir, log dir). Source from shell scripts that need user-local paths; no hardcoded usernames.
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred for ntuple).

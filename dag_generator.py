@@ -23,7 +23,7 @@ import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3010,6 +3010,62 @@ def discover_ntuple_jobs(
     return result
 
 
+def discover_ntuple_jobs_remote(
+    miniaod_base_url: str,
+    campaign_names: Sequence[str],
+    filename: str = "output_MINIAOD.root",
+    proxy_path: str = "",
+    max_jobs: int = 0,
+) -> Dict[str, List[int]]:
+    """Scan remote XRootD directory structure for available MiniAOD files.
+
+    Expected structure: {miniaod_base_url}/{campaign_name}/{job_index}/{filename}
+    Returns campaign_name -> sorted job index list mapping.
+    """
+    result: Dict[str, List[int]] = OrderedDict()
+    if not proxy_path:
+        proxy_path = detect_proxy_path()
+    local_proxy = ensure_local_xrootd_proxy(proxy_path)
+    env = os.environ.copy()
+    env["X509_USER_PROXY"] = local_proxy
+    base_path = miniaod_base_url.replace(f"root://{EOS_XRDFS_TARGET}/", "")
+    for campaign_name in campaign_names:
+        campaign_dir = f"{base_path}/{campaign_name}"
+        # Use recursive listing to discover {idx}/{filename} in one shot
+        try:
+            r = subprocess.run(
+                ["xrdfs", EOS_XRDFS_TARGET, "ls", "-R", campaign_dir],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=120, check=False, env=env,
+            )
+        except Exception:
+            print(f"警告: 无法列出远端目录: {campaign_dir}")
+            continue
+        if r.returncode != 0:
+            print(f"警告: 远端 campaign 目录不存在: {miniaod_base_url}/{campaign_name}")
+            continue
+        # Parse lines like: /path/to/campaign/0/output_MINIAOD.root
+        indices: Set[int] = set()
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line.endswith(filename):
+                continue
+            # Extract the index from the path component before the filename
+            parent = line[:-(len(filename) + 1)].rsplit("/", 1)[-1]
+            try:
+                indices.add(int(parent))
+            except ValueError:
+                continue
+        indices_sorted = sorted(indices)
+        if max_jobs > 0:
+            indices_sorted = indices_sorted[:max_jobs]
+        if indices_sorted:
+            result[campaign_name] = indices_sorted
+        else:
+            print(f"警告: campaign {campaign_name} 中没有找到 {filename} 文件")
+    return result
+
+
 def execute_ntuple_only_generation(
     campaign_names: Sequence[str],
     miniaod_dir: str,
@@ -3060,23 +3116,19 @@ def execute_ntuple_only_generation(
             miniaod_dir, campaign_names, miniaod_filename, max_jobs=max_jobs_int,
         )
     else:
-        if not jobs:
-            print("错误: 使用 --miniaod-base-url 时必须提供 --jobs", file=sys.stderr)
-            return 1
-        if isinstance(jobs, dict):
-            campaign_jobs_map = OrderedDict()
-            for name in campaign_names:
-                count = jobs.get(name)
-                if count is None:
-                    print(f"警告: campaign {name} 未在 --jobs 中指定，跳过", file=sys.stderr)
-                    continue
-                if count <= 0:
-                    continue
-                campaign_jobs_map[name] = list(range(count))
-        else:
-            campaign_jobs_map = OrderedDict(
-                (name, list(range(jobs))) for name in campaign_names
-            )
+        max_jobs_int = jobs if isinstance(jobs, int) else 0
+        per_campaign_caps = {} if isinstance(jobs, int) or jobs is None else jobs
+        campaign_jobs_map = discover_ntuple_jobs_remote(
+            miniaod_base_url, campaign_names, miniaod_filename,
+            proxy_path=options.proxy_path,
+            max_jobs=max_jobs_int,
+        )
+        # Apply per-campaign caps if --jobs is a dict
+        if isinstance(per_campaign_caps, dict):
+            for name in list(campaign_jobs_map.keys()):
+                limit = per_campaign_caps.get(name)
+                if limit is not None and limit > 0:
+                    campaign_jobs_map[name] = campaign_jobs_map[name][:limit]
 
     if not campaign_jobs_map:
         print("错误: 没有任何可用的 ntuple job（未找到 MiniAOD 文件）", file=sys.stderr)
