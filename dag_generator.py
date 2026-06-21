@@ -445,9 +445,9 @@ class WorkflowOptions:
         local_log_dir: str = "",
         local_output_base: str = "",
         log_root: str = "",
-        maxjobs_lhe: int = 20,
-        maxjobs_processing: int = 50,
-        maxjobs_ntuple: int = 30,
+        maxjobs_lhe: int = 0,
+        maxjobs_processing: int = 0,
+        maxjobs_ntuple: int = 0,
         cmssw15_runtime_tarball: Optional[str] = None,
         shuffle_mixing: bool = False,
         strict_vtx_smearing_check: bool = False,
@@ -2761,8 +2761,9 @@ class DAGBuilder:
                     subprocess_id = SUBPROCESS_MAP.get(campaign_name, "")
                     if subprocess_id:
                         target_eos_base = self.options.target_base_url or CHIW_EOS_OUTPUT_BASE
-                        custom_output_subpath = f"JpsiJpsiPhi/Ntuple/{subprocess_id}"
                         version = self.options.ntuple_version or NTUPLE_VERSION
+                        ntuple_dir = f"Ntuple-{version}" if self.options.ntuple_version else "Ntuple"
+                        custom_output_subpath = f"JpsiJpsiPhi/{ntuple_dir}/{subprocess_id}"
                         custom_ntuple_basename = f"{subprocess_id}-Ntuple-{version}-{job_index}.root"
                 self.add_ntuple_job(
                     campaign_name, job_index,
@@ -4161,7 +4162,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTCondor stdout/stderr/event log 输出目录。",
     )
     ntuple_only_parser.add_argument(
-        "--maxjobs-ntuple", type=int, default=30,
+        "--maxjobs-ntuple", type=int, default=0,
         help="DAGMan ntuple category throttle。",
     )
     ntuple_only_parser.add_argument(
