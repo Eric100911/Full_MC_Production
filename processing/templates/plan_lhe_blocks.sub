@@ -9,7 +9,7 @@ Universe = vanilla
 
 Executable = $(plan_wrapper_path)
 transfer_executable = True
-Arguments = "$(proxy_bundle_name) $(plan_bundle_name) $(pool) $(seed) $(lhe_path) $(output_dir) $(events_per_block) $(shuffle_seed) $(shuffle_mode) $(n_strata) $(drop_incomplete) $(block_output_dir) $(local_output_base) $(reuse_blocks) $(manifest_output_path)"
+Arguments = "$(proxy_bundle_name) $(plan_bundle_name) $(pool) $(group_id) $(primary_seed) $(seeds) $(lhe_paths) $(output_dir) $(events_per_block) $(shuffle_seed) $(shuffle_mode) $(n_strata) $(drop_incomplete) $(block_output_dir) $(local_output_base) $(reuse_blocks) $(manifest_output_path)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
@@ -17,9 +17,9 @@ Transfer_Input_Files = $(plan_bundle_path), $(proxy_bundle_path)
 
 transfer_output_files =
 
-Output = $(log_root)/plan_$(pool)_$(seed)_$(Cluster)_$(Process).stdout
-Error  = $(log_root)/plan_$(pool)_$(seed)_$(Cluster)_$(Process).stderr
-Log    = $(log_root)/plan_$(pool)_$(seed)_$(Cluster).log
+Output = $(log_root)/plan_$(pool)_$(group_id)_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/plan_$(pool)_$(group_id)_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/plan_$(pool)_$(group_id)_$(Cluster).log
 
 request_cpus   = 1
 request_memory = 2GB

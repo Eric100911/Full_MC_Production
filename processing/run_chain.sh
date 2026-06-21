@@ -1654,18 +1654,31 @@ else
             # Local file path (from test_full_chain or local runs)
             lhe_file="${spec#file:}"
         elif [[ "$spec" == BLOCK:* ]]; then
-            # Format: BLOCK:pool_name:helac_seed:block_idx
+            # Format: BLOCK:pool_name:block_namespace:block_idx
+            # block_namespace is a group_id for grouped blocks or a seed for legacy blocks.
             IFS=':' read -ra parts <<< "$spec"
             pool_name="${parts[1]}"
-            helac_seed="${parts[2]}"
+            block_namespace="${parts[2]}"
             block_idx="${parts[3]}"
-            # Try .lhe.gz first, then uncompressed .lhe
-            lhe_file="${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe.gz"
+
+            block_pool_base="${EOS_LHE_POOL}"
+            if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
+                block_pool_base="${LOCAL_OUTPUT_BASE}/lhe_pools"
+            fi
+
+            # Try grouped directory first, then legacy flat block names.
+            lhe_file="${block_pool_base}/${pool_name}/lhe_blocks/${block_namespace}/block_${block_namespace}_${block_idx}.lhe.gz"
             if ! check_remote_file "$lhe_file"; then
-                lhe_file="${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe"
+                lhe_file="${block_pool_base}/${pool_name}/lhe_blocks/${block_namespace}/block_${block_namespace}_${block_idx}.lhe"
                 if ! check_remote_file "$lhe_file"; then
-                    msg_error "Could not resolve LHE block file for: $spec (tried: ${EOS_LHE_POOL}/${pool_name}/lhe_blocks/block_${helac_seed}_${block_idx}.lhe.gz / .lhe)"
-                    exit 1
+                    lhe_file="${block_pool_base}/${pool_name}/lhe_blocks/block_${block_namespace}_${block_idx}.lhe.gz"
+                    if ! check_remote_file "$lhe_file"; then
+                        lhe_file="${block_pool_base}/${pool_name}/lhe_blocks/block_${block_namespace}_${block_idx}.lhe"
+                        if ! check_remote_file "$lhe_file"; then
+                            msg_error "Could not resolve LHE block file for: $spec"
+                            exit 1
+                        fi
+                    fi
                 fi
             fi
         elif [[ "$spec" == GEN:* ]]; then

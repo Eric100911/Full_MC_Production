@@ -13,7 +13,7 @@ Universe = vanilla
 
 Executable = $(processing_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(inputs) $(modes) $(analysis) $(campaign) $(job_id) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(local_output_base) $(shuffle_mixing)"
+arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(inputs) $(modes) $(analysis) $(campaign) $(job_id) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(local_output_base) $(shuffle_mixing) $(target_eos_base)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

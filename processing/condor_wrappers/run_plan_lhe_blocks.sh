@@ -6,42 +6,47 @@
 #   $1  PROXY_BUNDLE
 #   $2  PLAN_BUNDLE
 #   $3  POOL
-#   $4  SEED
-#   $5  LHE_PATH
-#   $6  OUTPUT_DIR
-#   $7  EVENTS_PER_BLOCK
-#   $8  SHUFFLE_SEED
-#   $9  SHUFFLE_MODE
-#   $10 N_STRATA
-#   $11 DROP_INCOMPLETE
-#   $12 BLOCK_OUTPUT_DIR
-#   $13 LOCAL_OUTPUT_BASE
-#   $14 REUSE_BLOCKS
-#   $15 MANIFEST_OUTPUT_PATH
+#   $4  GROUP_ID
+#   $5  PRIMARY_SEED
+#   $6  SEEDS
+#   $7  LHE_PATHS
+#   $8  OUTPUT_DIR
+#   $9  EVENTS_PER_BLOCK
+#   $10 SHUFFLE_SEED
+#   $11 SHUFFLE_MODE
+#   $12 N_STRATA
+#   $13 DROP_INCOMPLETE
+#   $14 BLOCK_OUTPUT_DIR
+#   $15 LOCAL_OUTPUT_BASE
+#   $16 REUSE_BLOCKS
+#   $17 MANIFEST_OUTPUT_PATH
 # ==============================================================================
 set -euo pipefail
 
 PROXY_BUNDLE="$1"
 PLAN_BUNDLE="$2"
 POOL="$3"
-SEED="$4"
-LHE_PATH="$5"
-OUTPUT_DIR="$6"
-EVENTS_PER_BLOCK="${7:-1000}"
-SHUFFLE_SEED="$8"
-SHUFFLE_MODE="${9:-stratified}"
-N_STRATA="${10:-auto}"
-DROP_INCOMPLETE="${11:-false}"
-BLOCK_OUTPUT_DIR="$12"
-LOCAL_OUTPUT_BASE="${13:-}"
-REUSE_BLOCKS="${14:-false}"
-MANIFEST_OUTPUT_PATH="${15:-}"
+GROUP_ID="$4"
+PRIMARY_SEED="$5"
+SEEDS="$6"
+LHE_PATHS="$7"
+OUTPUT_DIR="$8"
+EVENTS_PER_BLOCK="${9:-1000}"
+SHUFFLE_SEED="${10}"
+SHUFFLE_MODE="${11:-stratified}"
+N_STRATA="${12:-auto}"
+DROP_INCOMPLETE="${13:-false}"
+BLOCK_OUTPUT_DIR="$14"
+LOCAL_OUTPUT_BASE="${15:-}"
+REUSE_BLOCKS="${16:-false}"
+MANIFEST_OUTPUT_PATH="${17:-}"
 
 export LOCAL_OUTPUT_BASE="${LOCAL_OUTPUT_BASE}"
 
 echo "=== LHE Block Planner Wrapper ==="
-echo "Pool: ${POOL}  Seed: ${SEED}"
-echo "LHE path: ${LHE_PATH}"
+echo "Pool: ${POOL}  Group: ${GROUP_ID}  Primary seed: ${PRIMARY_SEED}"
+echo "Seeds: ${SEEDS}"
+echo "LHE paths: ${LHE_PATHS}"
 echo "Events per block: ${EVENTS_PER_BLOCK}"
 echo "Shuffle seed: ${SHUFFLE_SEED}"
 
@@ -60,8 +65,9 @@ tar -xzf "${PLAN_BUNDLE}"
 # Build planner args
 PLANNER_ARGS=(
     --pool-name "${POOL}"
-    --helac-seed "${SEED}"
-    --lhe-path "${LHE_PATH}"
+    --group-id "${GROUP_ID}"
+    --primary-seed "${PRIMARY_SEED}"
+    --helac-seeds "${SEEDS}"
     --output-dir "${OUTPUT_DIR}"
     --events-per-block "${EVENTS_PER_BLOCK}"
     --shuffle-seed "${SHUFFLE_SEED}"
@@ -70,6 +76,10 @@ PLANNER_ARGS=(
     --block-output-dir "${BLOCK_OUTPUT_DIR}"
     --lhe-shuffle-split-bin ./lhe_shuffle_split
 )
+IFS=',' read -ra PATH_ARRAY <<< "${LHE_PATHS}"
+for path in "${PATH_ARRAY[@]}"; do
+    PLANNER_ARGS+=(--lhe-path "${path}")
+done
 if [[ "${DROP_INCOMPLETE}" == "true" ]]; then
     PLANNER_ARGS+=(--drop-incomplete-last-block)
 fi

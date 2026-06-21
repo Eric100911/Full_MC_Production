@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--request-memory", default="20GB")
     p.add_argument("--request-disk", default="50GB")
     p.add_argument("--target-machine", default="")
+    p.add_argument("--target-eos-base", default="",
+                   help="EOS base for block lookup and output staging")
     p.add_argument("--output-dir", required=True, help="Directory for coordinator output")
     p.add_argument("--processing-sub-template-path", required=True,
                    help="Path to processing.sub for the SubDAG JOB lines")
@@ -95,7 +97,7 @@ def main() -> int:
         return 1
 
     # --- 2. Read plan manifests ---
-    source_blocks: list = []  # list of (pool, seed, [block_dict, ...])
+    source_blocks: list = []  # list of (pool, group_id, primary_seed, seeds, [block_dict, ...])
     for info in source_infos:
         manifest_path = info["path"]
         if not os.path.exists(manifest_path):
@@ -103,8 +105,11 @@ def main() -> int:
             return 1
         with open(manifest_path, "r") as f:
             m = json.load(f)
-        source_blocks.append((info["pool"], info["seed"], m.get("blocks", [])))
-        print(f"[INFO] Source {info['pool']} (seed={info['seed']}): "
+        primary_seed = info.get("primary_seed", info.get("seed", m.get("primary_seed", m.get("helac_seed"))))
+        group_id = info.get("group_id", m.get("group_id", str(primary_seed)))
+        seeds = info.get("seeds", m.get("seeds", [primary_seed]))
+        source_blocks.append((info["pool"], group_id, primary_seed, seeds, m.get("blocks", [])))
+        print(f"[INFO] Source {info['pool']} (group={group_id}, primary_seed={primary_seed}): "
               f"{len(m.get('blocks', []))} blocks")
 
     # --- 3. Resolve campaign input multiplicity and strict-min block count ---
@@ -119,13 +124,18 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # Build pool→(seed, blocks) lookup for block generation
+    # Build pool→source lookup for block generation
     pool_lookup: dict = {}
-    for pool, seed, blocks in source_blocks:
+    for pool, group_id, primary_seed, seeds, blocks in source_blocks:
         if pool in pool_lookup:
             print(f"[ERROR] Duplicate source manifest for pool: {pool}", file=sys.stderr)
             return 1
-        pool_lookup[pool] = (seed, blocks)
+        pool_lookup[pool] = {
+            "group_id": group_id,
+            "primary_seed": primary_seed,
+            "seeds": seeds,
+            "blocks": blocks,
+        }
 
     missing_pools = sorted(set(campaign_inputs) - set(pool_lookup))
     if missing_pools:
@@ -136,7 +146,7 @@ def main() -> int:
         return 1
 
     input_multiplicity = Counter(campaign_inputs)
-    n_blocks_by_pool = {pool: len(blocks) for pool, (_, blocks) in pool_lookup.items()}
+    n_blocks_by_pool = {pool: len(source["blocks"]) for pool, source in pool_lookup.items()}
     n_mixed = min(
         n_blocks_by_pool[pool] // input_multiplicity[pool]
         for pool in input_multiplicity
@@ -154,11 +164,12 @@ def main() -> int:
 
     # Record unused blocks after duplicate source offsets are consumed.
     unused = []
-    for pool, seed, blocks in source_blocks:
+    for pool, group_id, primary_seed, seeds, blocks in source_blocks:
         used_count = n_mixed * input_multiplicity.get(pool, 0)
         leftover = list(range(used_count, len(blocks)))
         if leftover:
-            unused.append({"pool": pool, "seed": seed, "unused_indices": leftover,
+            unused.append({"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
+                           "seeds": seeds, "unused_indices": leftover,
                            "unused_count": len(leftover)})
             print(f"[INFO] {pool}: {len(leftover)} unused blocks (indices {leftover[0]}-{leftover[-1]})")
 
@@ -168,11 +179,13 @@ def main() -> int:
         for pool_name in campaign_inputs:
             occurrence = occurrence_seen[pool_name]
             occurrence_seen[pool_name] += 1
-            seed, _ = pool_lookup[pool_name]
+            source = pool_lookup[pool_name]
             source_block_index = block_index * input_multiplicity[pool_name] + occurrence
             inputs.append({
                 "pool": pool_name,
-                "seed": seed,
+                "group_id": source["group_id"],
+                "primary_seed": source["primary_seed"],
+                "seeds": source["seeds"],
                 "block_index": source_block_index,
                 "occurrence": occurrence,
             })
@@ -189,7 +202,7 @@ def main() -> int:
         dag.write(f"# Generated: {datetime.now(timezone.utc).isoformat()}\n")
         dag.write(f"# Tool: coordinate_lhe_blocks.py\n")
         dag.write(f"# Strict-min: {n_mixed} mixed blocks from "
-                  f"{' + '.join(f'{pool}({n_blocks_by_pool[pool]}/{input_multiplicity.get(pool, 0)} uses)' for pool, _, _ in source_blocks)}\n")
+                  f"{' + '.join(f'{pool}({n_blocks_by_pool[pool]}/{input_multiplicity.get(pool, 0)} uses)' for pool, _, _, _, _ in source_blocks)}\n")
         dag.write("# ================================================\n")
         dag.write("\n")
         dag.write(f"MAXJOBS block_processing {args.max_block_subdag_jobs}\n")
@@ -198,7 +211,7 @@ def main() -> int:
         for i in range(n_mixed):
             # Build inputs string from campaign inputs (with duplicates)
             input_parts = [
-                f"BLOCK:{item['pool']}:{item['seed']}:{item['block_index']:06d}"
+                f"BLOCK:{item['pool']}:{item['group_id']}:{item['block_index']:06d}"
                 for item in mixed_block_inputs(i)
             ]
             inputs_str = ",".join(input_parts)
@@ -233,7 +246,8 @@ def main() -> int:
                 f'processing_wrapper_path="{dag_escape(args.processing_wrapper_path)}" '
                 f'log_root="{dag_escape(args.log_root)}" '
                 f'local_output_base="{dag_escape(args.local_output_base)}" '
-                f'target_machine="{dag_escape(args.target_machine)}"'
+                f'target_machine="{dag_escape(args.target_machine)}" '
+                f'target_eos_base="{dag_escape(args.target_eos_base)}"'
             )
             dag.write(vars_line + "\n")
             dag.write(f"RETRY {node_name} 1\n")
@@ -282,10 +296,11 @@ def main() -> int:
         "n_mixed_blocks": n_mixed,
         "events_per_block": args.max_events,
         "sources": [
-            {"pool": pool, "seed": seed, "n_blocks": len(blocks),
+            {"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
+             "seeds": seeds, "n_blocks": len(blocks),
              "n_used": n_mixed * input_multiplicity.get(pool, 0),
              "multiplicity": input_multiplicity.get(pool, 0)}
-            for pool, seed, blocks in source_blocks
+            for pool, group_id, primary_seed, seeds, blocks in source_blocks
         ],
         "mixed_blocks": [
             {

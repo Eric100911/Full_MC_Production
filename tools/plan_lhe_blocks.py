@@ -30,8 +30,12 @@ from datetime import datetime, timezone
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Per-pool LHE block planner")
     p.add_argument("--pool-name", required=True, help="LHE pool name")
-    p.add_argument("--helac-seed", type=int, required=True, help="HELAC generation seed")
-    p.add_argument("--lhe-path", required=True, help="Path to LHE file (local or root:// URL)")
+    p.add_argument("--helac-seed", type=int, default=None, help="Legacy HELAC generation seed")
+    p.add_argument("--primary-seed", type=int, default=None, help="Primary seed for grouped LHE input")
+    p.add_argument("--group-id", default="", help="Group namespace for output block files")
+    p.add_argument("--helac-seeds", default="", help="Comma-separated seeds corresponding to --lhe-path inputs")
+    p.add_argument("--lhe-path", action="append", required=True,
+                   help="Path to LHE file (local or root:// URL); may be repeated")
     p.add_argument("--output-dir", required=True, help="Directory for manifest output")
     p.add_argument("--events-per-block", type=int, default=1000)
     p.add_argument("--shuffle-seed", type=int, required=True)
@@ -86,72 +90,107 @@ def _extract_eos_path(url: str) -> str:
     return url
 
 
+def _ensure_remote_dir(url: str) -> None:
+    """Best-effort mkdir for XRootD destinations."""
+    if not url.startswith("root://"):
+        return
+    subprocess.run(["xrdfs", "cceos.ihep.ac.cn", "mkdir", "-p", _extract_eos_path(url)],
+                   check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _normalize_inputs(args: argparse.Namespace) -> tuple:
+    primary_seed = args.primary_seed or args.helac_seed
+    if primary_seed is None:
+        raise ValueError("--primary-seed or --helac-seed is required")
+
+    group_id = args.group_id or str(primary_seed)
+    seeds = [int(s) for s in args.helac_seeds.split(",") if s]
+    if not seeds:
+        seeds = [primary_seed]
+    if len(seeds) != len(args.lhe_path):
+        raise ValueError(
+            f"--helac-seeds has {len(seeds)} entries but --lhe-path has {len(args.lhe_path)}"
+        )
+    return primary_seed, group_id, seeds
+
+
 def main() -> int:
     args = parse_args()
+    try:
+        primary_seed, group_id, seeds = _normalize_inputs(args)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
 
-    is_remote = args.lhe_path.startswith("root://")
+    is_remote_output = args.block_output_dir.startswith("root://")
+    grouped_output = group_id != str(primary_seed)
     workdir = tempfile.mkdtemp(prefix="plan_lhe_blocks_")
 
     try:
-        # --- 1. Resolve LHE file ---
-        local_lhe: str = ""
-        if is_remote:
-            basename = os.path.basename(_extract_eos_path(args.lhe_path))
-            local_lhe = os.path.join(workdir, basename)
-            print(f"[INFO] Downloading {args.lhe_path} -> {local_lhe}")
-            subprocess.run(["xrdcp", "--nopbar", "--force", args.lhe_path, local_lhe], check=True)
-        elif args.local_output_base:
-            local_lhe = args.lhe_path
-        else:
-            local_lhe = args.lhe_path
+        # --- 1. Resolve and decompress LHE files ---
+        local_inputs = []
+        input_event_counts = []
+        for i, lhe_path in enumerate(args.lhe_path):
+            local_lhe = lhe_path
+            if lhe_path.startswith("root://"):
+                basename = os.path.basename(_extract_eos_path(lhe_path))
+                local_lhe = os.path.join(workdir, f"input_{i}_{basename}")
+                print(f"[INFO] Downloading {lhe_path} -> {local_lhe}")
+                subprocess.run(["xrdcp", "--nopbar", "--force", lhe_path, local_lhe], check=True)
 
-        if not os.path.exists(local_lhe):
-            print(f"[ERROR] LHE file not found: {local_lhe}", file=sys.stderr)
-            return 1
+            if not os.path.exists(local_lhe):
+                print(f"[ERROR] LHE file not found: {local_lhe}", file=sys.stderr)
+                return 1
 
-        # --- 2. Decompress if needed ---
-        if local_lhe.endswith(".gz"):
-            decompressed = os.path.join(workdir, "input_decompressed.lhe")
-            print(f"[INFO] Decompressing {local_lhe} -> {decompressed}")
-            with gzip.open(local_lhe, "rb") as f_in:
-                with open(decompressed, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-            local_lhe = decompressed
+            if local_lhe.endswith(".gz"):
+                decompressed = os.path.join(workdir, f"input_{i}.lhe")
+                print(f"[INFO] Decompressing {local_lhe} -> {decompressed}")
+                with gzip.open(local_lhe, "rb") as f_in:
+                    with open(decompressed, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                local_lhe = decompressed
 
-        # --- 3. Count events ---
-        n_events = count_lhe_events(local_lhe)
+            n_input_events = count_lhe_events(local_lhe)
+            local_inputs.append(local_lhe)
+            input_event_counts.append(n_input_events)
+
+        n_events = sum(input_event_counts)
         if n_events == 0:
             print("[ERROR] LHE file contains zero events", file=sys.stderr)
             return 1
-        print(f"[INFO] Input LHE has {n_events} events")
+        print(f"[INFO] Input LHE group {group_id} has {n_events} events from {len(local_inputs)} file(s)")
 
-        # --- 4. Check for existing blocks (reuse) ---
+        # --- 2. Check for existing blocks (reuse) ---
         manifest_path = args.manifest_output_path or os.path.join(
-            args.output_dir, f"plan_manifest_{args.pool_name}_{args.helac_seed}.json"
+            args.output_dir, f"plan_manifest_{args.pool_name}_{group_id}.json"
         )
-        prefix = f"block_{args.helac_seed}_"
+        prefix = f"block_{group_id}_"
+        block_stage_dir = args.block_output_dir.rstrip("/")
+        if grouped_output:
+            block_stage_dir = block_stage_dir + "/" + group_id
 
         if args.reuse_existing_blocks:
-            existing = _list_existing_blocks(args.block_output_dir, prefix, is_remote)
+            existing = _list_existing_blocks(block_stage_dir, prefix, is_remote_output)
             if existing and _blocks_match_manifest(existing, manifest_path):
                 print(f"[INFO] Reusing {len(existing)} existing blocks (--reuse-existing-blocks)")
                 return 0
             print("[INFO] Existing blocks incomplete or mismatched, regenerating...")
 
-        # --- 5. Run lhe_shuffle_split ---
+        # --- 3. Run lhe_shuffle_split ---
         split_out = os.path.join(workdir, "split_out")
         os.makedirs(split_out, exist_ok=True)
         shuffle_cmd = [
             args.lhe_shuffle_split_bin,
-            "--input", local_lhe,
             "--output-dir", split_out,
             "--seed", str(args.shuffle_seed),
             "--events-per-block", str(args.events_per_block),
             "--mode", args.shuffle_mode,
             "--n-strata", args.n_strata,
-            "--filename-prefix", f"{args.helac_seed}_",
+            "--filename-prefix", f"{group_id}_",
             "--write-provenance",
         ]
+        for local_lhe in local_inputs:
+            shuffle_cmd.extend(["--input", local_lhe])
         if args.drop_incomplete_last_block:
             shuffle_cmd.append("--drop-incomplete-last-block")
 
@@ -169,20 +208,31 @@ def main() -> int:
         with open(shuffle_manifest_path, "r") as f:
             shuffle_manifest = json.load(f)
 
+        splitter_events = shuffle_manifest.get("total_input_events")
+        if splitter_events != n_events:
+            print(
+                f"[ERROR] Event conservation mismatch before staging: planner counted {n_events}, "
+                f"splitter counted {splitter_events}",
+                file=sys.stderr,
+            )
+            return 1
+
         n_blocks = shuffle_manifest.get("n_blocks", 0)
         if n_blocks == 0:
             print("[ERROR] lhe_shuffle_split produced zero blocks", file=sys.stderr)
             return 1
 
-        # --- 6. Compress each block and stage out ---
+        # --- 4. Compress each block and stage out ---
         os.makedirs(args.output_dir, exist_ok=True)
-        if not is_remote:
-            os.makedirs(args.block_output_dir, exist_ok=True)
+        if is_remote_output:
+            _ensure_remote_dir(block_stage_dir)
+        else:
+            os.makedirs(block_stage_dir, exist_ok=True)
 
         plan_blocks = []
         for bi in range(n_blocks):
-            src_name = f"{args.helac_seed}_block_{bi:06d}.lhe"
-            dst_name = f"block_{args.helac_seed}_{bi:06d}.lhe.gz"
+            src_name = f"{group_id}_block_{bi:06d}.lhe"
+            dst_name = f"block_{group_id}_{bi:06d}.lhe.gz"
             src_path = os.path.join(split_out, src_name)
             gz_tmp = os.path.join(workdir, dst_name)
 
@@ -193,8 +243,8 @@ def main() -> int:
                     shutil.copyfileobj(f_in, f_out)
 
             # Stage
-            if is_remote:
-                dst_url = args.block_output_dir.rstrip("/") + "/" + dst_name
+            if is_remote_output:
+                dst_url = block_stage_dir.rstrip("/") + "/" + dst_name
                 stage_file(gz_tmp, dst_url, is_remote=True)
                 # Verify
                 if not check_remote_file(dst_url):
@@ -204,19 +254,24 @@ def main() -> int:
                                     "n_events": shuffle_manifest["blocks"][bi]["n_events"],
                                     "path": dst_url})
             else:
-                dst_path = os.path.join(args.block_output_dir, dst_name)
+                dst_path = os.path.join(block_stage_dir, dst_name)
                 stage_file(gz_tmp, dst_path, is_remote=False)
                 plan_blocks.append({"index": bi, "filename": dst_name,
                                     "n_events": shuffle_manifest["blocks"][bi]["n_events"],
                                     "path": dst_path})
 
-        # --- 7. Write plan manifest ---
+        # --- 5. Write plan manifest ---
         manifest = {
             "tool": "plan_lhe_blocks",
-            "version": "1.0",
+            "version": "2.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "pool": args.pool_name,
-            "helac_seed": args.helac_seed,
+            "group_id": group_id,
+            "primary_seed": primary_seed,
+            "helac_seed": primary_seed,
+            "seeds": seeds,
+            "input_files": args.lhe_path,
+            "input_event_counts": input_event_counts,
             "shuffle_seed": args.shuffle_seed,
             "shuffle_mode": args.shuffle_mode,
             "n_strata_arg": args.n_strata,
@@ -237,7 +292,7 @@ def main() -> int:
 
         # Cleanup uncompressed block files
         for bi in range(n_blocks):
-            src_name = f"{args.helac_seed}_block_{bi:06d}.lhe"
+            src_name = f"{group_id}_block_{bi:06d}.lhe"
             src_path = os.path.join(split_out, src_name)
             if os.path.exists(src_path):
                 os.remove(src_path)

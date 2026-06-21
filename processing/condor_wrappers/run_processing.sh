@@ -15,8 +15,10 @@ EFFICIENCY_NTUPLE="${10:-false}"
 CLEANUP="${11:-true}"
 LOCAL_OUTPUT_BASE="${12:-}"
 SHUFFLE_MIXING="${13:-false}"
+TARGET_EOS_BASE="${14:-}"
 
 export LOCAL_OUTPUT_BASE="${LOCAL_OUTPUT_BASE:-}"
+export TARGET_EOS_BASE="${TARGET_EOS_BASE:-}"
 
 echo "=== Processing Chain Wrapper ==="
 echo "Working directory: $(pwd)"

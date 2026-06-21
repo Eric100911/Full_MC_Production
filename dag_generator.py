@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -388,6 +390,23 @@ class LHEPool:
         }
 
 
+@dataclass(frozen=True)
+class LHEGroup:
+    """A reproducible group of immutable raw LHE files."""
+
+    pool: str
+    group_index: int
+    group_id: str
+    primary_seed: int
+    seeds: List[int]
+    paths: List[str]
+    event_counts: List[int]
+
+    @property
+    def total_events(self) -> int:
+        return sum(self.event_counts)
+
+
 class Campaign:
     """单个 physics campaign 的定义。"""
 
@@ -467,6 +486,9 @@ class WorkflowOptions:
         ntuple_version: str = "",
         skip_lhe_generation: bool = False,
         existing_lhe_base: str = "",
+        lhe_group_min_events: int = 0,
+        lhe_group_max_events: int = 0,
+        lhe_group_max_files: int = 20,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -493,6 +515,9 @@ class WorkflowOptions:
         self.force_generate_lhe = force_generate_lhe
         self.skip_lhe_generation = skip_lhe_generation
         self.existing_lhe_base = existing_lhe_base or ""
+        self.lhe_group_min_events = lhe_group_min_events
+        self.lhe_group_max_events = lhe_group_max_events
+        self.lhe_group_max_files = lhe_group_max_files
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -511,6 +536,15 @@ class WorkflowOptions:
         if self.lhe_unwevt is not None:
             return self.lhe_unwevt
         return 100 if self.test_mode else 100000
+
+    @property
+    def lhe_grouping_enabled(self) -> bool:
+        return self.lhe_group_min_events > 0
+
+    def resolved_lhe_group_max_events(self) -> int:
+        if self.lhe_group_max_events > 0:
+            return self.lhe_group_max_events
+        return 3 * self.lhe_events_per_block
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -545,6 +579,9 @@ class WorkflowOptions:
             "max_block_subdag_jobs": self.max_block_subdag_jobs,
             "skip_lhe_generation": self.skip_lhe_generation,
             "existing_lhe_base": self.existing_lhe_base,
+            "lhe_group_min_events": self.lhe_group_min_events,
+            "lhe_group_max_events": self.lhe_group_max_events,
+            "lhe_group_max_files": self.lhe_group_max_files,
         }
 
 
@@ -1110,10 +1147,13 @@ def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: st
     # Strategy 1: standard layout — single known subdirectory
     for parent in ("lhe_pools", "LHE_pool"):
         std_dir = f"{base}/{parent}/{storage_name}".replace(eos_prefix, "")
+        files = []
         for line in _list_remote_dir(std_dir, proxy_path):
             fname = line.rsplit("/", 1)[-1] if "/" in line else line
             if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
-                return sorted([f"{eos_prefix}{l.strip()}" for l in [line]])
+                files.append(f"{eos_prefix}{line.strip()}")
+        if files:
+            return sorted(files)
 
     # Strategy 2: scan subdirectories of LHE_pool / lhe_pools
     for parent in ("LHE_pool", "lhe_pools"):
@@ -1171,6 +1211,29 @@ def list_lhe_files_local(pool_name: str, local_output_base: str) -> List[str]:
             pass
 
     return []
+
+
+def parse_seed_from_lhe_filename(path: str) -> Optional[int]:
+    """Extract the trailing seed from sample_<pool>_<seed>.lhe[.gz] names."""
+    filename = os.path.basename(path)
+    match = re.search(r"_(\d+)\.lhe(?:\.gz)?$", filename)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def count_lhe_events_for_grouping(path: str) -> Optional[int]:
+    """Count events for local files; return None when the path cannot be read locally."""
+    if path.startswith("root://"):
+        return None
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+                return sum(1 for line in handle if line.strip().startswith("<event>"))
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return sum(1 for line in handle if line.strip().startswith("<event>"))
+    except Exception:
+        return None
 
 
 def pool_remote_path(pool_name: str, local_output_base: str = "") -> str:
@@ -1966,6 +2029,8 @@ class DAGBuilder:
         self.generated_jobs_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_specs_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_planners_by_pool: Dict[str, List[str]] = OrderedDict()
+        self.generated_group_planners_by_pool: Dict[str, Dict[str, str]] = OrderedDict()
+        self.generated_lhe_groups_by_pool: Dict[str, List[LHEGroup]] = OrderedDict()
         self.allocations_by_pool: Dict[str, int] = OrderedDict()
         self.dag_lines: List[str] = []
         self.metadata: Dict[str, object] = OrderedDict()
@@ -2120,6 +2185,7 @@ class DAGBuilder:
             "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
             "log_root=\"{log_root}\" "
             "processing_wrapper_path=\"{processing_wrapper_path}\" target_machine=\"{target_machine}\" "
+            "target_eos_base=\"{target_eos_base}\" "
             "premix_input_mode=\"{premix_input_mode}\" "
             "premix_redirector=\"{premix_redirector}\" "
             "premix_cache_files=\"{premix_cache_files}\" "
@@ -2150,6 +2216,7 @@ class DAGBuilder:
                     os.path.join(BASE_DIR, "processing", "condor_wrappers", "run_processing.sh")
                 ),
                 target_machine=dag_escape(self.options.machine_env.target_machine),
+                target_eos_base=dag_escape(self.options.target_base_url),
                 premix_input_mode=dag_escape(os.environ.get("PREMIX_INPUT_MODE", "eoscms")),
                 premix_redirector=dag_escape(os.environ.get("PREMIX_REDIRECTOR", "root://eoscms.cern.ch")),
                 premix_cache_files=dag_escape(os.environ.get("PREMIX_CACHE_FILES", "1")),
@@ -2245,7 +2312,7 @@ class DAGBuilder:
     def _resolve_block_output_dir(self, pool_name: str, seed: int) -> str:
         """Return the directory where block .lhe.gz files should be stored."""
         storage = pool_storage_name(pool_name)
-        base = self.options.existing_lhe_base or EOS_BASE
+        base = self.options.target_base_url or self.options.existing_lhe_base or EOS_BASE
         if self.options.machine_env.uses_local_storage and self.options.local_output_base:
             return os.path.join(
                 self.options.local_output_base,
@@ -2261,6 +2328,15 @@ class DAGBuilder:
             f"seed_{seed}",
         )
         return os.path.join(subdir, f"plan_manifest_{pool_name}_{seed}.json")
+
+    def _resolve_group_plan_manifest_path(self, pool_name: str, group_id: str) -> str:
+        """Return the grouped plan manifest path."""
+        subdir = os.path.join(
+            self.output_dir, "plan_subdags",
+            pool_dag_label(pool_name),
+            group_id,
+        )
+        return os.path.join(subdir, f"plan_manifest_{pool_name}_{group_id}.json")
 
     def _ensure_skip_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
         """Get or create a planner node for skip-lhe-generation mode.
@@ -2308,14 +2384,141 @@ class DAGBuilder:
             return files[job_index]
         return f"{fallback_dir}/sample_{storage}_{seed}.lhe.gz"
 
-    def add_planning_job(self, pool_name: str, index: int, seed: int,
-                         lhe_path_override: str = "") -> str:
+    def _discover_existing_lhe_files(self, pool_name: str) -> List[str]:
+        """Return cached existing LHE file paths for grouping and skip-LHE planning."""
+        base = self.options.existing_lhe_base or EOS_BASE
+        cache_key = f"{pool_name}::{base}"
+        if cache_key not in self._existing_lhe_cache:
+            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = list_lhe_files_local(pool_name, self.options.local_output_base)
+            else:
+                files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
+            self._existing_lhe_cache[cache_key] = files
+        return self._existing_lhe_cache[cache_key]
+
+    def _ensure_lhe_groups(self, pool_name: str) -> List[LHEGroup]:
+        """Build deterministic groups of immutable existing LHE files."""
+        if pool_name in self.generated_lhe_groups_by_pool:
+            return self.generated_lhe_groups_by_pool[pool_name]
+
+        files = self._discover_existing_lhe_files(pool_name)
+        if not files:
+            if self.options.scan_existing:
+                raise ValueError(
+                    f"No existing LHE files discovered for {pool_name}; "
+                    "cannot build LHE groups."
+                )
+            storage = pool_storage_name(pool_name)
+            base = self.options.existing_lhe_base or EOS_BASE
+            fallback_dir = f"{base}/lhe_pools/{storage}"
+            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                fallback_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
+            synthetic_count = self.options.jobs_per_campaign * max(1, self.options.lhe_group_max_files)
+            files = [
+                f"{fallback_dir}/sample_{storage}_{self.seed_for_pool_index(pool_name, i)}.lhe.gz"
+                for i in range(synthetic_count)
+            ]
+
+        min_events = self.options.lhe_group_min_events
+        max_events = self.options.resolved_lhe_group_max_events()
+        max_files = max(1, self.options.lhe_group_max_files)
+
+        groups: List[LHEGroup] = []
+        current_paths: List[str] = []
+        current_seeds: List[int] = []
+        current_counts: List[int] = []
+        current_has_unknown_counts = False
+
+        def flush_group() -> None:
+            nonlocal current_has_unknown_counts
+            if not current_paths:
+                return
+            group_index = len(groups)
+            groups.append(
+                LHEGroup(
+                    pool=pool_name,
+                    group_index=group_index,
+                    group_id=f"g{group_index:06d}",
+                    primary_seed=current_seeds[0],
+                    seeds=list(current_seeds),
+                    paths=list(current_paths),
+                    event_counts=list(current_counts),
+                )
+            )
+            current_paths.clear()
+            current_seeds.clear()
+            current_counts.clear()
+            current_has_unknown_counts = False
+
+        for job_index, path in enumerate(files):
+            seed = parse_seed_from_lhe_filename(path)
+            if seed is None:
+                seed = self.seed_for_pool_index(pool_name, job_index)
+            count = count_lhe_events_for_grouping(path)
+            if count is None:
+                current_has_unknown_counts = True
+                count = 0
+            current_paths.append(path)
+            current_seeds.append(seed)
+            current_counts.append(count)
+
+            total_events = sum(current_counts)
+            reached_file_cap = len(current_paths) >= max_files
+            reached_min = not current_has_unknown_counts and total_events >= min_events
+            reached_soft_max = not current_has_unknown_counts and total_events >= max_events
+            if reached_file_cap or reached_min or reached_soft_max:
+                flush_group()
+
+        flush_group()
+        self.generated_lhe_groups_by_pool[pool_name] = groups
+        return groups
+
+    def _ensure_group_planning_job(self, pool_name: str, group_index: int) -> Tuple[str, LHEGroup]:
+        """Get or create one planner node for a grouped existing-LHE input."""
+        groups = self._ensure_lhe_groups(pool_name)
+        if group_index >= len(groups):
+            raise ValueError(
+                f"Pool {pool_name} has only {len(groups)} LHE groups, "
+                f"but group index {group_index} was requested."
+            )
+        group = groups[group_index]
+        planners = self.generated_group_planners_by_pool.setdefault(pool_name, {})
+        if group.group_id in planners:
+            return planners[group.group_id], group
+
+        plan_job = self.add_planning_job(
+            pool_name,
+            group.group_index,
+            group.primary_seed,
+            group_id=group.group_id,
+            seeds=group.seeds,
+            lhe_paths=group.paths,
+        )
+        planners[group.group_id] = plan_job
+        return plan_job, group
+
+    def add_planning_job(
+        self,
+        pool_name: str,
+        index: int,
+        seed: int,
+        lhe_path_override: str = "",
+        group_id: str = "",
+        seeds: Optional[List[int]] = None,
+        lhe_paths: Optional[List[str]] = None,
+    ) -> str:
         """Emit a per-pool LHE block planner DAG node."""
         pool_label = pool_dag_label(pool_name)
         job_name = f"PLAN_{pool_label}_{index}"
         lhe_path = lhe_path_override or self._resolve_lhe_path(pool_name, seed)
+        group_id = group_id or str(seed)
+        seeds = seeds or [seed]
+        lhe_paths = lhe_paths or [lhe_path]
         block_output_dir = self._resolve_block_output_dir(pool_name, seed)
-        plan_manifest_path = self._resolve_plan_manifest_path(pool_name, seed)
+        if group_id == str(seed):
+            plan_manifest_path = self._resolve_plan_manifest_path(pool_name, seed)
+        else:
+            plan_manifest_path = self._resolve_group_plan_manifest_path(pool_name, group_id)
         output_dir = os.path.dirname(plan_manifest_path)
         shuffle_seed = self.options.lhe_shuffle_seed_base or (seed * 1000 + 37)
 
@@ -2328,8 +2531,9 @@ class DAGBuilder:
             "plan_wrapper_path=\"{plan_wrapper_path}\" "
             "plan_bundle_path=\"{plan_bundle_path}\" plan_bundle_name=\"{plan_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
-            "pool=\"{pool}\" seed=\"{seed}\" "
-            "lhe_path=\"{lhe_path}\" output_dir=\"{output_dir}\" "
+            "pool=\"{pool}\" seed=\"{seed}\" group_id=\"{group_id}\" "
+            "primary_seed=\"{primary_seed}\" seeds=\"{seeds}\" "
+            "lhe_path=\"{lhe_path}\" lhe_paths=\"{lhe_paths}\" output_dir=\"{output_dir}\" "
             "events_per_block=\"{events_per_block}\" shuffle_seed=\"{shuffle_seed}\" "
             "shuffle_mode=\"{shuffle_mode}\" n_strata=\"{n_strata}\" "
             "drop_incomplete=\"{drop_incomplete}\" "
@@ -2346,7 +2550,11 @@ class DAGBuilder:
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                 pool=dag_escape(pool_name),
                 seed=dag_escape(seed),
+                group_id=dag_escape(group_id),
+                primary_seed=dag_escape(seed),
+                seeds=dag_escape(",".join(str(item) for item in seeds)),
                 lhe_path=dag_escape(lhe_path),
+                lhe_paths=dag_escape(",".join(lhe_paths)),
                 output_dir=dag_escape(output_dir),
                 events_per_block=dag_escape(self.options.lhe_events_per_block),
                 shuffle_seed=dag_escape(shuffle_seed),
@@ -2366,7 +2574,7 @@ class DAGBuilder:
         self,
         campaign_name: str,
         job_index: int,
-        source_infos: List[Tuple[str, int]],
+        source_infos: List[object],
         campaign_inputs: Tuple[str, ...],
     ) -> str:
         """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
@@ -2375,12 +2583,33 @@ class DAGBuilder:
 
         # Build source_manifests JSON: list of {pool, seed, path}
         source_manifest_entries = []
-        for pool_name, seed in source_infos:
-            source_manifest_entries.append({
-                "pool": pool_name,
-                "seed": seed,
-                "path": self._resolve_plan_manifest_path(pool_name, seed),
-            })
+        for source in source_infos:
+            if isinstance(source, dict):
+                pool_name = str(source["pool"])
+                group_id = str(source.get("group_id") or source.get("seed"))
+                primary_seed = int(source.get("primary_seed", source.get("seed")))
+                seeds = list(source.get("seeds", [primary_seed]))
+                manifest_path = str(source.get("path") or self._resolve_group_plan_manifest_path(pool_name, group_id))
+                source_manifest_entries.append({
+                    "source_id": source.get("source_id", f"{pool_name}:{group_id}"),
+                    "pool": pool_name,
+                    "group_id": group_id,
+                    "primary_seed": primary_seed,
+                    "seed": primary_seed,
+                    "seeds": seeds,
+                    "path": manifest_path,
+                })
+            else:
+                pool_name, seed = source
+                source_manifest_entries.append({
+                    "source_id": f"{pool_name}:{seed}",
+                    "pool": pool_name,
+                    "group_id": str(seed),
+                    "primary_seed": seed,
+                    "seed": seed,
+                    "seeds": [seed],
+                    "path": self._resolve_plan_manifest_path(pool_name, seed),
+                })
         source_manifests_json = dag_escape(json.dumps(source_manifest_entries))
 
         campaign_inputs_str = dag_escape(",".join(campaign_inputs))
@@ -2424,6 +2653,7 @@ class DAGBuilder:
             "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" "
             "request_disk=\"{request_disk}\" "
             "target_machine=\"{target_machine}\" "
+            "target_eos_base=\"{target_eos_base}\" "
             "output_dir=\"{output_dir}\" "
             "processing_sub_template_path=\"{processing_sub_template_path}\" "
             "processing_bundle_path=\"{processing_bundle_path}\" "
@@ -2463,6 +2693,7 @@ class DAGBuilder:
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
                 target_machine=dag_escape(self.options.machine_env.target_machine),
+                target_eos_base=dag_escape(self.options.target_base_url),
                 output_dir=dag_escape(subdag_dir),
                 processing_sub_template_path=dag_escape(
                     os.path.join(BASE_DIR, self.options.machine_env.processing_submit_template)
@@ -2587,7 +2818,35 @@ class DAGBuilder:
             if use_block_subdags and self.options.skip_lhe_generation:
                 # Short-circuit: skip HELAC generation, use existing LHE files.
                 # Planners are deduplicated across campaigns (same pool+index → one node).
-                if campaign.n_sources == 1:
+                if self.options.lhe_grouping_enabled:
+                    for group_index in range(self.options.jobs_per_campaign):
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: set = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            plan_job, group = self._ensure_group_planning_job(pool_name, group_index)
+                            plan_jobs.append(plan_job)
+                            source_infos.append({
+                                "source_id": f"{pool_name}:{group.group_id}",
+                                "pool": pool_name,
+                                "group_id": group.group_id,
+                                "primary_seed": group.primary_seed,
+                                "seed": group.primary_seed,
+                                "seeds": group.seeds,
+                                "path": self._resolve_group_plan_manifest_path(pool_name, group.group_id),
+                            })
+                        coord_job = self.add_coordinator_job(campaign_name, group_index, source_infos, campaign.inputs)
+                        for pj in plan_jobs:
+                            self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, group_index, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                elif campaign.n_sources == 1:
                     pool_name = campaign.inputs[0]
                     for job_index in range(self.options.jobs_per_campaign):
                         plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
@@ -3244,6 +3503,13 @@ def execute_generation(
     options: WorkflowOptions,
     dry_run: bool,
 ) -> int:
+    if options.lhe_grouping_enabled and not options.skip_lhe_generation:
+        print("Error: --lhe-group-min-events requires --skip-lhe-generation in this implementation", file=sys.stderr)
+        return 1
+    if options.lhe_grouping_enabled and not options.enable_lhe_block_subdags:
+        print("Error: --lhe-group-min-events requires --enable-lhe-block-subdags", file=sys.stderr)
+        return 1
+
     if options.strict_vtx_smearing_check:
         result = subprocess.run(
             [sys.executable, os.path.join(BASE_DIR, "tools", "check_gensim_vtxsmeared_config.py")],
@@ -3713,6 +3979,24 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="每个 block 的事件数，默认 1000。",
     )
     parser.add_argument(
+        "--lhe-group-min-events",
+        type=int,
+        default=0,
+        help="启用 existing-LHE 分组；每组至少累计的事件数。默认 0 表示关闭。",
+    )
+    parser.add_argument(
+        "--lhe-group-max-events",
+        type=int,
+        default=0,
+        help="existing-LHE 分组的软事件上限；默认 0 表示 3 * --lhe-events-per-block。",
+    )
+    parser.add_argument(
+        "--lhe-group-max-files",
+        type=int,
+        default=20,
+        help="existing-LHE 分组中最多串联的原始 LHE 文件数，默认 20。",
+    )
+    parser.add_argument(
         "--lhe-shuffle-mode",
         default="stratified",
         choices=("stratified", "original-order"),
@@ -3903,6 +4187,17 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="machine-env=ihep 时传给 hep_sub 的 walltime 等级。",
     )
     parser.add_argument("--dry-run", action="store_true", help="只打印 DAG，不写文件。")
+    parser.add_argument(
+        "--use-subprocess-naming",
+        action="store_true",
+        default=False,
+        help="使用 SUBPROCESS_MAP 命名的 ntuple 输出目录结构。",
+    )
+    parser.add_argument(
+        "--target-base-url",
+        default="",
+        help="输出目标 EOS 基础 URL。同时控制 block staging 和处理输出的 EOS 区域。",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4345,6 +4640,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_block_subdag_jobs=args.max_block_subdag_jobs,
             skip_lhe_generation=args.skip_lhe_generation,
             existing_lhe_base=args.existing_lhe_base,
+            use_subprocess_naming=args.use_subprocess_naming,
+            target_base_url=args.target_base_url,
+            lhe_group_min_events=args.lhe_group_min_events,
+            lhe_group_max_events=args.lhe_group_max_events,
+            lhe_group_max_files=args.lhe_group_max_files,
         )
         return execute_generation(
             campaign_names=campaign_names,
