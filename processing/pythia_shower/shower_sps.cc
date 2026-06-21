@@ -153,7 +153,7 @@ int main(int argc, char* argv[]) {
         cerr << "\n====== SPS Phi-Enriched Shower Processing ======" << endl;
         cerr << "Specialized for Single Parton Scattering (SPS) processes" << endl;
         cerr << "MPI is DISABLED for clean SPS event topology" << endl;
-        cerr << "\nUsage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry]" << endl;
+        cerr << "\nUsage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]" << endl;
         cerr << "\nArguments:" << endl;
         cerr << "  input.lhe   : Input LHE file from HELAC-Onia" << endl;
         cerr << "  output.hepmc: Output HepMC file" << endl;
@@ -162,6 +162,7 @@ int main(int argc, char* argv[]) {
         cerr << "  minMuonPt   : Minimum muon pT in GeV (default: 2.5)" << endl;
         cerr << "  maxMuonEta  : Maximum muon |eta| (default: 2.4)" << endl;
         cerr << "  maxRetry    : Maximum hadronization retries (default: 5000)" << endl;
+        cerr << "  rngSeed     : Optional Pythia RNG seed" << endl;
         cerr << "\nExample:" << endl;
         cerr << "  ./shower_sps 2jpsi.lhe jjp_sps.hepmc 1000 3.0 2.5 2.4 1000" << endl;
         return 1;
@@ -174,6 +175,7 @@ int main(int argc, char* argv[]) {
     double minMuonPt = (argc > 5) ? atof(argv[5]) : 2.5;
     double maxMuonEta = (argc > 6) ? atof(argv[6]) : 2.4;
     int maxRetry = (argc > 7) ? atoi(argv[7]) : 5000;
+    int rngSeed = (argc > 8) ? atoi(argv[8]) : 0;
     
     cout << "\n====== SPS Phi-Enriched Shower Processing ======" << endl;
     cout << "Mode:         SPS (MPI disabled)" << endl;
@@ -184,10 +186,16 @@ int main(int argc, char* argv[]) {
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, SPS phi 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, SPS phi 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << endl;
+    cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
     cout << "================================================\n" << endl;
     
     // Initialize Pythia
     Pythia pythia;
+
+    if (rngSeed > 0) {
+        pythia.readString("Random:setSeed = on");
+        pythia.readString("Random:seed = " + to_string(rngSeed));
+    }
 
     auto setFlagIfExists = [&](const string& name, bool value) {
         if (pythia.settings.isFlag(name)) {

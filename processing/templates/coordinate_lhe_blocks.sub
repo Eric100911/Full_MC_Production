@@ -10,7 +10,7 @@ Universe = vanilla
 
 Executable = $(coord_wrapper_path)
 transfer_executable = True
-Arguments = "$(proxy_bundle_name) $(coord_bundle_name) $(campaign) $(job_index) $(source_manifests) $(shower_modes) $(analysis_type) $(n_sources) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(shuffle_mixing) $(log_root) $(request_cpus) $(request_memory) $(request_disk) $(target_machine) $(output_dir) $(processing_sub_template_path) $(processing_bundle_path) $(processing_bundle_name) $(proxy_bundle_path) $(proxy_bundle_name) $(processing_wrapper_path) $(ntuple_sub_template_path) $(ntuple_bundle_path) $(ntuple_bundle_name) $(ntuple_wrapper_path) $(subdag_output_path) $(max_block_subdag_jobs) $(local_output_base)"
+Arguments = "$(proxy_bundle_name) $(coord_bundle_name) $(campaign) $(job_index) $(source_manifests) $(shower_modes) $(campaign_inputs) $(analysis_type) $(n_sources) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(shuffle_mixing) $(log_root) $(request_cpus) $(request_memory) $(request_disk) $(target_machine) $(output_dir) $(processing_sub_template_path) $(processing_bundle_path) $(processing_bundle_name) $(proxy_bundle_path) $(proxy_bundle_name) $(processing_wrapper_path) $(ntuple_sub_template_path) $(ntuple_bundle_path) $(ntuple_bundle_name) $(ntuple_wrapper_path) $(subdag_output_path) $(max_block_subdag_jobs) $(local_output_base)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

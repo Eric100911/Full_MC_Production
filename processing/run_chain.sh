@@ -193,6 +193,18 @@ normalize_shower_mode() {
     esac
 }
 
+stable_seed() {
+    local material="$1"
+    python3 - "${material}" <<'PYHELPER'
+import hashlib
+import sys
+
+material = sys.argv[1].encode("utf-8", errors="replace")
+value = int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+print(value % 900000000 + 1)
+PYHELPER
+}
+
 # XRootD tools from CVMFS (compatible with el8 containers)
 XROOTD_BASE="/cvmfs/cms.cern.ch/el8_amd64_gcc10/external/xrootd/5.5.0-a0410a6758fd4d07b495e4c473820f38"
 XROOTD_BIN="${XROOTD_BASE}/bin"
@@ -1044,18 +1056,22 @@ run_shower() {
         # already have correct Pythia8 PDG codes. This conversion handles any
         # remaining HELAC-style codes that might be present.
         convert_lhe_octet_codes "${lhe_file}"
+
+        local source_seed
+        source_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|source=${i}|${INPUT_SPECS[$i]}|${mode}")
+        msg_info "Pythia RNG seed for source $((i+1)): ${source_seed}"
         
         if [[ "$normalized_mode" == "phi_mpi_off" ]]; then
             # workbook_v2 默认模式：关闭 MPI，循环 hadronize 找 phi。
             msg_info "Running phi-enriched mode-1 shower (MPI off)..."
-            run_logged "shower_sps_${i}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000
+            run_logged "shower_sps_${i}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000 "${source_seed}"
         elif [[ "$normalized_mode" == "phi_mpi_on_gluon" ]]; then
             # 扩展模式：开启 MPI，并交给 shower_phi 处理来源判定。
             msg_info "Running phi-enriched mode-2 shower (MPI on)..."
-            run_logged "shower_phi_${i}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000 1
+            run_logged "shower_phi_${i}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000 1 "${source_seed}"
         else
             # 普通 shower。
-            run_logged "shower_normal_${i}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${shower_events}" 2.5 2.4 1000
+            run_logged "shower_normal_${i}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${shower_events}" 2.5 2.4 1000 "${source_seed}"
         fi
         
         if [[ ! -f "${hepmc_output}" ]]; then
@@ -1086,7 +1102,8 @@ run_mix() {
     else
         msg_info "Mixing ${n_sources} sources..."
         if [[ "${SHUFFLE_MIXING}" == "true" ]]; then
-            local shuffle_seed=$((JOB_ID * 1000 + 1))
+            local shuffle_seed
+            shuffle_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|shuffle|${INPUTS}|${MODES}")
             msg_info "Shuffle mixing enabled with seed base ${shuffle_seed}"
             run_logged "event_mixer_shuffle" ./event_mixer_multisource \
                 "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" \

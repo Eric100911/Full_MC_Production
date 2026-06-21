@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 3) {
         cerr << "\n=== Pythia8 Standard Shower Processing ===" << endl;
-        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry]" << endl;
+        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]" << endl;
         cerr << "\nArguments:" << endl;
         cerr << "  input.lhe   : Input LHE file" << endl;
         cerr << "  output.hepmc: Output HepMC file" << endl;
@@ -112,6 +112,7 @@ int main(int argc, char* argv[]) {
         cerr << "  minMuonPt   : Minimum muon pT in GeV (default: 2.5)" << endl;
         cerr << "  maxMuonEta  : Maximum muon |eta| (default: 2.4)" << endl;
         cerr << "  maxRetry    : Maximum hadronization retries (default: 100)" << endl;
+        cerr << "  rngSeed     : Optional Pythia RNG seed" << endl;
         return 1;
     }
     
@@ -121,6 +122,7 @@ int main(int argc, char* argv[]) {
     double minMuonPt = (argc > 4) ? atof(argv[4]) : 2.5;
     double maxMuonEta = (argc > 5) ? atof(argv[5]) : 2.4;
     int maxRetry = (argc > 6) ? atoi(argv[6]) : 1000;
+    int rngSeed = (argc > 7) ? atoi(argv[7]) : 0;
     
     cout << "\n=== Pythia8 Standard Shower Processing ===" << endl;
     cout << "Input LHE:    " << inputFile << endl;
@@ -129,10 +131,16 @@ int main(int argc, char* argv[]) {
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << " (legacy arg, standard 模式不使用)" << endl;
+    cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
     cout << "==========================================\n" << endl;
     
     // Initialize Pythia
     Pythia pythia;
+
+    if (rngSeed > 0) {
+        pythia.readString("Random:setSeed = on");
+        pythia.readString("Random:seed = " + to_string(rngSeed));
+    }
 
     auto setFlagIfExists = [&](const string& name, bool value) {
         if (pythia.settings.isFlag(name)) {

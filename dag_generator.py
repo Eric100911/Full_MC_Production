@@ -51,6 +51,7 @@ SUBPROCESS_MAP = OrderedDict([
     ("JJP_DPS2_CS", "DPS-JpsiJpsi-Phi-LO"),
     ("JJP_DPS2_G",  "DPS-JpsiJpsi-Phi-NLOstar"),
     ("JJP_DPS1",    "DPS-Jpsi-JpsiPhi"),
+    ("JJP_TPS",     "TPS-JpsiJpsiPhi"),
 ])
 
 def parse_jobs_arg(jobs_str: str):
@@ -2366,6 +2367,7 @@ class DAGBuilder:
         campaign_name: str,
         job_index: int,
         source_infos: List[Tuple[str, int]],
+        campaign_inputs: Tuple[str, ...],
     ) -> str:
         """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
         campaign = CAMPAIGNS[campaign_name]
@@ -2380,6 +2382,8 @@ class DAGBuilder:
                 "path": self._resolve_plan_manifest_path(pool_name, seed),
             })
         source_manifests_json = dag_escape(json.dumps(source_manifest_entries))
+
+        campaign_inputs_str = dag_escape(",".join(campaign_inputs))
 
         subdag_dir = os.path.join(
             self.output_dir, "plan_subdags", campaign_name,
@@ -2410,7 +2414,9 @@ class DAGBuilder:
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
             "campaign=\"{campaign}\" job_index=\"{job_index}\" "
             "source_manifests=\"{source_manifests}\" "
-            "shower_modes=\"{shower_modes}\" analysis_type=\"{analysis_type}\" "
+            "shower_modes=\"{shower_modes}\" "
+            "campaign_inputs=\"{campaign_inputs}\" "
+            "analysis_type=\"{analysis_type}\" "
             "n_sources=\"{n_sources}\" max_events=\"{max_events}\" "
             "enable_ntuple=\"{enable_ntuple}\" efficiency_ntuple=\"{efficiency_ntuple}\" "
             "cleanup=\"{cleanup}\" shuffle_mixing=\"{shuffle_mixing}\" "
@@ -2442,6 +2448,7 @@ class DAGBuilder:
                 job_index=dag_escape(job_index),
                 source_manifests=source_manifests_json,
                 shower_modes=dag_escape(",".join(campaign.shower_modes)),
+                campaign_inputs=campaign_inputs_str,
                 analysis_type=dag_escape(campaign.analysis_type),
                 n_sources=dag_escape(campaign.n_sources),
                 max_events=dag_escape(self.options.max_events),
@@ -2530,8 +2537,24 @@ class DAGBuilder:
             self.dag_lines.append(f"MAXJOBS lhe_coordination {self.options.maxjobs_lhe}")
         self.dag_lines.append("")
 
-        for pool_name, required_count in self.pool_requirements.items():
-            self.ensure_lhe_jobs(pool_name, required_count)
+        if (
+            self.options.enable_lhe_block_subdags
+            and not self.options.keep_legacy_single_processing_path
+            and not self.options.skip_lhe_generation
+        ):
+            block_pool_requirements: Dict[str, int] = OrderedDict()
+            for campaign_name in campaign_names:
+                campaign = CAMPAIGNS[campaign_name]
+                for pool_name in dict.fromkeys(campaign.inputs):
+                    block_pool_requirements[pool_name] = max(
+                        block_pool_requirements.get(pool_name, 0),
+                        self.options.jobs_per_campaign,
+                    )
+            for pool_name, required_count in block_pool_requirements.items():
+                self.ensure_lhe_jobs(pool_name, required_count)
+        else:
+            for pool_name, required_count in self.pool_requirements.items():
+                self.ensure_lhe_jobs(pool_name, required_count)
 
         for campaign_name in campaign_names:
             campaign = CAMPAIGNS[campaign_name]
@@ -2588,7 +2611,7 @@ class DAGBuilder:
                             plan_jobs.append(plan_job)
                             seed = self.seed_for_pool_index(pool_name, job_index)
                             source_infos.append((pool_name, seed))
-                        coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos)
+                        coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
                         for pj in plan_jobs:
                             self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
                         subdag_name = self.add_block_subdag_node(
@@ -2628,7 +2651,7 @@ class DAGBuilder:
                         self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
                         plan_jobs.append(plan_job)
                         source_infos.append((pool_name, seed))
-                    coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos)
+                    coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
                     for pj in plan_jobs:
                         self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
                     subdag_name = self.add_block_subdag_node(

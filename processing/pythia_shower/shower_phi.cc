@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 3) {
         cerr << "\n====== Phi-Enriched Shower Processing ======" << endl;
-        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [requireLheGluon]" << endl;
+        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [requireLheGluon] [rngSeed]" << endl;
         cerr << "\nArguments:" << endl;
         cerr << "  input.lhe   : Input LHE file from HELAC-Onia" << endl;
         cerr << "  output.hepmc: Output HepMC file" << endl;
@@ -195,6 +195,7 @@ int main(int argc, char* argv[]) {
         cerr << "  maxMuonEta  : Maximum muon |eta| (default: 2.4)" << endl;
         cerr << "  maxRetry    : Maximum hadronization retries (default: 5000)" << endl;
         cerr << "  requireLheGluon : 1/true 表示要求 phi 可追溯到 LHE 硬过程胶子" << endl;
+        cerr << "  rngSeed     : Optional Pythia RNG seed" << endl;
         cerr << "\nExample:" << endl;
         cerr << "  ./shower_phi jpsi_jpsi.lhe phi_enriched.hepmc 1000 3.0 2.5 2.4 1000" << endl;
         return 1;
@@ -212,6 +213,7 @@ int main(int argc, char* argv[]) {
         string modeArg = argv[8];
         requireLheGluon = (modeArg == "1" || modeArg == "true" || modeArg == "lhegluon");
     }
+    int rngSeed = (argc > 9) ? atoi(argv[9]) : 0;
     
     cout << "\n====== Phi-Enriched Shower Processing ======" << endl;
     cout << "Input LHE:    " << inputFile << endl;
@@ -222,10 +224,16 @@ int main(int argc, char* argv[]) {
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, phi 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << endl;
     cout << "Require LHE gluon ancestry: " << (requireLheGluon ? "yes" : "no") << endl;
+    cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
     cout << "=============================================\n" << endl;
     
     // Initialize Pythia
     Pythia pythia;
+
+    if (rngSeed > 0) {
+        pythia.readString("Random:setSeed = on");
+        pythia.readString("Random:seed = " + to_string(rngSeed));
+    }
 
     auto setFlagIfExists = [&](const string& name, bool value) {
         if (pythia.settings.isFlag(name)) {
