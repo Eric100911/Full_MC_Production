@@ -27,9 +27,6 @@ request_memory = 2GB
 request_disk   = 5GB
 
 +MaxRuntime = 86400
-Environment = "HOME=/srv"
-
-+SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86_64"
 
 OnExitHold = (ExitCode != 0)
 OnExitHoldReason = "LHE block coordination failed"

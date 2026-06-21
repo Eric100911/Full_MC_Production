@@ -68,7 +68,7 @@ PLANNER_ARGS=(
     --shuffle-mode "${SHUFFLE_MODE}"
     --n-strata "${N_STRATA}"
     --block-output-dir "${BLOCK_OUTPUT_DIR}"
-    --lhe-shuffle-split-bin runtime/tools/lhe_shuffle_split
+    --lhe-shuffle-split-bin ./lhe_shuffle_split
 )
 if [[ "${DROP_INCOMPLETE}" == "true" ]]; then
     PLANNER_ARGS+=(--drop-incomplete-last-block)

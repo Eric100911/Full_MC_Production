@@ -70,7 +70,8 @@ def check_remote_file(url: str) -> bool:
     """Check if a remote file exists via xrdfs stat."""
     try:
         subprocess.run(["xrdfs", "cceos.ihep.ac.cn", "stat", _extract_eos_path(url)],
-                       check=True, capture_output=True, timeout=30)
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=30)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
@@ -155,7 +156,8 @@ def main() -> int:
             shuffle_cmd.append("--drop-incomplete-last-block")
 
         print(f"[INFO] Running: {' '.join(shuffle_cmd)}")
-        result = subprocess.run(shuffle_cmd, capture_output=True, text=True)
+        result = subprocess.run(shuffle_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
         if result.returncode != 0:
             print(f"[ERROR] lhe_shuffle_split failed (exit {result.returncode})", file=sys.stderr)
             print(result.stderr, file=sys.stderr)
@@ -254,7 +256,8 @@ def _list_existing_blocks(block_output_dir: str, prefix: str, is_remote: bool) -
             eos_path = _extract_eos_path(block_output_dir)
             result = subprocess.run(
                 ["xrdfs", "cceos.ihep.ac.cn", "ls", eos_path],
-                capture_output=True, text=True, timeout=30)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=30)
             files = [os.path.basename(line.strip()) for line in result.stdout.splitlines()
                      if line.strip().endswith(".lhe.gz") and prefix in line]
             return sorted(files)

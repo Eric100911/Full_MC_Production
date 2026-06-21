@@ -98,13 +98,25 @@ static bool parse_init_block(const string &raw, InitBlock &init) {
     // Skip past <init> line
     while (getline(iss, line)) {
         if (ltrim(line).find("<init") == 0) continue;
-        // First non-init-tag line is the beam/weight line
+        // First non-init-tag line is the beam/weight line.
+        // HELAC writes 10 fields (includes pdfsup1/pdfsup2);
+        // standard LHE has 8.  Grab all tokens, take first 6
+        // as the standard fields and last 2 as idwtup/nprup.
         {
             istringstream ls(line);
-            if (!(ls >> init.idbmup1 >> init.idbmup2 >> init.ebmup1 >> init.ebmup2
-                  >> init.pdfgup1 >> init.pdfgup2 >> init.idwtup >> init.nprup)) {
-                return false;
-            }
+            vector<string> tokens;
+            string tok;
+            while (ls >> tok) tokens.push_back(tok);
+            size_t n = tokens.size();
+            if (n < 8) return false;
+            init.idbmup1 = stoi(tokens[0]);
+            init.idbmup2 = stoi(tokens[1]);
+            init.ebmup1  = stod(tokens[2]);
+            init.ebmup2  = stod(tokens[3]);
+            init.pdfgup1 = stoi(tokens[4]);
+            init.pdfgup2 = stoi(tokens[5]);
+            init.idwtup  = stoi(tokens[n - 2]);
+            init.nprup   = stoi(tokens[n - 1]);
         }
         break;
     }

@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/../common/paths.sh"
 LOG_DIR="${SCRIPT_DIR}/log"
 
 mkdir -p "${LOG_DIR}"
@@ -28,26 +28,7 @@ msg_info() { printf '[INFO] %s\n' "$1"; }
 msg_warn() { printf '[WARN] %s\n' "$1"; }
 msg_error() { printf '[ERROR] %s\n' "$1" >&2; }
 
-resolve_proxy_path() {
-    local afs_proxy="/afs/cern.ch/user/x/xcheng/x509up_u$(id -u)"
-    local tmp_proxy="/tmp/x509up_u$(id -u)"
-
-    if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
-        printf '%s\n' "${X509_USER_PROXY}"
-        return 0
-    fi
-    if [[ -f "${afs_proxy}" ]]; then
-        printf '%s\n' "${afs_proxy}"
-        return 0
-    fi
-    if [[ -f "${tmp_proxy}" ]]; then
-        printf '%s\n' "${tmp_proxy}"
-        return 0
-    fi
-    return 1
-}
-
-OUTPUT_DIR="${BASE_DIR}/tests/generated/lhe_matrix_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${WORKSPACE_ROOT}/tests/generated/lhe_matrix_$(date +%Y%m%d_%H%M%S)"
 DO_SUBMIT=0
 DO_WAIT=0
 
@@ -112,7 +93,7 @@ msg_info "执行八重态 PDG 映射自检 ..."
 
 msg_info "准备 worker runtime bundle ..."
 RUNTIME_JSON="${OUTPUT_DIR}/runtime_assets.json"
-python3 "${BASE_DIR}/dag_generator.py" prepare-runtime --output-dir "${OUTPUT_DIR}" > "${RUNTIME_JSON}"
+python3 "${WORKSPACE_ROOT}/dag_generator.py" prepare-runtime --output-dir "${OUTPUT_DIR}" > "${RUNTIME_JSON}"
 
 LHE_BUNDLE_PATH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lhe_bundle_path"])' "${RUNTIME_JSON}")
 LHE_BUNDLE_NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lhe_bundle_name"])' "${RUNTIME_JSON}")
@@ -189,7 +170,7 @@ submit_one() {
     local submit_output=""
     local cluster_id=""
 
-    submit_output=$(condor_submit "${BASE_DIR}/processing/templates/lhe_gen_test.sub" \
+    submit_output=$(condor_submit "${WORKSPACE_ROOT}/processing/templates/lhe_gen_test.sub" \
         -append "pool = ${pool}" \
         -append "seed = ${seed}" \
         -append "min_pt_conia = ${MIN_PT_CONIA[${pool}]}" \
@@ -250,9 +231,9 @@ for idx in "${!SUBMITTED_POOLS[@]}"; do
     pool="${SUBMITTED_POOLS[$idx]}"
     seed="${SUBMITTED_SEEDS[$idx]}"
     cluster_id="${SUBMITTED_CLUSTERS[$idx]}"
-    log_file="${BASE_DIR}/log/lhe_${pool}_${seed}_${cluster_id}.log"
+    log_file="${WORKSPACE_ROOT}/log/lhe_${pool}_${seed}_${cluster_id}.log"
     remote_url="root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/lhe_pools/${pool}/sample_${pool}_${seed}.lhe"
-    local_copy="/tmp/xcheng/${pool}_${seed}.lhe"
+    local_copy="/tmp/${USER}/${pool}_${seed}.lhe"
 
     if [[ ! -f "${log_file}" ]]; then
         msg_error "缺少 condor 事件日志: ${log_file}"
@@ -265,7 +246,7 @@ for idx in "${!SUBMITTED_POOLS[@]}"; do
 
     msg_info "下载并检查 ${remote_url}"
     xrdcp --nopbar --force "${remote_url}" "${local_copy}" >/dev/null
-    python3 "${BASE_DIR}/common/octet_pdg.py" scan "${local_copy}" --fail-on-legacy
+    python3 "${WORKSPACE_ROOT}/common/octet_pdg.py" scan "${local_copy}" --fail-on-legacy
 done
 
 msg_info "LHE 小批量矩阵测试完成"

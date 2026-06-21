@@ -10,7 +10,8 @@
 universe = vanilla
 executable = /bin/bash
 initialdir = /tmp
-base_dir = /afs/cern.ch/user/c/chiw/condor/Full_MC_Production
+# base_dir is injected by tests/submit_test.sh (sources common/paths.sh).
+base_dir = <SET_BY_WRAPPER>
 log_root = $(base_dir)/tests/log
 
 # Arguments: test_mode pool_type shower_mode random_seed num_events
