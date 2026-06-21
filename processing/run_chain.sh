@@ -72,7 +72,7 @@ CMSSW_15_BASE="${CMSSW_15_BASE:-/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMS
 # Override TARGET_EOS_BASE to redirect output to a different storage area.
 EOS_HOST="cceos.ihep.ac.cn"
 EOS_XRDFS_TARGET="${EOS_HOST}"
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_HOST}/eos/ihep/cms/store/user/xcheng/MC_Production_v3}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_HOST}//eos/ihep/cms/store/user/xcheng/MC_Production_v3}"
 EOS_PATH_BASE="${EOS_BASE#root://${EOS_HOST}/}"
 EOS_LHE_POOL="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
