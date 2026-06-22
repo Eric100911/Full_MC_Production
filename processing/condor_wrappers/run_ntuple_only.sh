@@ -1,99 +1,106 @@
 #!/bin/bash
 # ==============================================================================
-# run_ntuple_only.sh — HTCondor wrapper for standalone ntuple re-running.
-#
-# Usage (arguments passed positionally by condor submit file):
-#   $1  ntuple_bundle_name   e.g. ntuple_runtime_bundle.tar.gz
-#   $2  proxy_bundle_name    e.g. proxy_bundle.tar.gz
-#   $3  analysis             e.g. JJP
-#   $4  campaign             e.g. JJP_TPS
-#   $5  job_id               e.g. 0
-#   $6  max_events           e.g. -1
-#   $7  efficiency_ntuple    true|false
-#   $8  cleanup              true|false
-#   $9  miniaod_input        file:/path/to/MINIAOD.root  or  root://...
-#   $10 target_eos_base       override EOS_BASE for XRootD output (may be empty)
-#   $11 custom_output_subpath override output subpath (may be empty)
-#   $12 custom_ntuple_basename override remote ntuple filename (may be empty)
-#   LOCAL_OUTPUT_BASE is read from the environment (injected by ntuple.sub).
+# run_ntuple_only.sh - HTCondor wrapper for standalone ntuple re-running.
 # ==============================================================================
 
 set -euo pipefail
 
-NTUPLE_BUNDLE="${1:?}"
-PROXY_BUNDLE="${2:?}"
-ANALYSIS="${3:?}"
-CAMPAIGN="${4:?}"
-JOB_ID="${5:?}"
-MAX_EVENTS="${6:--1}"
-EFFICIENCY_NTUPLE="${7:-false}"
-CLEANUP="${8:-true}"
-MINIAOD_INPUT="${9:?}"
-# LOCAL_OUTPUT_BASE is read from the environment (set by ntuple.sub Environment line).
+PROXY_BUNDLE="${1:?missing proxy bundle}"
+NTUPLE_BUNDLE="${2:?missing ntuple bundle}"
+CONFIG_NAME="${3:?missing ntuple config JSON}"
+CONFIG_PATH="${PWD}/${CONFIG_NAME}"
 
-TARGET_EOS_BASE="${10:-}"
-CUSTOM_OUTPUT_SUBPATH="${11:-}"
-CUSTOM_NTUPLE_BASENAME="${12:-}"
-
-export LOCAL_OUTPUT_BASE TARGET_EOS_BASE CUSTOM_OUTPUT_SUBPATH CUSTOM_NTUPLE_BASENAME
+if [[ ! -s "${CONFIG_PATH}" ]]; then
+    echo "FATAL: Ntuple config JSON not found or empty: ${CONFIG_PATH}" >&2
+    exit 1
+fi
 
 echo "=== Ntuple-only Wrapper ==="
 echo "Host: $(hostname)"
 echo "Date: $(date -Iseconds)"
 echo "Working dir: $(pwd)"
-echo "Campaign: ${CAMPAIGN}"
-echo "Job ID:   ${JOB_ID}"
-echo "Analysis: ${ANALYSIS}"
-echo "MiniAOD:  ${MINIAOD_INPUT}"
-echo "LOCAL_OUTPUT_BASE: ${LOCAL_OUTPUT_BASE:-NOT SET}"
+echo "Config: ${CONFIG_NAME}"
 
-# --- Extract proxy bundle ---
 echo "--- Extracting proxy bundle ---"
-if ! tar -xzf "${PROXY_BUNDLE}"; then
-    echo "FATAL: Failed to extract proxy bundle" >&2
-    exit 1
-fi
+tar -xzf "${PROXY_BUNDLE}"
 
 PROXY_TARGET="/tmp/x509up_u$(id -u)"
-if ! install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"; then
-    echo "FATAL: Failed to install proxy" >&2
-    exit 1
-fi
+install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"
 rm -rf credentials
 export X509_USER_PROXY="${PROXY_TARGET}"
 
-# --- Extract ntuple runtime bundle ---
 echo "--- Extracting ntuple runtime bundle ---"
-if ! tar -xzf "${NTUPLE_BUNDLE}"; then
-    echo "FATAL: Failed to extract ntuple runtime bundle" >&2
-    exit 1
-fi
+tar -xzf "${NTUPLE_BUNDLE}"
 
-# --- Ensure library path ---
 export LD_LIBRARY_PATH="/usr/lib64:${LD_LIBRARY_PATH:-}"
 
-# --- Run the ntuple chain ---
 echo "--- Running ntuple chain ---"
 cd runtime/processing
 
-bash run_chain.sh \
-    --inputs file:/dev/null \
-    --modes normal \
-    --analysis "${ANALYSIS}" \
-    --campaign "${CAMPAIGN}" \
-    --job-id "${JOB_ID}" \
-    --max-events "${MAX_EVENTS}" \
-    --enable-ntuple true \
-    --efficiency-ntuple "${EFFICIENCY_NTUPLE}" \
-    --cleanup "${CLEANUP}" \
-    --skip-to ntuple \
-    --miniaod-input "${MINIAOD_INPUT}" \
-    --transfer-miniaod false
+if ! python3 - "${CONFIG_PATH}" <<'PY'
+import json
+import os
+import subprocess
+import sys
 
-rc=$?
-if [[ $rc -ne 0 ]]; then
-    echo "FATAL: run_chain.sh exited with code ${rc}" >&2
-    exit $rc
+config_path = sys.argv[1]
+with open(config_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+
+required = [
+    "analysis",
+    "campaign",
+    "job_id",
+    "max_events",
+    "efficiency_ntuple",
+    "cleanup",
+    "miniaod_input",
+]
+missing = [key for key in required if key not in cfg or cfg[key] in (None, "")]
+if missing:
+    raise SystemExit(f"Missing ntuple config keys: {', '.join(missing)}")
+
+def bool_text(value):
+    return "true" if bool(value) else "false"
+
+env = os.environ.copy()
+storage = cfg.get("storage", {})
+if storage and not isinstance(storage, dict):
+    raise SystemExit("Ntuple config key storage must be an object when provided")
+for cfg_key, env_key in [
+    ("local_output_base", "LOCAL_OUTPUT_BASE"),
+    ("custom_output_subpath", "CUSTOM_OUTPUT_SUBPATH"),
+    ("custom_ntuple_basename", "CUSTOM_NTUPLE_BASENAME"),
+]:
+    value = cfg.get(cfg_key)
+    if value:
+        env[env_key] = str(value)
+target_eos_base = cfg.get("target_eos_base") or storage.get("target_eos_base")
+if target_eos_base:
+    env["TARGET_EOS_BASE"] = str(target_eos_base)
+
+cmd = [
+    "bash",
+    "run_chain.sh",
+    "--inputs", "file:/dev/null",
+    "--modes", "normal",
+    "--analysis", str(cfg["analysis"]),
+    "--campaign", str(cfg["campaign"]),
+    "--job-id", str(cfg["job_id"]),
+    "--max-events", str(cfg["max_events"]),
+    "--enable-ntuple", "true",
+    "--efficiency-ntuple", bool_text(cfg["efficiency_ntuple"]),
+    "--cleanup", bool_text(cfg["cleanup"]),
+    "--skip-to", "ntuple",
+    "--miniaod-input", str(cfg["miniaod_input"]),
+    "--transfer-miniaod", "false",
+]
+
+raise SystemExit(subprocess.run(cmd, env=env, check=False).returncode)
+PY
+then
+    echo "FATAL: run_chain.sh failed" >&2
+    exit 1
 fi
 
 echo "=== Ntuple-only wrapper completed successfully ==="

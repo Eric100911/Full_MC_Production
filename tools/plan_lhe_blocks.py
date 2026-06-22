@@ -209,7 +209,7 @@ def main() -> int:
             shuffle_manifest = json.load(f)
 
         splitter_events = shuffle_manifest.get("total_input_events")
-        if splitter_events != n_events:
+        if splitter_events is not None and splitter_events != n_events:
             print(
                 f"[ERROR] Event conservation mismatch before staging: planner counted {n_events}, "
                 f"splitter counted {splitter_events}",

@@ -16,7 +16,7 @@
 //       -I$HEPMC3/include -L$HEPMC3/lib64 -lHepMC3
 //
 // Usage:
-//   ./shower_phi input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry]
+//   ./shower_phi input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]
 // ==============================================================================
 
 #include "Pythia8/Pythia.h"

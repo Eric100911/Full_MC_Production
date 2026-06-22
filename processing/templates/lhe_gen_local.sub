@@ -2,12 +2,8 @@
 # lhe_gen_local.sub - LHE generation submit template for local HTCondor.
 #
 # Template variables:
-#   proxy_bundle_name, proxy_bundle_path
-#   lhe_bundle_name, lhe_bundle_path
-#   pool, seed, min_pt_conia, min_pt_bonia, min_pt_q, unwevt, test_mode
-#   request_cpus, request_memory, request_disk
-#   log_dir, LOCAL_LOG_DIR
-#   local_output_base
+#   proxy/lhe bundle names and paths, config_path/config_name
+#   request_cpus, request_memory, request_disk, log_dir
 #   Cluster, Process (HTCondor built-ins)
 # ==============================================================================
 
@@ -17,12 +13,12 @@ Universe = vanilla
 
 Executable = $(lhe_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(pool) $(seed) $(min_pt_conia) $(min_pt_bonia) $(min_pt_q) $(unwevt) $(test_mode) $(local_output_base) $(compress_lhe) $(lhe_compression_level) $(lhe_shuffle_split) $(lhe_events_per_block) $(lhe_shuffle_mode) $(lhe_n_strata) $(lhe_drop_incomplete_last_block)"
+arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 

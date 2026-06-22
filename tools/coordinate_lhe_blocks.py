@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
                    help="MAXJOBS block_processing throttle")
     p.add_argument("--local-output-base", default="",
                    help="Local storage base (for local condor mode)")
+    p.add_argument("--storage-config", default="{}",
+                   help="JSON object with explicit storage roots for node configs")
+    p.add_argument("--processing-environment-config", default="{}",
+                   help="JSON object with processing environment defaults")
     return p.parse_args()
 
 
@@ -79,7 +83,16 @@ def dag_escape(value) -> str:
 
 
 def bool_str(flag: bool) -> str:
-    return "True" if flag else "False"
+    return "true" if flag else "false"
+
+
+def write_json_file(path: str, payload: object) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    os.rename(tmp, path)
 
 
 def main() -> int:
@@ -90,6 +103,18 @@ def main() -> int:
         source_infos = json.loads(args.source_manifests)
     except json.JSONDecodeError as e:
         print(f"[ERROR] Invalid --source-manifests JSON: {e}", file=sys.stderr)
+        return 1
+    try:
+        storage_config = json.loads(args.storage_config)
+        processing_environment_config = json.loads(args.processing_environment_config)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Invalid node config JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(storage_config, dict):
+        print("[ERROR] --storage-config must be a JSON object", file=sys.stderr)
+        return 1
+    if not isinstance(processing_environment_config, dict):
+        print("[ERROR] --processing-environment-config must be a JSON object", file=sys.stderr)
         return 1
 
     if len(source_infos) == 0:
@@ -193,6 +218,24 @@ def main() -> int:
 
     # --- 4. Generate SubDAG ---
     os.makedirs(os.path.dirname(args.subdag_output_path), exist_ok=True)
+    if args.enable_ntuple and args.ntuple_sub_template_path:
+        ntuple_target_base = (
+            args.target_eos_base
+            or storage_config.get("target_eos_base")
+            or storage_config.get("default_eos_base")
+        )
+        if not ntuple_target_base:
+            print(
+                "[ERROR] Ntuple SubDAG generation requires target_eos_base in args or storage config",
+                file=sys.stderr,
+            )
+            return 1
+    node_config_dir = os.path.join(args.output_dir, "node_configs")
+    processing_config_dir = os.path.join(node_config_dir, "processing")
+    ntuple_config_dir = os.path.join(node_config_dir, "ntuple")
+    os.makedirs(processing_config_dir, exist_ok=True)
+    if args.enable_ntuple and args.ntuple_sub_template_path:
+        os.makedirs(ntuple_config_dir, exist_ok=True)
     dag_tmp = args.subdag_output_path + ".tmp"
 
     with open(dag_tmp, "w") as dag:
@@ -214,28 +257,37 @@ def main() -> int:
                 f"BLOCK:{item['pool']}:{item['group_id']}:{item['block_index']:06d}"
                 for item in mixed_block_inputs(i)
             ]
-            inputs_str = ",".join(input_parts)
-            modes_str = args.shower_modes
+            modes = [mode.strip() for mode in args.shower_modes.split(",") if mode.strip()]
 
             node_name = f"MIX_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
+            block_job_id = f"BLOCK{i:06d}"
+            processing_config = {
+                "inputs": input_parts,
+                "modes": modes,
+                "analysis": args.analysis_type,
+                "campaign": args.campaign,
+                "job_id": block_job_id,
+                "max_events": args.max_events,
+                "enable_ntuple": args.enable_ntuple,
+                "efficiency_ntuple": args.efficiency_ntuple,
+                "cleanup": args.cleanup,
+                "shuffle_mixing": args.shuffle_mixing,
+                "local_output_base": args.local_output_base,
+                "target_eos_base": args.target_eos_base,
+                "storage": storage_config,
+                "processing_environment": processing_environment_config,
+            }
+            processing_config_name = f"{node_name}.json"
+            processing_config_path = os.path.join(processing_config_dir, processing_config_name)
+            write_json_file(processing_config_path, processing_config)
 
             dag.write(f"JOB {node_name} {args.processing_sub_template_path}\n")
             dag.write(f"CATEGORY {node_name} block_processing\n")
 
-            # VARS — following the pattern of add_processing_job() in dag_generator.py
             vars_line = (
                 f'VARS {node_name} '
                 f'campaign="{dag_escape(args.campaign)}" '
-                f'job_id="{dag_escape(f"BLOCK{i:06d}")}" '
-                f'inputs="{dag_escape(inputs_str)}" '
-                f'modes="{dag_escape(modes_str)}" '
-                f'analysis="{dag_escape(args.analysis_type)}" '
-                f'n_sources="{dag_escape(args.n_sources)}" '
-                f'max_events="{dag_escape(args.max_events)}" '
-                f'enable_ntuple="{dag_escape(bool_str(args.enable_ntuple))}" '
-                f'efficiency_ntuple="{dag_escape(bool_str(args.efficiency_ntuple))}" '
-                f'cleanup="{dag_escape(bool_str(args.cleanup))}" '
-                f'shuffle_mixing="{dag_escape(bool_str(args.shuffle_mixing))}" '
+                f'job_id="{dag_escape(block_job_id)}" '
                 f'request_cpus="{dag_escape(args.request_cpus)}" '
                 f'request_memory="{dag_escape(args.request_memory)}" '
                 f'request_disk="{dag_escape(args.request_disk)}" '
@@ -245,9 +297,9 @@ def main() -> int:
                 f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
                 f'processing_wrapper_path="{dag_escape(args.processing_wrapper_path)}" '
                 f'log_root="{dag_escape(args.log_root)}" '
-                f'local_output_base="{dag_escape(args.local_output_base)}" '
                 f'target_machine="{dag_escape(args.target_machine)}" '
-                f'target_eos_base="{dag_escape(args.target_eos_base)}"'
+                f'config_path="{dag_escape(processing_config_path)}" '
+                f'config_name="{dag_escape(processing_config_name)}"'
             )
             dag.write(vars_line + "\n")
             dag.write(f"RETRY {node_name} 1\n")
@@ -255,18 +307,35 @@ def main() -> int:
             # Ntuple node (if enabled)
             if args.enable_ntuple and args.ntuple_sub_template_path:
                 ntuple_name = f"NTUPLE_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
+                target_base = (
+                    args.target_eos_base
+                    or storage_config.get("target_eos_base")
+                    or storage_config.get("default_eos_base")
+                )
+                miniaod_input = f"{str(target_base).rstrip('/')}/output/{args.campaign}/{block_job_id}/output_MINIAOD.root"
+                ntuple_config = {
+                    "analysis": args.analysis_type,
+                    "campaign": args.campaign,
+                    "job_id": block_job_id,
+                    "max_events": args.max_events,
+                    "efficiency_ntuple": args.efficiency_ntuple,
+                    "cleanup": args.cleanup,
+                    "miniaod_input": miniaod_input,
+                    "local_output_base": args.local_output_base,
+                    "target_eos_base": args.target_eos_base,
+                    "custom_output_subpath": "",
+                    "custom_ntuple_basename": "",
+                    "storage": storage_config,
+                }
+                ntuple_config_name = f"{ntuple_name}.json"
+                ntuple_config_path = os.path.join(ntuple_config_dir, ntuple_config_name)
+                write_json_file(ntuple_config_path, ntuple_config)
                 dag.write(f"JOB {ntuple_name} {args.ntuple_sub_template_path}\n")
                 dag.write(f"CATEGORY {ntuple_name} ntuple\n")
                 ntuple_vars = (
                     f'VARS {ntuple_name} '
                     f'campaign="{dag_escape(args.campaign)}" '
-                    f'job_id="{dag_escape(f"BLOCK{i:06d}")}" '
-                    f'analysis="{dag_escape(args.analysis_type)}" '
-                    f'max_events="{dag_escape(args.max_events)}" '
-                    f'cleanup="{dag_escape(bool_str(args.cleanup))}" '
-                    f'efficiency_ntuple="{dag_escape(bool_str(args.efficiency_ntuple))}" '
-                    f'miniaod_input="" '
-                    f'local_output_base="{dag_escape(args.local_output_base)}" '
+                    f'job_id="{dag_escape(block_job_id)}" '
                     f'request_cpus="2" request_memory="12GB" request_disk="8GB" '
                     f'ntuple_bundle_path="{dag_escape(args.ntuple_bundle_path)}" '
                     f'ntuple_bundle_name="{dag_escape(args.ntuple_bundle_name)}" '
@@ -274,7 +343,9 @@ def main() -> int:
                     f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
                     f'ntuple_wrapper_path="{dag_escape(args.ntuple_wrapper_path)}" '
                     f'ntuple_wrapper_name="{dag_escape(os.path.basename(args.ntuple_wrapper_path or "run_ntuple_only.sh"))}" '
-                    f'log_root="{dag_escape(args.log_root)}"'
+                    f'log_root="{dag_escape(args.log_root)}" '
+                    f'config_path="{dag_escape(ntuple_config_path)}" '
+                    f'config_name="{dag_escape(ntuple_config_name)}"'
                 )
                 dag.write(ntuple_vars + "\n")
                 dag.write(f"RETRY {ntuple_name} 1\n")

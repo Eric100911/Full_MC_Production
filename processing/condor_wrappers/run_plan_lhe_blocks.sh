@@ -1,56 +1,22 @@
 #!/bin/bash
 # ==============================================================================
-# run_plan_lhe_blocks.sh — Wrapper for the per-pool LHE block planner.
-#
-# Positional args from plan_lhe_blocks.sub:
-#   $1  PROXY_BUNDLE
-#   $2  PLAN_BUNDLE
-#   $3  POOL
-#   $4  GROUP_ID
-#   $5  PRIMARY_SEED
-#   $6  SEEDS
-#   $7  LHE_PATHS
-#   $8  OUTPUT_DIR
-#   $9  EVENTS_PER_BLOCK
-#   $10 SHUFFLE_SEED
-#   $11 SHUFFLE_MODE
-#   $12 N_STRATA
-#   $13 DROP_INCOMPLETE
-#   $14 BLOCK_OUTPUT_DIR
-#   $15 LOCAL_OUTPUT_BASE
-#   $16 REUSE_BLOCKS
-#   $17 MANIFEST_OUTPUT_PATH
+# run_plan_lhe_blocks.sh - Wrapper for the per-pool LHE block planner.
 # ==============================================================================
 set -euo pipefail
 
-PROXY_BUNDLE="$1"
-PLAN_BUNDLE="$2"
-POOL="$3"
-GROUP_ID="$4"
-PRIMARY_SEED="$5"
-SEEDS="$6"
-LHE_PATHS="$7"
-OUTPUT_DIR="$8"
-EVENTS_PER_BLOCK="${9:-1000}"
-SHUFFLE_SEED="${10}"
-SHUFFLE_MODE="${11:-stratified}"
-N_STRATA="${12:-auto}"
-DROP_INCOMPLETE="${13:-false}"
-BLOCK_OUTPUT_DIR="$14"
-LOCAL_OUTPUT_BASE="${15:-}"
-REUSE_BLOCKS="${16:-false}"
-MANIFEST_OUTPUT_PATH="${17:-}"
+PROXY_BUNDLE="${1:?missing proxy bundle}"
+PLAN_BUNDLE="${2:?missing planner bundle}"
+CONFIG_NAME="${3:?missing planner config JSON}"
+CONFIG_PATH="${PWD}/${CONFIG_NAME}"
 
-export LOCAL_OUTPUT_BASE="${LOCAL_OUTPUT_BASE}"
+if [[ ! -s "${CONFIG_PATH}" ]]; then
+    echo "ERROR: Planner config JSON not found or empty: ${CONFIG_PATH}" >&2
+    exit 1
+fi
 
 echo "=== LHE Block Planner Wrapper ==="
-echo "Pool: ${POOL}  Group: ${GROUP_ID}  Primary seed: ${PRIMARY_SEED}"
-echo "Seeds: ${SEEDS}"
-echo "LHE paths: ${LHE_PATHS}"
-echo "Events per block: ${EVENTS_PER_BLOCK}"
-echo "Shuffle seed: ${SHUFFLE_SEED}"
+echo "Config: ${CONFIG_NAME}"
 
-# Extract proxy bundle
 echo "Extracting proxy bundle..."
 tar -xzf "${PROXY_BUNDLE}"
 PROXY_TARGET="/tmp/x509up_u$(id -u)"
@@ -58,45 +24,70 @@ install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"
 rm -rf credentials
 export X509_USER_PROXY="${PROXY_TARGET}"
 
-# Extract planner bundle
 echo "Extracting planner bundle..."
 tar -xzf "${PLAN_BUNDLE}"
 
-# Build planner args
-PLANNER_ARGS=(
-    --pool-name "${POOL}"
-    --group-id "${GROUP_ID}"
-    --primary-seed "${PRIMARY_SEED}"
-    --helac-seeds "${SEEDS}"
-    --output-dir "${OUTPUT_DIR}"
-    --events-per-block "${EVENTS_PER_BLOCK}"
-    --shuffle-seed "${SHUFFLE_SEED}"
-    --shuffle-mode "${SHUFFLE_MODE}"
-    --n-strata "${N_STRATA}"
-    --block-output-dir "${BLOCK_OUTPUT_DIR}"
-    --lhe-shuffle-split-bin ./lhe_shuffle_split
-)
-IFS=',' read -ra PATH_ARRAY <<< "${LHE_PATHS}"
-for path in "${PATH_ARRAY[@]}"; do
-    PLANNER_ARGS+=(--lhe-path "${path}")
-done
-if [[ "${DROP_INCOMPLETE}" == "true" ]]; then
-    PLANNER_ARGS+=(--drop-incomplete-last-block)
-fi
-if [[ -n "${LOCAL_OUTPUT_BASE}" ]]; then
-    PLANNER_ARGS+=(--local-output-base "${LOCAL_OUTPUT_BASE}")
-fi
-if [[ "${REUSE_BLOCKS}" == "true" ]]; then
-    PLANNER_ARGS+=(--reuse-existing-blocks)
-fi
-if [[ -n "${MANIFEST_OUTPUT_PATH}" ]]; then
-    PLANNER_ARGS+=(--manifest-output-path "${MANIFEST_OUTPUT_PATH}")
-fi
-
-# Run the planner
 echo "Running plan_lhe_blocks.py..."
 cd runtime/tools
-if ! python3 plan_lhe_blocks.py "${PLANNER_ARGS[@]}"; then
+if ! python3 - "${CONFIG_PATH}" <<'PY'
+import json
+import subprocess
+import sys
+
+config_path = sys.argv[1]
+with open(config_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+
+required = [
+    "pool_name",
+    "group_id",
+    "primary_seed",
+    "seeds",
+    "lhe_paths",
+    "output_dir",
+    "events_per_block",
+    "shuffle_seed",
+    "shuffle_mode",
+    "n_strata",
+    "block_output_dir",
+    "manifest_output_path",
+]
+missing = [key for key in required if key not in cfg or cfg[key] in (None, "")]
+if missing:
+    raise SystemExit(f"Missing planner config keys: {', '.join(missing)}")
+if not isinstance(cfg["lhe_paths"], list) or not cfg["lhe_paths"]:
+    raise SystemExit("Planner config key lhe_paths must be a non-empty list")
+if not isinstance(cfg["seeds"], list) or not cfg["seeds"]:
+    raise SystemExit("Planner config key seeds must be a non-empty list")
+
+cmd = [
+    "python3",
+    "plan_lhe_blocks.py",
+    "--pool-name", str(cfg["pool_name"]),
+    "--group-id", str(cfg["group_id"]),
+    "--primary-seed", str(cfg["primary_seed"]),
+    "--helac-seeds", ",".join(str(seed) for seed in cfg["seeds"]),
+    "--output-dir", str(cfg["output_dir"]),
+    "--events-per-block", str(cfg["events_per_block"]),
+    "--shuffle-seed", str(cfg["shuffle_seed"]),
+    "--shuffle-mode", str(cfg["shuffle_mode"]),
+    "--n-strata", str(cfg["n_strata"]),
+    "--block-output-dir", str(cfg["block_output_dir"]),
+    "--manifest-output-path", str(cfg["manifest_output_path"]),
+    "--lhe-shuffle-split-bin", "./lhe_shuffle_split",
+]
+for path in cfg["lhe_paths"]:
+    cmd.extend(["--lhe-path", str(path)])
+if cfg.get("drop_incomplete_last_block", False):
+    cmd.append("--drop-incomplete-last-block")
+if cfg.get("local_output_base"):
+    cmd.extend(["--local-output-base", str(cfg["local_output_base"])])
+if cfg.get("reuse_existing_blocks", False):
+    cmd.append("--reuse-existing-blocks")
+
+raise SystemExit(subprocess.run(cmd, check=False).returncode)
+PY
+then
     echo "ERROR: LHE block planning failed" >&2
     exit 1
 fi

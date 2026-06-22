@@ -4,33 +4,27 @@
 # Template variables:
 #   proxy_bundle_name, proxy_bundle_path
 #   processing_bundle_name, processing_bundle_path
-#   inputs, modes, analysis, campaign, job_id, max_events
-#   enable_ntuple, efficiency_ntuple, cleanup
 #   request_cpus, request_memory, request_disk
-#   log_dir, LOCAL_LOG_DIR
-#   local_output_base
-#   premix_input_mode, premix_redirector, premix_cache_files, premix_cache_redirector
+#   log_root
 #   Cluster, Process (HTCondor built-ins)
 # ==============================================================================
-
-LOCAL_LOG_DIR = $(log_dir)
 
 Universe = vanilla
 
 Executable = $(processing_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(inputs) $(modes) $(analysis) $(campaign) $(job_id) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(local_output_base) $(shuffle_mixing)"
+arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 
-Output = $(LOCAL_LOG_DIR)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).stdout
-Error  = $(LOCAL_LOG_DIR)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).stderr
-Log    = $(LOCAL_LOG_DIR)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).log
+Output = $(log_root)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/proc_$(campaign)_$(job_id)_$(Cluster)_$(Process).log
 
 request_cpus = $(request_cpus)
 request_memory = $(request_memory)
@@ -38,7 +32,7 @@ request_disk = $(request_disk)
 
 +MaxRuntime = 604800
 
-Environment = "HOME=/srv LOCAL_OUTPUT_BASE=$(local_output_base) RAW_THREADS=1 RAW_STREAMS=1 RAW_WATCHDOG_TIMEOUT=7200s RAW_WATCHDOG_KILL_AFTER=300s RAW_CMSDRIVER_TIMEOUT=600s PREMIX_INPUT_MODE=$(premix_input_mode) PREMIX_REDIRECTOR=$(premix_redirector) PREMIX_CACHE_FILES=$(premix_cache_files) PREMIX_CACHE_TIMEOUT=7200s PREMIX_CACHE_RETRIES=3 PREMIX_CACHE_REDIRECTOR=$(premix_cache_redirector)"
+Environment = "HOME=/srv"
 
 +SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el8:x86_64"
 

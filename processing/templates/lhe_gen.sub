@@ -1,23 +1,19 @@
 # ==============================================================================
 # lhe_gen.sub - LHE 生成节点 submit 模板
 # ==============================================================================
-# 由 dag_generator.py 通过 DAGMan VARS 注入以下变量：
-#   pool / seed / min_pt_* / unwevt / test_mode
-#   request_cpus / request_memory / request_disk
-#   lhe_bundle_path / lhe_bundle_name / proxy_bundle_path / proxy_bundle_name
-#   log_root
+# dag_generator.py injects stable bundle/log/resource names and a JSON config.
 # ==============================================================================
 
 Universe = vanilla
 
 Executable = $(lhe_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(pool) $(seed) $(min_pt_conia) $(min_pt_bonia) $(min_pt_q) $(unwevt) $(test_mode) $(local_output_base) $(compress_lhe) $(lhe_compression_level) $(lhe_shuffle_split) $(lhe_events_per_block) $(lhe_shuffle_mode) $(lhe_n_strata) $(lhe_drop_incomplete_last_block)"
+arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 

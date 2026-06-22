@@ -2,10 +2,9 @@
 # ntuple.sub - CMSSW15 TPS-Onia2MuMu ntuple node submit template
 # ==============================================================================
 # Variables injected by dag_generator.py:
-#   campaign / job_id / analysis / max_events / cleanup / efficiency_ntuple / miniaod_input
-#   local_output_base  (may be empty for t2_xrootd mode)
-#   target_eos_base / custom_output_subpath / custom_ntuple_basename  (may be empty)
+#   campaign / job_id
 #   request_cpus / request_memory / request_disk
+#   config_path / config_name
 #   ntuple_bundle_path / ntuple_bundle_name / proxy_bundle_path / proxy_bundle_name
 #   ntuple_wrapper_path / ntuple_wrapper_name
 #   log_root
@@ -15,12 +14,12 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "./$(ntuple_wrapper_name) $(ntuple_bundle_name) $(proxy_bundle_name) $(analysis) $(campaign) $(job_id) $(max_events) $(efficiency_ntuple) $(cleanup) $(miniaod_input) $(target_eos_base) $(custom_output_subpath) $(custom_ntuple_basename)"
+Arguments = "./$(ntuple_wrapper_name) $(proxy_bundle_name) $(ntuple_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(ntuple_bundle_path), $(proxy_bundle_path), $(ntuple_wrapper_path)
+Transfer_Input_Files = $(ntuple_bundle_path), $(proxy_bundle_path), $(ntuple_wrapper_path), $(config_path)
 
 transfer_output_files =
 
@@ -36,7 +35,7 @@ Requirements = (TARGET.Machine =!= "nd-11.hepthu.com") && (TARGET.Arch == "X86_6
 
 +MaxRuntime = 604800
 
-Environment = "HOME=/srv LOCAL_OUTPUT_BASE=$(local_output_base)"
+Environment = "HOME=/srv"
 
 OnExitHold = (ExitCode != 0)
 OnExitHoldReason = "Ntuple chain failed"

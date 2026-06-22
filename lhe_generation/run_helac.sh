@@ -69,9 +69,15 @@ LAST_STDERR_LOG=""
 LOG_STAGEOUT_ATTEMPTED=0
 
 # T2_CN_Beijing XRootD storage paths
-EOS_HOST="cceos.ihep.ac.cn"
+# Canonical form: redirector + LFN (see common/node_config_defaults.json).
+# Override TARGET_EOS_BASE to redirect output to a different storage area.
+EOS_REDIRECTOR="cceos.ihep.ac.cn"
+EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="root://${EOS_HOST}"
-EOS_PATH_BASE="/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
+EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_PATH_BASE="${EOS_LFN_BASE}"
+EOS_OUTPUT="${EOS_BASE}/output"
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -1294,6 +1300,7 @@ if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         --events-per-block "${LHE_EVENTS_PER_BLOCK}"
         --mode "${LHE_SHUFFLE_MODE}"
         --n-strata "${LHE_N_STRATA}"
+        --filename-prefix "${MY_SEED}_"
         --write-provenance
     )
     if bool_is_true "${LHE_DROP_INCOMPLETE_LAST_BLOCK}"; then

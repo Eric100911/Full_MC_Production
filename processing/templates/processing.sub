@@ -2,9 +2,9 @@
 # processing.sub - shower/mix/CMSSW 处理节点 submit 模板
 # ==============================================================================
 # 由 dag_generator.py 通过 DAGMan VARS 注入以下变量：
-#   campaign / job_id / inputs / modes / analysis / n_sources
-#   max_events / enable_ntuple / efficiency_ntuple / cleanup
+#   campaign / job_id
 #   request_cpus / request_memory / request_disk
+#   config_path / config_name
 #   processing_bundle_path / processing_bundle_name / proxy_bundle_path / proxy_bundle_name
 #   log_root
 # ==============================================================================
@@ -13,12 +13,12 @@ Universe = vanilla
 
 Executable = $(processing_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(inputs) $(modes) $(analysis) $(campaign) $(job_id) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(local_output_base) $(shuffle_mixing) $(target_eos_base)"
+arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 

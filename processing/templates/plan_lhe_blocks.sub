@@ -9,11 +9,11 @@ Universe = vanilla
 
 Executable = $(plan_wrapper_path)
 transfer_executable = True
-Arguments = "$(proxy_bundle_name) $(plan_bundle_name) $(pool) $(group_id) $(primary_seed) $(seeds) $(lhe_paths) $(output_dir) $(events_per_block) $(shuffle_seed) $(shuffle_mode) $(n_strata) $(drop_incomplete) $(block_output_dir) $(local_output_base) $(reuse_blocks) $(manifest_output_path)"
+Arguments = "$(proxy_bundle_name) $(plan_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
-Transfer_Input_Files = $(plan_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(plan_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 

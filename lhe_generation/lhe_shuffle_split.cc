@@ -208,6 +208,7 @@ static bool parse_lhe_file(const string &path, LHESource &src, bool first_file) 
     bool in_init = false;
     bool in_event = false;
     bool in_epilogue = false;
+    bool in_lhe_header_block = false;
     int n_events = 0;
 
     auto flush_event = [&]() {
@@ -239,8 +240,20 @@ static bool parse_lhe_file(const string &path, LHESource &src, bool first_file) 
             continue;
         }
 
+        // Track <header> block to suppress false <event>/<init> detection
+        if (!in_lhe_header_block && trimmed.find("<header") == 0 && trimmed.find("</header>") == string::npos) {
+            in_lhe_header_block = true;
+            if (in_header && first_file) prologue_lines.push_back(line);
+            continue;
+        }
+        if (in_lhe_header_block && trimmed.find("</header>") == 0) {
+            in_lhe_header_block = false;
+            if (in_header && first_file) prologue_lines.push_back(line);
+            continue;
+        }
+
         // Detect <event>
-        if (!in_event && trimmed.find("<event") == 0 && trimmed.find("</event") == string::npos) {
+        if (!in_event && !in_lhe_header_block && trimmed.find("<event") == 0 && trimmed.find("</event") == string::npos) {
             if (in_init) {
                 in_init = false;
             }
@@ -266,7 +279,7 @@ static bool parse_lhe_file(const string &path, LHESource &src, bool first_file) 
         }
 
         // Detect <init>
-        if (!in_init && trimmed.find("<init") == 0) {
+        if (!in_init && !in_lhe_header_block && trimmed.find("<init") == 0) {
             in_header = false;
             in_init = true;
             init_raw.clear();

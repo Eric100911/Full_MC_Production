@@ -1,53 +1,52 @@
 # MC Production unified workflow
 
-本目录用一套代码生成不同 submit 环境的生产工作流，覆盖以下物理链路：
+This repository generates HTCondor DAGMan production workflows for heavy-flavor MC, covering the full chain:
 
-`LHE(HELAC-Onia) -> Pythia8 shower -> HepMC mixing -> CMSSW GEN-SIM -> RAW -> RECO -> MiniAOD -> Ntuple`
+`LHE(HELAC-Onia) → Pythia8 shower → HepMC mixing → CMSSW GEN-SIM → RAW → RECO → MiniAOD → Ntuple`
 
-`T2_CN_Beijing` 在当前配置中表示 IHEP T2 存储端点；对应的 `lxplus_t2_ihep` profile 是在 CERN lxplus 提交 HTCondor/DAGMan 作业，并把 LHE/output 写到 IHEP T2。
+The `lxplus_t2_ihep` profile submits HTCondor/DAGMan jobs from CERN lxplus and writes LHE/output to IHEP T2 via XRootD. Other machine environments support hepthu, local Condor, and IHEP/lxlogin HepJob submission.
 
-当前代码按 [`workbook_v2.md`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/workbook_v2.md) 重构，默认支持两类分析：
+Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`J/psi + Upsilon + phi`). TPS campaigns (three-J/psi) are also supported for ntuple-only re-processing.
 
-- `JJP`: `J/psi + J/psi + phi`
-- `JUP`: `J/psi + Upsilon + phi`
+## Current acceptance criteria
 
-## 当前验收口径
+- Code interface retains full chain capability including the Ntuple step.
+- Small-batch HTCondor testing defaults to completing through MiniAOD with remote stage-out.
+- The Ntuple step is retained in the interface; to run it, ensure the `external/TPS-Onia2MuMu` submodule is initialized and its gitlink points to the desired analysis code state.
+- Ntuple input files, output files, and `maxEvents` are switched through `cmsRun` CLI. Analysis behavior (`analysisMode`, MC truth tree, acceptance gating) is fixed in `common/cmssw_configs/ntuple_*.py`.
+- All programs, files, and certificates are bundled and uploaded to workers — worker nodes never read from AFS business directories at runtime.
+- Worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; subsequent programs do not reference local files in the unpack directory.
+- Use `dag_generator.py --machine-env ...` to select the submit/storage profile. There are no longer separate branches for `VtxSmeared`, `ihep`, or `hepthu`.
+- `pool_jpsi_CSCO_g` and `pool_upsilon_CSCO_g` use HELAC-Onia's CrystalBall pT model.
 
-- 代码接口保留全链路能力，包括 `Ntuple` 步骤。
-- 本轮小批量 HTCondor 测试默认以跑通到 `MiniAOD` 并完成远端 stage-out 为准。
-- `Ntuple` 步骤保留在接口中；若要真正执行，请确保 `external/TPS-Onia2MuMu` submodule 已初始化，且其 gitlink 指向你要打包的分析代码状态。
-- Ntuple 的输入文件、输出文件和 `maxEvents` 仍通过 `cmsRun` CLI 切换；`analysisMode`、MC truth tree 和 acceptance gating 这类长期分析行为固定在 `common/cmssw_configs/ntuple_*.py` 中。
-- `workbook_v2.md` 中要求的“所有程序、文件、证书统一打包上传后在 worker 解压运行”已经落实到当前 submit 模板；worker 运行时不再回读 AFS 业务目录。
-- worker 启动时会把打包证书复制到节点默认代理路径 `/tmp/x509up_u$UID`；后续程序不再通过环境变量指向解压目录中的本地文件。
-- 不再通过 `VtxSmeared`、`ihep`、`hepthu` 等分支区分运行位置；使用 `dag_generator.py --machine-env ...` 选择 submit/storage profile。
-- `pool_jpsi_CSCO_g` 与 `pool_upsilon_CSCO_g` 使用 `HELAC-Onia addon/pp_psiX_CrystalBall` 的 CrystalBall pT model。
+## Directory structure
 
-## 目录说明
+- **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, and `MachineEnv` dataclasses plus all subcommands (`list`, `validate`, `generate`, `generate-test`, `generate-helac-matrix`, `generate-ntuple-only`, `prepare-runtime`). Campaign/pool definitions are Python literals in this file.
+- **`hepjob_workflow.py`** — IHEP/lxlogin HepJob backend adapter. Generates bash job scripts instead of HTCondor submit files.
+- **`common/node_config_defaults.json`** — Centralized storage and processing configuration, including EOS/XRootD roots, `LHE_pool` mappings, and premix/runtime defaults.
+- **`common/octet_pdg.py`** — HELAC octet PDG encoding converter/scan tool.
+- **`common/compression_util.py`** / **`common/compression_helpers.sh`** — Python and bash gzip helpers for transparent `.lhe.gz` handling.
+- **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuples.
+- **`common/paths.sh`** — Workspace-relative path definitions; no hardcoded usernames.
+- **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional).
+- **`external/TPS-Onia2MuMu`** — Git submodule for the ntuple analyzer (v2.0_patch2). Used as fallback when the prebuilt CMSSW15 runtime tarball is unavailable.
+- **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Supports compressed output, shuffle-split, block staging, and `TARGET_EOS_BASE` override.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 stratified LHE shuffle and fixed-size block splitter. Pre-compiled inside `cmssw/el7` container.
+- **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE job wrapper using JSON config (3 positional args) instead of legacy positional args.
+- **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
+- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG.
+- **`tools/compress_existing_lhe.py`** — Backfill utility to compress existing uncompressed LHE pools.
+- **`tools/transfer_compress_lhe.py`** — Condor worker script for batch LHE compression with XRootD transfer.
+- **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker.
+- **`processing/condor_wrappers/`** — Lightweight bash wrappers invoked by submit templates (`run_processing.sh`, `run_ntuple_only.sh`, `run_plan_lhe_blocks.sh`, `run_coordinate_lhe_blocks.sh`). Wrappers take only bootstrap bundle/config arguments; node settings are read from JSON.
+- **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `shower_sps.cc`, `event_mixer_multisource.cc`) with a Makefile.
+- **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type (including `plan_lhe_blocks.sub`, `coordinate_lhe_blocks.sub`, `compress.sub`, `transfer_compress.sub`).
+- **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `mock_test_worker.sh` (local worker-bundle/config mock), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_lhe_shuffle_split.sh` (shuffle-split unit tests), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus `generate_synthetic_lhe.py` and `check_y_symmetry.py`.
+- **`docs/`** — Design notes, investigation reports, and review documents.
 
-- [`dag_generator.py`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/dag_generator.py)
-  主入口。负责列出配置、校验环境、生成正式 DAG、生成测试 DAG。
-- [`lhe_generation/run_helac.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/lhe_generation/run_helac.sh)
-  LHE 生成节点执行脚本。
-- [`processing/run_chain.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/processing/run_chain.sh)
-  processing 节点执行脚本，负责 shower/mix/CMSSW/可选 Ntuple/stage-out；为避免 `lxplus` 与 worker 容器的 glibc/ABI 不一致，脚本会在 worker 上强制重编译 `pythia_shower/` 下的工具。
-- [`common/octet_pdg.py`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/common/octet_pdg.py)
-  HELAC 八重态旧编码与 Pythia8 `99nqnsnrnLnJ` 编码之间的统一转换/扫描工具。
-- [`processing/templates/`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/processing/templates)
-  DAG 节点对应的 submit 模板；当前通过 runtime bundle + proxy bundle 在 worker 侧解压运行。
-- [`tests/submit_tests.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/tests/submit_tests.sh)
-  生成并可选提交小批量测试 DAG。
-- [`tests/run_all_tests.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/tests/run_all_tests.sh)
-  重构后测试总入口。
-- [`tests/test_octet_pdg_tool.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/tests/test_octet_pdg_tool.sh)
-  八重态 PDG 映射规则的本地确定性自检。
-- [`tests/submit_lhe_matrix.sh`](/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/tests/submit_lhe_matrix.sh)
-  所有真实 LHE pool 的 HTCondor 小批量矩阵测试入口。
+## Environment setup
 
-## 环境准备
-
-### 1. 代理
-
-优先确保当前 shell 已有可用代理：
+### 1. Proxy
 
 ```bash
 source /cvmfs/cms.cern.ch/cmsset_default.sh
@@ -55,56 +54,44 @@ source /cvmfs/cms.cern.ch/cmsset_default.sh
 ./check_proxy.sh --status
 ```
 
-若你已经手动初始化过代理，也可以直接导出：
+DAGMan on lxplus uses a persistent proxy copy on AFS so that `condor_dagman` direct-submit works without access to the submit host's `/tmp`:
 
 ```bash
-export X509_USER_PROXY=/tmp/x509up_u$(id -u)
+export X509_USER_PROXY=/afs/cern.ch/user/c/chiw/x509up_u$(id -u)
 ```
 
-重构后的 DAG 默认会优先使用 AFS 上的持久代理副本：
+### 2. Required packages
 
-```bash
-/afs/cern.ch/user/x/xcheng/x509up_u$(id -u)
-```
+Hard dependency:
 
-这样 `condor_dagman` 在 schedd 上做 direct submit 时不会因为看不到 submit host 的 `/tmp` 证书而失败。
+- `common/packages/helac_package.tar.gz` — HELAC-Onia and HepMC sources for LHE generation.
 
-### 2. 必需包
+Optional but recommended:
 
-硬依赖：
-
-- `common/packages/helac_package.tar.gz`
-
-该包应包含 HELAC-Onia 与 HepMC 源码 tarball；当前 worker bundle 会把它解压到 LHE generation 节点中使用。
-
-可选但推荐：
-
-- `external/TPS-Onia2MuMu` git submodule
-
-分析包缺失时，`validate` 默认只给出提示，不会阻止生成“到 MiniAOD”为止的测试 DAG；只有启用 ntuple 时才需要它。运行 `prepare-runtime`、`generate` 或 `generate-test` 时，`dag_generator.py` 会从 submodule 自动打包出 `tpsonia2mumu_code.tar.gz` 并放进 runtime bundle。
-
-首次克隆或切换分支后请先初始化 submodule：
+- `external/TPS-Onia2MuMu` git submodule — provides the ntuple analyzer source. Missing submodule produces a warning during validation; only required when ntuple is enabled.
 
 ```bash
 git submodule update --init --recursive
 ```
 
-## 主入口用法
+- `common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz` — prebuilt CMSSW15 runtime (preferred over source-package fallback for ntuple).
 
-### Machine env selector
+## Main CLI usage
 
-所有生成/校验命令都支持 `--machine-env`：
+All commands share `--machine-env` to select the submit/storage profile.
 
-- `auto`
-  根据 hostname/cwd 自动选择。当前 `/home/storage29/...` 环境会默认选择 `hepthu`。
-- `lxplus_t2_ihep`
-  在 CERN lxplus 使用 HTCondor/DAGMan 提交；LHE/output 存到 IHEP `T2_CN_Beijing` XRootD。别名：`t2_cn_beijing`。
-- `hepthu`
-  在 hepthu HTCondor 提交；LHE/output 存到本地目录，默认 `~/MC_Production_result`，可用 `--local-output-base` 覆盖。
-- `ihep`
-  在 IHEP/lxlogin 使用 HepJob backend；通过同一个 CLI selector 转发到 `hepjob_workflow.py`。
+### Machine environments
 
-### 列出可用配置
+| Name | Backend | Storage |
+|------|---------|---------|
+| `lxplus_t2_ihep` (alias: `t2_cn_beijing`) | HTCondor DAGMan on CERN lxplus | IHEP T2 via XRootD |
+| `hepthu` | HTCondor DAGMan on hepthu | Local filesystem |
+| `local_condor` | Local HTCondor | Local filesystem |
+| `ihep` | HepJob on IHEP/lxlogin | IHEP T2 via XRootD |
+
+`lxplus_t2_ihep` splits MiniAOD and ntuple into separate DAG nodes; `hepthu` keeps ntuple inline to avoid cross-node local file access.
+
+### Listing available configurations
 
 ```bash
 python3 dag_generator.py list --kind all
@@ -112,20 +99,20 @@ python3 dag_generator.py list --kind campaigns
 python3 dag_generator.py list --kind pools
 ```
 
-### 校验环境
+### Validating the environment
 
 ```bash
 python3 dag_generator.py validate --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS --scan-existing
 python3 dag_generator.py validate --machine-env hepthu --campaign JUP_DPS1 --scan-existing
 ```
 
-若要把 `external/TPS-Onia2MuMu` submodule 也作为硬依赖：
+With strict analysis package check:
 
 ```bash
 python3 dag_generator.py validate --campaign JJP_DPS1 --strict-analysis-packages
 ```
 
-### 生成正式 DAG
+### Generating a production DAG
 
 ```bash
 python3 dag_generator.py generate \
@@ -137,46 +124,33 @@ python3 dag_generator.py generate \
   --max-events -1
 ```
 
-常用可选项：
-
-- `--disable-ntuple`
-  只跑到 MiniAOD，再做 transfer。
-- `--efficiency-ntuple`
-  仅支持 JJP campaigns；启用 `common/cmssw_configs/ntuple_jjp_efficiency_cfg.py` 中固定的 full-GEN truth ntuple 配置，并在输出目录写出可直接供 `run-multileppat-efficiency --input-file-manifest` 使用的 `ntuple_manifest.json`。
-- `--force-generate-lhe`
-  不复用远端已有 LHE pool。
-- `--no-scan-existing`
-  不扫描远端已有 LHE。
-- `--test-mode`
-  把 LHE 生成切到 fast-test。
-- `--local-output-base`
-  `hepthu` profile 的本地 LHE/output 根目录。
-- `--local-log-dir`
-  `hepthu` profile 的 HTCondor stdout/stderr/log 目录；默认是输出 DAG 目录下的 `logs/`。
-- `--log-root`
-  lxplus/T2 split-node submit 模板使用的日志根目录；未指定时沿用 `--local-log-dir` 或 machine-env 默认。
-
-Ntuple 配置策略：
-
-- 常规 JJP/JUP 分别使用 `common/cmssw_configs/ntuple_jjp_cfg.py` 和 `common/cmssw_configs/ntuple_jup_cfg.py`。
-- 效率/acceptance JJP 使用 `common/cmssw_configs/ntuple_jjp_efficiency_cfg.py`，其中 `DoMonteCarloTree=True`。
-- `RequireAcceptedCandidatesForMonteCarloTree=False` 是当前默认，用于避免 MC truth tree 被 reconstructed accepted candidates 门控。
-- runtime wrapper 只传 `inputFiles`、`outputFile`、`runOnMC` 和 `maxEvents`；不要再为 `analysisMode`、`DoMonteCarloTree` 或 `RequireAcceptedCandidatesForMonteCarloTree` 增加命令行开关。
-
-在 hepthu 生成本地存储 DAG：
+### Generating a smoke test DAG
 
 ```bash
+# Minimal smoke test (1 job, 5 events, ntuple disabled)
 python3 dag_generator.py generate-test \
-  --machine-env hepthu \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_DPS2_CS \
+  --output-dir tests/generated/smoke \
+  --output smoke.dag
+
+# With ntuple and efficiency manifest
+python3 dag_generator.py generate-test \
+  --machine-env lxplus_t2_ihep \
   --campaign JJP_DPS1 \
-  --jobs 1 \
-  --max-events 5 \
-  --enable-ntuple \
-  --efficiency-ntuple \
-  --output-dir tests/generated/hepthu_eff_smoke
+  --jobs 1 --max-events 5 --enable-ntuple --efficiency-ntuple \
+  --output-dir tests/generated/jjp_efficiency_smoke --output mc_test.dag
+
+# Multi-campaign smoke test
+python3 dag_generator.py generate-test \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JUP_DPS1 \
+  --jobs 1 --max-events 5 \
+  --output-dir tests/generated/manual_test \
+  --output mc_test.dag
 ```
 
-### 生成 HELAC-only Fock-state matrix DAG
+### Generating a HELAC Fock-state matrix DAG
 
 ```bash
 python3 dag_generator.py generate-helac-matrix \
@@ -187,13 +161,9 @@ python3 dag_generator.py generate-helac-matrix \
   --maxjobs-lhe 20
 ```
 
-该入口只运行 HELAC-Onia，不接后续 shower/CMSSW。它会生成 162 个 job：
-9 个 `cc~` Fock state、9 个 `bb~` Fock state，以及 born / `+ g` 两种过程。
-每个 job 会上传一个 `PROC_HO_*/P0_*/output/` 目录 tarball，远端路径位于
-`/eos/ihep/cms/store/user/xcheng/MC_Production_v3/helac_matrix/jpsi_upsilon_fock_scan/`。
-色八重态 charm/bottom state 会在 HELAC 输入中把对应重夸克质量提高 `0.1 GeV`。
+This runs only HELAC-Onia (no downstream shower/CMSSW). It generates 162 jobs covering 9 `cc~` Fock states, 9 `bb~` Fock states, and both born / `+ g` processes. Output tarballs are staged under the target EOS base.
 
-### 仅准备 worker runtime bundle
+### Preparing worker runtime bundles
 
 ```bash
 python3 dag_generator.py prepare-runtime \
@@ -201,184 +171,281 @@ python3 dag_generator.py prepare-runtime \
   --output-dir tests/generated/runtime_bundle_check
 ```
 
-说明：
+Generates: `lhe_runtime_bundle.tar.gz`, `processing_runtime_bundle.tar.gz`, `summary_runtime_bundle.tar.gz`, `proxy_bundle.tar.gz`. Submit-mode bundles must be written to AFS workspace, not `/tmp`.
 
-- submit 模式下，bundle 输出目录必须放在 AFS 工作区，而不是 submit host 的本地 `/tmp`。
-- 需要 ntuple runtime 时加 `--include-ntuple`；若提供
-  `--cmssw15-runtime-tarball` 或 `common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz`
-  存在且结构有效，会优先打包预编译 CMSSW15 runtime，否则回退到 submodule source package。
-- `lxplus_t2_ihep` 会把 MiniAOD 和 ntuple 拆成独立 DAG nodes；`hepthu` 本地存储 profile 保持 ntuple inline，避免单独 ntuple node 需要跨节点读取本地 MiniAOD。
-- 该命令会同时生成：
-  - `lhe_runtime_bundle.tar.gz`
-  - `processing_runtime_bundle.tar.gz`
-  - `summary_runtime_bundle.tar.gz`
-  - `proxy_bundle.tar.gz`
+---
 
-### 生成小批量测试 DAG
+## Condor node configuration
 
-```bash
-python3 dag_generator.py generate-test \
-  --machine-env lxplus_t2_ihep \
-  --campaign JJP_DPS2_CS \
-  --campaign JJP_DPS2_G \
-  --campaign JUP_DPS1 \
-  --jobs 1 \
-  --max-events 5 \
-  --output-dir tests/generated/manual_test \
-  --output mc_test.dag
+Generated HTCondor nodes use JSON config files instead of long positional shell argument lists. For LHE generation, planning, coordination, processing, and ntuple nodes, the submit template passes only:
+
+```text
+$(proxy_bundle_name) $(runtime_bundle_name) $(config_name)
 ```
 
-`generate-test` 默认行为：
+The matching `$(config_path)` is transferred with the runtime and proxy bundles. DAG `VARS` lines keep only stable names/paths used by the submit templates, such as bundle names, log roots, resource requests, wrapper path, and `config_path`/`config_name`.
 
-- `jobs = 1`
-- `max-events = 5`
-- `disable-ntuple`
-- `scan-existing = true`
+Generated configs are written under the DAG output tree:
 
-效率/acceptance 小样本可以显式启用 ntuple：
+| Node type | Config directory |
+|-----------|------------------|
+| LHE generation | `node_configs/lhe_generation/LHE_*.json` |
+| LHE planning | `node_configs/planning/PLAN_*.json` |
+| LHE coordination | `node_configs/coordination/COORD_*.json` |
+| Direct processing | `node_configs/processing/PROC_*.json` |
+| Direct ntuple | `node_configs/ntuple/NTUPLE_*.json` |
+| Block processing SubDAG | `plan_subdags/<campaign>/job_<N>/node_configs/processing/MIX_*.json` |
+| Block ntuple SubDAG | `plan_subdags/<campaign>/job_<N>/node_configs/ntuple/NTUPLE_*.json` |
 
-```bash
-python3 dag_generator.py generate-test \
-  --machine-env lxplus_t2_ihep \
-  --campaign JJP_DPS1 \
-  --jobs 1 \
-  --max-events 5 \
-  --enable-ntuple \
-  --efficiency-ntuple \
-  --output-dir tests/generated/jjp_efficiency_smoke \
-  --output mc_test.dag
+Storage defaults come from `common/node_config_defaults.json`. Raw/generated LHE pool files use the configured `xrootd_store_user_base` plus `LHE_pool/<mapped-subdir>`, for example:
+
+```text
+root://cceos.ihep.ac.cn///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO/sample_pool_2jpsi_cs_60100.lhe.gz
 ```
 
-## 测试入口
+Processing output still uses `target_eos_base/output/<campaign>/<job_id>/...` unless overridden by config.
 
-### 只做静态校验和测试 DAG 生成
+---
+
+### LHE compression
+
+LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning tries `.lhe.gz` first then falls back to `.lhe`. HepMC intermediates always remain plain text for CMSSW compatibility.
 
 ```bash
+# Generate with compressed LHE output (default gzip level 1)
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
+  --jobs 20 --output-dir generated/jjp_dps1 --output jjp_dps1.dag \
+  --compress-lhe --lhe-compression-level 3
+
+# Backfill compress an existing LHE pool
+python3 tools/compress_existing_lhe.py --pool-dir /path/to/lhe_pool --dry-run
+python3 tools/compress_existing_lhe.py --pool-dir /path/to/lhe_pool --keep --level 3
+```
+
+### LHE shuffle-split
+
+The `--lhe-shuffle-split` flag enables stratified shuffle-and-split of LHE output into fixed-size blocks. The original single LHE is always preserved for backward-compatible processing.
+
+```bash
+# Generate with 1000-event blocks
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
+  --jobs 20 --output-dir generated/jjp_dps1 --output jjp_dps1.dag \
+  --lhe-shuffle-split --lhe-events-per-block 1000
+
+# Smoke test with shuffle-split
+python3 dag_generator.py generate-test \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS \
+  --output-dir tests/generated/shuffle_smoke --output smoke.dag \
+  --lhe-shuffle-split --lhe-events-per-block 100
+```
+
+### Block SubDAG workflow
+
+The `--enable-lhe-block-subdags` flag enables a two-stage block-level workflow:
+
+1. **Planner** (`tools/plan_lhe_blocks.py`) — runs after each HELAC job, compresses and shuffle-splits LHE into blocks, stages them, writes a plan manifest.
+2. **Coordinator** (`tools/coordinate_lhe_blocks.py`) — for multi-source campaigns, reads all per-pool plan manifests, matches blocks with strict-min policy, generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+
+Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness.
+
+```bash
+# Block SubDAG — single-source SPS
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --jobs 10 --enable-lhe-block-subdags --no-scan-existing \
+  --output-dir generated/jjp_sps_cs_subdag --output mc_sps_subdag.dag
+
+# Block SubDAG — multi-source DPS with coordinator
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS \
+  --jobs 10 --enable-lhe-block-subdags --no-scan-existing \
+  --output-dir generated/jjp_dps2_subdag --output mc_dps_subdag.dag
+
+# Legacy override — flat DAG even with block SubDAG flag
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --jobs 10 --enable-lhe-block-subdags --keep-legacy-single-processing-path \
+  --output-dir generated/legacy --output mc_legacy.dag
+```
+
+### Ntuple-only re-processing from existing MiniAOD
+
+The `generate-ntuple-only` subcommand produces a DAG that runs only the ntuple step, reading MiniAOD files from an existing production output area via XRootD.
+
+```bash
+# Discover MiniAOD files remotely, generate ntuple DAG
+python3 dag_generator.py generate-ntuple-only \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_SPS_CS --campaign JJP_DPS1 \
+  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --jobs 50 --dry-run
+
+# With subprocess-based output naming
+python3 dag_generator.py generate-ntuple-only \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
+  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --jobs 50 --use-subprocess-naming \
+  --output-dir generated/ntuple_from_v3_miniaod
+```
+
+### Reprocessing existing LHE
+
+Use `--skip-lhe-generation` with `--existing-lhe-base` to redirect LHE pool scanning to a different storage area:
+
+```bash
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --skip-lhe-generation \
+  --existing-lhe-base root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MC_Production_v3 \
+  --jobs 10 --output-dir generated/reprocess --output reprocess.dag
+```
+
+### Overriding the target EOS base
+
+The `--target-base-url` flag overrides the default EOS output base for all worker scripts:
+
+```bash
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
+  --target-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MyTestArea \
+  --jobs 20 --output-dir generated/custom_eos --output custom.dag
+```
+
+---
+
+### Common options reference
+
+| Flag | Applies to | Description |
+|------|-----------|-------------|
+| `--disable-ntuple` | `generate`, `generate-test` | Stop at MiniAOD |
+| `--enable-ntuple` | `generate-test` | Enable ntuple in smoke test |
+| `--efficiency-ntuple` | `generate`, `generate-test` | Write `ntuple_manifest.json` for efficiency tool (JJP only) |
+| `--force-generate-lhe` | `generate`, `generate-test` | Skip remote LHE reuse |
+| `--no-scan-existing` | `generate`, `generate-test` | Skip remote pool scan |
+| `--test-mode` | `generate`, `generate-test` | Fast-test mode for HELAC |
+| `--compress-lhe` | `generate`, `generate-test` | Write compressed `.lhe.gz` output |
+| `--lhe-compression-level` | `generate`, `generate-test` | Gzip compression level (default: 1) |
+| `--lhe-shuffle-split` | `generate`, `generate-test` | Stratified shuffle-split LHE into blocks |
+| `--lhe-events-per-block` | `generate`, `generate-test` | Events per shuffle-split block (default: 1000) |
+| `--enable-lhe-block-subdags` | `generate`, `generate-test` | Block SubDAG workflow with planner/coordinator |
+| `--keep-legacy-single-processing-path` | `generate` | Flat DAG override even with `--enable-lhe-block-subdags` |
+| `--skip-lhe-generation` | `generate`, `generate-test` | Reuse existing LHE without generation |
+| `--existing-lhe-base` | `generate`, `generate-test` | Base URL for existing LHE pool scanning |
+| `--target-base-url` | `generate`, `generate-test` | Override EOS output base for all workers |
+| `--local-output-base` | `generate`, `generate-test` | Local LHE/output root (hepthu) |
+| `--local-log-dir` | `generate`, `generate-test` | HTCondor stdout/stderr/log directory (hepthu) |
+| `--use-subprocess-naming` | `generate-ntuple-only` | Subprocess-based ntuple output directory structure |
+
+## Shower modes
+
+Three canonical shower modes are supported:
+
+| Mode | Description |
+|------|-------------|
+| `normal` | Standard Pythia8 shower, no phi enrichment |
+| `phi_mpi_off` | Phi-enriched mode, MPI off, retry hadronization until target phi appears |
+| `phi_mpi_on_gluon` | Phi-enriched mode, MPI on, gluon-origin phi classification |
+
+Compatibility aliases: `phi`, `phi_mode1`, `sps` → `phi_mpi_off`; `phi_mode2` → `phi_mpi_on_gluon`. Normalization is handled by `canonical_mode()` in `dag_generator.py`.
+
+## JJP double J/psi splitting
+
+- `JJP_SPS_CS` and `JJP_SPS_G` produce `gg → J/psi + J/psi` born/color-singlet and `gg → J/psi + J/psi + g` sources respectively. They do not mix sources on the worker.
+- `JJP_DPS2_CS` and `JJP_DPS2_G` combine `pool_2jpsi_cs`/`pool_2jpsi_g` with `pool_gg`. Output paths are separated by campaign name.
+- `pool_gg` uses `minptq = 4.0`; all other real pools use `minptq = 0.0`.
+
+## Ntuple configuration
+
+The JJP ntuple config (`common/cmssw_configs/ntuple_jjp_cfg.py`) is a thin adaptation over the upstream TPS-Onia2MuMu reference (`external/TPS-Onia2MuMu` submodule). The former separate efficiency config has been merged — efficiency mode is now controlled by the `analysisMode` VarParsing parameter in the unified config.
+
+The `--efficiency-ntuple` flag in `run_chain.sh` controls only whether an `ntuple_manifest.json` is written for the external `run-multileppat-efficiency` tool, not which cmsRun config is used.
+
+When updating the submodule, diff `external/TPS-Onia2MuMu/test/ConfFile_cfg.py` against `common/cmssw_configs/ntuple_jjp_cfg.py` and re-apply campaign adjustments (`keepAllSingleObjectCandsInMC=True`, correct MC GlobalTag, relevant VarParsing defaults).
+
+### Troubleshooting
+
+| Symptom | Check |
+|---------|-------|
+| `MC_GenPart_*` arrays all empty | `inputGEN` must be `prunedGenParticles`, not `genParticles`. MiniAOD drops the `genParticles` collection. |
+| Zero HLT-matched muons in efficiency | `FiltersForJpsi` must be `["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]`. Old labels match no trigger objects. |
+
+## Running tests
+
+```bash
+# Static validation + smoke DAG generation (no submit)
 ./tests/run_all_tests.sh
-```
 
-该入口默认覆盖：
-
-- `JJP_DPS2_CS`
-- `JJP_DPS2_G`
-- `JUP_DPS1`
-
-并会先执行：
-
-- `./tests/test_octet_pdg_tool.sh`
-
-### 生成后直接提交到 HTCondor
-
-```bash
+# Generate and submit to HTCondor
 ./tests/run_all_tests.sh --submit
-```
-
-### 指定等待 DAGMan 结束
-
-```bash
 ./tests/run_all_tests.sh --submit --wait
-```
 
-### 启用 ntuple runtime smoke
-
-```bash
+# With ntuple
 ./tests/run_all_tests.sh \
   --enable-ntuple \
   --cmssw15-runtime-tarball common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz
-```
 
-启用 ntuple 时，校验会要求预编译 CMSSW15 runtime tarball 或
-`external/TPS-Onia2MuMu` submodule 至少有一个可用。
-
-### 更细的测试控制
-
-```bash
-./tests/submit_tests.sh \
-  --campaign JJP_DPS2_CS \
-  --campaign JJP_DPS2_G \
-  --campaign JUP_DPS1 \
-  --jobs 1 \
-  --max-events 5 \
-  --submit
-```
-
-### LHE 全池小批量矩阵测试
-
-```bash
+# LHE pool matrix test
 ./tests/submit_lhe_matrix.sh --submit --wait
+
+# LHE shuffle-split unit tests
+./tests/test_lhe_shuffle_split.sh
+
+# PDG encoding self-check
+./tests/test_octet_pdg_tool.sh
+
+# Worker-bundle/config mock through the Pythia shower stop point
+./tests/mock_test_worker.sh
+
+# Local HTCondor test
+./run_local_test.sh --submit --wait
+./run_local_test.sh --campaign JJP_DPS1 --jobs 2 --max-events 10 --submit --enable-ntuple
 ```
 
-该入口会覆盖：
+Default test coverage: `JJP_DPS2_CS`, `JJP_DPS2_G`, `JUP_DPS1`, plus `test_octet_pdg_tool.sh`. `mock_test_worker.sh` builds a production processing bundle, transfers a dummy proxy and JSON config into a temporary worker directory, runs `run_processing.sh`, and stops after the shower step. It validates config parsing, bundle extraction, local `.lhe.gz` decompression, CMSSW setup, Pythia startup, and non-empty `shower_*.hepmc` outputs without requiring HTCondor submission.
 
-- `pool_jpsi_CSCO_g`
-- `pool_upsilon_CSCO_g`
-- `pool_gg`
-- `pool_2jpsi_cs`
-- `pool_2jpsi_g`
-- `pool_jpsi_upsilon_CSCO`
+The LHE matrix test covers: `pool_jpsi_CSCO_g`, `pool_upsilon_CSCO_g`, `pool_gg`, `pool_2jpsi_cs`, `pool_2jpsi_g`, `pool_jpsi_upsilon_CSCO`, and auto-scans for legacy `9900xxxx` PDG encoding.
 
-并在作业结束后自动：
+## Current known limitations
 
-- 从远端把对应 LHE 拉回本地临时目录
-- 用 `common/octet_pdg.py scan --fail-on-legacy` 检查是否还残留 `9900xxxx` 旧编码
+- Even with the ntuple submodule initialized, small-batch Condor validation defaults to `--disable-ntuple` to focus acceptance on MiniAOD and remote stage-out.
+- `phi_mpi_on_gluon` determines phi origin from hardest-process gluon ancestry (status 21-29) in the Pythia event record. This is closer to workbook requirements than the old placeholder but should still get dedicated physics spot-checks before large-scale production.
+- `condor_submit` warns that `MaxRetries` in submit templates is "unused" — this is cosmetic; retry control lives in DAGMan `RETRY` directives.
+- LHE files with `<event>` or `<init>` substrings inside `<header>` blocks (e.g. `<event_info>`) are handled correctly by `lhe_shuffle_split.cc` v2.1+ but may confuse naive parsers.
+- Ntuple-only DAGs (`generate-ntuple-only`) discover MiniAOD files via XRootD listing. If the remote directory structure doesn't match the expected `<campaign>/<job_id>/` pattern, discovery may miss files.
+- `mock_test_worker.sh` intentionally uses `normal,normal` shower modes and `stop_at: shower`; phi-enriched `shower_sps` / `shower_phi` behavior is still covered by production/container or component tests because bare lxplus/el9 hosts may not match the bundled binary ABI.
 
-测试输出会写到：
-
-- DAG 和元数据：`tests/generated/<时间戳>/`
-- 提交日志：`tests/log/`
-- HTCondor stdout/stderr/log：仓库根目录 `log/`
-- 远端物理输出：`root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output/<campaign>/<job_id>/`
-
-## shower 模式说明
-
-目前统一支持三种模式名：
-
-- `normal`
-  普通 shower。
-- `phi_mpi_off`
-  workbook 默认的 phi-enriched 模式，关闭 MPI，循环 hadronize 直到出现目标 `phi`。
-- `phi_mpi_on_gluon`
-  保留给 workbook 的扩展模式 2，当前由 `shower_phi` 执行。
-
-兼容别名：
-
-- `phi`、`phi_mode1`、`sps` 都会映射为 `phi_mpi_off`
-- `phi_mode2` 会映射为 `phi_mpi_on_gluon`
-
-## JJP 双 J/psi 拆分
-
-- `JJP_SPS_CS` 与 `JJP_SPS_G` 分别生产 `gg -> J/psi + J/psi` born/color-singlet 与 `gg -> J/psi + J/psi + g` 两类源，不再在 worker 端混合。
-- `JJP_DPS2_CS` 与 `JJP_DPS2_G` 分别把 `pool_2jpsi_cs`、`pool_2jpsi_g` 与 `pool_gg` 组合，输出路径按 campaign 名独立分开。
-- `pool_gg` 保留 `minptq = 4.0`；其他真实 pool，包括 `pool_jpsi_CSCO_g`、`pool_upsilon_CSCO_g`、`pool_2jpsi_cs`、`pool_2jpsi_g`、`pool_jpsi_upsilon_CSCO`，统一使用 `minptq = 0.0`。
-
-## 当前已知限制
-
-- 即使 ntuple submodule 已初始化，本轮小批量 Condor 验证也仍建议默认使用 `--disable-ntuple`，先把验收聚焦在 MiniAOD 与远端 stage-out。
-- `phi_mpi_on_gluon` 当前通过 Pythia 事件记录里 `status 21-29` 的 hardest-process gluon 祖先关系判定 `phi` 来源；这已经比原来的占位接口更接近 workbook 要求，但仍建议在正式大样本前做额外物理抽查。
-- `condor_submit` 目前会对 submit 模板中的 `MaxRetries` 给出“unused”警告；这不影响实际提交，但说明该字段不是 submit 描述层的生效参数，真正的重试控制仍以 DAGMan `RETRY` 为准。
-
-## 典型工作流
+## Typical workflow
 
 ```bash
-# 1. 检查代理与环境
+# 1. Check proxy and environment
 python3 dag_generator.py validate --machine-env lxplus_t2_ihep --campaign JJP_DPS2_CS --scan-existing
 
-# 2. 生成小批量测试 DAG
+# 2. Generate smoke test DAG
 python3 dag_generator.py generate-test \
   --machine-env lxplus_t2_ihep \
-  --campaign JJP_DPS2_CS \
-  --campaign JJP_DPS2_G \
-  --campaign JUP_DPS1 \
-  --output-dir tests/generated/smoke \
-  --output smoke.dag
+  --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JUP_DPS1 \
+  --output-dir tests/generated/smoke --output smoke.dag
 
-# 3. 提交
+# 3. Submit
 condor_submit_dag tests/generated/smoke/smoke.dag
 
-# 4. 观察队列
+# 4. Monitor
 condor_q
+
+# 5. Production run with block SubDAG workflow
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --jobs 20 --enable-lhe-block-subdags --compress-lhe \
+  --output-dir generated/production --output mc_production.dag
 ```
 
-## 旧脚本说明
+## Legacy test scripts
 
-`tests/test_lhe_generation.sh`、`tests/test_shower_chain.sh`、`tests/test_cmssw_chain.sh` 和 `tests/test_pipeline.sh` 仍然保留，主要用于组件级调试。重构后的推荐提交流程以 `dag_generator.py + tests/submit_tests.sh` 为准。
+`tests/test_lhe_generation.sh`, `tests/test_shower_chain.sh`, `tests/test_cmssw_chain.sh`, and `tests/test_pipeline.sh` are retained for component-level debugging. The recommended submission workflow uses `dag_generator.py` with `tests/run_all_tests.sh` or `tests/submit_tests.sh`.
+
+## Developer reference
+
+See `CLAUDE.md` for the full architecture reference, coding conventions, and detailed invariants used by Claude Code when working in this repository. The `docs/` directory contains design notes and investigation reports.

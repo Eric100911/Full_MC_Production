@@ -10,7 +10,7 @@
 //       -I$HEPMC3/include -L$HEPMC3/lib64 -lHepMC3
 //
 // Usage:
-//   ./shower_normal input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry]
+//   ./shower_normal input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]
 // ==============================================================================
 
 #include "Pythia8/Pythia.h"

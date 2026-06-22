@@ -23,8 +23,11 @@ from typing import Dict, List, Optional, Sequence
 # Add repo root to path for imports from dag_generator
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dag_generator import (  # noqa: E402
+    EOS_REDIRECTOR,
+    EOS_LFN_BASE,
     EOS_HOST,
     EOS_XRDFS_TARGET,
+    EXISTING_LHE_SUBDIR_BY_POOL,
     build_bundle,
     build_proxy_bundle,
     BUNDLE_NAMES,
@@ -36,13 +39,12 @@ from dag_generator import (  # noqa: E402
     bool_string,
     dag_escape,
     ensure_dir,
+    pool_storage_name,
 )
 
-SOURCE_LHE_POOLS_BASE = f"/eos/ihep/cms/store/user/xcheng/MC_Production_v3/lhe_pools"
-TARGET_LHE_POOL_BASE = f"/eos/ihep/cms/store/user/chiw/MC_Production_v3/LHE_pool"
-
-# Source base for URLs (with double-slash after host for XRootD)
-SOURCE_URL_PREFIX = f"root://{EOS_HOST}/{SOURCE_LHE_POOLS_BASE}"
+SOURCE_LHE_POOLS_BASE = f"{EOS_LFN_BASE}/lhe_pools"
+TARGET_LHE_POOL_BASE = f"{EOS_LFN_BASE}/LHE_pool"
+SOURCE_URL_PREFIX = f"root://{EOS_REDIRECTOR}/{EOS_LFN_BASE}/lhe_pools"
 
 
 def _run_xrdfs(*args: str) -> str:

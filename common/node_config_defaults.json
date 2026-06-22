@@ -1,0 +1,38 @@
+{
+  "storage": {
+    "eos_redirector": "cceos.ihep.ac.cn",
+    "eos_lfn_base": "/store/user/chiw/MC_Production_v3",
+    "output_subdir": "output",
+    "lhe_pool_subdir": "lhe_pools",
+    "legacy_lhe_pool_subdir": "LHE_pool"
+  },
+  "lhe_pool_directories": {
+    "pool_jpsi_CSCO_g":        {"storage_name": "pool_jpsi_CSCO_g",        "lhe_pool_subdir": "SPS-Jpsi"},
+    "pool_upsilon_CSCO_g":     {"storage_name": "pool_upsilon_CSCO_g",     "lhe_pool_subdir": "SPS-Upsilon"},
+    "pool_gg":                 {"storage_name": "pool_gg",                 "lhe_pool_subdir": "SPS-gg_to_gg"},
+    "pool_2jpsi_cs":           {"storage_name": "pool_2jpsi_cs",           "lhe_pool_subdir": "SPS-JpsiJpsi-LO"},
+    "pool_2jpsi_g":            {"storage_name": "pool_2jpsi_g",            "lhe_pool_subdir": "SPS-JpsiJpsi-NLOstar"},
+    "pool_jpsi_upsilon_CSCO":  {"storage_name": "pool_jpsi_upsilon_CSCO",  "lhe_pool_subdir": "SPS-JpsiUpsilon"}
+  },
+  "subprocess_ids_by_campaign": {
+    "JJP_SPS_CS":  "SPS-JpsiJpsiPhi-LO",
+    "JJP_SPS_G":   "SPS-JpsiJpsiPhi-NLOstar",
+    "JJP_DPS2_CS": "DPS-JpsiJpsi-Phi-LO",
+    "JJP_DPS2_G":  "DPS-JpsiJpsi-Phi-NLOstar",
+    "JJP_DPS1":    "DPS-Jpsi-JpsiPhi",
+    "JJP_TPS":     "TPS-JpsiJpsiPhi"
+  },
+  "processing_environment": {
+    "premix_input_mode": "eoscms",
+    "premix_redirector": "root://eoscms.cern.ch",
+    "premix_cache_files": "1",
+    "premix_cache_redirector": "root://eoscms.cern.ch",
+    "raw_threads": "1",
+    "raw_streams": "1",
+    "raw_watchdog_timeout": "7200s",
+    "raw_watchdog_kill_after": "300s",
+    "raw_cmsdriver_timeout": "600s",
+    "premix_cache_timeout": "7200s",
+    "premix_cache_retries": "3"
+  }
+}

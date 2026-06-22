@@ -69,11 +69,14 @@ CMSSW_12_BASE="${CMSSW_12_BASE:-/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMS
 CMSSW_15_BASE="${CMSSW_15_BASE:-/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMSSW_15_0_15}"
 
 # T2_CN_Beijing XRootD storage paths
+# Canonical form: redirector + LFN (see common/node_config_defaults.json).
 # Override TARGET_EOS_BASE to redirect output to a different storage area.
-EOS_HOST="cceos.ihep.ac.cn"
+EOS_REDIRECTOR="cceos.ihep.ac.cn"
+EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="${EOS_HOST}"
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_HOST}//eos/ihep/cms/store/user/xcheng/MC_Production_v3}"
-EOS_PATH_BASE="${EOS_BASE#root://${EOS_HOST}/}"
+EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_LHE_POOL="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
 
@@ -1029,7 +1032,8 @@ run_shower() {
         fi
         msg_info "Shower mode: ${mode} -> ${normalized_mode}"
         
-        # Download LHE file if it's a remote XRootD URL
+        # Download remote LHE inputs first; C++ shower tools always receive a
+        # plain local .lhe file, never .lhe.gz.
         if [[ "$lhe_file" == root://* ]]; then
             msg_info "Downloading LHE from XRootD..."
             run_logged "xrdcp_input_lhe_${i}" run_xrdcp -f "${lhe_file}" "${local_lhe}"
@@ -1038,17 +1042,15 @@ run_shower() {
                 return 1
             fi
             msg_ok "Downloaded: ${local_lhe}"
-            # Transparently decompress .lhe.gz files for C++ shower tools.
-            if is_gz_file "${lhe_file}"; then
-                local plain_lhe="${WORKDIR}/input_${i}.lhe"
-                msg_info "Decompressing ${local_lhe} -> ${plain_lhe}"
-                gunzip -c "${local_lhe}" > "${plain_lhe}.tmp" \
-                    && mv "${plain_lhe}.tmp" "${plain_lhe}" \
-                    || { msg_error "Failed to decompress ${local_lhe}"; return 1; }
-                lhe_file="${plain_lhe}"
-            else
-                lhe_file="${local_lhe}"
-            fi
+            lhe_file="${local_lhe}"
+        fi
+        if is_gz_file "${lhe_file}"; then
+            local plain_lhe="${WORKDIR}/input_${i}.lhe"
+            msg_info "Decompressing ${lhe_file} -> ${plain_lhe}"
+            gunzip -c "${lhe_file}" > "${plain_lhe}.tmp" \
+                && mv "${plain_lhe}.tmp" "${plain_lhe}" \
+                || { msg_error "Failed to decompress ${lhe_file}"; return 1; }
+            lhe_file="${plain_lhe}"
         fi
 
         # Convert HELAC 9900xxxx octet codes to OniaShower 99nqnsnrnLnJ scheme

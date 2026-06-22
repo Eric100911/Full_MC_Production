@@ -6,12 +6,12 @@ Universe = vanilla
 
 Executable = $(processing_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(inputs) $(modes) $(analysis) $(campaign) $(job_id) $(max_events) $(enable_ntuple) $(efficiency_ntuple) $(cleanup) $(local_output_base) $(shuffle_mixing)"
+arguments = "$(proxy_bundle_name) $(processing_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
 
-Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(processing_bundle_path), $(proxy_bundle_path), $(config_path)
 
 transfer_output_files =
 
@@ -25,9 +25,9 @@ request_disk = $(request_disk)
 
 requirements = (TARGET.Machine == "$(target_machine)")
 getenv = True
-initialdir = $(log_dir)
+initialdir = $(log_root)
 
-environment = "LOCAL_OUTPUT_BASE=$(local_output_base) RAW_THREADS=1 RAW_STREAMS=1 RAW_WATCHDOG_TIMEOUT=7200s RAW_WATCHDOG_KILL_AFTER=300s RAW_CMSDRIVER_TIMEOUT=600s PREMIX_INPUT_MODE=$(premix_input_mode) PREMIX_REDIRECTOR=$(premix_redirector) PREMIX_CACHE_FILES=$(premix_cache_files) PREMIX_CACHE_TIMEOUT=7200s PREMIX_CACHE_RETRIES=3 PREMIX_CACHE_REDIRECTOR=$(premix_cache_redirector)"
+environment = ""
 
 +MaxRuntime = 604800
 
