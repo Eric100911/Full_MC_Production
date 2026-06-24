@@ -15,6 +15,41 @@ Keep Python PEP 8 compliant: 4-space indentation, `snake_case`, and uppercase co
 ## Testing Guidelines
 Default smoke validation on this branch stops at MiniAOD unless `--enable-ntuple` is set. For code changes, run `bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh` and one `generate-test --dry-run`. If you touch DAG staging, verify the dry-run emits `CATEGORY` and `MAXJOBS` lines for `lhe`, `processing`, and `ntuple` where applicable. If you touch the ntuple stage, confirm `prepare-runtime --include-ntuple` either packages the prebuilt CMSSW15 runtime or emits `tpsonia2mumu_code.tar.gz` from the submodule fallback, then test `--enable-ntuple` on one JJP and one JUP campaign.
 
+## Production Operations
+
+- Never infer or probe storage layouts in worker jobs. Compile exact pool paths
+  into `common/node_config_defaults.json`, validate each path before submission,
+  and fail fast if the configured directory is unavailable or ambiguous.
+- Use the explicit IHEP endpoint `root://cceos.ihep.ac.cn:1094/`. Before
+  diagnosing XRootD connectivity, verify the active X509 proxy and reproduce
+  the operation with the same `xrdfs`/`xrdcp` executable and environment.
+- Run `cmsenv` only from a valid CMSSW project area, normally its `src`
+  directory. Do not treat its absence in an arbitrary checkout as a CMSSW
+  installation failure.
+- Before submitting a pilot or production DAG, state the configured event count,
+  source-file count, events per block, expected blocks per source, and
+  subprocess coverage. `--jobs` in block mode counts source LHE files, not final
+  processing jobs.
+- Block reuse across different subprocess classes is allowed. Within one
+  subprocess, repeated inputs must consume distinct non-overlapping blocks.
+  Preserve deterministic shuffling and include both source-job and block indices
+  in output IDs to prevent collisions.
+- For full JJP production, verify that `JJP_ALL` includes `JJP_TPS`. The
+  `JpsiJpsiPhi_MC_Production_v4` campaign stores MiniAOD and ntuples under
+  `/store/user/chiw/JpsiJpsiPhi_MC_Production_v4/`.
+- Treat DAGMan controls independently: `DAGMAN_MAX_JOBS_SUBMITTED` and
+  `DAGMAN_MAX_JOBS_IDLE` bound queue width,
+  `DAGMAN_MAX_SUBMITS_PER_INTERVAL` controls batch size, and
+  `DAGMAN_SUBMIT_DELAY` adds delay per node. Production defaults use 100 submits
+  per interval and zero per-node delay; do not introduce hidden throttling.
+- Before removing a DAG, inspect completed nodes, active children, deterministic
+  outputs, and recovery files. Prefer rescue/recovery resubmission that preserves
+  completed work; do not use `condor_submit_dag -force` unless discarding state
+  is intentional.
+- Verify operational changes in live DAGMan and worker logs. Generated
+  configuration alone is not evidence that a running process loaded the new
+  values.
+
 ## Commit & Pull Request Guidelines
 The history mixes brief descriptive subjects with `feat:`/`fix:` prefixes; gitmoji-style subjects are also acceptable when every commit-message line starts with a `:emoji_name:` token. Keep commit messages imperative and specific to the workflow stage you changed. PRs should state whether the change affects DAG generation, worker runtime, storage interaction, or ntuple packaging, and include the validation commands used. When changing remote paths, package contracts, log roots, DAG categories, or analysis modes, include representative log excerpts or generated DAG metadata.
 

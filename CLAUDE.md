@@ -77,6 +77,43 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Helmholtz wrapper scripts use `set -euo pipefail`; LHE wrapper uses a JSON config file (3 positional args: proxy bundle, lhe bundle, config JSON) read by an inline Python script.
 - The `ntuple_jjp_efficiency_cfg.py` was merged into `ntuple_jjp_cfg.py`. Efficiency mode is now controlled by the `analysisMode` parameter in the unified config, not a separate config file. `keepAllSingleObjectCandsInMC` defaults to `True`. The `--efficiency-ntuple` flag controls manifest JSON file creation, not config selection.
 
+## Production Operations
+
+- Do not synthesize, guess, or probe pool-directory variants in worker jobs.
+  Compile exact paths into `common/node_config_defaults.json`, validate them
+  before submission, and make runtime resolution fail fast on missing or
+  ambiguous paths.
+- Use `root://cceos.ihep.ac.cn:1094/` explicitly for IHEP XRootD access. Before
+  attributing `No route to host` or listing failures to the endpoint, check the
+  X509 proxy and reproduce with the same `xrdfs`/`xrdcp` binary and environment.
+- `cmsenv` is valid only inside an initialized CMSSW project, normally from its
+  `src` directory.
+- Before every pilot or production submission, report the configured number of
+  events, source LHE files, events per block, expected blocks per source, and
+  included subprocesses. In block SubDAG mode, `--jobs` counts source files,
+  while planner manifests determine the number of processing blocks.
+- Reuse of a source block across different subprocess classes is acceptable.
+  Repeated inputs within one subprocess must consume distinct, non-overlapping
+  blocks. Keep shuffling deterministic and use
+  `JOB<source-index>_BLOCK<block-index>` output IDs to avoid collisions.
+- Full JJP production must explicitly include TPS through `JJP_ALL`. The
+  `JpsiJpsiPhi_MC_Production_v4` MiniAOD and ntuple products belong under
+  `/store/user/chiw/JpsiJpsiPhi_MC_Production_v4/`.
+- DAGMan throttles have separate meanings:
+  `DAGMAN_MAX_JOBS_SUBMITTED`/`DAGMAN_MAX_JOBS_IDLE` bound queue width,
+  `DAGMAN_MAX_SUBMITS_PER_INTERVAL` controls submission batches, and
+  `DAGMAN_SUBMIT_DELAY` sleeps per node. Production uses 100 submissions per
+  interval and zero per-node delay; avoid hidden throttling when ceilings are
+  intentionally non-binding.
+- Before removing a running DAG, inspect completed nodes, child jobs, staged
+  outputs, and available rescue state. Prefer rescue/recovery resubmission so
+  completed nodes remain done. Do not use `condor_submit_dag -force` unless the
+  explicit goal is to discard prior state.
+- Confirm configuration changes in live DAGMan or worker logs after submission.
+  A generated file does not prove an already-running process loaded it.
+- Keep generated DAGs, rescue files, logs, and campaign products out of Git.
+  Stage only intentional source, test, and documentation changes.
+
 ## Ntuple Config
 
 The JJP ntuple config (`common/cmssw_configs/ntuple_jjp_cfg.py`) is a thin adaptation
