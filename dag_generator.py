@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import json
 import os
@@ -72,9 +73,14 @@ SUBPROCESS_MAP = OrderedDict(
     NODE_CONFIG_DEFAULTS.get("subprocess_ids_by_campaign", {})
 )
 
-EXISTING_LHE_SUBDIR_BY_POOL = {
-    pool: info["lhe_pool_subdir"]
-    for pool, info in NODE_CONFIG_DEFAULTS.get("lhe_pool_directories", {}).items()
+LHE_POOL_DIRECTORY_CONFIG = NODE_CONFIG_DEFAULTS.get("lhe_pool_directories", {})
+if not isinstance(LHE_POOL_DIRECTORY_CONFIG, dict):
+    raise ValueError("common/node_config_defaults.json field 'lhe_pool_directories' must be an object")
+
+EXACT_LHE_POOL_PATH_BY_POOL = {
+    pool: str(info.get("path", "")).rstrip("/")
+    for pool, info in LHE_POOL_DIRECTORY_CONFIG.items()
+    if isinstance(info, dict) and info.get("path")
 }
 
 def parse_jobs_arg(jobs_str: str):
@@ -818,10 +824,6 @@ def pool_storage_name(pool_name: str) -> str:
     return LHE_POOLS[pool_name].storage_name
 
 
-def existing_lhe_subdir_name(pool_name: str) -> str:
-    return EXISTING_LHE_SUBDIR_BY_POOL.get(pool_name, pool_storage_name(pool_name))
-
-
 def default_existing_lhe_base() -> str:
     """Base URL for immutable/raw LHE pools."""
 
@@ -835,15 +837,14 @@ def existing_lhe_base_url(existing_lhe_base: str = "") -> str:
 def existing_lhe_pool_dir(pool_name: str, existing_lhe_base: str = "") -> str:
     """Directory containing raw LHE files for one pool."""
 
-    base = existing_lhe_base_url(existing_lhe_base)
-    base_leaf = base.rstrip("/").rsplit("/", 1)[-1]
-    storage_name = pool_storage_name(pool_name)
-    existing_subdir = existing_lhe_subdir_name(pool_name)
-    if base_leaf == "LHE_pool":
-        return f"{base}/{existing_subdir}"
-    if base_leaf == "lhe_pools":
-        return f"{base}/{storage_name}"
-    return f"{base}/LHE_pool/{existing_subdir}"
+    if existing_lhe_base:
+        return f"{existing_lhe_base.rstrip('/')}/{pool_storage_name(pool_name)}"
+    configured_path = EXACT_LHE_POOL_PATH_BY_POOL.get(pool_name, "")
+    if not configured_path:
+        raise ValueError(
+            f"Missing exact LHE pool path for {pool_name} in common/node_config_defaults.json"
+        )
+    return configured_path
 
 
 def machine_env_choices() -> Tuple[str, ...]:
@@ -1147,7 +1148,11 @@ def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, 
         return 0, str(exc)
 
 
-def _list_remote_dir(eos_path: str, proxy_path: str) -> Tuple[List[str], Optional[str]]:
+def _list_remote_dir(
+    eos_path: str,
+    proxy_path: str,
+    host: str = EOS_XRDFS_TARGET,
+) -> Tuple[List[str], Optional[str]]:
     """Run xrdfs ls on a remote directory.
 
     Returns (entries, error).  An empty list with None error means the
@@ -1157,9 +1162,10 @@ def _list_remote_dir(eos_path: str, proxy_path: str) -> Tuple[List[str], Optiona
     local_proxy_path = ensure_local_xrootd_proxy(proxy_path)
     env = os.environ.copy()
     env["X509_USER_PROXY"] = local_proxy_path
+    xrdfs_host = host if host.startswith("root://") else f"root://{host}"
     try:
         result = subprocess.run(
-            ["xrdfs", EOS_XRDFS_TARGET, "ls", eos_path],
+            ["xrdfs", xrdfs_host, "ls", eos_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=30, check=False, env=env,
         )
@@ -1197,102 +1203,38 @@ def _list_remote_dir(eos_path: str, proxy_path: str) -> Tuple[List[str], Optiona
 
 
 def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: str = "") -> List[str]:
-    """Discover existing LHE files for a pool by scanning the remote pool directory tree.
-
-    Tries multiple directory layouts:
-      1. {base}/lhe_pools/{storage_name}/  (standard production layout)
-      2. {base}/LHE_pool/{mapped_subdir}/  (current subprocess-named layout)
-      3. {base}/LHE_pool/<any_subdir>/     (legacy broad fallback)
-
-    Files are matched by the ``sample_{storage_name}_`` prefix.
-    Returns sorted list of full XRootD URLs.
-    """
+    """Discover existing LHE files for a pool from its exact configured directory."""
     storage_name = pool_storage_name(pool_name)
-    existing_subdir = existing_lhe_subdir_name(pool_name)
-    base = existing_lhe_base_url(existing_lhe_base)
-    eos_prefix = f"root://{EOS_HOST}/"
+    exact_dir = existing_lhe_pool_dir(pool_name, existing_lhe_base)
+    if not exact_dir.startswith("root://"):
+        return list_lhe_files_local(pool_name, exact_dir)
 
-    # Strategy 1: standard and mapped layouts.
-    base_leaf = base.rstrip("/").rsplit("/", 1)[-1]
-    if base_leaf == "LHE_pool":
-        candidate_dirs = (f"{base}/{existing_subdir}",)
-    elif base_leaf == "lhe_pools":
-        candidate_dirs = (f"{base}/{storage_name}",)
-    else:
-        candidate_dirs = (
-            f"{base}/LHE_pool/{existing_subdir}",
-            f"{base}/lhe_pools/{storage_name}",
-        )
-    for candidate_dir in candidate_dirs:
-        std_dir = candidate_dir.replace(eos_prefix, "")
-        entries, _err = _list_remote_dir(std_dir, proxy_path)
-        files = []
-        for line in entries:
-            fname = line.rsplit("/", 1)[-1] if "/" in line else line
-            if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
-                files.append(f"{eos_prefix}{line.strip()}")
-        if files:
-            return sorted(files)
-
-    # Strategy 2: scan subdirectories of LHE_pool / lhe_pools
-    for parent in ("LHE_pool", "lhe_pools"):
-        parent_eos = f"{base}/{parent}".replace(eos_prefix, "")
-        subdirs, _parent_err = _list_remote_dir(parent_eos, proxy_path)
-        if _parent_err:
-            print(f"[WARN] Cannot list {parent_eos}: {_parent_err}", file=sys.stderr)
-        if not subdirs:
-            continue
-        all_files = []
-        for subdir in subdirs:
-            sub_entries, _sub_err = _list_remote_dir(subdir, proxy_path)
-            for line in sub_entries:
-                fname = line.rsplit("/", 1)[-1] if "/" in line else line
-                if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
-                    all_files.append(f"{eos_prefix}{line.strip()}")
-        if all_files:
-            return sorted(all_files)
-
-    return []
+    rest = exact_dir[len("root://"):]
+    host = rest.split("/", 1)[0]
+    remote_dir = "/" + rest.split("/", 1)[1].lstrip("/")
+    entries, err = _list_remote_dir(remote_dir, proxy_path, host=host)
+    if err:
+        print(f"[WARN] Cannot list exact LHE pool path {exact_dir}: {err}", file=sys.stderr)
+        return []
+    files = []
+    for line in entries:
+        fname = line.rsplit("/", 1)[-1] if "/" in line else line
+        if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
+            files.append(f"root://{host}/{line.strip()}")
+    return sorted(files)
 
 
 def list_lhe_files_local(pool_name: str, local_output_base: str) -> List[str]:
-    """Discover existing LHE files for a pool in the local pool directory tree.
-
-    Tries the same layouts as the remote version.
-    Returns sorted list of full local paths.
-    """
+    """Discover existing LHE files for a pool in one exact local directory."""
     storage_name = pool_storage_name(pool_name)
     prefix = f"sample_{storage_name}_"
-
-    for parent in ("lhe_pools", "LHE_pool"):
-        parent_dir = os.path.join(local_output_base, parent)
-        if not os.path.isdir(parent_dir):
-            continue
-        # Strategy 1: standard layout — single known subdirectory
-        std_dir = os.path.join(parent_dir, storage_name)
-        if os.path.isdir(std_dir):
-            files = sorted(
-                os.path.join(std_dir, f) for f in os.listdir(std_dir)
-                if accepts_lhe_ext(f) and f.startswith(prefix)
-            )
-            if files:
-                return files
-        # Strategy 2: scan all subdirectories
-        try:
-            all_files = []
-            for subdir_name in sorted(os.listdir(parent_dir)):
-                subdir = os.path.join(parent_dir, subdir_name)
-                if not os.path.isdir(subdir):
-                    continue
-                for f in os.listdir(subdir):
-                    if accepts_lhe_ext(f) and f.startswith(prefix):
-                        all_files.append(os.path.join(subdir, f))
-            if all_files:
-                return sorted(all_files)
-        except Exception:
-            pass
-
-    return []
+    exact_dir = local_output_base
+    if not os.path.isdir(exact_dir):
+        return []
+    return sorted(
+        os.path.join(exact_dir, f) for f in os.listdir(exact_dir)
+        if accepts_lhe_ext(f) and f.startswith(prefix)
+    )
 
 
 def parse_seed_from_lhe_filename(path: str) -> Optional[int]:
@@ -1518,7 +1460,7 @@ def write_json_file(path: str, payload: object) -> None:
         handle.write("\n")
 
 
-def node_storage_config(target_eos_base: str = "") -> Dict[str, str]:
+def node_storage_config(target_eos_base: str = "") -> Dict[str, object]:
     """Storage roots that wrappers/tools should treat as explicit node config."""
 
     effective_target = target_eos_base or EOS_BASE
@@ -1530,20 +1472,16 @@ def node_storage_config(target_eos_base: str = "") -> Dict[str, str]:
         "eos_xrdfs_target": EOS_XRDFS_TARGET,
         "eos_path_base": EOS_PATH_BASE,
         "existing_lhe_base": default_existing_lhe_base(),
-        "existing_lhe_pool_base": (
-            f"{default_existing_lhe_base()}/"
-            f"{STORAGE_CONFIG_DEFAULTS.get('legacy_lhe_pool_subdir', 'LHE_pool')}"
-        ),
         "target_eos_base": effective_target,
         "eos_output": f"{effective_target.rstrip('/')}/output",
+        "generated_lhe_base": f"{effective_target.rstrip('/')}/lhe_pools",
     }
     for key in (
         "output_subdir",
-        "lhe_pool_subdir",
-        "legacy_lhe_pool_subdir",
     ):
         if key in STORAGE_CONFIG_DEFAULTS:
             storage[key] = str(STORAGE_CONFIG_DEFAULTS[key])
+    storage["lhe_pool_directories"] = copy.deepcopy(LHE_POOL_DIRECTORY_CONFIG)
     return storage
 
 
@@ -2446,13 +2384,12 @@ class DAGBuilder:
     def _resolve_block_output_dir(self, pool_name: str, seed: int) -> str:
         """Return the directory where block .lhe.gz files should be stored."""
         storage = pool_storage_name(pool_name)
-        base = self.options.target_base_url or self.options.existing_lhe_base or EOS_BASE
+        base = str(node_storage_config(self.options.target_base_url)["generated_lhe_base"])
         if self.options.machine_env.uses_local_storage and self.options.local_output_base:
             return os.path.join(
-                self.options.local_output_base,
-                "lhe_pools", storage, "lhe_blocks",
+                self.options.local_output_base, storage, "lhe_blocks",
             )
-        return f"{base}/lhe_pools/{storage}/lhe_blocks"
+        return f"{base.rstrip('/')}/{storage}/lhe_blocks"
 
     def _resolve_plan_manifest_path(self, pool_name: str, seed: int) -> str:
         """Return the path where the plan manifest JSON will be written."""
@@ -2493,27 +2430,21 @@ class DAGBuilder:
         return plan_job
 
     def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
-        """Discover and return the path to an existing LHE file for the given pool + job_index.
-
-        Scans the remote/local pool directory tree (trying both ``lhe_pools/`` and
-        ``LHE_pool/`` layouts). Results are cached per pool to avoid redundant xrdfs
-        calls when generating many jobs.
-        Falls back to the standard naming convention when listing returns nothing
-        (e.g. dry-run without proxy).
-        """
+        """Discover and return an LHE file from the exact configured pool directory."""
         storage = pool_storage_name(pool_name)
         base = existing_lhe_base_url(self.options.existing_lhe_base)
         cache_key = f"{pool_name}::{base}"
         if cache_key not in self._existing_lhe_cache:
             if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-                files = list_lhe_files_local(pool_name, self.options.local_output_base)
+                files = list_lhe_files_local(
+                    pool_name,
+                    existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                )
             else:
                 files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
             self._existing_lhe_cache[cache_key] = files
         files = self._existing_lhe_cache[cache_key]
         fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
-        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-            fallback_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
         if job_index < len(files):
             return files[job_index]
         return f"{fallback_dir}/sample_{storage}_{seed}.lhe.gz"
@@ -2524,7 +2455,10 @@ class DAGBuilder:
         cache_key = f"{pool_name}::{base}"
         if cache_key not in self._existing_lhe_cache:
             if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-                files = list_lhe_files_local(pool_name, self.options.local_output_base)
+                files = list_lhe_files_local(
+                    pool_name,
+                    existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                )
             else:
                 files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
             self._existing_lhe_cache[cache_key] = files
@@ -2544,8 +2478,6 @@ class DAGBuilder:
                 )
             storage = pool_storage_name(pool_name)
             fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
-            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-                fallback_dir = os.path.join(self.options.local_output_base, "lhe_pools", storage)
             synthetic_count = self.options.jobs_per_campaign * max(1, self.options.lhe_group_max_files)
             files = [
                 f"{fallback_dir}/sample_{storage}_{self.seed_for_pool_index(pool_name, i)}.lhe.gz"

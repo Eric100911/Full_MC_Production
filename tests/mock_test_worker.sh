@@ -140,7 +140,7 @@ grep -q 'CMSSW environment: CMSSW_12_4_14' "${MOCK_DIR}/wrapper.log" 2>/dev/null
     || fail "CMSSW environment not set up"
 
 # Check shower binaries were validated/used
-grep -q 'Reusing transferred shower' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
+grep -Eq 'Reusing transferred shower|Rebuilding shower/mixer tools' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
     && pass "Shower binaries validated" \
     || fail "Shower binaries not validated"
 

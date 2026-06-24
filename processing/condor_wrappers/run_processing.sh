@@ -125,6 +125,7 @@ cmd = [
     "--efficiency-ntuple", bool_text(cfg["efficiency_ntuple"]),
     "--shuffle-mixing", bool_text(cfg["shuffle_mixing"]),
     "--cleanup", bool_text(cfg["cleanup"]),
+    "--config", config_path,
 ]
 if cfg.get("skip_to"):
     cmd.extend(["--skip-to", str(cfg["skip_to"])])

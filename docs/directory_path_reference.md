@@ -1,6 +1,7 @@
 # Directory & Path Reference
 
-How intermediate and final product files are named and placed — every variable, every function, every fallback.
+How intermediate and final product files are named and placed. Existing LHE
+pool paths are exact configuration values; there is no runtime layout fallback.
 
 ---
 
@@ -11,22 +12,27 @@ All default paths flow from `common/node_config_defaults.json`:
 ```json
 {
   "storage": {
-    "eos_host": "cceos.ihep.ac.cn",
-    "eos_path_base": "/eos/ihep/cms/store/user/chiw/MC_Production_v3",
-    "default_eos_base": "root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MC_Production_v3",
-    "xrootd_store_user_base": "root://cceos.ihep.ac.cn///store/user/chiw/MC_Production_v3",
-    "legacy_store_user_base": "root://cceos.ihep.ac.cn//store/user/chiw/MC_Production_v3",
-    "existing_lhe_subdirs_by_pool": {
-      "pool_jpsi_CSCO_g": "SPS-Jpsi",
-      "pool_2jpsi_cs":   "SPS-JpsiJpsi-LO",
-      "pool_2jpsi_g":    "SPS-JpsiJpsi-NLOstar",
-      "pool_gg":         "SPS-gg_to_gg"
+    "eos_redirector": "cceos.ihep.ac.cn:1094",
+    "eos_lfn_base": "/store/user/chiw/MC_Production_v3",
+    "output_subdir": "output"
+  },
+  "lhe_pool_directories": {
+    "pool_2jpsi_cs": {
+      "storage_name": "pool_2jpsi_cs",
+      "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO"
     }
   }
 }
 ```
 
-`dag_generator.py` reads this on import and embeds the relevant storage/processing settings into each generated node config JSON. Runtime scripts still keep conservative fallback defaults, but generated jobs should receive storage settings through JSON config and wrapper-provided environment variables.
+`dag_generator.py` reads this on import and deep-copies the exact
+`lhe_pool_directories` mapping into generated node configs. `run_chain.sh`
+resolves `EOS:<pool>:...` only from that mapping and fails if the path is
+missing, cannot be listed, or contains no LHE files.
+
+`tools/compile_node_config.py` can compile explicit mappings and validates each
+configured directory with `xrdfs ls` or local directory inspection. This
+validation belongs before submission, not in worker-side layout inference.
 
 ---
 
@@ -35,22 +41,24 @@ All default paths flow from `common/node_config_defaults.json`:
 Every worker script that writes to remote storage follows the same pattern:
 
 ```bash
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_HOST}//eos/ihep/cms/store/user/chiw/MC_Production_v3}"
-EOS_PATH_BASE="${EOS_BASE#root://${EOS_HOST}/}"
-EOS_LHE_POOL="${EOS_BASE}/lhe_pools"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
 ```
 
 | Variable | Derivation | Example |
 |----------|-----------|---------|
-| `EOS_BASE` | `$TARGET_EOS_BASE` if set, else hardcoded default | `root://cceos.ihep.ac.cn//eos/…/MC_Production_v3` |
-| `EOS_PATH_BASE` | `EOS_BASE` with `root://host/` stripped | `/eos/ihep/cms/store/user/chiw/MC_Production_v3` |
-| `EOS_LHE_POOL` | `$EOS_BASE/lhe_pools` | `root://…/MC_Production_v3/lhe_pools` |
+| `EOS_BASE` | Configured target base or `$TARGET_EOS_BASE` | `root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3` |
+| `EOS_GENERATED_LHE_BASE` | `storage.generated_lhe_base` | `$EOS_BASE/lhe_pools` |
 | `EOS_OUTPUT` | `$EOS_BASE/output` | `root://…/MC_Production_v3/output` |
 
-**How `TARGET_EOS_BASE` is set**: `dag_generator.py --target-base-url <url>` → generated node JSON `target_eos_base` / `storage.target_eos_base` → JSON wrapper sets `TARGET_EOS_BASE` in the worker environment → `run_chain.sh` derives `EOS_BASE`, `EOS_LHE_POOL`, and `EOS_OUTPUT`.
+**How `TARGET_EOS_BASE` is set**: `dag_generator.py --target-base-url <url>` → generated node JSON `target_eos_base` / `storage.target_eos_base` → JSON wrapper sets `TARGET_EOS_BASE` in the worker environment → `run_chain.sh` derives processing output and generated-block roots.
 
-LHE generation is separate: `run_lhe_gen.sh` reads `node_configs/lhe_generation/LHE_*.json` and passes `output_dir` directly to `run_helac.sh --output-dir`. The default raw/generated LHE pool base is `storage.xrootd_store_user_base + /LHE_pool`.
+LHE generation is separate: `run_lhe_gen.sh` reads
+`node_configs/lhe_generation/LHE_*.json`, passes `output_dir` directly to
+`run_helac.sh --output-dir`, and also passes the node config with `--config`.
+Generated data uses `storage.generated_lhe_base`. Existing immutable pools use
+their exact `lhe_pool_directories.<pool>.path`.
 
 ---
 
@@ -68,7 +76,7 @@ LHE generation is separate: `run_lhe_gen.sh` reads `node_configs/lhe_generation/
 │               └── block_{group_id}_{idx}.lhe.gz
 │
 ├── LHE_pool/
-│   └── {mapped_subdir}/               ← existing-LHE layout (EXISTING_LHE_SUBDIR_BY_POOL)
+│   └── {configured_subdir}/           ← exact existing path from node config
 │       └── sample_{storage_name}_{seed}.lhe[.gz]
 │
 ├── output/
@@ -97,14 +105,15 @@ The LHE generation node JSON determines the remote directory:
 ```
 node_configs/lhe_generation/LHE_*.json:
   output_dir = existing_lhe_pool_dir(pool_name, existing_lhe_base)
-             = {CHIW_XROOTD_STORE_USER_BASE}/LHE_pool/{mapped_subdir}
 ```
 
 **Resolution** (`dag_generator.py` `existing_lhe_pool_dir`):
-1. Start from `existing_lhe_base` (or `CHIW_XROOTD_STORE_USER_BASE` default).
-2. Look at the last path component. If it's `LHE_pool`, append the mapped subdirectory. If it's `lhe_pools`, append the storage name. Otherwise append `LHE_pool/{mapped_subdir}`.
+1. If `--existing-lhe-base` is supplied, append the pool's `storage_name`.
+2. Otherwise return the exact configured `lhe_pool_directories.<pool>.path`.
+3. If no exact path is configured, fail during DAG generation.
 
-**Example for `pool_jpsi_CSCO_g`**: `root://cceos.ihep.ac.cn///store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi`
+**Example for `pool_jpsi_CSCO_g`**:
+`root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi`
 
 ### Remote filename
 
@@ -146,7 +155,7 @@ Called by the planner DAG node, NOT directly by `run_helac.sh`. Runs `lhe_shuffl
 
 Derived from `dag_generator.py` `_resolve_block_output_dir()`:
 ```
-{target_base_url or existing_lhe_base or EOS_BASE}/lhe_pools/{storage_name}/lhe_blocks
+{storage.generated_lhe_base}/{storage_name}/lhe_blocks
 ```
 
 When grouped (`group_id != str(primary_seed)`), blocks go into a subdirectory:
@@ -174,9 +183,9 @@ or for grouped:
 Format: `GEN:pool_name:job_index[:seed]`
 
 ```
-{EOS_LHE_POOL}/{pool_name}/sample_{pool_name}_{seed}.lhe.gz
+{storage.generated_lhe_base}/{storage_name}/sample_{storage_name}_{seed}.lhe.gz
 ```
-Falls back to `.lhe`, then to directory listing via `get_lhe_file()`.
+Falls back to `.lhe`, then to listing the exact configured existing pool path.
 
 ### `BLOCK:` input specs
 
@@ -188,13 +197,15 @@ Resolution tries four paths in order:
 3. `{pool_base}/{pool}/lhe_blocks/block_{ns}_{idx}.lhe.gz`       (flat+compressed)
 4. `{pool_base}/{pool}/lhe_blocks/block_{ns}_{idx}.lhe`          (flat+plain)
 
-Where `pool_base = EOS_LHE_POOL` (remote) or `{LOCAL_OUTPUT_BASE}/lhe_pools` (local).
+Where `pool_base = storage.generated_lhe_base`.
 
 ### `EOS:` input specs
 
 Format: `EOS:pool_name:job_id:usage_idx`
 
-Calls `get_lhe_file()` which lists the pool directory and wraps around by modulo.
+Calls `get_lhe_file()`, which reads
+`storage.lhe_pool_directories.<pool>.path`, lists only that directory, filters
+`.lhe` and `.lhe.gz`, and wraps by modulo. No other directory is tried.
 
 ### `file:` input specs
 
@@ -223,7 +234,7 @@ Constructs the remote URL by prepending `EOS_BASE`:
 
 Full example for MiniAOD:
 ```
-root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/BLOCK000042/output_MINIAOD.root
+root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/BLOCK000042/output_MINIAOD.root
 ```
 
 ### Files produced
@@ -261,10 +272,8 @@ ntuple_basename  = {subprocess_id}-Ntuple-{version}-{job_index}.root
 
 Full URL:
 ```
-root://cceos.ihep.ac.cn//store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple-v01_06/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
+root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple-v01_06/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
 ```
-
-Note: `CHIW_EOS_OUTPUT_BASE` uses `//store/` (no `/eos/` segment), unlike `EOS_BASE` which uses `//eos/ihep/cms/store/`.
 
 ### Ntuple-only DAG mode
 
@@ -325,8 +334,8 @@ $(proxy_bundle_name) $(runtime_bundle_name) $(config_name)
 
 | Function/script | Purpose |
 |-----------------|---------|
-| `existing_lhe_pool_dir()` | Resolve raw/generated LHE output dir from pool name and existing-LHE base |
-| `existing_lhe_base_url()` | Resolve existing-LHE base URL, defaulting to `xrootd_store_user_base` |
+| `existing_lhe_pool_dir()` | Return an explicit override path or the exact configured pool path |
+| `existing_lhe_base_url()` | Normalize an optional explicit existing-LHE override |
 | `node_storage_config()` | Build storage dict embedded in generated JSON configs |
 | `DAGBuilder.write_node_config()` | Write per-node JSON configs under the DAG output tree |
 | `_resolve_lhe_path()` | Path to HELAC LHE output for a seed |
@@ -341,10 +350,11 @@ $(proxy_bundle_name) $(runtime_bundle_name) $(config_name)
 | `transfer_output()` | Stage all processing outputs |
 | `ntuple_cfg_path()` | Select CMSSW config for ntuple |
 | `stable_seed()` | Deterministic seed from campaign+job |
+| `tools/compile_node_config.py` | Compile and verify exact pool paths before submission |
 
 ---
 
-## `chiw` vs `xcheng` — summary
+## Storage ownership summary
 
 After the fixes applied in this branch:
 
@@ -356,4 +366,7 @@ After the fixes applied in this branch:
 | `run_helac.sh` | **chiw** | `--output-dir` from LHE generation JSON wrapper |
 | `check_proxy.sh` | — (proxy-only) | N/A |
 
-All hardcoded `xcheng` paths have been replaced with `chiw` defaults. Use `common/node_config_defaults.json` for site defaults, `--existing-lhe-base` for raw/generated LHE pool discovery/stage-out, and `--target-base-url` for processing/ntuple output.
+Operational scripts and active documentation use the `chiw` storage area.
+Use `common/node_config_defaults.json` for exact existing pool paths,
+`--existing-lhe-base` only as an explicit alternate base, and
+`--target-base-url` for generated blocks and processing/ntuple output.

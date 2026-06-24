@@ -102,6 +102,7 @@ cmd = [
     "--unwevt", str(cfg["unwevt"]),
     "--test-mode", bool_text(cfg["test_mode"]),
     "--output-dir", str(cfg["output_dir"]),
+    "--config", config_path,
 ]
 
 if cfg.get("compress_lhe", False):

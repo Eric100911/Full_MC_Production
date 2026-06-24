@@ -37,12 +37,14 @@
 - **`tools/plan_lhe_blocks.py`** — 单 pool LHE 分块规划器：压缩、shuffle-split、stage 分块、写出 `plan_manifest_<pool>_<seed>.json`。作为 Condor 作业在 HELAC 生成后运行。
 - **`tools/coordinate_lhe_blocks.py`** — 多源 campaign 协调器：读取各 pool 的 plan manifest，按 strict-min 策略匹配分块，生成 `blocks_processing.dag` SubDAG。
 - **`tools/compress_existing_lhe.py`** — 回填工具：压缩已有的未压缩 LHE pool。
+- **`tools/compile_node_config.py`** — 在生产配置生成前编译并验证每个 pool 的精确 LHE 路径。
 - **`tools/transfer_compress_lhe.py`** — Condor worker 脚本，用于批量 LHE 压缩及 XRootD 传输。
 - **`processing/run_chain.sh`** — Worker 端处理链：shower → mix → CMSSW 步骤 → 可选 ntuple → stage-out。在 worker 上重新编译 Pythia shower 工具以避免 glibc/ABI 不兼容。
 - **`processing/condor_wrappers/`** — Submit 模板调用的轻量 bash wrapper（`run_processing.sh`、`run_ntuple_only.sh`、`run_plan_lhe_blocks.sh`、`run_coordinate_lhe_blocks.sh`）。
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower 工具（`shower_normal.cc`、`shower_phi.cc`、`shower_sps.cc`、`event_mixer_multisource.cc`）及 Makefile。
 - **`processing/templates/`** — 各 machine environment 和 DAG 节点类型的 HTCondor submit 描述文件（包括 `plan_lhe_blocks.sub`、`coordinate_lhe_blocks.sub`、`compress.sub`、`transfer_compress.sub`）。
 - **`tests/`** — Shell 测试套件：`run_all_tests.sh`（主入口）、`submit_tests.sh`（按 campaign 的 smoke DAG）、`submit_lhe_matrix.sh`（LHE pool 矩阵）、`test_lhe_shuffle_split.sh`（shuffle-split 单元测试）、`test_octet_pdg_tool.sh`（PDG 映射自检），以及 `generate_synthetic_lhe.py` 和 `check_y_symmetry.py`。
+- **`docs/testing.md`** — 静态检查、本地 mock、组件测试、pilot、输出验证和清理的规范流程。
 - **`docs/`** — 设计笔记、调查报告和评审文档。
 
 ## 环境准备
@@ -176,6 +178,24 @@ python3 dag_generator.py prepare-runtime \
 
 ---
 
+## 精确 LHE pool 路径
+
+`common/node_config_defaults.json` 为每个已有 LHE pool 保存完全展开的
+`path`。Worker 不会在运行时猜测 `LHE_pool`、`lhe_pools`、大小写或旧目录布局。
+
+```bash
+mkdir -p /tmp/chiw
+python3 tools/compile_node_config.py \
+  --pool-paths common/node_config_defaults.json \
+  --pool pool_2jpsi_cs --pool pool_gg \
+  --output /tmp/chiw/node_config_defaults.verified.json
+```
+
+验证器对选中的远端目录执行 `xrdfs ls`，并要求目录中至少有一个 `.lhe` 或
+`.lhe.gz` 文件。按当前 campaign 选择 pool；尚未生产的无关 pool 不阻塞
+pilot。IHEP endpoint 使用显式端口
+`root://cceos.ihep.ac.cn:1094/`。
+
 ### LHE 压缩
 
 LHE 文件可以压缩（`.lhe.gz`）或未压缩（`.lhe`）形式存储。Pool 扫描优先尝试 `.lhe.gz`，回退到 `.lhe`。HepMC 中间文件始终为纯文本以兼容 CMSSW。
@@ -248,14 +268,14 @@ python3 dag_generator.py generate \
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # 使用子过程命名输出
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
@@ -268,7 +288,7 @@ python3 dag_generator.py generate-ntuple-only \
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
   --skip-lhe-generation \
-  --existing-lhe-base root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MC_Production_v3 \
+  --existing-lhe-base root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/lhe_pools \
   --jobs 10 --output-dir generated/reprocess --output reprocess.dag
 ```
 
@@ -279,7 +299,7 @@ python3 dag_generator.py generate \
 ```bash
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
-  --target-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MyTestArea \
+  --target-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MyTestArea \
   --jobs 20 --output-dir generated/custom_eos --output custom.dag
 ```
 
@@ -343,6 +363,9 @@ JJP ntuple 配置（`common/cmssw_configs/ntuple_jjp_cfg.py`）是对上游 TPS-
 
 ## 运行测试
 
+完整验收流程见 [`docs/testing.md`](docs/testing.md)，包括事例数口径、按
+schedd 监控、远端 stage-out 验证、ROOT 事例数检查和旧 pilot 清理。
+
 ```bash
 # 仅静态校验 + smoke DAG 生成（不提交）
 ./tests/run_all_tests.sh
@@ -372,6 +395,10 @@ JJP ntuple 配置（`common/cmssw_configs/ntuple_jjp_cfg.py`）是对上游 TPS-
 
 默认测试覆盖：`JJP_DPS2_CS`、`JJP_DPS2_G`、`JUP_DPS1`，外加 `test_octet_pdg_tool.sh`。
 
+单作业 `JJP_DPS2_CS` pilot 使用 `--max-events 5` 时，两个输入 source
+分别最多 shower 5 个事例，mixer 最终产生 **5 个输出事例**，不是 10 个。
+提交前必须记录 `myschedd show`，因为 cluster ID 只在对应 schedd 上有效。
+
 LHE 矩阵测试覆盖：`pool_jpsi_CSCO_g`、`pool_upsilon_CSCO_g`、`pool_gg`、`pool_2jpsi_cs`、`pool_2jpsi_g`、`pool_jpsi_upsilon_CSCO`，并自动扫描残留的 `9900xxxx` 旧 PDG 编码。
 
 ## 当前已知限制
@@ -394,11 +421,12 @@ python3 dag_generator.py generate-test \
   --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JUP_DPS1 \
   --output-dir tests/generated/smoke --output smoke.dag
 
-# 3. 提交
+# 3. 记录 schedd 并提交
+myschedd show
 condor_submit_dag tests/generated/smoke/smoke.dag
 
-# 4. 监控
-condor_q
+# 4. 在记录的 schedd 上监控
+condor_q -name bigbirdNN.cern.ch <dag-cluster> -nobatch
 
 # 5. 使用 Block SubDAG 工作流进行生产运行
 python3 dag_generator.py generate \

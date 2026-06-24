@@ -36,12 +36,14 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
 - **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG.
 - **`tools/compress_existing_lhe.py`** — Backfill utility to compress existing uncompressed LHE pools.
+- **`tools/compile_node_config.py`** — Compile and validate exact per-pool LHE paths before generating production configs.
 - **`tools/transfer_compress_lhe.py`** — Condor worker script for batch LHE compression with XRootD transfer.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker.
 - **`processing/condor_wrappers/`** — Lightweight bash wrappers invoked by submit templates (`run_processing.sh`, `run_ntuple_only.sh`, `run_plan_lhe_blocks.sh`, `run_coordinate_lhe_blocks.sh`). Wrappers take only bootstrap bundle/config arguments; node settings are read from JSON.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `shower_sps.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type (including `plan_lhe_blocks.sub`, `coordinate_lhe_blocks.sub`, `compress.sub`, `transfer_compress.sub`).
 - **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `mock_test_worker.sh` (local worker-bundle/config mock), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_lhe_shuffle_split.sh` (shuffle-split unit tests), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus `generate_synthetic_lhe.py` and `check_y_symmetry.py`.
+- **`docs/testing.md`** — Canonical static, mock, component, pilot, output-verification, and cleanup procedures.
 - **`docs/`** — Design notes, investigation reports, and review documents.
 
 ## Environment setup
@@ -197,13 +199,26 @@ Generated configs are written under the DAG output tree:
 | Block processing SubDAG | `plan_subdags/<campaign>/job_<N>/node_configs/processing/MIX_*.json` |
 | Block ntuple SubDAG | `plan_subdags/<campaign>/job_<N>/node_configs/ntuple/NTUPLE_*.json` |
 
-Storage defaults come from `common/node_config_defaults.json`. Raw/generated LHE pool files use the configured `xrootd_store_user_base` plus `LHE_pool/<mapped-subdir>`, for example:
+Storage defaults come from `common/node_config_defaults.json`. Each existing
+LHE pool has a fully expanded and verified `path`; workers do not synthesize or
+probe layout variants. For example:
 
 ```text
-root://cceos.ihep.ac.cn///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO/sample_pool_2jpsi_cs_60100.lhe.gz
+root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO/sample_pool_2jpsi_cs_60100.lhe.gz
 ```
 
-Processing output still uses `target_eos_base/output/<campaign>/<job_id>/...` unless overridden by config.
+Compile or verify exact pool paths before production:
+
+```bash
+mkdir -p /tmp/chiw
+python3 tools/compile_node_config.py \
+  --pool-paths common/node_config_defaults.json \
+  --pool pool_2jpsi_cs --pool pool_gg \
+  --output /tmp/chiw/node_config_defaults.verified.json
+```
+
+Generated LHE blocks use `storage.generated_lhe_base`; processing output uses
+`storage.target_eos_base/output/<campaign>/<job_id>/...`.
 
 ---
 
@@ -279,14 +294,14 @@ The `generate-ntuple-only` subcommand produces a DAG that runs only the ntuple s
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # With subprocess-based output naming
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
@@ -299,7 +314,7 @@ Use `--skip-lhe-generation` with `--existing-lhe-base` to redirect LHE pool scan
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
   --skip-lhe-generation \
-  --existing-lhe-base root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MC_Production_v3 \
+  --existing-lhe-base root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/lhe_pools \
   --jobs 10 --output-dir generated/reprocess --output reprocess.dag
 ```
 
@@ -310,7 +325,7 @@ The `--target-base-url` flag overrides the default EOS output base for all worke
 ```bash
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
-  --target-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/chiw/MyTestArea \
+  --target-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MyTestArea \
   --jobs 20 --output-dir generated/custom_eos --output custom.dag
 ```
 
@@ -374,6 +389,10 @@ When updating the submodule, diff `external/TPS-Onia2MuMu/test/ConfFile_cfg.py` 
 
 ## Running tests
 
+See [`docs/testing.md`](docs/testing.md) for the complete acceptance procedure,
+including event accounting, schedd-specific monitoring, remote stage-out
+verification, ROOT event counting, and cleanup.
+
 ```bash
 # Static validation + smoke DAG generation (no submit)
 ./tests/run_all_tests.sh
@@ -406,6 +425,11 @@ When updating the submodule, diff `external/TPS-Onia2MuMu/test/ConfFile_cfg.py` 
 
 Default test coverage: `JJP_DPS2_CS`, `JJP_DPS2_G`, `JUP_DPS1`, plus `test_octet_pdg_tool.sh`. `mock_test_worker.sh` builds a production processing bundle, transfers a dummy proxy and JSON config into a temporary worker directory, runs `run_processing.sh`, and stops after the shower step. It validates config parsing, bundle extraction, local `.lhe.gz` decompression, CMSSW setup, Pythia startup, and non-empty `shower_*.hepmc` outputs without requiring HTCondor submission.
 
+For a one-job `JJP_DPS2_CS` pilot with `--max-events 5`, both source showers
+are capped at five events and the mixer produces **five output events**. Record
+the `myschedd show` result before submission because cluster IDs are local to
+that schedd.
+
 The LHE matrix test covers: `pool_jpsi_CSCO_g`, `pool_upsilon_CSCO_g`, `pool_gg`, `pool_2jpsi_cs`, `pool_2jpsi_g`, `pool_jpsi_upsilon_CSCO`, and auto-scans for legacy `9900xxxx` PDG encoding.
 
 ## Current known limitations
@@ -429,11 +453,12 @@ python3 dag_generator.py generate-test \
   --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JUP_DPS1 \
   --output-dir tests/generated/smoke --output smoke.dag
 
-# 3. Submit
+# 3. Record the schedd and submit
+myschedd show
 condor_submit_dag tests/generated/smoke/smoke.dag
 
-# 4. Monitor
-condor_q
+# 4. Monitor on the recorded schedd
+condor_q -name bigbirdNN.cern.ch <dag-cluster> -nobatch
 
 # 5. Production run with block SubDAG workflow
 python3 dag_generator.py generate \

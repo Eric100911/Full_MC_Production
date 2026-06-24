@@ -78,6 +78,8 @@ EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
 EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
 EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_OUTPUT="${EOS_BASE}/output"
+EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
+NODE_CONFIG=""
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -125,6 +127,59 @@ build_helac_matrix_process() {
         process="${process} g"
     fi
     printf '%s\n' "${process}"
+}
+
+load_node_config() {
+    local config_path="$1"
+    [[ -n "${config_path}" ]] || return 0
+    if [[ ! -s "${config_path}" ]]; then
+        msg_error "Node config JSON not found or empty: ${config_path}"
+        return 1
+    fi
+
+    local kind key value extra
+    while IFS=$'\t' read -r kind key value extra; do
+        [[ "${kind}" == "storage" ]] || continue
+        case "${key}" in
+            eos_redirector)
+                EOS_REDIRECTOR="${value}"
+                EOS_HOST="${EOS_REDIRECTOR}"
+                EOS_XRDFS_TARGET="root://${EOS_HOST}"
+                ;;
+            eos_lfn_base)
+                EOS_LFN_BASE="${value}"
+                EOS_PATH_BASE="${EOS_LFN_BASE}"
+                ;;
+            eos_base)
+                EOS_BASE="${TARGET_EOS_BASE:-${value}}"
+                ;;
+            target_eos_base)
+                if [[ -n "${value}" ]]; then
+                    EOS_BASE="${TARGET_EOS_BASE:-${value}}"
+                fi
+                ;;
+            generated_lhe_base)
+                EOS_GENERATED_LHE_BASE="${value}"
+                ;;
+            output_subdir)
+                EOS_OUTPUT="${EOS_BASE}/${value}"
+                ;;
+        esac
+    done < <(python3 - "${config_path}" <<'PYHELPER'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+storage = cfg.get("storage", {})
+if not isinstance(storage, dict):
+    raise SystemExit("storage must be an object")
+for key in ("eos_redirector", "eos_lfn_base", "eos_base", "target_eos_base", "generated_lhe_base", "output_subdir"):
+    value = storage.get(key)
+    if value not in (None, ""):
+        print(f"storage\t{key}\t{value}\t")
+PYHELPER
+    )
 }
 
 ensure_job_log_dir() {
@@ -872,6 +927,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --config)
+            NODE_CONFIG="$2"
+            shift 2
+            ;;
         --unwevt)
             UNWEVT="$2"
             UNWEVT_OVERRIDE=1
@@ -958,6 +1017,10 @@ if [ -z "$POOL_NAME" ]; then
     exit 1
 fi
 
+if ! load_node_config "${NODE_CONFIG}"; then
+    exit 1
+fi
+
 # Set default process string based on pool name if not specified
 if [ -z "$PROCESS_STRING" ]; then
     case "$POOL_NAME" in
@@ -1002,7 +1065,7 @@ fi
 
 # Set default output directory (XRootD path for T2_CN_Beijing)
 if [ -z "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR="lhe_pools/${POOL_NAME}"
+    OUTPUT_DIR="${EOS_GENERATED_LHE_BASE%/}/${POOL_NAME}"
 fi
 
 # Validate seed

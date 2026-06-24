@@ -21,8 +21,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common/paths.sh"
 LOG_DIR="${SCRIPT_DIR}/log"
+TMP_ROOT="/tmp/chiw"
 
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${TMP_ROOT}"
 
 msg_info() { printf '[INFO] %s\n' "$1"; }
 msg_warn() { printf '[WARN] %s\n' "$1"; }
@@ -232,8 +233,14 @@ for idx in "${!SUBMITTED_POOLS[@]}"; do
     seed="${SUBMITTED_SEEDS[$idx]}"
     cluster_id="${SUBMITTED_CLUSTERS[$idx]}"
     log_file="${WORKSPACE_ROOT}/log/lhe_${pool}_${seed}_${cluster_id}.log"
-    remote_url="root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/lhe_pools/${pool}/sample_${pool}_${seed}.lhe"
-    local_copy="/tmp/${USER}/${pool}_${seed}.lhe"
+    generated_lhe_base=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import dag_generator
+print(dag_generator.node_storage_config()["generated_lhe_base"])
+' "${WORKSPACE_ROOT}" 2>/dev/null)
+    remote_url="${generated_lhe_base}/${pool}/sample_${pool}_${seed}.lhe"
+    local_copy="${TMP_ROOT}/${pool}_${seed}.lhe"
 
     if [[ ! -f "${log_file}" ]]; then
         msg_error "缺少 condor 事件日志: ${log_file}"

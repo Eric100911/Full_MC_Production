@@ -22,12 +22,12 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 
 - **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, `MachineEnv` dataclasses and all subcommands (`list`, `validate`, `generate`, `generate-test`, `generate-helac-matrix`, `prepare-runtime`). Campaign/pool definitions are Python literals in this file, not loaded from external config.
 - **`hepjob_workflow.py`** — IHEP/lxlogin HepJob backend adapter. Reuses campaign/pool definitions and bundle-building utilities from `dag_generator.py`. Generates bash job scripts instead of HTCondor submit files.
-- **`common/setup.sh`** — Environment setup for local debugging (CMSSW 12/15, HELAC, Pythia, XRootD). Not used by worker nodes at runtime; they self-configure via bundled tarballs.
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter: translates between old `9900xxxx` codes and Pythia8 `99nqnsnrnLnJ` encoding. Also provides a `scan` subcommand for auditing LHE files.
 - **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Unpacks `helac_package.tar.gz`, builds HepMC/HELAC, generates LHE, optionally shuffle-splits into blocks, stages out to XRootD.
 - **`lhe_generation/lhe_shuffle_split.cc`** — C++14 tool for stratified LHE shuffle and 1000-event block splitting. Supports `--filename-prefix` for seed-specific output naming. Pre-compiled inside cmssw/el7 container and bundled with both LHE and planner runtimes.
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
 - **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+- **`tools/compile_node_config.py`** — Config compiler/validator for fully expanded per-pool LHE paths. Validation happens before submission, never through worker-side layout guessing.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker to avoid glibc/ABI mismatches.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type. Templates use wrapper scripts rather than inline bash.
@@ -70,12 +70,24 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Coordinator: `tools/coordinate_lhe_blocks.py` runs after all per-source planners for a multi-source campaign, matches blocks with strict-min policy, and generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
 - New DAG categories: `lhe_planning` (planner jobs), `lhe_coordination` (coordinator jobs), `block_processing` (block-level processing inside SubDAGs).
 - The `--filename-prefix` option on `lhe_shuffle_split` allows seed-specific block filenames (e.g. `100_block_000000.lhe`).
+- Storage configuration is centralized in `common/node_config_defaults.json` (EOS host, path base, pool subdirectory mappings). Runtime scripts read this via the JSON config pattern (`write_node_config()` in dag_generator.py). The constants `EOS_HOST`, `EOS_PATH_BASE`, `EOS_BASE`, `CHIW_EOS_OUTPUT_BASE` in `dag_generator.py` derive from this file.
+- Existing LHE pools use exact `lhe_pool_directories.<pool>.path` values with the explicit IHEP `:1094` endpoint. DAG generation copies the mapping into every relevant node config. `EOS:<pool>:...` resolution lists only that exact directory and fails if it is missing or empty.
+- `TARGET_EOS_BASE` environment variable overrides the default EOS base in all worker scripts (`run_chain.sh`, `run_helac.sh`). Set via `--target-base-url` in dag_generator.py CLI, which flows through submit template VARS → wrapper script → environment.
+- `--existing-lhe-base` is an explicit override. It appends only the pool storage name to the supplied base; it does not trigger legacy-layout probing.
+- Helmholtz wrapper scripts use `set -euo pipefail`; LHE wrapper uses a JSON config file (3 positional args: proxy bundle, lhe bundle, config JSON) read by an inline Python script.
+- The `ntuple_jjp_efficiency_cfg.py` was merged into `ntuple_jjp_cfg.py`. Efficiency mode is now controlled by the `analysisMode` parameter in the unified config, not a separate config file. `keepAllSingleObjectCandsInMC` defaults to `True`. The `--efficiency-ntuple` flag controls manifest JSON file creation, not config selection.
 
 ## Ntuple Config
 
 The JJP ntuple config (`common/cmssw_configs/ntuple_jjp_cfg.py`) is a thin adaptation
 layer over the upstream TPS-Onia2MuMu reference. The submodule at
 `external/TPS-Onia2MuMu` pins the ntuple format version and defines the data contract.
+
+The former `ntuple_jjp_efficiency_cfg.py` has been merged into `ntuple_jjp_cfg.py`.
+Efficiency mode is controlled by the `analysisMode` VarParsing parameter; the
+`--efficiency-ntuple` flag in `run_chain.sh` now only controls whether an
+`ntuple_manifest.json` is written for the external `run-multileppat-efficiency` tool,
+not which cmsRun config is used.
 
 ### Syncing with upstream
 
@@ -105,6 +117,7 @@ When the submodule is updated to a new tag:
 ### Test environment
 - Local tests (`tests/test_lhe_shuffle_split.sh`) compile and run inside the same `cmssw/el7` + LCG_88b container via `singularity exec`
 - Synthetic LHE generation (`tests/generate_synthetic_lhe.py`) runs on the host Python
+- Mock tests (`tests/mock_test_worker.sh`) validate the infrastructure chain (prepare-runtime → bundle → wrapper → config → execution) using the same tooling and patterns as production. **Mock tests must use the same commands, bundles, and config format as production.** If the production container image is unavailable locally, bare execution is acceptable only when the host OS matches the container OS (both el9). Never substitute a different container or alter the worker scripts for test convenience.
 
 ## Common Commands
 
@@ -194,19 +207,25 @@ python3 dag_generator.py generate \
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # Ntuple-only with subprocess-based output naming
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
 
 ### Running tests
+
+`docs/testing.md` is the canonical procedure. In particular, record
+`myschedd show` before a pilot submission, state the configured output event
+count before submitting, verify stage-out with `xrdfs ...:1094`, download
+products under `/tmp/chiw/`, and count the ROOT `Events` entries. `cmsenv` is
+valid only from an actual CMSSW project `src` directory.
 
 ```bash
 # Static validation + smoke DAG generation (no submit)
@@ -231,13 +250,13 @@ python3 dag_generator.py generate-ntuple-only \
 ./run_local_test.sh --campaign JJP_DPS1 --jobs 2 --max-events 10 --submit --enable-ntuple
 
 # Syntax-check all shell scripts
-bash -n common/setup.sh processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
+bash -n processing/run_chain.sh lhe_generation/run_helac.sh \
+  tests/run_all_tests.sh tests/submit_tests.sh tests/submit_lhe_matrix.sh
 ```
 
 ### Local shower rebuild
 
 ```bash
-source common/setup.sh --cmssw12
 cd processing/pythia_shower && make -B all
 ```
 
@@ -254,4 +273,5 @@ condor_q
 - **Bash**: `set -e`, long-form flags (`--campaign`, `--enable-ntuple`, `--miniaod-input`). No inline bash in submit templates — use wrapper scripts.
 - **Vocabulary**: Use the canonical names: pool names like `pool_jpsi_CSCO_g`, shower modes like `phi_mpi_off`, DAG categories `lhe`/`processing`/`ntuple`, analysis types `JJP`/`JUP`.
 - **Commit messages**: Gitmoji-style with each line starting with a `:emoji_name:` token, or `feat:`/`fix:` prefixes. Keep messages imperative and specific to the workflow stage changed.
-- **Security**: Never commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Site-specific paths should be centralized in `common/setup.sh` or `dag_generator.py` constants.
+- **Security**: Never commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Storage paths are centralized in `common/node_config_defaults.json`; physics constants in `dag_generator.py`.
+- **Temporary files**: Put downloads, extracted artifacts, and scratch output under `/tmp/chiw/`. Keep submit-time bundles on AFS.

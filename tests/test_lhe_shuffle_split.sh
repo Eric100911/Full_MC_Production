@@ -8,7 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TOOL_SRC="${BASE_DIR}/lhe_generation/lhe_shuffle_split.cc"
 GEN_PY="${SCRIPT_DIR}/generate_synthetic_lhe.py"
-TMP_DIR="$(mktemp -d)"
+TMP_ROOT="/tmp/chiw"
+mkdir -p "${TMP_ROOT}"
+TMP_DIR="$(mktemp -d "${TMP_ROOT}/lhe_shuffle_split_XXXXX")"
 TOOL="${TMP_DIR}/lhe_shuffle_split"
 PASS=0
 FAIL=0
