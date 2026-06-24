@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,20 +74,52 @@ def stage_file(src: str, dst: str, is_remote: bool):
 def check_remote_file(url: str) -> bool:
     """Check if a remote file exists via xrdfs stat."""
     try:
-        subprocess.run(["xrdfs", "cceos.ihep.ac.cn", "stat", _extract_eos_path(url)],
-                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       timeout=30)
+        endpoint, remote_path = _parse_xrootd_url(url)
+        subprocess.run(
+            ["xrdfs", endpoint, "stat", remote_path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=120,
+        )
         return True
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except ValueError as exc:
+        print(f"[ERROR] Cannot verify remote file: {exc}", file=sys.stderr)
         return False
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        print(
+            f"[ERROR] xrdfs stat failed for {url}"
+            f" (exit code {exc.returncode}): {detail or 'no diagnostic output'}",
+            file=sys.stderr,
+        )
+        return False
+    except subprocess.TimeoutExpired as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        print(
+            f"[ERROR] xrdfs stat timed out after 120 seconds for {url}: "
+            f"{detail or 'no diagnostic output'}",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _parse_xrootd_url(url: str) -> tuple:
+    """Return the exact xrdfs endpoint and normalized remote path."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "root" or not parsed.netloc:
+        raise ValueError(f"Invalid XRootD URL: {url}")
+    endpoint = f"root://{parsed.netloc}/"
+    remote_path = "/" + parsed.path.lstrip("/")
+    return endpoint, remote_path
 
 
 def _extract_eos_path(url: str) -> str:
     """Extract /eos/... path from root://host//eos/... URL."""
     if url.startswith("root://"):
-        parts = url.split("//", 2)
-        if len(parts) >= 3:
-            return "/" + parts[2]
+        _, remote_path = _parse_xrootd_url(url)
+        return remote_path
     return url
 
 
@@ -94,7 +127,8 @@ def _ensure_remote_dir(url: str) -> None:
     """Best-effort mkdir for XRootD destinations."""
     if not url.startswith("root://"):
         return
-    subprocess.run(["xrdfs", "cceos.ihep.ac.cn", "mkdir", "-p", _extract_eos_path(url)],
+    endpoint, remote_path = _parse_xrootd_url(url)
+    subprocess.run(["xrdfs", endpoint, "mkdir", "-p", remote_path],
                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -308,9 +342,9 @@ def _list_existing_blocks(block_output_dir: str, prefix: str, is_remote: bool) -
     """List existing block files matching the prefix."""
     if is_remote:
         try:
-            eos_path = _extract_eos_path(block_output_dir)
+            endpoint, eos_path = _parse_xrootd_url(block_output_dir)
             result = subprocess.run(
-                ["xrdfs", "cceos.ihep.ac.cn", "ls", eos_path],
+                ["xrdfs", endpoint, "ls", eos_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 universal_newlines=True, timeout=30)
             files = [os.path.basename(line.strip()) for line in result.stdout.splitlines()
