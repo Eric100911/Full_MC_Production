@@ -467,6 +467,14 @@ python3 dag_generator.py generate \
   --output-dir generated/production --output mc_production.dag
 ```
 
+For the `JpsiJpsiPhi_MC_Production_v4` full JJP round, use the immutable v3
+LHE pools through block SubDAGs. `--jobs 1000` selects 1,000 source files per
+pool; each file is deterministically shuffled into non-overlapping 1,000-event
+blocks. Cross-subprocess block reuse is allowed, while duplicate inputs within
+`JJP_DPS1` and `JJP_TPS` consume distinct blocks. See
+[`docs/testing.md`](docs/testing.md#jpsijpsiphi-v4-production) for the verified
+command and output layout.
+
 ## Legacy test scripts
 
 `tests/test_lhe_generation.sh`, `tests/test_shower_chain.sh`, `tests/test_cmssw_chain.sh`, and `tests/test_pipeline.sh` are retained for component-level debugging. The recommended submission workflow uses `dag_generator.py` with `tests/run_all_tests.sh` or `tests/submit_tests.sh`.

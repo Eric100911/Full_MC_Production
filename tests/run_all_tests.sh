@@ -98,4 +98,10 @@ echo "[INFO] 先执行八重态 PDG 映射自检"
 echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 "${BASE_DIR}/tools/check_gensim_vtxsmeared_config.py"
 
+echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
+python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
+
+echo "[INFO] 检查 DAGMan 提交批次配置"
+python3 "${SCRIPT_DIR}/test_dagman_config.py"
+
 "${CMD[@]}"

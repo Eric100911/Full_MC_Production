@@ -223,7 +223,10 @@ Compressed local inputs are decompressed to `{WORKDIR}/input_<i>.lhe` before the
 output_subpath = ${CUSTOM_OUTPUT_SUBPATH:-output/${CAMPAIGN_NAME}/${JOB_ID}}
 ```
 
-For block SubDAG jobs, `JOB_ID` is `BLOCKxxxxxx`.
+For block SubDAG jobs, `JOB_ID` is
+`JOB<source-file-index>_BLOCK<block-index>`, with both indices zero-padded to
+six digits. Including the source-file index prevents output collisions between
+different per-file SubDAGs.
 
 ### `stage_out()` function
 

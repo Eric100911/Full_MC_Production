@@ -435,6 +435,13 @@ python3 dag_generator.py generate \
   --output-dir generated/production --output mc_production.dag
 ```
 
+`JpsiJpsiPhi_MC_Production_v4` 的完整 JJP 生产必须使用 immutable v3 LHE
+pool 和 block SubDAG。`--jobs 1000` 表示每个 pool 选择 1,000 个源 LHE
+文件；每个文件确定性 shuffle 后切成互不重叠的 1,000-event block。允许不同
+subprocess 复用 block，但 `JJP_DPS1` 与 `JJP_TPS` 内的重复输入使用不同
+block。验证命令和输出布局见
+[`docs/testing.md`](docs/testing.md#jpsijpsiphi-v4-production)。
+
 ## 旧测试脚本
 
 `tests/test_lhe_generation.sh`、`tests/test_shower_chain.sh`、`tests/test_cmssw_chain.sh` 和 `tests/test_pipeline.sh` 保留用于组件级调试。推荐的提交流程以 `dag_generator.py` 配合 `tests/run_all_tests.sh` 或 `tests/submit_tests.sh` 为准。

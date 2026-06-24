@@ -2432,8 +2432,8 @@ class DAGBuilder:
     def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
         """Discover and return an LHE file from the exact configured pool directory."""
         storage = pool_storage_name(pool_name)
-        base = existing_lhe_base_url(self.options.existing_lhe_base)
-        cache_key = f"{pool_name}::{base}"
+        explicit_base = self.options.existing_lhe_base
+        cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
         if cache_key not in self._existing_lhe_cache:
             if self.options.machine_env.uses_local_storage and self.options.local_output_base:
                 files = list_lhe_files_local(
@@ -2441,7 +2441,11 @@ class DAGBuilder:
                     existing_lhe_pool_dir(pool_name, self.options.local_output_base),
                 )
             else:
-                files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
+                files = list_lhe_files_remote(
+                    pool_name,
+                    self.options.proxy_path,
+                    explicit_base,
+                )
             self._existing_lhe_cache[cache_key] = files
         files = self._existing_lhe_cache[cache_key]
         fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
@@ -2451,8 +2455,8 @@ class DAGBuilder:
 
     def _discover_existing_lhe_files(self, pool_name: str) -> List[str]:
         """Return cached existing LHE file paths for grouping and skip-LHE planning."""
-        base = existing_lhe_base_url(self.options.existing_lhe_base)
-        cache_key = f"{pool_name}::{base}"
+        explicit_base = self.options.existing_lhe_base
+        cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
         if cache_key not in self._existing_lhe_cache:
             if self.options.machine_env.uses_local_storage and self.options.local_output_base:
                 files = list_lhe_files_local(
@@ -2460,7 +2464,11 @@ class DAGBuilder:
                     existing_lhe_pool_dir(pool_name, self.options.local_output_base),
                 )
             else:
-                files = list_lhe_files_remote(pool_name, self.options.proxy_path, base)
+                files = list_lhe_files_remote(
+                    pool_name,
+                    self.options.proxy_path,
+                    explicit_base,
+                )
             self._existing_lhe_cache[cache_key] = files
         return self._existing_lhe_cache[cache_key]
 
@@ -2915,11 +2923,19 @@ class DAGBuilder:
                     pool_name = campaign.inputs[0]
                     for job_index in range(self.options.jobs_per_campaign):
                         plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
+                        seed = self.seed_for_pool_index(pool_name, job_index)
+                        coord_job = self.add_coordinator_job(
+                            campaign_name,
+                            job_index,
+                            [(pool_name, seed)],
+                            campaign.inputs,
+                        )
+                        self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
                         subdag_name = self.add_block_subdag_node(
                             campaign_name, job_index, is_single_source=True,
                             pool_name=pool_name,
                         )
-                        self.dag_lines.append(f"PARENT {plan_job} CHILD {subdag_name}")
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
                         processing_jobs.append(subdag_name)
                 else:
                     # Multi-source: planner per unique pool → coordinator → SubDAG
@@ -2952,11 +2968,18 @@ class DAGBuilder:
                     plan_job = self.add_planning_job(pool_name, job_index, seed)
                     lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
                     self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                    coord_job = self.add_coordinator_job(
+                        campaign_name,
+                        job_index,
+                        [(pool_name, seed)],
+                        campaign.inputs,
+                    )
+                    self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
                     subdag_name = self.add_block_subdag_node(
                         campaign_name, job_index, is_single_source=True,
                         pool_name=pool_name,
                     )
-                    self.dag_lines.append(f"PARENT {plan_job} CHILD {subdag_name}")
+                    self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
                     processing_jobs.append(subdag_name)
 
             elif use_block_subdags and campaign.n_sources >= 2:
@@ -3136,8 +3159,8 @@ def render_dagman_config(options: WorkflowOptions) -> str:
     if options.dagman_max_jobs_submitted > 0 or options.dagman_max_jobs_idle > 0:
         lines.extend(
             (
-                "DAGMAN_MAX_SUBMITS_PER_INTERVAL = 20",
-                "DAGMAN_SUBMIT_DELAY = 1",
+                "DAGMAN_MAX_SUBMITS_PER_INTERVAL = 100",
+                "DAGMAN_SUBMIT_DELAY = 0",
             )
         )
     lines.extend(
@@ -3607,9 +3630,17 @@ def execute_generation(
     pool_requirements = compute_pool_requirements(campaign_names, options.jobs_per_campaign)
     if options.skip_lhe_generation:
         # Short-circuit: mark all pools as "existing" so ensure_lhe_jobs()
-        # is a no-op. Planners will be fed existing file paths directly.
+        # is a no-op. In block mode, planners are shared across campaigns and
+        # duplicate campaign inputs consume distinct blocks from one manifest,
+        # so each pool needs one source file per top-level job index rather
+        # than the aggregate flat-DAG occurrence count.
         existing_pools = OrderedDict()
         for pool_name, required_count in pool_requirements.items():
+            source_file_requirement = (
+                options.jobs_per_campaign
+                if options.enable_lhe_block_subdags
+                else required_count
+            )
             count = 0
             error = None
             if options.scan_existing:
@@ -3622,9 +3653,11 @@ def execute_generation(
                         options.existing_lhe_base,
                     )
             existing_pools[pool_name] = {
-                "required_count": required_count,
+                "required_count": source_file_requirement,
                 "remote_count": count,
-                "use_existing": error is None and (count >= required_count or not options.scan_existing),
+                "use_existing": error is None and (
+                    count >= source_file_requirement or not options.scan_existing
+                ),
                 "error": error,
                 "remote_path": pool_remote_path(pool_name, local_output_base, options.existing_lhe_base),
             }

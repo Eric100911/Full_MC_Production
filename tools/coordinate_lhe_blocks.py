@@ -260,7 +260,10 @@ def main() -> int:
             modes = [mode.strip() for mode in args.shower_modes.split(",") if mode.strip()]
 
             node_name = f"MIX_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
-            block_job_id = f"BLOCK{i:06d}"
+            block_job_id = f"JOB{args.job_index:06d}_BLOCK{i:06d}"
+            processing_enable_ntuple = (
+                args.enable_ntuple and not args.ntuple_sub_template_path
+            )
             processing_config = {
                 "inputs": input_parts,
                 "modes": modes,
@@ -268,7 +271,7 @@ def main() -> int:
                 "campaign": args.campaign,
                 "job_id": block_job_id,
                 "max_events": args.max_events,
-                "enable_ntuple": args.enable_ntuple,
+                "enable_ntuple": processing_enable_ntuple,
                 "efficiency_ntuple": args.efficiency_ntuple,
                 "cleanup": args.cleanup,
                 "shuffle_mixing": args.shuffle_mixing,

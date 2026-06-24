@@ -36,6 +36,7 @@ bash -n \
   tests/mock_test_worker.sh \
   tests/test_lhe_shuffle_split.sh
 python3 -m py_compile dag_generator.py tools/compile_node_config.py
+python3 tests/test_coordinate_lhe_blocks.py
 ./tests/run_all_tests.sh
 ./tests/mock_test_worker.sh
 ./tests/test_lhe_shuffle_split.sh
@@ -171,3 +172,78 @@ until their logs and metadata are no longer needed.
 The scripts `tests/test_lhe_generation.sh`, `tests/test_shower_chain.sh`,
 `tests/test_cmssw_chain.sh`, and `tests/test_pipeline.sh` are retained for
 component debugging. They are not the primary acceptance workflow.
+
+## JpsiJpsiPhi v4 Production
+
+Full JJP production from the immutable v3 LHE pools must use block SubDAGs:
+
+```bash
+--campaign JJP_ALL
+--jobs 1000
+--enable-lhe-block-subdags
+--skip-lhe-generation
+--scan-existing
+--lhe-events-per-block 1000
+--lhe-shuffle-mode stratified
+```
+
+Here `--jobs 1000` means 1,000 source LHE files per required pool, not 1,000
+output files. Planner nodes deterministically shuffle each file and split it
+into non-overlapping blocks. Planner results may be reused by different
+subprocesses. Within one subprocess, repeated inputs such as the two
+`pool_jpsi_CSCO_g` occurrences in `JJP_DPS1` and `JJP_TPS` consume distinct
+block indices. Strict-min determines the number of mixed output blocks.
+
+Each output ID includes both the source-file index and block index:
+`JOBxxxxxx_BLOCKxxxxxx`. This prevents different planner groups from
+overwriting one another.
+
+The v4 target base is:
+
+```text
+root://cceos.ihep.ac.cn:1094//store/user/chiw/JpsiJpsiPhi_MC_Production_v4
+```
+
+MiniAOD and ntuple files are written under:
+
+```text
+JpsiJpsiPhi_MC_Production_v4/output/<campaign>/JOBxxxxxx_BLOCKxxxxxx/
+```
+
+`JJP_ALL` includes `JJP_TPS`. TPS uses two distinct J/psi blocks plus one gg
+block for every mixed output block.
+
+Generate the full v4 DAG with:
+
+```bash
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_ALL \
+  --jobs 1000 \
+  --max-events -1 \
+  --enable-lhe-block-subdags \
+  --skip-lhe-generation \
+  --scan-existing \
+  --lhe-events-per-block 1000 \
+  --lhe-shuffle-mode stratified \
+  --enable-ntuple \
+  --cleanup \
+  --cmssw15-runtime-tarball \
+    common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz \
+  --target-base-url \
+    root://cceos.ihep.ac.cn:1094//store/user/chiw/JpsiJpsiPhi_MC_Production_v4 \
+  --dagman-max-jobs-submitted 20000 \
+  --dagman-max-jobs-idle 20000 \
+  --maxjobs-lhe 20000 \
+  --maxjobs-processing 20000 \
+  --maxjobs-ntuple 20000 \
+  --max-block-subdag-jobs 20000 \
+  --output-dir generated/JpsiJpsiPhi_MC_Production_v4 \
+  --output JpsiJpsiPhi_MC_Production_v4.dag
+```
+
+The validated top-level shape is 4,000 shared planner nodes, 6,000
+coordinator nodes, 6,000 block SubDAGs, and zero HELAC-generation nodes. Record
+`myschedd show` immediately before `condor_submit_dag`. The `20000` ceilings
+are deliberately above the expected workflow width and serve as non-binding
+safety bounds rather than production throttles.
