@@ -44,7 +44,7 @@ from dag_generator import (  # noqa: E402
 
 SOURCE_LHE_POOLS_BASE = f"{EOS_LFN_BASE}/lhe_pools"
 TARGET_LHE_POOL_BASE = f"{EOS_LFN_BASE}/LHE_pool"
-SOURCE_URL_PREFIX = f"root://{EOS_REDIRECTOR}/{EOS_LFN_BASE}/lhe_pools"
+SOURCE_URL_PREFIX = f"root://{EOS_REDIRECTOR}//{EOS_LFN_BASE}/lhe_pools"
 
 
 def _run_xrdfs(*args: str) -> str:

@@ -60,7 +60,7 @@ TPS_ONIA2MUMU_SUBMODULE = os.path.join(BASE_DIR, "external", "TPS-Onia2MuMu")
 
 EOS_REDIRECTOR = str(STORAGE_CONFIG_DEFAULTS.get("eos_redirector", "cceos.ihep.ac.cn"))
 EOS_LFN_BASE = str(STORAGE_CONFIG_DEFAULTS.get("eos_lfn_base", "/store/user/chiw/MC_Production_v3"))
-EOS_BASE = f"root://{EOS_REDIRECTOR}/{EOS_LFN_BASE}"
+EOS_BASE = f"root://{EOS_REDIRECTOR}///{EOS_LFN_BASE.lstrip('/')}"
 EOS_HOST = EOS_REDIRECTOR
 EOS_XRDFS_TARGET = EOS_HOST
 EOS_PATH_BASE = EOS_LFN_BASE
@@ -298,6 +298,17 @@ COORDINATE_SUBMIT_TEMPLATE = "processing/templates/coordinate_lhe_blocks.sub"
 COORDINATE_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_coordinate_lhe_blocks.sh"
 )
+MINIAOD_MERGE_SUBMIT_TEMPLATE = "processing/templates/miniaod_merge.sub"
+MINIAOD_MERGE_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_miniaod_merge.sh"
+)
+MINIAOD_MERGE_WRAPPER_NAME = "run_miniaod_merge.sh"
+SUBDAG_FINAL_SUBMIT_TEMPLATE = "processing/templates/subdag_final.sub"
+SUBDAG_FINAL_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_subdag_final_inventory.sh"
+)
+SUBDAG_FINAL_WRAPPER_NAME = "run_subdag_final_inventory.sh"
+SUBDAG_LOG_ARCHIVE_SCRIPT = os.path.join(BASE_DIR, "tools", "archive_subdag_logs.sh")
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -517,6 +528,10 @@ class WorkflowOptions:
         lhe_group_min_events: int = 0,
         lhe_group_max_events: int = 0,
         lhe_group_max_files: int = 20,
+        miniaod_merge_events: int = 5000,
+        miniaod_merge_validation: str = "event-count",
+        maxjobs_miniaod_merge: int = 0,
+        archive_subdag_logs: bool = True,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -546,6 +561,10 @@ class WorkflowOptions:
         self.lhe_group_min_events = lhe_group_min_events
         self.lhe_group_max_events = lhe_group_max_events
         self.lhe_group_max_files = lhe_group_max_files
+        self.miniaod_merge_events = miniaod_merge_events
+        self.miniaod_merge_validation = miniaod_merge_validation
+        self.maxjobs_miniaod_merge = maxjobs_miniaod_merge if maxjobs_miniaod_merge > 0 else maxjobs_ntuple
+        self.archive_subdag_logs = archive_subdag_logs
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -610,6 +629,10 @@ class WorkflowOptions:
             "lhe_group_min_events": self.lhe_group_min_events,
             "lhe_group_max_events": self.lhe_group_max_events,
             "lhe_group_max_files": self.lhe_group_max_files,
+            "miniaod_merge_events": self.miniaod_merge_events,
+            "miniaod_merge_validation": self.miniaod_merge_validation,
+            "maxjobs_miniaod_merge": self.maxjobs_miniaod_merge,
+            "archive_subdag_logs": self.archive_subdag_logs,
         }
 
 
@@ -1183,7 +1206,7 @@ def _list_remote_dir(
             return [], f"xrdfs ls returned {result.returncode}: {stderr or eos_path}"
         url = eos_path
         if eos_path.startswith("/"):
-            url = f"root://{EOS_HOST}/{eos_path}"
+            url = f"root://{EOS_HOST}//{eos_path}"
         try:
             fallback = subprocess.run(
                 ["gfal-ls", url],
@@ -1220,7 +1243,8 @@ def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: st
     for line in entries:
         fname = line.rsplit("/", 1)[-1] if "/" in line else line
         if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
-            files.append(f"root://{host}/{line.strip()}")
+            remote_path = "/" + line.strip().lstrip("/")
+            files.append(f"root://{host}//{remote_path}")
     return sorted(files)
 
 
@@ -1414,7 +1438,7 @@ def display_remote_target(target: str) -> str:
     if target.startswith("/eos/"):
         return f"root://eosuser.cern.ch/{target}"
     if target.startswith("/store/"):
-        return f"root://{EOS_HOST}/{target}"
+        return f"root://{EOS_HOST}//{target}"
     return f"{EOS_BASE}/{target.strip('/')}"
 
 
@@ -2097,6 +2121,12 @@ class DAGBuilder:
         write_json_file(config_path, payload)
         return config_path, os.path.basename(config_path)
 
+    def log_directory(self, *parts: object) -> str:
+        """Return and create one deterministic leaf directory for Condor logs."""
+        path = os.path.join(self.options.log_root, *(str(part) for part in parts))
+        ensure_dir(path)
+        return path
+
     def seed_for_pool_index(self, pool_name: str, index: int) -> int:
         pool = LHE_POOLS[pool_name]
         seed = 100 + pool.seed_offset + index
@@ -2170,6 +2200,9 @@ class DAGBuilder:
                 f"{job_name}.json",
                 lhe_config,
             )
+            log_root = self.log_directory(
+                "_shared", "lhe_generation", pool.name, f"seed_{seed}"
+            )
             jobs.append(job_name)
             specs.append(f"GEN:{pool_name}:{index}:{seed}")
             self.dag_lines.append(
@@ -2202,7 +2235,7 @@ class DAGBuilder:
                         os.path.join(BASE_DIR, "lhe_generation", "condor_wrappers", "run_lhe_gen.sh")
                     ),
                     target_machine=dag_escape(self.options.machine_env.target_machine),
-                    log_root=dag_escape(self.options.log_root),
+                    log_root=dag_escape(log_root),
                 )
             )
             self.dag_lines.append(f"RETRY {job_name} 2")
@@ -2259,6 +2292,9 @@ class DAGBuilder:
             f"{job_name}.json",
             processing_config,
         )
+        log_root = self.log_directory(
+            campaign.name, "processing", f"job_{job_index:06d}"
+        )
         self.dag_lines.append(
             f"JOB {job_name} {os.path.join(BASE_DIR, self.options.machine_env.processing_submit_template)}"
         )
@@ -2282,7 +2318,7 @@ class DAGBuilder:
                 processing_bundle_name=dag_escape(self.runtime_assets["processing_bundle_name"]),
                 proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
-                log_root=dag_escape(self.options.log_root),
+                log_root=dag_escape(log_root),
                 processing_wrapper_path=dag_escape(
                     os.path.join(BASE_DIR, "processing", "condor_wrappers", "run_processing.sh")
                 ),
@@ -2334,6 +2370,9 @@ class DAGBuilder:
             f"{job_name}.json",
             ntuple_config,
         )
+        log_root = self.log_directory(
+            campaign.name, "ntuple", f"job_{job_index:06d}"
+        )
         self.dag_lines.append(f"JOB {job_name} {os.path.join(BASE_DIR, 'processing/templates/ntuple.sub')}")
         self.dag_lines.append(f"CATEGORY {job_name} ntuple")
         self.dag_lines.append(
@@ -2356,7 +2395,7 @@ class DAGBuilder:
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                 ntuple_wrapper_path=dag_escape(NTUPLE_WRAPPER_PATH),
                 ntuple_wrapper_name=dag_escape(NTUPLE_WRAPPER_NAME),
-                log_root=dag_escape(self.options.log_root),
+                log_root=dag_escape(log_root),
                 config_path=dag_escape(config_path),
                 config_name=dag_escape(config_name),
             )
@@ -2617,6 +2656,9 @@ class DAGBuilder:
             f"{job_name}.json",
             plan_config,
         )
+        log_root = self.log_directory(
+            "_shared", "lhe_planning", pool_name, f"group_{group_id}"
+        )
 
         self.dag_lines.append(
             f"JOB {job_name} {os.path.join(BASE_DIR, PLAN_SUBMIT_TEMPLATE)}"
@@ -2640,7 +2682,7 @@ class DAGBuilder:
                 group_id=dag_escape(group_id),
                 config_path=dag_escape(config_path),
                 config_name=dag_escape(config_name),
-                log_root=dag_escape(self.options.log_root),
+                log_root=dag_escape(log_root),
             )
         )
         self.dag_lines.append(f"RETRY {job_name} 2")
@@ -2741,6 +2783,13 @@ class DAGBuilder:
             "ntuple_bundle_path": ntuple_bundle_path,
             "ntuple_bundle_name": ntuple_bundle_name,
             "ntuple_wrapper_path": ntuple_wrapper_path,
+            "miniaod_merge_events": self.options.miniaod_merge_events,
+            "miniaod_merge_validation": self.options.miniaod_merge_validation,
+            "max_miniaod_merge_jobs": self.options.maxjobs_miniaod_merge,
+            "miniaod_merge_sub_template_path": os.path.join(BASE_DIR, MINIAOD_MERGE_SUBMIT_TEMPLATE),
+            "miniaod_merge_wrapper_path": MINIAOD_MERGE_WRAPPER_PATH,
+            "final_sub_template_path": os.path.join(BASE_DIR, SUBDAG_FINAL_SUBMIT_TEMPLATE),
+            "final_wrapper_path": SUBDAG_FINAL_WRAPPER_PATH,
             "subdag_output_path": subdag_output_path,
             "max_block_subdag_jobs": self.options.max_block_subdag_jobs,
             "local_output_base": self.options.local_output_base,
@@ -2751,6 +2800,9 @@ class DAGBuilder:
             "coordination",
             f"{job_name}.json",
             coord_config,
+        )
+        log_root = self.log_directory(
+            campaign_name, "lhe_coordination", f"job_{job_index:06d}"
         )
 
         self.dag_lines.append(
@@ -2776,7 +2828,7 @@ class DAGBuilder:
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                 campaign=dag_escape(campaign_name),
                 job_index=dag_escape(job_index),
-                log_root=dag_escape(self.options.log_root),
+                log_root=dag_escape(log_root),
                 request_cpus=dag_escape(request_cpus),
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
@@ -2812,6 +2864,19 @@ class DAGBuilder:
         self.dag_lines.append(
             f"SUBDAG EXTERNAL {subdag_name} {subdag_path}"
         )
+        if self.options.archive_subdag_logs:
+            self.dag_lines.append(
+                "SCRIPT POST {node} {script} "
+                "--campaign {campaign} --job-index {job_index} "
+                "--log-root {log_root} --target-eos-base {target}".format(
+                    node=subdag_name,
+                    script=dag_escape(SUBDAG_LOG_ARCHIVE_SCRIPT),
+                    campaign=dag_escape(campaign_name),
+                    job_index=dag_escape(job_index),
+                    log_root=dag_escape(self.options.log_root),
+                    target=dag_escape(self.options.target_base_url or EOS_BASE),
+                )
+            )
         return subdag_name
 
     def build(self, campaign_names: Sequence[str], dag_filename: str) -> str:
@@ -2839,6 +2904,8 @@ class DAGBuilder:
         if self.options.enable_lhe_block_subdags:
             self.dag_lines.append(f"MAXJOBS lhe_planning {self.options.maxjobs_lhe}")
             self.dag_lines.append(f"MAXJOBS lhe_coordination {self.options.maxjobs_lhe}")
+            if self.options.maxjobs_miniaod_merge > 0:
+                self.dag_lines.append(f"MAXJOBS miniaod_merge {self.options.maxjobs_miniaod_merge}")
         self.dag_lines.append("")
 
         if (
@@ -3018,6 +3085,7 @@ class DAGBuilder:
             self.dag_lines.append("")
 
         if processing_jobs:
+            summary_log_root = self.log_directory("_shared", "summary")
             self.dag_lines.append("# -------- 汇总节点 --------")
             self.dag_lines.append(f"FINAL SUMMARY {os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}")
             self.dag_lines.append(
@@ -3027,7 +3095,7 @@ class DAGBuilder:
                     summary_bundle_path=dag_escape(self.runtime_assets["summary_bundle_path"]),
                     summary_bundle_name=dag_escape(self.runtime_assets["summary_bundle_name"]),
                     log_dir=dag_escape(self.options.local_log_dir),
-                    log_root=dag_escape(self.options.log_root),
+                    log_root=dag_escape(summary_log_root),
                 )
             )
 
@@ -4156,6 +4224,37 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="block SubDAG 内部 MAXJOBS block_processing 节流值；默认与 --maxjobs-processing 相同。",
     )
     parser.add_argument(
+        "--miniaod-merge-events",
+        type=int,
+        default=5000,
+        help="block SubDAG 中每个 merged MiniAOD 的目标事件数；0 表示关闭 merge 并保留 per-block ntuple。",
+    )
+    parser.add_argument(
+        "--miniaod-merge-validation",
+        choices=("none", "event-count"),
+        default="event-count",
+        help="MiniAOD merge 后的轻量验证级别，默认 event-count。",
+    )
+    parser.add_argument(
+        "--maxjobs-miniaod-merge",
+        type=int,
+        default=0,
+        help="DAGMan miniaod_merge category throttle；默认与 --maxjobs-ntuple 相同。",
+    )
+    parser.add_argument(
+        "--archive-subdag-logs",
+        dest="archive_subdag_logs",
+        action="store_true",
+        default=True,
+        help="为 block SubDAG 添加 submit-side 日志归档 SCRIPT POST。",
+    )
+    parser.add_argument(
+        "--no-archive-subdag-logs",
+        dest="archive_subdag_logs",
+        action="store_false",
+        help="不为 block SubDAG 添加日志归档 SCRIPT POST。",
+    )
+    parser.add_argument(
         "--skip-lhe-generation",
         action="store_true",
         default=False,
@@ -4527,7 +4626,7 @@ def build_parser() -> argparse.ArgumentParser:
     ntuple_only_parser.add_argument(
         "--miniaod-base-url",
         default="",
-        help="远端 MiniAOD URL 基础 (e.g. root://cceos.ihep.ac.cn//eos/.../output)，与 --jobs 配合使用。",
+        help="远端 MiniAOD URL 基础 (e.g. root://cceos.ihep.ac.cn:1094///store/.../output)，与 --jobs 配合使用。",
     )
     ntuple_only_parser.add_argument(
         "--miniaod-filename",
@@ -4762,6 +4861,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             keep_legacy_single_processing_path=args.keep_legacy_single_processing_path,
             lhe_shuffle_seed_base=args.lhe_shuffle_seed_base,
             max_block_subdag_jobs=args.max_block_subdag_jobs,
+            miniaod_merge_events=args.miniaod_merge_events,
+            miniaod_merge_validation=args.miniaod_merge_validation,
+            maxjobs_miniaod_merge=args.maxjobs_miniaod_merge,
+            archive_subdag_logs=args.archive_subdag_logs,
             skip_lhe_generation=args.skip_lhe_generation,
             existing_lhe_base=args.existing_lhe_base,
             use_subprocess_naming=args.use_subprocess_naming,

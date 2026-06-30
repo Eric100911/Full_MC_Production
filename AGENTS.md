@@ -1,67 +1,126 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
-This branch targets the `T2_CN_Beijing` workflow, not the older `master` layout. `dag_generator.py` is the main entry point for listing campaigns, validating the environment, building runtime bundles, and generating DAGs. `lhe_generation/` contains HELAC-Onia production and LHE conversion helpers. `processing/run_chain.sh` is the worker-side chain from showering through MiniAOD and, when enabled, a separate ntuple-only DAG node. Shared CMSSW configs, XRootD helpers, compression utilities (`compression_util.py`, `compression_helpers.sh`), centralized path definitions (`common/paths.sh`), and package metadata live in `common/`. The ntuple analyzer source is tracked as the `external/TPS-Onia2MuMu` submodule (v2.0) for source-package fallback, while prebuilt `cmssw15_tpsonia2mumu_runtime.tar.gz` is preferred for production ntuple runtime. Use `tests/` for smoke DAG generation and component checks.
+This branch targets the `T2_CN_Beijing` workflow. Keep this file short and
+durable; detailed procedures belong in `docs/testing.md` and path details in
+`docs/directory_path_reference.md`.
 
-## Build, Test, and Development Commands
-List workflows with `python3 dag_generator.py list --kind all`. Validate the local environment with `python3 dag_generator.py validate --campaign JJP_DPS2 --scan-existing`. Generate a smoke DAG with `python3 dag_generator.py generate-test --campaign JJP_DPS2 --output-dir tests/generated/smoke --output smoke.dag`. Use `python3 dag_generator.py prepare-runtime --output-dir <dir> --include-ntuple --cmssw15-runtime-tarball <tarball>` when preparing the ntuple bundle explicitly. Run `git submodule update --init --recursive` before ntuple source-package fallback builds; it is not required when a prebuilt CMSSW15 runtime tarball is supplied. Run the branch smoke harness with `./tests/run_all_tests.sh`; add `--submit` or `--wait` only when you intend to send jobs to HTCondor. For local shower rebuilds: `cd processing/pythia_shower && make -B all`. Compress existing LHE pools with `python3 tools/compress_existing_lhe.py --pool-dir <dir> --dry-run` (preview) and `python3 tools/compress_existing_lhe.py --pool-dir <dir> --keep --level 3` (execute). Test LHE shuffle-split with `./tests/test_lhe_shuffle_split.sh`; build inside the cmssw/el7 container with `singularity exec --bind /cvmfs:/cvmfs cmssw/el7:x86_64 bash -c "source LCG_88b/setup.sh && g++ -std=c++14 -O2 -Wall -o lhe_shuffle_split lhe_generation/lhe_shuffle_split.cc"`. Test planner with `python3 tools/plan_lhe_blocks.py --pool-name test --helac-seed 42 --lhe-path /path/to/sample.lhe --output-dir /tmp/chiw/plan_out --events-per-block 100 --shuffle-seed 42037 --block-output-dir /tmp/chiw/plan_blocks`. Test coordinator with `python3 tools/coordinate_lhe_blocks.py --campaign JJP_DPS2_CS --job-index 0 --source-manifests '[{...}]' --shower-modes "normal,phi_mpi_off" --analysis-type JJP --n-sources 2 --output-dir /tmp/chiw/coord_out --subdag-output-path /tmp/chiw/coord_out/blocks_processing.dag --processing-sub-template-path processing/templates/processing.sub`. Follow `docs/testing.md` for pilot submission, schedd tracking, output download, event-count verification, and cleanup.
+## Project Map
 
-## Planning Guidelines
-When asked to plan a code change, read the relevant implementation carefully before proposing a plan. Plans should be comprehensive enough for another engineer or agent to implement directly, and should include relevant code snippets for non-obvious algorithms, interfaces, or command changes.
+- `dag_generator.py` is the main entry point for listing campaigns, validating
+  environment, preparing runtime bundles, and generating DAGs.
+- `processing/run_chain.sh` is the worker-side chain from showering through
+  MiniAOD; ntuple is usually a separate DAG node.
+- `tools/plan_lhe_blocks.py` and `tools/coordinate_lhe_blocks.py` implement the
+  LHE block planner/coordinator and generated block SubDAGs.
+- Shared storage paths and processing defaults live in
+  `common/node_config_defaults.json`.
+- Campaign CMSSW configs live under `common/cmssw_configs/`.
+- The upstream ntuple analyzer is the `external/TPS-Onia2MuMu` submodule; use
+  the prebuilt `common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz` when
+  available.
 
-## Coding Style & Naming Conventions
-Keep Python PEP 8 compliant: 4-space indentation, `snake_case`, and uppercase constants for site paths and fixed workflow settings. Bash scripts are written for `bash` with `set -e` and long-form flags such as `--campaign`, `--enable-ntuple`, `--force-generate-lhe`, `--miniaod-input`, and `--transfer-miniaod`. Preserve the current naming vocabulary: pool names like `pool_jpsi_CSCO_g`, shower modes like `phi_mpi_off`, DAG categories `lhe`/`processing`/`ntuple`, and analysis types `JJP`/`JUP`. Use `.lhe.gz` for compressed LHE files and `.hepmc.gz` for compressed HepMC files; always check both compressed and uncompressed extensions when discovering input files. LHE shuffle-split output blocks use `block_NNNNNN.lhe` (6-digit zero-padded) with a `shuffle_split_manifest.json` manifest. Block SubDAG blocks use `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed disambiguation. Processing nodes consume blocks via the `BLOCK:<pool>:<seed>:<idx>` input spec format. New DAG categories: `lhe_planning`, `lhe_coordination`, `block_processing`.
+## Development Commands
 
-## Testing Guidelines
-Default smoke validation on this branch stops at MiniAOD unless `--enable-ntuple` is set. For code changes, run `bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh` and one `generate-test --dry-run`. If you touch DAG staging, verify the dry-run emits `CATEGORY` and `MAXJOBS` lines for `lhe`, `processing`, and `ntuple` where applicable. If you touch the ntuple stage, confirm `prepare-runtime --include-ntuple` either packages the prebuilt CMSSW15 runtime or emits `tpsonia2mumu_code.tar.gz` from the submodule fallback, then test `--enable-ntuple` on one JJP and one JUP campaign.
+- List workflows: `python3 dag_generator.py list --kind all`
+- Static validation: `python3 dag_generator.py validate --campaign JJP_DPS1 --scan-existing`
+- Smoke DAG: `python3 dag_generator.py generate-test --campaign JJP_DPS1 --output-dir tests/generated/smoke --output smoke.dag`
+- Runtime bundle: `python3 dag_generator.py prepare-runtime --output-dir <dir> --include-ntuple --cmssw15-runtime-tarball <tarball>`
+- Default checks: `./tests/run_all_tests.sh`
+- Local worker mock: `./tests/mock_test_worker.sh`
+- LHE splitter test: `./tests/test_lhe_shuffle_split.sh`
+
+For pilot submission, monitoring, output verification, and optional MiniAOD
+merge smoke tests, follow `docs/testing.md`.
+
+## Coding and Naming
+
+- Python: PEP 8, 4-space indentation, `snake_case`, uppercase constants for
+  fixed paths/settings.
+- Bash: `bash` with `set -euo pipefail` where practical; prefer long-form
+  flags already used by the repo.
+- Preserve existing names:
+  - pools such as `pool_jpsi_CSCO_g`;
+  - shower modes such as `phi_mpi_off`;
+  - analysis types `JJP` and `JUP`;
+  - DAG categories `lhe`, `processing`, `ntuple`, `lhe_planning`,
+    `lhe_coordination`, `block_processing`, and `miniaod_merge`.
+- Use `.lhe.gz` and `.hepmc.gz` for compressed products. Discovery code must
+  check both compressed and uncompressed LHE extensions.
+- Block processing inputs use `BLOCK:<pool>:<group_id>:<idx>`.
+- Block output IDs must include both source-job and block indices, e.g.
+  `JOB000123_BLOCK000045`, to avoid collisions.
+
+## Storage and XRootD Rules
+
+- Do not infer or probe alternate storage layouts in worker jobs. Use exact
+  configured paths from `common/node_config_defaults.json`.
+- IHEP full XRootD URLs use the explicit endpoint and triple slash before the
+  LFN:
+
+  ```text
+  root://cceos.ihep.ac.cn:1094///store/...
+  ```
+
+  Do not normalize this to `:1094//store/...` or `:1094/store/...`.
+- `xrdfs` listings may use the endpoint plus a plain path, e.g.
+  `xrdfs root://cceos.ihep.ac.cn:1094/ ls /store/...`.
+- Restricted Codex sandboxes can make `xrdfs`/`xrdcp` fail with
+  `[FATAL] Invalid address`; reproduce XRootD issues on a normal CERN/IHEP
+  shell or approved unsandboxed command with the same proxy and executable.
+- Run `cmsenv` only from a valid CMSSW project area, normally its `src`
+  directory.
+- Put scratch files under `/tmp/chiw/`. Keep generated DAG bundles on AFS or
+  another submit-visible persistent filesystem.
+
+## Testing Expectations
+
+For code changes, run at minimum:
+
+```bash
+bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
+python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py
+python3 tests/test_coordinate_lhe_blocks.py
+```
+
+Also run one `generate-test --dry-run` or generated-DAG inspection relevant to
+the changed workflow. If touching:
+
+- DAG staging/categories: verify emitted `CATEGORY` and `MAXJOBS` lines.
+- Block SubDAGs: verify planner/coordinator configs and generated dependencies.
+- MiniAOD merge: verify `processing -> miniaod_merge -> ntuple` ordering and
+  provenance manifest content.
+- Ntuple packaging: confirm `prepare-runtime --include-ntuple` uses the
+  prebuilt CMSSW15 runtime or submodule fallback.
 
 ## Production Operations
 
-- Never infer or probe storage layouts in worker jobs. Compile exact pool paths
-  into `common/node_config_defaults.json`, validate each path before submission,
-  and fail fast if the configured directory is unavailable or ambiguous.
-- Use the explicit IHEP endpoint `root://cceos.ihep.ac.cn:1094/`. Before
-  diagnosing XRootD connectivity, verify the active X509 proxy and reproduce
-  the operation with the same `xrdfs`/`xrdcp` executable and environment.
-- Run `cmsenv` only from a valid CMSSW project area, normally its `src`
-  directory. Do not treat its absence in an arbitrary checkout as a CMSSW
-  installation failure.
-- Before submitting a pilot or production DAG, state the configured event count,
-  source-file count, events per block, expected blocks per source, and
-  subprocess coverage. `--jobs` in block mode counts source LHE files, not final
-  processing jobs.
-- Block reuse across different subprocess classes is allowed. Within one
-  subprocess, repeated inputs must consume distinct non-overlapping blocks.
-  Preserve deterministic shuffling and include both source-job and block indices
-  in output IDs to prevent collisions.
-- For full JJP production, verify that `JJP_ALL` includes `JJP_TPS`. The
-  `JpsiJpsiPhi_MC_Production_v4` campaign stores MiniAOD and ntuples under
-  `/store/user/chiw/JpsiJpsiPhi_MC_Production_v4/`.
-- Treat DAGMan controls independently: `DAGMAN_MAX_JOBS_SUBMITTED` and
-  `DAGMAN_MAX_JOBS_IDLE` bound queue width,
+- Before submitting a pilot or production DAG, state event count, source-file
+  count, events per block, expected blocks per source, merge target, and
+  subprocess coverage. In block mode, `--jobs` counts source LHE files, not
+  final processing jobs.
+- For known existing-LHE pilots, prefer `--skip-lhe-generation --no-scan-existing`
+  with configured exact paths when running from environments where remote scans
+  are unreliable.
+- Repeated inputs within one subprocess must consume distinct non-overlapping
+  blocks. Deterministic shuffling must be preserved.
+- Treat DAGMan queue controls independently:
+  `DAGMAN_MAX_JOBS_SUBMITTED`/`DAGMAN_MAX_JOBS_IDLE` bound queue width,
   `DAGMAN_MAX_SUBMITS_PER_INTERVAL` controls batch size, and
-  `DAGMAN_SUBMIT_DELAY` adds delay per node. Production defaults use 100 submits
-  per interval and zero per-node delay; do not introduce hidden throttling.
-- Before removing a DAG, inspect completed nodes, active children, deterministic
-  outputs, and recovery files. Prefer rescue/recovery resubmission that preserves
-  completed work; do not use `condor_submit_dag -force` unless discarding state
-  is intentional.
-- Verify operational changes in live DAGMan and worker logs. Generated
-  configuration alone is not evidence that a running process loaded the new
-  values.
+  `DAGMAN_SUBMIT_DELAY` adds per-node delay.
+- Before removing or forcing a DAG, inspect completed nodes, active children,
+  deterministic outputs, and rescue files. Prefer rescue/recovery resubmission.
+- Verify operational changes in live DAGMan and worker logs; generated configs
+  alone are not proof that a running process loaded the new values.
 
-## Commit & Pull Request Guidelines
-The history mixes brief descriptive subjects with `feat:`/`fix:` prefixes; gitmoji-style subjects are also acceptable when every commit-message line starts with a `:emoji_name:` token. Keep commit messages imperative and specific to the workflow stage you changed. PRs should state whether the change affects DAG generation, worker runtime, storage interaction, or ntuple packaging, and include the validation commands used. When changing remote paths, package contracts, log roots, DAG categories, or analysis modes, include representative log excerpts or generated DAG metadata.
+## Config and Security
 
-## Config Management
-
-- The canonical ntuple config is the upstream `ConfFile_cfg.py` in the
-  `external/TPS-Onia2MuMu` submodule. Do not add campaign-specific logic there.
-- Campaign adaptations (GT, defaults) live in `common/cmssw_configs/ntuple_jjp_cfg.py`.
-- When proposing config changes, diff against the upstream reference first to
-  confirm the change belongs in the campaign layer.
-- The submodule tag defines the ntuple format contract with downstream consumers
-  (NtupleAnalyzer). Document format-affecting tag changes in the PR.
-
-## Security & Configuration Tips
-Do not commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Keep storage paths centralized in `common/node_config_defaults.json`; physics constants in `dag_generator.py`. Use generated `--log-root` paths instead of hardcoded submit-template logs, and document any new CVMFS, XRootD, or container requirement in the PR. Place temporary downloads, extracted artifacts, and scratch outputs under `/tmp/chiw/`; create that directory first when needed rather than writing directly under `/tmp/`.
+- Keep storage paths centralized in `common/node_config_defaults.json`.
+- Physics constants and campaign definitions live in `dag_generator.py`.
+- Do not add campaign-specific logic to the upstream
+  `external/TPS-Onia2MuMu/test/ConfFile_cfg.py`; use campaign-layer configs in
+  `common/cmssw_configs/`.
+- Do not commit proxies, tokens, Kerberos artifacts, CRAB work areas, generated
+  ROOT outputs, or temporary scratch data.
+- PRs should state whether the change affects DAG generation, worker runtime,
+  storage interaction, ntuple packaging, or output format, and include the
+  validation commands used.

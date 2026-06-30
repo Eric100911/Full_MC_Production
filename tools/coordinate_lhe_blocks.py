@@ -61,6 +61,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ntuple-bundle-path", default="")
     p.add_argument("--ntuple-bundle-name", default="")
     p.add_argument("--ntuple-wrapper-path", default="")
+    p.add_argument("--miniaod-merge-events", type=int, default=0,
+                   help="Target events per merged MiniAOD; 0 disables merge")
+    p.add_argument("--miniaod-merge-validation", default="event-count",
+                   choices=("none", "event-count"))
+    p.add_argument("--max-miniaod-merge-jobs", type=int, default=10,
+                   help="MAXJOBS miniaod_merge throttle inside the SubDAG")
+    p.add_argument("--miniaod-merge-sub-template-path", default="")
+    p.add_argument("--miniaod-merge-wrapper-path", default="")
+    p.add_argument("--final-sub-template-path", default="")
+    p.add_argument("--final-wrapper-path", default="")
     p.add_argument("--subdag-output-path", required=True,
                    help="Full path for the output blocks_processing.dag")
     p.add_argument("--max-block-subdag-jobs", type=int, default=10,
@@ -93,6 +103,38 @@ def write_json_file(path: str, payload: object) -> None:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
     os.rename(tmp, path)
+
+
+def log_directory(log_root: str, *parts: object) -> str:
+    """Return and create one deterministic leaf directory for Condor logs."""
+    path = os.path.join(log_root, *(str(part) for part in parts))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def output_base(args: argparse.Namespace, storage_config: dict) -> str:
+    return str(
+        args.target_eos_base
+        or storage_config.get("target_eos_base")
+        or storage_config.get("default_eos_base")
+        or ""
+    ).rstrip("/")
+
+
+def block_job_id(job_index: int, block_index: int) -> str:
+    return f"JOB{job_index:06d}_BLOCK{block_index:06d}"
+
+
+def merge_job_id(job_index: int, merge_index: int) -> str:
+    return f"JOB{job_index:06d}_MERGE{merge_index:06d}"
+
+
+def miniaod_url(base: str, campaign: str, job_id: str) -> str:
+    return f"{base}/output/{campaign}/{job_id}/output_MINIAOD.root"
+
+
+def ntuple_url(base: str, campaign: str, job_id: str) -> str:
+    return f"{base}/output/{campaign}/{job_id}/output_ntuple.root"
 
 
 def main() -> int:
@@ -206,6 +248,7 @@ def main() -> int:
             occurrence_seen[pool_name] += 1
             source = pool_lookup[pool_name]
             source_block_index = block_index * input_multiplicity[pool_name] + occurrence
+            block = source["blocks"][source_block_index]
             inputs.append({
                 "pool": pool_name,
                 "group_id": source["group_id"],
@@ -213,11 +256,26 @@ def main() -> int:
                 "seeds": source["seeds"],
                 "block_index": source_block_index,
                 "occurrence": occurrence,
+                "n_events": int(block.get("n_events", 0) or 0),
+                "path": block.get("path", ""),
             })
         return inputs
 
+    def mixed_block_event_count(block_index: int) -> int:
+        counts = [
+            int(item.get("n_events", 0) or 0)
+            for item in mixed_block_inputs(block_index)
+            if int(item.get("n_events", 0) or 0) > 0
+        ]
+        return min(counts) if counts else 0
+
     # --- 4. Generate SubDAG ---
     os.makedirs(os.path.dirname(args.subdag_output_path), exist_ok=True)
+    merge_enabled = (
+        args.enable_ntuple
+        and bool(args.ntuple_sub_template_path)
+        and args.miniaod_merge_events > 0
+    )
     if args.enable_ntuple and args.ntuple_sub_template_path:
         ntuple_target_base = (
             args.target_eos_base
@@ -230,12 +288,83 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    if merge_enabled and (
+        not args.miniaod_merge_sub_template_path
+        or not args.miniaod_merge_wrapper_path
+    ):
+        print("[ERROR] MiniAOD merge mode requires merge submit template and wrapper paths", file=sys.stderr)
+        return 1
+    if not args.final_sub_template_path or not args.final_wrapper_path:
+        print("[ERROR] Final inventory requires final submit template and wrapper paths", file=sys.stderr)
+        return 1
+
+    target_base = output_base(args, storage_config)
     node_config_dir = os.path.join(args.output_dir, "node_configs")
     processing_config_dir = os.path.join(node_config_dir, "processing")
+    merge_config_dir = os.path.join(node_config_dir, "miniaod_merge")
     ntuple_config_dir = os.path.join(node_config_dir, "ntuple")
+    final_config_dir = os.path.join(node_config_dir, "final")
     os.makedirs(processing_config_dir, exist_ok=True)
+    os.makedirs(final_config_dir, exist_ok=True)
+    if merge_enabled:
+        os.makedirs(merge_config_dir, exist_ok=True)
     if args.enable_ntuple and args.ntuple_sub_template_path:
         os.makedirs(ntuple_config_dir, exist_ok=True)
+
+    block_records = []
+    for i in range(n_mixed):
+        jid = block_job_id(args.job_index, i)
+        block_records.append({
+            "block_index": i,
+            "job_id": jid,
+            "expected_events": mixed_block_event_count(i),
+            "inputs": mixed_block_inputs(i),
+            "miniaod_url": miniaod_url(target_base, args.campaign, jid),
+        })
+
+    merge_groups = []
+    if merge_enabled:
+        current = []
+        current_events = 0
+        for record in block_records:
+            if current and current_events >= args.miniaod_merge_events:
+                merge_groups.append(current)
+                current = []
+                current_events = 0
+            current.append(record)
+            current_events += int(record.get("expected_events", 0) or 0)
+        if current:
+            merge_groups.append(current)
+    merge_records = []
+    ntuple_records = []
+    if merge_enabled:
+        for merge_index, components in enumerate(merge_groups):
+            jid = merge_job_id(args.job_index, merge_index)
+            merged_url = miniaod_url(target_base, args.campaign, jid)
+            merge_records.append({
+                "merge_index": merge_index,
+                "job_id": jid,
+                "expected_events": sum(int(item.get("expected_events", 0) or 0) for item in components),
+                "component_block_ids": [item["job_id"] for item in components],
+                "components": components,
+                "merged_miniaod_url": merged_url,
+            })
+            ntuple_records.append({
+                "merge_index": merge_index,
+                "job_id": jid,
+                "miniaod_input": merged_url,
+                "ntuple_url": ntuple_url(target_base, args.campaign, jid),
+            })
+    elif args.enable_ntuple and args.ntuple_sub_template_path:
+        ntuple_records = [
+            {
+                "block_index": record["block_index"],
+                "job_id": record["job_id"],
+                "miniaod_input": record["miniaod_url"],
+                "ntuple_url": ntuple_url(target_base, args.campaign, record["job_id"]),
+            }
+            for record in block_records
+        ]
     dag_tmp = args.subdag_output_path + ".tmp"
 
     with open(dag_tmp, "w") as dag:
@@ -249,6 +378,8 @@ def main() -> int:
         dag.write("# ================================================\n")
         dag.write("\n")
         dag.write(f"MAXJOBS block_processing {args.max_block_subdag_jobs}\n")
+        if merge_enabled:
+            dag.write(f"MAXJOBS miniaod_merge {args.max_miniaod_merge_jobs}\n")
         dag.write("\n")
 
         for i in range(n_mixed):
@@ -260,7 +391,7 @@ def main() -> int:
             modes = [mode.strip() for mode in args.shower_modes.split(",") if mode.strip()]
 
             node_name = f"MIX_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
-            block_job_id = f"JOB{args.job_index:06d}_BLOCK{i:06d}"
+            block_job_id_value = block_job_id(args.job_index, i)
             processing_enable_ntuple = (
                 args.enable_ntuple and not args.ntuple_sub_template_path
             )
@@ -269,7 +400,7 @@ def main() -> int:
                 "modes": modes,
                 "analysis": args.analysis_type,
                 "campaign": args.campaign,
-                "job_id": block_job_id,
+                "job_id": block_job_id_value,
                 "max_events": args.max_events,
                 "enable_ntuple": processing_enable_ntuple,
                 "efficiency_ntuple": args.efficiency_ntuple,
@@ -283,6 +414,14 @@ def main() -> int:
             processing_config_name = f"{node_name}.json"
             processing_config_path = os.path.join(processing_config_dir, processing_config_name)
             write_json_file(processing_config_path, processing_config)
+            block_log_component = f"block_{i:06d}"
+            processing_log_root = log_directory(
+                args.log_root,
+                args.campaign,
+                "processing",
+                f"job_{args.job_index:06d}",
+                block_log_component,
+            )
 
             dag.write(f"JOB {node_name} {args.processing_sub_template_path}\n")
             dag.write(f"CATEGORY {node_name} block_processing\n")
@@ -290,7 +429,7 @@ def main() -> int:
             vars_line = (
                 f'VARS {node_name} '
                 f'campaign="{dag_escape(args.campaign)}" '
-                f'job_id="{dag_escape(block_job_id)}" '
+                f'job_id="{dag_escape(block_job_id_value)}" '
                 f'request_cpus="{dag_escape(args.request_cpus)}" '
                 f'request_memory="{dag_escape(args.request_memory)}" '
                 f'request_disk="{dag_escape(args.request_disk)}" '
@@ -299,7 +438,7 @@ def main() -> int:
                 f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
                 f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
                 f'processing_wrapper_path="{dag_escape(args.processing_wrapper_path)}" '
-                f'log_root="{dag_escape(args.log_root)}" '
+                f'log_root="{dag_escape(processing_log_root)}" '
                 f'target_machine="{dag_escape(args.target_machine)}" '
                 f'config_path="{dag_escape(processing_config_path)}" '
                 f'config_name="{dag_escape(processing_config_name)}"'
@@ -308,18 +447,13 @@ def main() -> int:
             dag.write(f"RETRY {node_name} 1\n")
 
             # Ntuple node (if enabled)
-            if args.enable_ntuple and args.ntuple_sub_template_path:
+            if args.enable_ntuple and args.ntuple_sub_template_path and not merge_enabled:
                 ntuple_name = f"NTUPLE_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
-                target_base = (
-                    args.target_eos_base
-                    or storage_config.get("target_eos_base")
-                    or storage_config.get("default_eos_base")
-                )
-                miniaod_input = f"{str(target_base).rstrip('/')}/output/{args.campaign}/{block_job_id}/output_MINIAOD.root"
+                miniaod_input = miniaod_url(target_base, args.campaign, block_job_id_value)
                 ntuple_config = {
                     "analysis": args.analysis_type,
                     "campaign": args.campaign,
-                    "job_id": block_job_id,
+                    "job_id": block_job_id_value,
                     "max_events": args.max_events,
                     "efficiency_ntuple": args.efficiency_ntuple,
                     "cleanup": args.cleanup,
@@ -333,12 +467,19 @@ def main() -> int:
                 ntuple_config_name = f"{ntuple_name}.json"
                 ntuple_config_path = os.path.join(ntuple_config_dir, ntuple_config_name)
                 write_json_file(ntuple_config_path, ntuple_config)
+                ntuple_log_root = log_directory(
+                    args.log_root,
+                    args.campaign,
+                    "ntuple",
+                    f"job_{args.job_index:06d}",
+                    block_log_component,
+                )
                 dag.write(f"JOB {ntuple_name} {args.ntuple_sub_template_path}\n")
                 dag.write(f"CATEGORY {ntuple_name} ntuple\n")
                 ntuple_vars = (
                     f'VARS {ntuple_name} '
                     f'campaign="{dag_escape(args.campaign)}" '
-                    f'job_id="{dag_escape(block_job_id)}" '
+                    f'job_id="{dag_escape(block_job_id_value)}" '
                     f'request_cpus="2" request_memory="12GB" request_disk="8GB" '
                     f'ntuple_bundle_path="{dag_escape(args.ntuple_bundle_path)}" '
                     f'ntuple_bundle_name="{dag_escape(args.ntuple_bundle_name)}" '
@@ -346,7 +487,7 @@ def main() -> int:
                     f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
                     f'ntuple_wrapper_path="{dag_escape(args.ntuple_wrapper_path)}" '
                     f'ntuple_wrapper_name="{dag_escape(os.path.basename(args.ntuple_wrapper_path or "run_ntuple_only.sh"))}" '
-                    f'log_root="{dag_escape(args.log_root)}" '
+                    f'log_root="{dag_escape(ntuple_log_root)}" '
                     f'config_path="{dag_escape(ntuple_config_path)}" '
                     f'config_name="{dag_escape(ntuple_config_name)}"'
                 )
@@ -355,6 +496,144 @@ def main() -> int:
                 dag.write(f"PARENT {node_name} CHILD {ntuple_name}\n")
 
             dag.write("\n")
+
+        if merge_enabled:
+            for record in merge_records:
+                merge_index = record["merge_index"]
+                merge_name = f"MERGE_{args.campaign}_{args.job_index}_GROUP{merge_index:06d}"
+                merge_log_root = log_directory(
+                    args.log_root,
+                    args.campaign,
+                    "miniaod_merge",
+                    f"job_{args.job_index:06d}",
+                    f"group_{merge_index:06d}",
+                )
+                merge_config = {
+                    "campaign": args.campaign,
+                    "job_id": record["job_id"],
+                    "input_miniaods": [
+                        {
+                            "block_index": component["block_index"],
+                            "job_id": component["job_id"],
+                            "url": component["miniaod_url"],
+                            "expected_events": component["expected_events"],
+                            "inputs": component["inputs"],
+                        }
+                        for component in record["components"]
+                    ],
+                    "expected_events": record["expected_events"],
+                    "output_url": record["merged_miniaod_url"],
+                    "max_size": 5000000,
+                    "validation": args.miniaod_merge_validation,
+                    "storage": storage_config,
+                }
+                merge_config_name = f"{merge_name}.json"
+                merge_config_path = os.path.join(merge_config_dir, merge_config_name)
+                write_json_file(merge_config_path, merge_config)
+                dag.write(f"JOB {merge_name} {args.miniaod_merge_sub_template_path}\n")
+                dag.write(f"CATEGORY {merge_name} miniaod_merge\n")
+                dag.write(
+                    f'VARS {merge_name} '
+                    f'campaign="{dag_escape(args.campaign)}" '
+                    f'job_id="{dag_escape(record["job_id"])}" '
+                    f'request_cpus="2" request_memory="12GB" request_disk="20GB" '
+                    f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
+                    f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
+                    f'miniaod_merge_wrapper_path="{dag_escape(args.miniaod_merge_wrapper_path)}" '
+                    f'miniaod_merge_wrapper_name="{dag_escape(os.path.basename(args.miniaod_merge_wrapper_path))}" '
+                    f'log_root="{dag_escape(merge_log_root)}" '
+                    f'config_path="{dag_escape(merge_config_path)}" '
+                    f'config_name="{dag_escape(merge_config_name)}"\n'
+                )
+                dag.write(f"RETRY {merge_name} 1\n")
+                parent_nodes = " ".join(
+                    f"MIX_{args.campaign}_{args.job_index}_BLOCK{component['block_index']:06d}"
+                    for component in record["components"]
+                )
+                dag.write(f"PARENT {parent_nodes} CHILD {merge_name}\n")
+
+                ntuple_name = f"NTUPLE_{args.campaign}_{args.job_index}_MERGE{merge_index:06d}"
+                ntuple_log_root = log_directory(
+                    args.log_root,
+                    args.campaign,
+                    "ntuple",
+                    f"job_{args.job_index:06d}",
+                    f"merge_{merge_index:06d}",
+                )
+                ntuple_config = {
+                    "analysis": args.analysis_type,
+                    "campaign": args.campaign,
+                    "job_id": record["job_id"],
+                    "max_events": args.max_events,
+                    "efficiency_ntuple": args.efficiency_ntuple,
+                    "cleanup": args.cleanup,
+                    "miniaod_input": record["merged_miniaod_url"],
+                    "local_output_base": args.local_output_base,
+                    "target_eos_base": args.target_eos_base,
+                    "custom_output_subpath": "",
+                    "custom_ntuple_basename": "",
+                    "storage": storage_config,
+                }
+                ntuple_config_name = f"{ntuple_name}.json"
+                ntuple_config_path = os.path.join(ntuple_config_dir, ntuple_config_name)
+                write_json_file(ntuple_config_path, ntuple_config)
+                dag.write(f"JOB {ntuple_name} {args.ntuple_sub_template_path}\n")
+                dag.write(f"CATEGORY {ntuple_name} ntuple\n")
+                dag.write(
+                    f'VARS {ntuple_name} '
+                    f'campaign="{dag_escape(args.campaign)}" '
+                    f'job_id="{dag_escape(record["job_id"])}" '
+                    f'request_cpus="2" request_memory="12GB" request_disk="8GB" '
+                    f'ntuple_bundle_path="{dag_escape(args.ntuple_bundle_path)}" '
+                    f'ntuple_bundle_name="{dag_escape(args.ntuple_bundle_name)}" '
+                    f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
+                    f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
+                    f'ntuple_wrapper_path="{dag_escape(args.ntuple_wrapper_path)}" '
+                    f'ntuple_wrapper_name="{dag_escape(os.path.basename(args.ntuple_wrapper_path or "run_ntuple_only.sh"))}" '
+                    f'log_root="{dag_escape(ntuple_log_root)}" '
+                    f'config_path="{dag_escape(ntuple_config_path)}" '
+                    f'config_name="{dag_escape(ntuple_config_name)}"\n'
+                )
+                dag.write(f"RETRY {ntuple_name} 1\n")
+                dag.write(f"PARENT {merge_name} CHILD {ntuple_name}\n\n")
+
+        final_name = f"FINAL_{args.campaign}_{args.job_index}"
+        final_job_id = f"JOB{args.job_index:06d}_FINAL"
+        final_output_url = (
+            f"{target_base}/output/{args.campaign}/{final_job_id}/"
+            f"subdag_inventory_{args.campaign}_{args.job_index}.json"
+        )
+        final_config = {
+            "campaign": args.campaign,
+            "job_index": args.job_index,
+            "output_url": final_output_url,
+            "blocks": block_records,
+            "merge_groups": merge_records,
+            "ntuples": ntuple_records,
+        }
+        final_config_name = f"{final_name}.json"
+        final_config_path = os.path.join(final_config_dir, final_config_name)
+        write_json_file(final_config_path, final_config)
+        final_log_root = log_directory(
+            args.log_root,
+            args.campaign,
+            "final",
+            f"job_{args.job_index:06d}",
+        )
+        dag.write(f"FINAL {final_name} {args.final_sub_template_path}\n")
+        dag.write(
+            f'VARS {final_name} '
+            f'campaign="{dag_escape(args.campaign)}" '
+            f'job_id="{dag_escape(final_job_id)}" '
+            f'request_cpus="1" request_memory="2GB" request_disk="2GB" '
+            f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
+            f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
+            f'final_wrapper_path="{dag_escape(args.final_wrapper_path)}" '
+            f'final_wrapper_name="{dag_escape(os.path.basename(args.final_wrapper_path))}" '
+            f'log_root="{dag_escape(final_log_root)}" '
+            f'config_path="{dag_escape(final_config_path)}" '
+            f'config_name="{dag_escape(final_config_name)}"\n'
+        )
 
     # Atomic rename
     os.rename(dag_tmp, args.subdag_output_path)
@@ -369,6 +648,9 @@ def main() -> int:
         "job_index": args.job_index,
         "n_mixed_blocks": n_mixed,
         "events_per_block": args.max_events,
+        "miniaod_merge_enabled": merge_enabled,
+        "miniaod_merge_events": args.miniaod_merge_events,
+        "miniaod_merge_validation": args.miniaod_merge_validation,
         "sources": [
             {"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
              "seeds": seeds, "n_blocks": len(blocks),
@@ -379,10 +661,14 @@ def main() -> int:
         "mixed_blocks": [
             {
                 "index": i,
+                "expected_events": mixed_block_event_count(i),
+                "miniaod_url": miniaod_url(target_base, args.campaign, block_job_id(args.job_index, i)),
                 "inputs": mixed_block_inputs(i),
             }
             for i in range(n_mixed)
         ],
+        "merge_groups": merge_records,
+        "ntuples": ntuple_records,
         "unused": unused,
     }
     coord_manifest_path = os.path.join(

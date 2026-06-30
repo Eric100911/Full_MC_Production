@@ -28,7 +28,7 @@ RANDOM_SEED="${4:-12345}"
 NUM_EVENTS="${5:-10}"
 
 # XRootD output base
-XROOTD_BASE="root://cceos.ihep.ac.cn//eos/ihep/cms/store/user/xcheng/MC_Production_v3"
+XROOTD_BASE="root://cceos.ihep.ac.cn:1094///store/user/xcheng/MC_Production_v3"
 OUTPUT_DIR="${XROOTD_BASE}/test_output/$(date +%Y%m%d_%H%M%S)_${POOL_TYPE}_${SHOWER_MODE}"
 
 # Work directory

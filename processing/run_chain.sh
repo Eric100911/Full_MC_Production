@@ -69,13 +69,14 @@ CMSSW_12_BASE="${CMSSW_12_BASE:-/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMS
 CMSSW_15_BASE="${CMSSW_15_BASE:-/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMSSW_15_0_15}"
 
 # T2_CN_Beijing XRootD storage paths
-# Canonical form: redirector + LFN (see common/node_config_defaults.json).
+# Canonical IHEP full URL form: root://host:1094///store/... .
+# Keep the triple slash after the endpoint; do not normalize it away.
 # Override TARGET_EOS_BASE to redirect output to a different storage area.
 EOS_REDIRECTOR="cceos.ihep.ac.cn"
 EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="${EOS_HOST}"
 EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}//${EOS_LFN_BASE}}"
 EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
@@ -457,7 +458,7 @@ list_lhe_files() {
         local host="${host_path%%/*}"
         while IFS= read -r line; do
             [[ -n "${line}" ]] || continue
-            printf 'root://%s/%s\n' "${host}" "${line}"
+            printf 'root://%s//%s\n' "${host}" "${line}"
         done <<< "${file_list}"
     else
         echo "${file_list}"

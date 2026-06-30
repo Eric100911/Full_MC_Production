@@ -1,0 +1,40 @@
+# ==============================================================================
+# subdag_final.sub - block SubDAG final inventory node
+# ==============================================================================
+# Variables injected by coordinate_lhe_blocks.py:
+#   campaign / job_id
+#   request_cpus / request_memory / request_disk
+#   config_path / config_name
+#   proxy_bundle_path / proxy_bundle_name
+#   final_wrapper_path / final_wrapper_name
+#   log_root
+# ==============================================================================
+
+Universe = vanilla
+
+Executable = /bin/bash
+transfer_executable = False
+Arguments = "./$(final_wrapper_name) $(proxy_bundle_name) $(config_name)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+
+Transfer_Input_Files = $(proxy_bundle_path), $(final_wrapper_path), $(config_path)
+
+transfer_output_files =
+
+Output = $(log_root)/final_$(campaign)_$(job_id)_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/final_$(campaign)_$(job_id)_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/final_$(campaign)_$(job_id)_$(Cluster).log
+
+request_cpus = $(request_cpus)
+request_memory = $(request_memory)
+request_disk = $(request_disk)
+
+Requirements = (TARGET.Arch == "X86_64") && (TARGET.OpSys == "LINUX") && (TARGET.Disk >= RequestDisk) && (TARGET.Memory >= RequestMemory) && (TARGET.Cpus >= RequestCpus) && (TARGET.HasFileTransfer)
+
++MaxRuntime = 3600
+
+Environment = "HOME=/srv"
+
+Queue 1

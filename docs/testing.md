@@ -47,6 +47,34 @@ check, environment validation, and smoke DAG generation for
 `JJP_DPS2_CS`, `JJP_DPS2_G`, and `JUP_DPS1`. It does not submit unless
 `--submit` is supplied.
 
+The MiniAOD merge worker has a separate CMSSW/XRootD smoke test because it
+requires CVMFS, a valid proxy, IHEP EOS read access, and real MiniAOD inputs:
+
+```bash
+./tests/test_miniaod_merge_smoke.sh
+# or from the common harness:
+./tests/run_all_tests.sh --with-miniaod-merge-smoke
+```
+
+By default it uses two files discovered under:
+
+```text
+root://cceos.ihep.ac.cn:1094///store/user/xcheng/MC_Production_v3/output/JUP_DPS1/47[0-9]/output_MINIAOD.root
+```
+
+For these `xcheng` MiniAOD inputs, keep the triple slash after the explicit
+IHEP endpoint (`:1094///store/...`). Do not normalize it to
+`:1094//store/...` or `:1094/store/...` in the smoke test URL builder.
+
+It writes merged output and the merge manifest under `/tmp/chiw/`.
+
+Do not run XRootD/IHEP remote-access smoke tests from the restricted Codex
+sandbox. In that environment `xrdfs`/`xrdcp` can fail immediately with
+`[FATAL] Invalid address` or equivalent sandbox/network errors even when the
+same command works on a normal CERN/IHEP login shell. Run these tests on an
+interactive shell with the usual CMS environment and proxy, or explicitly allow
+unsandboxed network execution when using an agent.
+
 ## Exact LHE Path Validation
 
 Production nodes receive exact paths from
@@ -133,7 +161,7 @@ xrdfs root://cceos.ihep.ac.cn:1094/ ls -l \
   /store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/0
 
 xrdcp -f \
-  root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/0/output_MINIAOD.root \
+  root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/0/output_MINIAOD.root \
   /tmp/chiw/pilot_JJP_DPS2_CS_0_MINIAOD.root
 
 file /tmp/chiw/pilot_JJP_DPS2_CS_0_MINIAOD.root
@@ -201,7 +229,7 @@ overwriting one another.
 The v4 target base is:
 
 ```text
-root://cceos.ihep.ac.cn:1094//store/user/chiw/JpsiJpsiPhi_MC_Production_v4
+root://cceos.ihep.ac.cn:1094///store/user/chiw/JpsiJpsiPhi_MC_Production_v4
 ```
 
 MiniAOD and ntuple files are written under:
@@ -231,7 +259,7 @@ python3 dag_generator.py generate \
   --cmssw15-runtime-tarball \
     common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz \
   --target-base-url \
-    root://cceos.ihep.ac.cn:1094//store/user/chiw/JpsiJpsiPhi_MC_Production_v4 \
+    root://cceos.ihep.ac.cn:1094///store/user/chiw/JpsiJpsiPhi_MC_Production_v4 \
   --dagman-max-jobs-submitted 20000 \
   --dagman-max-jobs-idle 20000 \
   --maxjobs-lhe 20000 \

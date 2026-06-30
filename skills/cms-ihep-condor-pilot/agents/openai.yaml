@@ -1,0 +1,4 @@
+interface:
+  display_name: "CMS IHEP Condor Pilot"
+  short_description: "Run T2_CN_Beijing pilot DAGs safely"
+  default_prompt: "Use $cms-ihep-condor-pilot to generate and monitor a small existing-LHE MiniAOD merge pilot."

@@ -21,6 +21,7 @@ MAX_EVENTS=5
 SCAN_EXISTING=1
 ENABLE_NTUPLE=0
 CMSSW15_RUNTIME_TARBALL=""
+WITH_MINIAOD_MERGE_SMOKE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,9 +53,13 @@ while [[ $# -gt 0 ]]; do
             CMSSW15_RUNTIME_TARBALL="$2"
             shift 2
             ;;
+        --with-miniaod-merge-smoke)
+            WITH_MINIAOD_MERGE_SMOKE=1
+            shift
+            ;;
         -h|--help)
             cat << EOF
-用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH]
+用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH] [--with-miniaod-merge-smoke]
 EOF
             exit 0
             ;;
@@ -101,7 +106,15 @@ echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
 python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
 
+echo "[INFO] 检查 block SubDAG final inventory 与日志归档 mock"
+"${SCRIPT_DIR}/test_subdag_final_and_archive.sh"
+
 echo "[INFO] 检查 DAGMan 提交批次配置"
 python3 "${SCRIPT_DIR}/test_dagman_config.py"
+
+if [[ ${WITH_MINIAOD_MERGE_SMOKE} -eq 1 ]]; then
+    echo "[INFO] 运行 MiniAOD merge CMSSW/XRootD smoke"
+    "${SCRIPT_DIR}/test_miniaod_merge_smoke.sh"
+fi
 
 "${CMD[@]}"

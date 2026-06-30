@@ -19,7 +19,7 @@ All default paths flow from `common/node_config_defaults.json`:
   "lhe_pool_directories": {
     "pool_2jpsi_cs": {
       "storage_name": "pool_2jpsi_cs",
-      "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO"
+      "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO"
     }
   }
 }
@@ -29,6 +29,10 @@ All default paths flow from `common/node_config_defaults.json`:
 `lhe_pool_directories` mapping into generated node configs. `run_chain.sh`
 resolves `EOS:<pool>:...` only from that mapping and fails if the path is
 missing, cannot be listed, or contains no LHE files.
+
+IHEP XRootD full URLs use the explicit endpoint and a triple slash before the
+LFN: `root://cceos.ihep.ac.cn:1094///store/...`. Do not normalize these URLs to
+`:1094//store/...` or `:1094/store/...`.
 
 `tools/compile_node_config.py` can compile explicit mappings and validates each
 configured directory with `xrdfs ls` or local directory inspection. This
@@ -41,14 +45,14 @@ validation belongs before submission, not in worker-side layout inference.
 Every worker script that writes to remote storage follows the same pattern:
 
 ```bash
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}//${EOS_LFN_BASE}}"
 EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
 EOS_OUTPUT="${EOS_BASE}/output"
 ```
 
 | Variable | Derivation | Example |
 |----------|-----------|---------|
-| `EOS_BASE` | Configured target base or `$TARGET_EOS_BASE` | `root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3` |
+| `EOS_BASE` | Configured target base or `$TARGET_EOS_BASE` | `root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3` |
 | `EOS_GENERATED_LHE_BASE` | `storage.generated_lhe_base` | `$EOS_BASE/lhe_pools` |
 | `EOS_OUTPUT` | `$EOS_BASE/output` | `root://…/MC_Production_v3/output` |
 
@@ -113,7 +117,7 @@ node_configs/lhe_generation/LHE_*.json:
 3. If no exact path is configured, fail during DAG generation.
 
 **Example for `pool_jpsi_CSCO_g`**:
-`root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi`
+`root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi`
 
 ### Remote filename
 
@@ -237,7 +241,7 @@ Constructs the remote URL by prepending `EOS_BASE`:
 
 Full example for MiniAOD:
 ```
-root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/BLOCK000042/output_MINIAOD.root
+root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/BLOCK000042/output_MINIAOD.root
 ```
 
 ### Files produced
@@ -275,7 +279,7 @@ ntuple_basename  = {subprocess_id}-Ntuple-{version}-{job_index}.root
 
 Full URL:
 ```
-root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple-v01_06/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
+root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple-v01_06/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
 ```
 
 ### Ntuple-only DAG mode

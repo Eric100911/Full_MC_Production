@@ -37,7 +37,7 @@ def split_remote_path(path: str, default_redirector: str) -> Tuple[str, str]:
 
 def normalize_remote_path(path: str, default_redirector: str) -> str:
     host, remote_path = split_remote_path(path, default_redirector)
-    return f"root://{host}/{remote_path}"
+    return f"root://{host}//{remote_path}"
 
 
 def validate_pool_path(path: str) -> None:

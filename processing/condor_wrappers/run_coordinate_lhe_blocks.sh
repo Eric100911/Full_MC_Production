@@ -60,6 +60,13 @@ required = [
     "processing_wrapper_path",
     "subdag_output_path",
     "max_block_subdag_jobs",
+    "miniaod_merge_events",
+    "miniaod_merge_validation",
+    "max_miniaod_merge_jobs",
+    "miniaod_merge_sub_template_path",
+    "miniaod_merge_wrapper_path",
+    "final_sub_template_path",
+    "final_wrapper_path",
 ]
 missing = [key for key in required if key not in cfg or cfg[key] in (None, "")]
 if missing:
@@ -105,6 +112,13 @@ cmd = [
     "--processing-wrapper-path", str(cfg["processing_wrapper_path"]),
     "--subdag-output-path", str(cfg["subdag_output_path"]),
     "--max-block-subdag-jobs", str(cfg["max_block_subdag_jobs"]),
+    "--miniaod-merge-events", str(cfg["miniaod_merge_events"]),
+    "--miniaod-merge-validation", str(cfg["miniaod_merge_validation"]),
+    "--max-miniaod-merge-jobs", str(cfg["max_miniaod_merge_jobs"]),
+    "--miniaod-merge-sub-template-path", str(cfg["miniaod_merge_sub_template_path"]),
+    "--miniaod-merge-wrapper-path", str(cfg["miniaod_merge_wrapper_path"]),
+    "--final-sub-template-path", str(cfg["final_sub_template_path"]),
+    "--final-wrapper-path", str(cfg["final_wrapper_path"]),
 ]
 if cfg.get("enable_ntuple", False):
     cmd.append("--enable-ntuple")

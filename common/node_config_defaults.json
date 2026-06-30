@@ -5,12 +5,12 @@
     "output_subdir": "output"
   },
   "lhe_pool_directories": {
-    "pool_jpsi_CSCO_g":        {"storage_name": "pool_jpsi_CSCO_g",        "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi"},
-    "pool_upsilon_CSCO_g":     {"storage_name": "pool_upsilon_CSCO_g",     "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-Upsilon"},
-    "pool_gg":                 {"storage_name": "pool_gg",                 "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-gg_to_gg"},
-    "pool_2jpsi_cs":           {"storage_name": "pool_2jpsi_cs",           "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO"},
-    "pool_2jpsi_g":            {"storage_name": "pool_2jpsi_g",            "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-NLOstar"},
-    "pool_jpsi_upsilon_CSCO":  {"storage_name": "pool_jpsi_upsilon_CSCO",  "path": "root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiUpsilon"}
+    "pool_jpsi_CSCO_g":        {"storage_name": "pool_jpsi_CSCO_g",        "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jpsi"},
+    "pool_upsilon_CSCO_g":     {"storage_name": "pool_upsilon_CSCO_g",     "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-Upsilon"},
+    "pool_gg":                 {"storage_name": "pool_gg",                 "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-gg_to_gg"},
+    "pool_2jpsi_cs":           {"storage_name": "pool_2jpsi_cs",           "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO"},
+    "pool_2jpsi_g":            {"storage_name": "pool_2jpsi_g",            "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-NLOstar"},
+    "pool_jpsi_upsilon_CSCO":  {"storage_name": "pool_jpsi_upsilon_CSCO",  "path": "root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiUpsilon"}
   },
   "subprocess_ids_by_campaign": {
     "JJP_SPS_CS":  "SPS-JpsiJpsiPhi-LO",
