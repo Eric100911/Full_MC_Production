@@ -513,6 +513,7 @@ class WorkflowOptions:
         lhe_compression_level: int = 1,
         lhe_shuffle_split: bool = False,
         lhe_events_per_block: int = 1000,
+        lhe_max_events_per_plan: int = 0,
         lhe_shuffle_mode: str = "stratified",
         lhe_n_strata: str = "auto",
         lhe_drop_incomplete_last_block: bool = False,
@@ -544,6 +545,7 @@ class WorkflowOptions:
         self.lhe_compression_level = lhe_compression_level
         self.lhe_shuffle_split = lhe_shuffle_split
         self.lhe_events_per_block = lhe_events_per_block
+        self.lhe_max_events_per_plan = lhe_max_events_per_plan
         self.lhe_shuffle_mode = lhe_shuffle_mode
         self.lhe_n_strata = lhe_n_strata
         self.lhe_drop_incomplete_last_block = lhe_drop_incomplete_last_block
@@ -624,6 +626,7 @@ class WorkflowOptions:
             "keep_legacy_single_processing_path": self.keep_legacy_single_processing_path,
             "lhe_shuffle_seed_base": self.lhe_shuffle_seed_base,
             "max_block_subdag_jobs": self.max_block_subdag_jobs,
+            "lhe_max_events_per_plan": self.lhe_max_events_per_plan,
             "skip_lhe_generation": self.skip_lhe_generation,
             "existing_lhe_base": self.existing_lhe_base,
             "lhe_group_min_events": self.lhe_group_min_events,
@@ -2641,6 +2644,7 @@ class DAGBuilder:
             "lhe_paths": lhe_paths,
             "output_dir": output_dir,
             "events_per_block": self.options.lhe_events_per_block,
+            "max_events_per_plan": self.options.lhe_max_events_per_plan,
             "shuffle_seed": shuffle_seed,
             "shuffle_mode": self.options.lhe_shuffle_mode,
             "n_strata": self.options.lhe_n_strata,
@@ -4165,6 +4169,16 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="每个 block 的事件数，默认 1000。",
     )
     parser.add_argument(
+        "--lhe-max-events-per-plan",
+        type=int,
+        default=0,
+        help=(
+            "每个 PLAN 节点最多输出的 LHE 事件数；0 表示不限制。"
+            "限制在 shuffle 排序后应用。generate-test + existing-LHE block SubDAG "
+            "默认从正数 --max-events 自动派生。"
+        ),
+    )
+    parser.add_argument(
         "--lhe-group-min-events",
         type=int,
         default=0,
@@ -4827,6 +4841,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except ValueError as exc:
                 parser.error(str(exc))
         local_output_base = args.local_output_base or (machine_env.local_output_base if machine_env.uses_local_storage else "")
+        lhe_max_events_per_plan = args.lhe_max_events_per_plan
+        if (
+            args.command == "generate-test"
+            and args.skip_lhe_generation
+            and args.enable_lhe_block_subdags
+            and lhe_max_events_per_plan <= 0
+            and args.max_events > 0
+        ):
+            lhe_max_events_per_plan = args.max_events
         options = WorkflowOptions(
             jobs_per_campaign=args.jobs,
             max_events=args.max_events,
@@ -4854,6 +4877,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lhe_compression_level=args.lhe_compression_level,
             lhe_shuffle_split=args.lhe_shuffle_split,
             lhe_events_per_block=args.lhe_events_per_block,
+            lhe_max_events_per_plan=lhe_max_events_per_plan,
             lhe_shuffle_mode=args.lhe_shuffle_mode,
             lhe_n_strata=args.lhe_n_strata,
             lhe_drop_incomplete_last_block=args.lhe_drop_incomplete_last_block,

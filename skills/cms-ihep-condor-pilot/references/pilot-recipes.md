@@ -13,8 +13,10 @@ For `JJP_DPS1` with one source file:
 - `--jobs 1` means one source LHE file from `pool_jpsi_CSCO_g`.
 - `JJP_DPS1` uses `pool_jpsi_CSCO_g` twice, so mixed blocks consume distinct
   block indices from the same planned source.
-- If the source has at least 20 events, `--lhe-events-per-block 5` gives at
-  least four source blocks and two mixed processing blocks.
+- `generate-test` with existing LHEs auto-caps each PLAN node from positive
+  `--max-events`, so `--max-events 20 --lhe-events-per-block 5` gives four
+  source blocks and two mixed processing blocks without splitting the whole
+  remote file into tiny blocks.
 - `--miniaod-merge-events 10` should produce one merged MiniAOD and one ntuple
   for a 2-block pilot.
 
@@ -29,7 +31,7 @@ mkdir -p "$out" "$log"
 python3 dag_generator.py generate-test \
   --campaign JJP_DPS1 \
   --jobs 1 \
-  --max-events -1 \
+  --max-events 20 \
   --enable-lhe-block-subdags \
   --skip-lhe-generation \
   --no-scan-existing \
@@ -52,6 +54,12 @@ FINAL SUMMARY
 
 There should be no `LHE_*` jobs. The merge and ntuple jobs are generated later
 inside `plan_subdags/<campaign>/job_0/blocks_processing.dag` by the coordinator.
+Inspect the planner JSON before submission; it should contain:
+
+```json
+"events_per_block": 5,
+"max_events_per_plan": 20
+```
 
 Submit:
 

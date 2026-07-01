@@ -37,6 +37,7 @@ bash -n \
   tests/test_lhe_shuffle_split.sh
 python3 -m py_compile dag_generator.py tools/compile_node_config.py
 python3 tests/test_coordinate_lhe_blocks.py
+python3 tests/test_lhe_planner_cap_generation.py
 ./tests/run_all_tests.sh
 ./tests/mock_test_worker.sh
 ./tests/test_lhe_shuffle_split.sh
@@ -225,6 +226,13 @@ block indices. Strict-min determines the number of mixed output blocks.
 Each output ID includes both the source-file index and block index:
 `JOBxxxxxx_BLOCKxxxxxx`. This prevents different planner groups from
 overwriting one another.
+
+For small existing-LHE pilots, do not combine a full-size LHE file with tiny
+`--lhe-events-per-block` values unless the planner is capped. In
+`generate-test`, positive `--max-events` automatically becomes
+`--lhe-max-events-per-plan` for existing-LHE block SubDAGs. For example,
+`--max-events 20 --lhe-events-per-block 5` makes each PLAN node shuffle the
+full input ordering but emit only four 5-event source blocks.
 
 The v4 target base is:
 

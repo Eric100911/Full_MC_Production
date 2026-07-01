@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
                    help="Path to LHE file (local or root:// URL); may be repeated")
     p.add_argument("--output-dir", required=True, help="Directory for manifest output")
     p.add_argument("--events-per-block", type=int, default=1000)
+    p.add_argument("--max-events-per-plan", type=int, default=0,
+                   help="Maximum events emitted by this planner after shuffle ordering; 0 means uncapped")
     p.add_argument("--shuffle-seed", type=int, required=True)
     p.add_argument("--shuffle-mode", default="stratified")
     p.add_argument("--n-strata", default="auto")
@@ -223,6 +225,8 @@ def main() -> int:
             "--filename-prefix", f"{group_id}_",
             "--write-provenance",
         ]
+        if args.max_events_per_plan > 0:
+            shuffle_cmd.extend(["--max-output-events", str(args.max_events_per_plan)])
         for local_lhe in local_inputs:
             shuffle_cmd.extend(["--input", local_lhe])
         if args.drop_incomplete_last_block:
@@ -311,7 +315,10 @@ def main() -> int:
             "n_strata_arg": args.n_strata,
             "n_blocks": n_blocks,
             "events_per_block": args.events_per_block,
+            "max_events_per_plan": args.max_events_per_plan,
             "total_input_events": n_events,
+            "planned_events": shuffle_manifest.get("event_conservation", {}).get("output_total"),
+            "event_selection": shuffle_manifest.get("event_selection", {}),
             "dropped_incomplete": shuffle_manifest.get("event_conservation", {}).get(
                 "dropped_from_incomplete_block", 0),
             "blocks": plan_blocks,

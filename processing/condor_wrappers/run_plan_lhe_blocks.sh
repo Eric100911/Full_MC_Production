@@ -76,6 +76,9 @@ cmd = [
     "--manifest-output-path", str(cfg["manifest_output_path"]),
     "--lhe-shuffle-split-bin", "./lhe_shuffle_split",
 ]
+max_events_per_plan = int(cfg.get("max_events_per_plan", 0) or 0)
+if max_events_per_plan > 0:
+    cmd.extend(["--max-events-per-plan", str(max_events_per_plan)])
 for path in cfg["lhe_paths"]:
     cmd.extend(["--lhe-path", str(path)])
 if cfg.get("drop_incomplete_last_block", False):

@@ -28,6 +28,10 @@ Prefer it for small, reversible pilots and live DAGMan checks.
 - For known existing-LHE pilots, use `--skip-lhe-generation --no-scan-existing`
   with configured exact paths. Avoid remote-scan-dependent generation from
   sandboxed or unreliable-network contexts.
+- For small existing-LHE `generate-test` pilots, keep positive `--max-events`.
+  It auto-caps each PLAN node through `--lhe-max-events-per-plan` after shuffle
+  ordering. Do not pair full-size existing LHE files with tiny
+  `--lhe-events-per-block` values and an uncapped planner.
 
 ## Existing-LHE MiniAOD merge pilot
 
@@ -92,5 +96,7 @@ python3 -m json.tool <output-dir>/plan_subdags/<campaign>/job_0/coord_manifest_<
   the DAG again.
 - Top-level DAG warns `miniaod_merge`/`ntuple` category has no assigned nodes:
   this is expected before the coordinator generates the block SubDAG.
+- PLAN node splits tens of thousands of tiny blocks: regenerate the pilot with
+  positive `--max-events` or explicit `--lhe-max-events-per-plan`.
 - Large remote MiniAOD merge smoke is slow: prefer a small pilot DAG that
   produces tiny MiniAODs, then merges those.

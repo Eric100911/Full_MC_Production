@@ -53,6 +53,7 @@ struct ShuffleSplitConfig {
     uint64_t seed = 42;
     string mode = "stratified";   // "stratified" or "original-order"
     string n_strata_arg = "auto"; // "auto" or a positive integer
+    int max_output_events = 0;     // 0 = all events; positive = cap after shuffle ordering
     bool gzip_output = false;     // accepted, deferred to shell wrapper
     int compression_level = 1;    // accepted, deferred
     bool drop_incomplete = false;
@@ -365,6 +366,7 @@ Required:
 Output control:
   --output-dir DIR        Output directory (default: .)
   --events-per-block N    Events per output block (default: 1000)
+  --max-output-events N   Emit at most N events after shuffle ordering (0 = all)
   --drop-incomplete-last-block
                           Discard final block if it has fewer than events-per-block
 
@@ -406,6 +408,12 @@ static ShuffleSplitConfig parse_args(int argc, char *argv[]) {
             }
         } else if (arg == "--seed" && i + 1 < argc) {
             cfg.seed = parse_u64(argv[++i], arg.c_str());
+        } else if (arg == "--max-output-events" && i + 1 < argc) {
+            cfg.max_output_events = parse_int(argv[++i], arg.c_str());
+            if (cfg.max_output_events < 0) {
+                cerr << "[ERROR] max-output-events must be non-negative" << endl;
+                exit(1);
+            }
         } else if (arg == "--mode" && i + 1 < argc) {
             cfg.mode = argv[++i];
             if (cfg.mode != "stratified" && cfg.mode != "original-order") {
@@ -529,10 +537,12 @@ static vector<vector<size_t>> fill_blocks_stratified(
     const vector<vector<size_t>> &strata,
     int events_per_block,
     bool drop_incomplete,
-    uint64_t seed)
+    uint64_t seed,
+    int max_output_events)
 {
     vector<vector<size_t>> blocks;
     int n_strata = (int)strata.size();
+    int selected = 0;
 
     // Working copies: deque-like access via front index
     struct StratumState {
@@ -554,6 +564,11 @@ static vector<vector<size_t>> fill_blocks_stratified(
     };
 
     for (int block_idx = 0; ; ++block_idx) {
+        int remaining_allowed = max_output_events > 0
+            ? max_output_events - selected
+            : events_per_block;
+        if (remaining_allowed <= 0) break;
+
         int n_active = count_active();
         if (n_active == 0) break;
 
@@ -564,11 +579,12 @@ static vector<vector<size_t>> fill_blocks_stratified(
             if (!states[s].exhausted()) order.push_back(s);
         shuffle(order.begin(), order.end(), order_rng);
 
-        int per_stratum = (events_per_block + n_active - 1) / n_active;
+        int target_block_size = min(events_per_block, remaining_allowed);
+        int per_stratum = (target_block_size + n_active - 1) / n_active;
         vector<size_t> block;
         for (int s : order) {
-            if (block.size() >= (size_t)events_per_block) break;
-            int take = (int)min((size_t)(events_per_block - (int)block.size()),
+            if (block.size() >= (size_t)target_block_size) break;
+            int take = (int)min((size_t)(target_block_size - (int)block.size()),
                                 min((size_t)per_stratum, states[s].remaining()));
             for (int t = 0; t < take; ++t) {
                 block.push_back((*states[s].events)[states[s].pos++]);
@@ -586,6 +602,7 @@ static vector<vector<size_t>> fill_blocks_stratified(
         shuffle(block.begin(), block.end(), block_rng);
 
         blocks.push_back(std::move(block));
+        selected += (int)blocks.back().size();
     }
 
     return blocks;
@@ -599,13 +616,18 @@ static vector<vector<size_t>> fill_blocks_original_order(
     size_t n_events,
     int events_per_block,
     bool drop_incomplete,
-    uint64_t seed)
+    uint64_t seed,
+    int max_output_events)
 {
     vector<vector<size_t>> blocks;
     size_t pos = 0;
+    size_t limit = n_events;
+    if (max_output_events > 0 && (size_t)max_output_events < limit) {
+        limit = (size_t)max_output_events;
+    }
 
-    while (pos < n_events) {
-        size_t take = min((size_t)events_per_block, n_events - pos);
+    while (pos < limit) {
+        size_t take = min((size_t)events_per_block, limit - pos);
         if (drop_incomplete && take < (size_t)events_per_block) break;
 
         vector<size_t> block(take);
@@ -698,7 +720,8 @@ static void write_manifest(
     int n_strata,
     const vector<vector<size_t>> &blocks,
     const vector<vector<size_t>> &strata,
-    int total_input)
+    int total_input,
+    int selected_before_drop)
 {
     string path = output_dir + "/shuffle_split_manifest.json";
     string tmp = path + ".tmp";
@@ -748,14 +771,21 @@ static void write_manifest(
     ofs << "    \"n_strata_arg\": \"" << cfg.n_strata_arg << "\"," << endl;
     ofs << "    \"resolved_n_strata\": " << n_strata << "," << endl;
     ofs << "    \"events_per_block\": " << cfg.events_per_block << "," << endl;
+    ofs << "    \"max_output_events\": " << cfg.max_output_events << "," << endl;
     ofs << "    \"drop_incomplete_last_block\": " << (cfg.drop_incomplete ? "true" : "false") << endl;
     ofs << "  }," << endl;
 
     // Event conservation
     ofs << "  \"total_input_events\": " << total_input << "," << endl;
-    int dropped = total_input - total_output;
+    ofs << "  \"event_selection\": {" << endl;
+    ofs << "    \"available_input_events\": " << total_input << "," << endl;
+    ofs << "    \"max_output_events\": " << cfg.max_output_events << "," << endl;
+    ofs << "    \"selected_before_drop\": " << selected_before_drop << "," << endl;
+    ofs << "    \"excluded_by_max_output_events\": " << (total_input - selected_before_drop) << endl;
+    ofs << "  }," << endl;
+    int dropped = selected_before_drop - total_output;
     ofs << "  \"event_conservation\": {" << endl;
-    ofs << "    \"input_total\": " << total_input << "," << endl;
+    ofs << "    \"input_total\": " << selected_before_drop << "," << endl;
     ofs << "    \"output_total\": " << total_output << "," << endl;
     ofs << "    \"dropped_from_incomplete_block\": " << dropped << "," << endl;
     ofs << "    \"conserved\": " << (dropped == 0 ? "true" : "false") << endl;
@@ -851,7 +881,7 @@ int main(int argc, char *argv[]) {
     if (first.events.empty() && extra_sources.empty()) {
         cerr << "[INFO] No events found — nothing to do." << endl;
         ensure_dir(cfg.output_dir);
-        write_manifest(cfg.output_dir, cfg, 0, {}, {}, 0);
+        write_manifest(cfg.output_dir, cfg, 0, {}, {}, 0, 0);
         return 0;
     }
 
@@ -890,6 +920,13 @@ int main(int argc, char *argv[]) {
     cerr << "[INFO] Total events: " << n_events << " ("
          << (n_events - n_from_extra) << " primary + "
          << n_from_extra << " from extra files)" << endl;
+    int selected_before_drop = n_events;
+    if (cfg.max_output_events > 0 && cfg.max_output_events < selected_before_drop) {
+        selected_before_drop = cfg.max_output_events;
+        cerr << "[INFO] Max output events: " << cfg.max_output_events
+             << " selected from " << n_events
+             << " after shuffle ordering" << endl;
+    }
 
     // Compute strata
     int n_strata = (cfg.mode == "stratified")
@@ -910,12 +947,14 @@ int main(int argc, char *argv[]) {
 
         shuffle_strata(strata, cfg.seed);
         blocks = fill_blocks_stratified(strata, cfg.events_per_block,
-                                        cfg.drop_incomplete, cfg.seed);
+                                        cfg.drop_incomplete, cfg.seed,
+                                        selected_before_drop);
     } else {
         // original-order mode
         strata.clear();
         blocks = fill_blocks_original_order((size_t)n_events, cfg.events_per_block,
-                                            cfg.drop_incomplete, cfg.seed);
+                                            cfg.drop_incomplete, cfg.seed,
+                                            selected_before_drop);
     }
 
     cerr << "[INFO] Blocks: " << blocks.size() << endl;
@@ -942,21 +981,23 @@ int main(int argc, char *argv[]) {
 
     // Event conservation check
     if (cfg.drop_incomplete) {
-        cerr << "[INFO] Event conservation: " << n_events
+        cerr << "[INFO] Event conservation: " << selected_before_drop
              << " input, " << total_output << " output ("
-             << (n_events - total_output) << " dropped from incomplete block)" << endl;
+             << (selected_before_drop - total_output) << " dropped from incomplete block)" << endl;
     } else {
-        if (n_events != total_output) {
+        if (selected_before_drop != total_output) {
             cerr << "[ERROR] Event conservation FAILED: "
-                 << n_events << " input vs " << total_output << " output" << endl;
+                 << selected_before_drop << " selected input vs "
+                 << total_output << " output" << endl;
             return 1;
         }
-        cerr << "[INFO] Event conservation: OK (" << n_events << " in, "
+        cerr << "[INFO] Event conservation: OK (" << selected_before_drop << " in, "
              << total_output << " out)" << endl;
     }
 
     // Write manifest
-    write_manifest(cfg.output_dir, cfg, n_strata, blocks, strata, n_events);
+    write_manifest(cfg.output_dir, cfg, n_strata, blocks, strata, n_events,
+                   selected_before_drop);
 
     return 0;
 }

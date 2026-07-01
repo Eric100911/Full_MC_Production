@@ -101,6 +101,9 @@ the changed workflow. If touching:
 - For known existing-LHE pilots, prefer `--skip-lhe-generation --no-scan-existing`
   with configured exact paths when running from environments where remote scans
   are unreliable.
+- For small existing-LHE `generate-test` pilots, keep a positive `--max-events`
+  so it auto-caps each planner via `--lhe-max-events-per-plan`; otherwise tiny
+  `--lhe-events-per-block` values can split the whole full-size source file.
 - Repeated inputs within one subprocess must consume distinct non-overlapping
   blocks. Deterministic shuffling must be preserved.
 - Treat DAGMan queue controls independently:

@@ -344,6 +344,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 13: Max output events applies after shuffle ordering
+# ---------------------------------------------------------------------------
+msg_info "Test 13: 100 events capped to 20 after shuffle ordering"
+mkdir -p "${TMP_DIR}/test13"
+python3 "${GEN_PY}" --n-events 100 --output "${TMP_DIR}/test13/input.lhe"
+shuffle_split --input "${TMP_DIR}/test13/input.lhe" \
+    --output-dir "${TMP_DIR}/test13/out" \
+    --events-per-block 5 --seed 42 --mode stratified --n-strata auto \
+    --max-output-events 20
+N_BLOCKS=$(ls "${TMP_DIR}/test13/out"/block_*.lhe | wc -l)
+OUTPUT_N=0
+for f in "${TMP_DIR}/test13/out"/block_*.lhe; do
+    N=$(grep -c '<event>' "$f" || true)
+    OUTPUT_N=$((OUTPUT_N + N))
+done
+if [[ "${N_BLOCKS}" -eq 4 && "${OUTPUT_N}" -eq 20 ]]; then
+    check_pass "Test 13: cap produced 4 blocks and 20 output events"
+else
+    check_fail "Test 13: expected 4 blocks/20 events, got ${N_BLOCKS}/${OUTPUT_N}"
+fi
+python3 - "${TMP_DIR}/test13/out/shuffle_split_manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert payload["total_input_events"] == 100
+assert payload["event_selection"]["max_output_events"] == 20
+assert payload["event_selection"]["selected_before_drop"] == 20
+assert payload["event_selection"]["excluded_by_max_output_events"] == 80
+assert payload["event_conservation"]["input_total"] == 20
+assert payload["event_conservation"]["output_total"] == 20
+assert payload["event_conservation"]["conserved"] is True
+PY
+check_pass "Test 13: capped manifest records full input and selected output"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
