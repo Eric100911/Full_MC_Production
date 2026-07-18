@@ -31,6 +31,14 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.compression_util import accepts_lhe_ext  # noqa: E402
+from tools.lhe_inventory_condor import (  # noqa: E402
+    atomic_write_json,
+    canonicalize_lhe_path,
+    load_workspace as load_lhe_inventory_workspace,
+    prepare_workspace as prepare_lhe_inventory_workspace,
+    submit_workspace as submit_lhe_inventory_workspace,
+    summarize_workspace as summarize_lhe_inventory_workspace,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 NODE_CONFIG_DEFAULTS_PATH = os.path.join(BASE_DIR, "common", "node_config_defaults.json")
@@ -50,10 +58,13 @@ def load_node_config_defaults() -> Dict[str, object]:
 NODE_CONFIG_DEFAULTS = load_node_config_defaults()
 STORAGE_CONFIG_DEFAULTS = NODE_CONFIG_DEFAULTS.get("storage", {})
 PROCESSING_ENV_DEFAULTS = NODE_CONFIG_DEFAULTS.get("processing_environment", {})
+INVENTORY_COUNTING_DEFAULTS = NODE_CONFIG_DEFAULTS.get("inventory_counting", {})
 if not isinstance(STORAGE_CONFIG_DEFAULTS, dict):
     raise ValueError("common/node_config_defaults.json field 'storage' must be an object")
 if not isinstance(PROCESSING_ENV_DEFAULTS, dict):
     raise ValueError("common/node_config_defaults.json field 'processing_environment' must be an object")
+if not isinstance(INVENTORY_COUNTING_DEFAULTS, dict):
+    raise ValueError("common/node_config_defaults.json field 'inventory_counting' must be an object")
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "generated")
 TEST_OUTPUT_DIR = os.path.join(BASE_DIR, "tests", "generated")
 TPS_ONIA2MUMU_SUBMODULE = os.path.join(BASE_DIR, "external", "TPS-Onia2MuMu")
@@ -129,6 +140,8 @@ REQUIRED_FILES = (
     "processing/templates/ntuple.sub",
     "processing/templates/summary.sub",
     "processing/templates/summary.sh",
+    "processing/templates/count_lhe_inventory.sub",
+    "tools/lhe_inventory_condor.py",
     "common/cmssw_configs/hepmc_to_GENSIM.py",
 )
 
@@ -430,6 +443,16 @@ class LHEPool:
 
 
 @dataclass(frozen=True)
+class LHEInventoryEntry:
+    """One immutable existing-LHE file discovered before DAG generation."""
+
+    path: str
+    seed: Optional[int] = None
+    actual_events: Optional[int] = None
+    status: str = "unknown"
+
+
+@dataclass(frozen=True)
 class LHEGroup:
     """A reproducible group of immutable raw LHE files."""
 
@@ -526,6 +549,8 @@ class WorkflowOptions:
         ntuple_version: str = "",
         skip_lhe_generation: bool = False,
         existing_lhe_base: str = "",
+        existing_lhe_inventory: str = "",
+        allow_incomplete_lhe_inventory: bool = False,
         lhe_group_min_events: int = 0,
         lhe_group_max_events: int = 0,
         lhe_group_max_files: int = 20,
@@ -560,6 +585,8 @@ class WorkflowOptions:
         self.force_generate_lhe = force_generate_lhe
         self.skip_lhe_generation = skip_lhe_generation
         self.existing_lhe_base = existing_lhe_base or ""
+        self.existing_lhe_inventory = existing_lhe_inventory or ""
+        self.allow_incomplete_lhe_inventory = allow_incomplete_lhe_inventory
         self.lhe_group_min_events = lhe_group_min_events
         self.lhe_group_max_events = lhe_group_max_events
         self.lhe_group_max_files = lhe_group_max_files
@@ -629,6 +656,8 @@ class WorkflowOptions:
             "lhe_max_events_per_plan": self.lhe_max_events_per_plan,
             "skip_lhe_generation": self.skip_lhe_generation,
             "existing_lhe_base": self.existing_lhe_base,
+            "existing_lhe_inventory": self.existing_lhe_inventory,
+            "allow_incomplete_lhe_inventory": self.allow_incomplete_lhe_inventory,
             "lhe_group_min_events": self.lhe_group_min_events,
             "lhe_group_max_events": self.lhe_group_max_events,
             "lhe_group_max_files": self.lhe_group_max_files,
@@ -926,6 +955,8 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
         machine_env.processing_submit_template,
         machine_env.summary_submit_template,
         "processing/templates/summary.sh",
+        "processing/templates/count_lhe_inventory.sub",
+        "tools/lhe_inventory_condor.py",
         "common/cmssw_configs/hepmc_to_GENSIM.py",
     ]
     if machine_env.name == "hepthu":
@@ -1104,6 +1135,79 @@ def load_pool_scan_cache() -> Dict[str, int]:
     return _POOL_SCAN_CACHE
 
 
+def _inventory_entry_from_raw(item: object, inventory_path: str, pool_name: str) -> LHEInventoryEntry:
+    if isinstance(item, str):
+        return LHEInventoryEntry(path=item, seed=parse_seed_from_lhe_filename(item))
+    if not isinstance(item, dict):
+        raise ValueError(f"Invalid file entry for pool {pool_name} in {inventory_path}")
+    lhe_path = str(item.get("path", "") or "")
+    if not lhe_path:
+        raise ValueError(f"Missing path for pool {pool_name} in {inventory_path}")
+    seed = item.get("seed")
+    if seed is None:
+        seed = parse_seed_from_lhe_filename(lhe_path)
+    else:
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid seed for {lhe_path} in {inventory_path}") from exc
+    actual_events = item.get("actual_events")
+    if actual_events is not None:
+        try:
+            actual_events = int(actual_events)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid actual_events for {lhe_path} in {inventory_path}") from exc
+    status = str(item.get("status", "ok" if actual_events is not None else "unknown"))
+    return LHEInventoryEntry(
+        path=lhe_path,
+        seed=seed,
+        actual_events=actual_events,
+        status=status,
+    )
+
+
+def load_existing_lhe_inventory(
+    path: str,
+    allow_incomplete: bool = False,
+) -> Dict[str, List[LHEInventoryEntry]]:
+    """Load an exact existing-LHE file inventory.
+
+    Supported formats:
+      {"pools": {"pool_name": {"files": [...]}}}
+      {"pool_name": [...]}
+    """
+
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"Cannot read existing LHE inventory {path}: {exc}") from exc
+
+    if isinstance(raw, dict) and raw.get("complete") is False and not allow_incomplete:
+        raise ValueError(
+            f"Existing-LHE inventory {path} is marked incomplete; "
+            "use --allow-incomplete-lhe-inventory only after reviewing its failures."
+        )
+
+    source = raw.get("pools", raw) if isinstance(raw, dict) else {}
+    inventory: Dict[str, List[LHEInventoryEntry]] = {}
+    if not isinstance(source, dict):
+        raise ValueError(f"Invalid existing LHE inventory format: {path}")
+    for pool_name, value in source.items():
+        files = value.get("files", []) if isinstance(value, dict) else value
+        if not isinstance(files, list):
+            raise ValueError(f"Invalid file list for pool {pool_name} in {path}")
+        clean = [
+            _inventory_entry_from_raw(item, path, str(pool_name))
+            for item in files
+            if item
+        ]
+        inventory[str(pool_name)] = sorted(clean, key=lambda entry: entry.path)
+    return inventory
+
+
 def check_proxy_valid(proxy_path: str) -> Tuple[bool, Optional[int], Optional[str]]:
     """返回代理是否可用、剩余秒数以及错误信息。"""
 
@@ -1273,18 +1377,49 @@ def parse_seed_from_lhe_filename(path: str) -> Optional[int]:
     return int(match.group(1))
 
 
-def count_lhe_events_for_grouping(path: str) -> Optional[int]:
-    """Count events for local files; return None when the path cannot be read locally."""
-    if path.startswith("root://"):
-        return None
-    try:
-        if path.endswith(".gz"):
-            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-                return sum(1 for line in handle if line.strip().startswith("<event>"))
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+def count_lhe_events_strict(path: str) -> int:
+    """Count <event> records in a local LHE file, failing on read errors."""
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
             return sum(1 for line in handle if line.strip().startswith("<event>"))
-    except Exception:
-        return None
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return sum(1 for line in handle if line.strip().startswith("<event>"))
+
+
+def count_existing_lhe_events(path: str, scratch_dir: str, proxy_path: str) -> int:
+    """Count a local or remote existing-LHE file for inventory discovery."""
+    if not path.startswith("root://"):
+        return count_lhe_events_strict(path)
+
+    ensure_dir(scratch_dir)
+    basename = os.path.basename(path)
+    scratch_handle = tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=scratch_dir,
+        prefix="lhe_count_",
+        suffix=f"_{basename}",
+    )
+    local_path = scratch_handle.name
+    scratch_handle.close()
+    env = os.environ.copy()
+    if proxy_path:
+        env["X509_USER_PROXY"] = ensure_local_xrootd_proxy(proxy_path)
+    try:
+        subprocess.run(
+            ["xrdcp", "--nopbar", "--force", path, local_path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1800,
+            env=env,
+        )
+        return count_lhe_events_strict(local_path)
+    finally:
+        try:
+            os.remove(local_path)
+        except FileNotFoundError:
+            pass
 
 
 def pool_remote_path(
@@ -1319,6 +1454,225 @@ def scan_existing_pools(
             "remote_path": pool_remote_path(pool_name, local_output_base, existing_lhe_base),
         }
     return result
+
+
+def execute_lhe_inventory_scan(
+    campaign_names: Sequence[str],
+    output_path: str,
+    proxy_path: str,
+    local_output_base: str = "",
+    existing_lhe_base: str = "",
+    allow_empty: bool = False,
+    count_events: bool = False,
+    count_scratch_dir: str = "/tmp/chiw/lhe_inventory_counts",
+    max_files_per_pool: int = 0,
+) -> int:
+    """Write an exact existing-LHE inventory for later offline DAG generation."""
+
+    pool_requirements = compute_pool_requirements(campaign_names, 1)
+    payload: Dict[str, object] = OrderedDict()
+    payload["complete"] = True
+    payload["created_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["campaigns"] = list(campaign_names)
+    payload["existing_lhe_base"] = existing_lhe_base
+    payload["local_output_base"] = local_output_base
+    payload["pools"] = OrderedDict()
+
+    missing: List[str] = []
+    pools_payload = payload["pools"]
+    assert isinstance(pools_payload, OrderedDict)
+    for pool_name in pool_requirements:
+        if local_output_base:
+            files = list_lhe_files_local(pool_name, pool_remote_path(pool_name, local_output_base))
+        else:
+            files = list_lhe_files_remote(pool_name, proxy_path, existing_lhe_base)
+        if max_files_per_pool > 0:
+            files = files[:max_files_per_pool]
+        if not files:
+            missing.append(pool_name)
+        pool_payload = OrderedDict()
+        pool_payload["path"] = pool_remote_path(pool_name, local_output_base, existing_lhe_base)
+        pool_payload["count"] = len(files)
+        if count_events:
+            counted_files = []
+            for idx, lhe_path in enumerate(files, start=1):
+                print(f"{pool_name}: counting {idx}/{len(files)} {lhe_path}")
+                try:
+                    actual_events = count_existing_lhe_events(
+                        lhe_path,
+                        count_scratch_dir,
+                        proxy_path,
+                    )
+                except Exception as exc:
+                    print(
+                        f"Error: failed to count events in {lhe_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if actual_events <= 0:
+                    print(
+                        f"Error: counted zero events in {lhe_path}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                counted_files.append(
+                    OrderedDict(
+                        [
+                            ("path", lhe_path),
+                            ("seed", parse_seed_from_lhe_filename(lhe_path)),
+                            ("actual_events", actual_events),
+                            ("status", "ok"),
+                        ]
+                    )
+                )
+            pool_payload["files"] = counted_files
+            pool_payload["counted_events"] = sum(
+                int(item["actual_events"]) for item in counted_files
+            )
+        else:
+            pool_payload["files"] = files
+        pools_payload[pool_name] = pool_payload
+        print(f"{pool_name}: {len(files)} files")
+
+    if missing and not allow_empty:
+        print(
+            "Error: empty LHE inventory for pool(s): " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        print("Use --allow-empty only when an empty pool is intentional.", file=sys.stderr)
+        return 1
+
+    write_json_file(output_path, payload)
+    print(f"Wrote exact LHE inventory: {output_path}")
+    return 0
+
+
+def prepare_condor_lhe_inventory_scan(
+    campaign_names: Sequence[str],
+    output_path: str,
+    workdir: str,
+    proxy_path: str,
+    machine_env: MachineEnv,
+    local_output_base: str = "",
+    existing_lhe_base: str = "",
+    allow_empty: bool = False,
+    max_files_per_pool: int = 0,
+    max_materialize: int = 50,
+) -> int:
+    """Discover exact inputs and create a plain Condor counting workspace."""
+
+    pool_requirements = compute_pool_requirements(campaign_names, 1)
+    pools: Dict[str, object] = OrderedDict()
+    tasks: List[Dict[str, object]] = []
+    missing: List[str] = []
+    needs_proxy = False
+
+    remote_discovery = not local_output_base and any(
+        existing_lhe_pool_dir(pool_name, existing_lhe_base).startswith("root://")
+        for pool_name in pool_requirements
+    )
+    if remote_discovery:
+        valid, _, error = check_proxy_valid(proxy_path)
+        if not valid:
+            raise ValueError(f"A valid X509 proxy is required for remote discovery: {error}")
+
+    for pool_name in pool_requirements:
+        if local_output_base:
+            discovered_files = list_lhe_files_local(
+                pool_name,
+                pool_remote_path(pool_name, local_output_base),
+            )
+        else:
+            discovered_files = list_lhe_files_remote(
+                pool_name,
+                proxy_path,
+                existing_lhe_base,
+            )
+        if max_files_per_pool > 0:
+            discovered_files = discovered_files[:max_files_per_pool]
+        if not discovered_files:
+            missing.append(pool_name)
+
+        discovered_pool_path = pool_remote_path(
+            pool_name,
+            local_output_base,
+            existing_lhe_base,
+        )
+        canonical_pool_path = canonicalize_lhe_path(
+            discovered_pool_path,
+            INVENTORY_COUNTING_DEFAULTS,
+        )
+        pools[pool_name] = OrderedDict(
+            [
+                ("path", canonical_pool_path),
+                ("discovered_path", discovered_pool_path),
+                ("discovered_count", len(discovered_files)),
+            ]
+        )
+        for discovered_path in discovered_files:
+            canonical_path = canonicalize_lhe_path(
+                discovered_path,
+                INVENTORY_COUNTING_DEFAULTS,
+            )
+            needs_proxy = needs_proxy or canonical_path.startswith("root://")
+            tasks.append(
+                OrderedDict(
+                    [
+                        ("task_id", len(tasks)),
+                        ("pool", pool_name),
+                        ("path", canonical_path),
+                        ("discovered_path", discovered_path),
+                        ("seed", parse_seed_from_lhe_filename(canonical_path)),
+                    ]
+                )
+            )
+        print(f"{pool_name}: discovered {len(discovered_files)} files")
+
+    if missing and not allow_empty:
+        raise ValueError(
+            "Empty LHE inventory for pool(s): " + ", ".join(missing) +
+            "; use --allow-empty only when intentional."
+        )
+    if needs_proxy:
+        valid, _, error = check_proxy_valid(proxy_path)
+        if not valid:
+            raise ValueError(f"A valid X509 proxy is required for remote counting: {error}")
+
+    worklist = OrderedDict(
+        [
+            ("schema_version", 1),
+            ("created_at", datetime.now().isoformat(timespec="seconds")),
+            ("campaigns", list(campaign_names)),
+            ("existing_lhe_base", existing_lhe_base),
+            ("local_output_base", local_output_base),
+            ("allow_empty", allow_empty),
+            ("pools", pools),
+            ("tasks", tasks),
+        ]
+    )
+    manifest = prepare_lhe_inventory_workspace(
+        workdir=workdir,
+        worklist=worklist,
+        output_path=output_path,
+        machine_env=machine_env.to_dict(),
+        proxy_path=proxy_path if needs_proxy else "",
+        max_materialize=max_materialize,
+        worker_path=os.path.join(BASE_DIR, "tools", "lhe_inventory_condor.py"),
+        template_path=os.path.join(
+            BASE_DIR,
+            "processing",
+            "templates",
+            "count_lhe_inventory.sub",
+        ),
+    )
+    print(f"Prepared Condor inventory workspace: {os.path.abspath(workdir)}")
+    print(f"Tasks: {manifest['task_count']}")
+    print(f"Submit: condor_submit {os.path.join(os.path.abspath(workdir), 'count_lhe_inventory.sub')}")
+    print(
+        "Summarize: python3 dag_generator.py scan-lhe-inventory "
+        f"--summarize-from {os.path.abspath(workdir)} --output {os.path.abspath(output_path)}"
+    )
+    return 0
 
 
 def expand_campaign_selection(items: Sequence[str]) -> List[str]:
@@ -1481,7 +1835,9 @@ def ensure_dir(path: str) -> None:
 
 
 def write_json_file(path: str, payload: object) -> None:
-    ensure_dir(os.path.dirname(path))
+    parent = os.path.dirname(path)
+    if parent:
+        ensure_dir(parent)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
@@ -2111,7 +2467,11 @@ class DAGBuilder:
         self.allocations_by_pool: Dict[str, int] = OrderedDict()
         self.dag_lines: List[str] = []
         self.metadata: Dict[str, object] = OrderedDict()
-        self._existing_lhe_cache: Dict[str, List[str]] = {}
+        self._existing_lhe_cache: Dict[str, List[LHEInventoryEntry]] = {}
+        self._existing_lhe_inventory: Dict[str, List[LHEInventoryEntry]] = load_existing_lhe_inventory(
+            self.options.existing_lhe_inventory,
+            allow_incomplete=self.options.allow_incomplete_lhe_inventory,
+        )
 
     def write_node_config(
         self,
@@ -2474,43 +2834,75 @@ class DAGBuilder:
     def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
         """Discover and return an LHE file from the exact configured pool directory."""
         storage = pool_storage_name(pool_name)
+        if self.options.existing_lhe_inventory and pool_name not in self._existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"does not contain pool {pool_name}."
+            )
         explicit_base = self.options.existing_lhe_base
         cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
         if cache_key not in self._existing_lhe_cache:
-            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-                files = list_lhe_files_local(
-                    pool_name,
-                    existing_lhe_pool_dir(pool_name, self.options.local_output_base),
-                )
+            if pool_name in self._existing_lhe_inventory:
+                files = self._existing_lhe_inventory[pool_name]
+            elif self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_local(
+                        pool_name,
+                        existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                    )
+                ]
             else:
-                files = list_lhe_files_remote(
-                    pool_name,
-                    self.options.proxy_path,
-                    explicit_base,
-                )
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_remote(
+                        pool_name,
+                        self.options.proxy_path,
+                        explicit_base,
+                    )
+                ]
             self._existing_lhe_cache[cache_key] = files
         files = self._existing_lhe_cache[cache_key]
         fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
         if job_index < len(files):
-            return files[job_index]
+            return files[job_index].path
+        if self.options.existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"has only {len(files)} files for pool {pool_name}; "
+                f"job index {job_index} was requested."
+            )
         return f"{fallback_dir}/sample_{storage}_{seed}.lhe.gz"
 
-    def _discover_existing_lhe_files(self, pool_name: str) -> List[str]:
+    def _discover_existing_lhe_files(self, pool_name: str) -> List[LHEInventoryEntry]:
         """Return cached existing LHE file paths for grouping and skip-LHE planning."""
+        if self.options.existing_lhe_inventory and pool_name not in self._existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"does not contain pool {pool_name}."
+            )
         explicit_base = self.options.existing_lhe_base
         cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
         if cache_key not in self._existing_lhe_cache:
-            if self.options.machine_env.uses_local_storage and self.options.local_output_base:
-                files = list_lhe_files_local(
-                    pool_name,
-                    existing_lhe_pool_dir(pool_name, self.options.local_output_base),
-                )
+            if pool_name in self._existing_lhe_inventory:
+                files = self._existing_lhe_inventory[pool_name]
+            elif self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_local(
+                        pool_name,
+                        existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                    )
+                ]
             else:
-                files = list_lhe_files_remote(
-                    pool_name,
-                    self.options.proxy_path,
-                    explicit_base,
-                )
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_remote(
+                        pool_name,
+                        self.options.proxy_path,
+                        explicit_base,
+                    )
+                ]
             self._existing_lhe_cache[cache_key] = files
         return self._existing_lhe_cache[cache_key]
 
@@ -2521,6 +2913,11 @@ class DAGBuilder:
 
         files = self._discover_existing_lhe_files(pool_name)
         if not files:
+            if self.options.existing_lhe_inventory:
+                raise ValueError(
+                    f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                    f"has no files for pool {pool_name}; refusing synthetic fallback."
+                )
             if self.options.scan_existing:
                 raise ValueError(
                     f"No existing LHE files discovered for {pool_name}; "
@@ -2530,7 +2927,10 @@ class DAGBuilder:
             fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
             synthetic_count = self.options.jobs_per_campaign * max(1, self.options.lhe_group_max_files)
             files = [
-                f"{fallback_dir}/sample_{storage}_{self.seed_for_pool_index(pool_name, i)}.lhe.gz"
+                LHEInventoryEntry(
+                    path=f"{fallback_dir}/sample_{storage}_{self.seed_for_pool_index(pool_name, i)}.lhe.gz",
+                    seed=self.seed_for_pool_index(pool_name, i),
+                )
                 for i in range(synthetic_count)
             ]
 
@@ -2565,12 +2965,24 @@ class DAGBuilder:
             current_counts.clear()
             current_has_unknown_counts = False
 
-        for job_index, path in enumerate(files):
-            seed = parse_seed_from_lhe_filename(path)
+        if self.options.lhe_grouping_enabled and not self.options.existing_lhe_inventory:
+            raise ValueError(
+                "Grouped existing-LHE mode requires --existing-lhe-inventory with "
+                "counted file records; run scan-lhe-inventory --count-events."
+            )
+
+        for job_index, entry in enumerate(files):
+            path = entry.path
+            seed = entry.seed
             if seed is None:
                 seed = self.seed_for_pool_index(pool_name, job_index)
-            count = count_lhe_events_for_grouping(path)
-            if count is None:
+            count = entry.actual_events
+            if count is None or count <= 0:
+                if self.options.lhe_grouping_enabled:
+                    raise ValueError(
+                        f"Grouped existing-LHE mode requires positive actual_events for "
+                        f"{path}; run scan-lhe-inventory --count-events."
+                    )
                 current_has_unknown_counts = True
                 count = 0
             current_paths.append(path)
@@ -2608,6 +3020,7 @@ class DAGBuilder:
             group_id=group.group_id,
             seeds=group.seeds,
             lhe_paths=group.paths,
+            lhe_event_counts=group.event_counts,
         )
         planners[group.group_id] = plan_job
         return plan_job, group
@@ -2621,6 +3034,7 @@ class DAGBuilder:
         group_id: str = "",
         seeds: Optional[List[int]] = None,
         lhe_paths: Optional[List[str]] = None,
+        lhe_event_counts: Optional[List[int]] = None,
     ) -> str:
         """Emit a per-pool LHE block planner DAG node."""
         pool_label = pool_dag_label(pool_name)
@@ -2629,6 +3043,7 @@ class DAGBuilder:
         group_id = group_id or str(seed)
         seeds = seeds or [seed]
         lhe_paths = lhe_paths or [lhe_path]
+        lhe_event_counts = lhe_event_counts or []
         block_output_dir = self._resolve_block_output_dir(pool_name, seed)
         if group_id == str(seed):
             plan_manifest_path = self._resolve_plan_manifest_path(pool_name, seed)
@@ -2642,6 +3057,7 @@ class DAGBuilder:
             "primary_seed": seed,
             "seeds": seeds,
             "lhe_paths": lhe_paths,
+            "lhe_event_counts": lhe_event_counts,
             "output_dir": output_dir,
             "events_per_block": self.options.lhe_events_per_block,
             "max_events_per_plan": self.options.lhe_max_events_per_plan,
@@ -3700,6 +4116,10 @@ def execute_generation(
         if options.log_root != options.local_log_dir:
             ensure_dir(options.log_root)
     pool_requirements = compute_pool_requirements(campaign_names, options.jobs_per_campaign)
+    existing_lhe_inventory = load_existing_lhe_inventory(
+        options.existing_lhe_inventory,
+        allow_incomplete=options.allow_incomplete_lhe_inventory,
+    )
     if options.skip_lhe_generation:
         # Short-circuit: mark all pools as "existing" so ensure_lhe_jobs()
         # is a no-op. In block mode, planners are shared across campaigns and
@@ -3713,9 +4133,11 @@ def execute_generation(
                 if options.enable_lhe_block_subdags
                 else required_count
             )
-            count = 0
+            count = len(existing_lhe_inventory.get(pool_name, []))
             error = None
-            if options.scan_existing:
+            if options.existing_lhe_inventory and pool_name not in existing_lhe_inventory:
+                error = f"missing from existing LHE inventory: {options.existing_lhe_inventory}"
+            elif options.scan_existing and not options.existing_lhe_inventory:
                 if local_output_base:
                     count, error = count_lhe_files_local(pool_name, local_output_base)
                 else:
@@ -3728,7 +4150,8 @@ def execute_generation(
                 "required_count": source_file_requirement,
                 "remote_count": count,
                 "use_existing": error is None and (
-                    count >= source_file_requirement or not options.scan_existing
+                    count >= source_file_requirement
+                    or (not options.scan_existing and not options.existing_lhe_inventory)
                 ),
                 "error": error,
                 "remote_path": pool_remote_path(pool_name, local_output_base, options.existing_lhe_base),
@@ -4056,6 +4479,8 @@ def execute_hepjob_delegate(args: argparse.Namespace) -> int:
         command.extend(["--max-events", str(args.max_events)])
         command.extend(["--proxy-path", args.proxy_path])
         command.extend(["--group", args.hepjob_group])
+        if args.existing_lhe_inventory:
+            command.extend(["--existing-lhe-inventory", args.existing_lhe_inventory])
 
         if args.enable_ntuple:
             command.append("--enable-ntuple")
@@ -4279,6 +4704,17 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="",
         help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。与 --skip-lhe-generation 配合使用。",
+    )
+    parser.add_argument(
+        "--existing-lhe-inventory",
+        type=str,
+        default="",
+        help="精确的已有 LHE 文件清单 JSON；用于跳过远端扫描且避免合成文件名 fallback。",
+    )
+    parser.add_argument(
+        "--allow-incomplete-lhe-inventory",
+        action="store_true",
+        help="显式允许使用标记为 incomplete 的 inventory；默认拒绝。",
     )
     parser.add_argument(
         "--enable-ntuple",
@@ -4529,6 +4965,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="快捷方式：等价于 --machine-env local_condor。",
     )
 
+    inventory_parser = subparsers.add_parser(
+        "scan-lhe-inventory",
+        help="一次性扫描已有 LHE 文件名并写出精确清单 JSON",
+    )
+    inventory_parser.add_argument(
+        "--machine-env",
+        choices=machine_env_choices(),
+        default="auto",
+        help="Condor 计数使用的运行环境。",
+    )
+    inventory_parser.add_argument(
+        "--campaign",
+        action="append",
+        help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
+    )
+    inventory_parser.add_argument("--output", help="输出 inventory JSON 路径。")
+    inventory_mode = inventory_parser.add_mutually_exclusive_group()
+    inventory_mode.add_argument(
+        "--run-on-condor",
+        metavar="WORKDIR",
+        help="准备或提交无 DAG 的 HTCondor 计数 cluster。",
+    )
+    inventory_mode.add_argument(
+        "--summarize-from",
+        metavar="WORKDIR",
+        help="从 Condor workspace 汇总已有结果。",
+    )
+    inventory_parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="立即提交新 workspace，或提交已准备但尚未提交的 workspace。",
+    )
+    inventory_parser.add_argument(
+        "--condor-max-materialize",
+        type=int,
+        default=50,
+        help="Condor cluster 同时 materialize 的最大 job 数，默认 50。",
+    )
+    inventory_parser.add_argument(
+        "--proxy-path",
+        default=detect_proxy_path(),
+        help="X509 代理路径；默认自动探测。",
+    )
+    inventory_parser.add_argument(
+        "--local-output-base",
+        default="",
+        help="本地 LHE 输出基础目录；设置后扫描本地 pool 而不是远端 T2。",
+    )
+    inventory_parser.add_argument(
+        "--existing-lhe-base",
+        default="",
+        help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。",
+    )
+    inventory_parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="允许某些 pool 扫描结果为空并仍写出清单。",
+    )
+    inventory_parser.add_argument(
+        "--count-events",
+        action="store_true",
+        help="逐个读取已有 LHE 文件并在清单中记录 actual_events。",
+    )
+    inventory_parser.add_argument(
+        "--count-scratch-dir",
+        default="/tmp/chiw/lhe_inventory_counts",
+        help="远端 LHE 计数时使用的本地临时目录。",
+    )
+    inventory_parser.add_argument(
+        "--max-files-per-pool",
+        type=int,
+        default=0,
+        help="每个 pool 最多写入/计数的 LHE 文件数；0 表示不限制。",
+    )
+    inventory_parser.add_argument(
+        "--local-condor",
+        action="store_true",
+        help="快捷方式：等价于 --machine-env local_condor。",
+    )
+
     generate_parser = subparsers.add_parser("generate", help="生成正式 DAG")
     add_common_generation_arguments(generate_parser)
     generate_parser.set_defaults(test_mode=False)
@@ -4740,6 +5256,7 @@ def normalize_args(argv: Sequence[str]) -> Sequence[str]:
         "list",
         "validate",
         "prepare-runtime",
+        "scan-lhe-inventory",
         "generate",
         "generate-test",
         "generate-helac-matrix",
@@ -4801,6 +5318,108 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env=machine_env,
             include_ntuple=args.include_ntuple,
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
+        )
+
+    if args.command == "scan-lhe-inventory":
+        if args.summarize_from:
+            if args.submit:
+                parser.error("--submit cannot be combined with --summarize-from")
+            if args.campaign:
+                parser.error("--campaign is read from the workspace in --summarize-from mode")
+            if not args.output:
+                parser.error("--summarize-from requires --output")
+            try:
+                payload, complete = summarize_lhe_inventory_workspace(args.summarize_from)
+                atomic_write_json(args.output, payload)
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"Wrote {'complete' if complete else 'partial'} LHE inventory: "
+                f"{os.path.abspath(args.output)}"
+            )
+            return 0 if complete else 1
+
+        if args.run_on_condor:
+            try:
+                machine_env = resolve_machine_env(requested_machine_env_name(args))
+            except ValueError as exc:
+                parser.error(str(exc))
+            if machine_env.is_hepjob:
+                parser.error("--run-on-condor does not support the HepJob-only ihep profile")
+
+            workspace_exists = os.path.isdir(args.run_on_condor)
+            if workspace_exists:
+                if not args.submit:
+                    parser.error(
+                        "Condor workspace already exists; use --submit to submit it, "
+                        "or choose a new directory"
+                    )
+                if args.campaign or args.output:
+                    parser.error(
+                        "Submitting an existing workspace does not accept --campaign or --output"
+                    )
+                try:
+                    manifest, _ = load_lhe_inventory_workspace(args.run_on_condor)
+                    workspace_proxy = str(manifest.get("proxy_path", "") or "")
+                    if workspace_proxy:
+                        valid, _, error = check_proxy_valid(workspace_proxy)
+                        if not valid:
+                            raise ValueError(f"X509 proxy is not valid: {error}")
+                    submit_lhe_inventory_workspace(args.run_on_condor)
+                    return 0
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
+
+            if not args.campaign:
+                parser.error("fresh --run-on-condor preparation requires --campaign")
+            if not args.output:
+                parser.error("fresh --run-on-condor preparation requires --output")
+            try:
+                campaign_names = expand_campaign_selection(args.campaign)
+                local_output_base = args.local_output_base or (
+                    machine_env.local_output_base if machine_env.uses_local_storage else ""
+                )
+                prepare_condor_lhe_inventory_scan(
+                    campaign_names=campaign_names,
+                    output_path=args.output,
+                    workdir=args.run_on_condor,
+                    proxy_path=args.proxy_path,
+                    machine_env=machine_env,
+                    local_output_base=local_output_base,
+                    existing_lhe_base=args.existing_lhe_base,
+                    allow_empty=args.allow_empty,
+                    max_files_per_pool=args.max_files_per_pool,
+                    max_materialize=args.condor_max_materialize,
+                )
+                if args.submit:
+                    submit_lhe_inventory_workspace(args.run_on_condor)
+                return 0
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        if args.submit:
+            parser.error("--submit requires --run-on-condor")
+        if not args.campaign:
+            parser.error("direct scan-lhe-inventory requires --campaign")
+        if not args.output:
+            parser.error("direct scan-lhe-inventory requires --output")
+        try:
+            campaign_names = expand_campaign_selection(args.campaign)
+        except ValueError as exc:
+            parser.error(str(exc))
+        return execute_lhe_inventory_scan(
+            campaign_names=campaign_names,
+            output_path=args.output,
+            proxy_path=args.proxy_path,
+            local_output_base=args.local_output_base,
+            existing_lhe_base=args.existing_lhe_base,
+            allow_empty=args.allow_empty,
+            count_events=args.count_events,
+            count_scratch_dir=args.count_scratch_dir,
+            max_files_per_pool=args.max_files_per_pool,
         )
 
     if args.command == "generate-helac-matrix":
@@ -4891,6 +5510,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             archive_subdag_logs=args.archive_subdag_logs,
             skip_lhe_generation=args.skip_lhe_generation,
             existing_lhe_base=args.existing_lhe_base,
+            existing_lhe_inventory=args.existing_lhe_inventory,
+            allow_incomplete_lhe_inventory=args.allow_incomplete_lhe_inventory,
             use_subprocess_naming=args.use_subprocess_naming,
             target_base_url=args.target_base_url,
             lhe_group_min_events=args.lhe_group_min_events,

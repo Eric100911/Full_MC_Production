@@ -83,6 +83,45 @@ Production nodes receive exact paths from
 guess between `LHE_pool`, `lhe_pools`, capitalization variants, or legacy
 layouts.
 
+## Parallel LHE Inventory Counting
+
+For a large existing-LHE inventory, prepare a plain HTCondor cluster with one
+counting process per source file. This is not a DAGMan workflow:
+
+```bash
+python3 dag_generator.py scan-lhe-inventory \
+  --campaign JJP_ALL \
+  --count-events \
+  --output inventories/jjp_counted.json \
+  --run-on-condor /afs/cern.ch/user/c/chiw/condor/jjp_inventory_count \
+  --machine-env lxplus_t2_ihep \
+  --condor-max-materialize 50
+```
+
+The preparation command does not submit unless `--submit` is included. Submit
+an existing prepared workspace through the same CLI:
+
+```bash
+python3 dag_generator.py scan-lhe-inventory \
+  --run-on-condor /afs/cern.ch/user/c/chiw/condor/jjp_inventory_count \
+  --submit
+```
+
+After the jobs finish, merge their result fragments:
+
+```bash
+python3 dag_generator.py scan-lhe-inventory \
+  --summarize-from /afs/cern.ch/user/c/chiw/condor/jjp_inventory_count \
+  --output inventories/jjp_counted.json
+```
+
+Summarization writes a diagnostic JSON even when results are missing or bad,
+but returns nonzero and marks it `complete: false`. DAG generation rejects
+such an inventory unless `--allow-incomplete-lhe-inventory` is explicitly
+given. Paths below `/eos/user/` are recorded as exact
+`root://eosuser.cern.ch///eos/user/...` URLs; other local paths must be visible
+at the same path on the selected execute nodes.
+
 Validate the committed configuration with:
 
 ```bash

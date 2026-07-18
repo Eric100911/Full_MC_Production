@@ -109,6 +109,12 @@ python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
 echo "[INFO] 检查 existing-LHE generate-test 的 planner 事件上限"
 python3 "${SCRIPT_DIR}/test_lhe_planner_cap_generation.py"
 
+echo "[INFO] 检查 counted existing-LHE inventory 分组"
+python3 "${SCRIPT_DIR}/test_existing_lhe_inventory.py"
+
+echo "[INFO] 检查 plain-Condor existing-LHE inventory counting"
+python3 "${SCRIPT_DIR}/test_condor_lhe_inventory.py"
+
 echo "[INFO] 检查 block SubDAG final inventory 与日志归档 mock"
 "${SCRIPT_DIR}/test_subdag_final_and_archive.sh"
 
