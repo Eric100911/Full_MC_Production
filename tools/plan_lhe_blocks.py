@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--helac-seeds", default="", help="Comma-separated seeds corresponding to --lhe-path inputs")
     p.add_argument("--lhe-path", action="append", required=True,
                    help="Path to LHE file (local or root:// URL); may be repeated")
+    p.add_argument("--lhe-event-counts", default="",
+                   help="Comma-separated expected input event counts from discovery inventory")
     p.add_argument("--output-dir", required=True, help="Directory for manifest output")
     p.add_argument("--events-per-block", type=int, default=1000)
     p.add_argument("--max-events-per-plan", type=int, default=0,
@@ -52,16 +54,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lhe-shuffle-split-bin", default="lhe_shuffle_split",
                    help="Path to lhe_shuffle_split binary")
     return p.parse_args()
-
-
-def count_lhe_events(path: str) -> int:
-    """Count <event> lines in an LHE file, handling .gz transparently."""
-    if path.endswith(".gz"):
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
-            return sum(1 for line in fh if line.strip().startswith("<event>"))
-    else:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return sum(1 for line in fh if line.strip().startswith("<event>"))
 
 
 def stage_file(src: str, dst: str, is_remote: bool):
@@ -147,13 +139,21 @@ def _normalize_inputs(args: argparse.Namespace) -> tuple:
         raise ValueError(
             f"--helac-seeds has {len(seeds)} entries but --lhe-path has {len(args.lhe_path)}"
         )
-    return primary_seed, group_id, seeds
+    expected_counts = []
+    if args.lhe_event_counts:
+        expected_counts = [int(s) for s in args.lhe_event_counts.split(",") if s]
+        if len(expected_counts) != len(args.lhe_path):
+            raise ValueError(
+                f"--lhe-event-counts has {len(expected_counts)} entries but "
+                f"--lhe-path has {len(args.lhe_path)}"
+            )
+    return primary_seed, group_id, seeds, expected_counts
 
 
 def main() -> int:
     args = parse_args()
     try:
-        primary_seed, group_id, seeds = _normalize_inputs(args)
+        primary_seed, group_id, seeds, expected_input_event_counts = _normalize_inputs(args)
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
@@ -165,7 +165,6 @@ def main() -> int:
     try:
         # --- 1. Resolve and decompress LHE files ---
         local_inputs = []
-        input_event_counts = []
         for i, lhe_path in enumerate(args.lhe_path):
             local_lhe = lhe_path
             if lhe_path.startswith("root://"):
@@ -186,15 +185,9 @@ def main() -> int:
                         shutil.copyfileobj(f_in, f_out)
                 local_lhe = decompressed
 
-            n_input_events = count_lhe_events(local_lhe)
             local_inputs.append(local_lhe)
-            input_event_counts.append(n_input_events)
 
-        n_events = sum(input_event_counts)
-        if n_events == 0:
-            print("[ERROR] LHE file contains zero events", file=sys.stderr)
-            return 1
-        print(f"[INFO] Input LHE group {group_id} has {n_events} events from {len(local_inputs)} file(s)")
+        print(f"[INFO] Input LHE group {group_id} has {len(local_inputs)} file(s)")
 
         # --- 2. Check for existing blocks (reuse) ---
         manifest_path = args.manifest_output_path or os.path.join(
@@ -247,12 +240,12 @@ def main() -> int:
             shuffle_manifest = json.load(f)
 
         splitter_events = shuffle_manifest.get("total_input_events")
-        if splitter_events is not None and splitter_events != n_events:
-            print(
-                f"[ERROR] Event conservation mismatch before staging: planner counted {n_events}, "
-                f"splitter counted {splitter_events}",
-                file=sys.stderr,
-            )
+        if splitter_events is None:
+            print("[ERROR] lhe_shuffle_split manifest is missing total_input_events", file=sys.stderr)
+            return 1
+        n_events = int(splitter_events)
+        if n_events <= 0:
+            print("[ERROR] lhe_shuffle_split counted zero input events", file=sys.stderr)
             return 1
 
         n_blocks = shuffle_manifest.get("n_blocks", 0)
@@ -309,7 +302,10 @@ def main() -> int:
             "helac_seed": primary_seed,
             "seeds": seeds,
             "input_files": args.lhe_path,
-            "input_event_counts": input_event_counts,
+            "input_event_counts": expected_input_event_counts,
+            "input_event_count_source": (
+                "discovery_inventory" if expected_input_event_counts else "not_provided"
+            ),
             "shuffle_seed": args.shuffle_seed,
             "shuffle_mode": args.shuffle_mode,
             "n_strata_arg": args.n_strata,

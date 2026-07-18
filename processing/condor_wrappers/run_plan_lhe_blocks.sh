@@ -59,6 +59,11 @@ if not isinstance(cfg["lhe_paths"], list) or not cfg["lhe_paths"]:
     raise SystemExit("Planner config key lhe_paths must be a non-empty list")
 if not isinstance(cfg["seeds"], list) or not cfg["seeds"]:
     raise SystemExit("Planner config key seeds must be a non-empty list")
+if "lhe_event_counts" in cfg and cfg["lhe_event_counts"]:
+    if not isinstance(cfg["lhe_event_counts"], list):
+        raise SystemExit("Planner config key lhe_event_counts must be a list")
+    if len(cfg["lhe_event_counts"]) != len(cfg["lhe_paths"]):
+        raise SystemExit("Planner config key lhe_event_counts must match lhe_paths length")
 
 cmd = [
     "python3",
@@ -79,6 +84,9 @@ cmd = [
 max_events_per_plan = int(cfg.get("max_events_per_plan", 0) or 0)
 if max_events_per_plan > 0:
     cmd.extend(["--max-events-per-plan", str(max_events_per_plan)])
+lhe_event_counts = cfg.get("lhe_event_counts", [])
+if lhe_event_counts:
+    cmd.extend(["--lhe-event-counts", ",".join(str(count) for count in lhe_event_counts)])
 for path in cfg["lhe_paths"]:
     cmd.extend(["--lhe-path", str(path)])
 if cfg.get("drop_incomplete_last_block", False):
