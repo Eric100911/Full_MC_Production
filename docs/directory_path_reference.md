@@ -85,15 +85,16 @@ their exact `lhe_pool_directories.<pool>.path`.
 │
 ├── output/
 │   └── {campaign_name}/
-│       └── {job_id}/                  ← or BLOCKxxxxxx for block SubDAGs
+│       └── {job_id}/                  ← JOBxxxxxx_BLOCKxxxxxx for block SubDAGs
 │           ├── output_GENSIM.root
 │           ├── output_RAW.root
 │           ├── output_RECO.root
 │           ├── output_MINIAOD.root
-│           └── output_ntuple.root     ← (or {subprocess_id}-Ntuple-{version}-{job_id}.root)
+│           ├── output_ntuple.root     ← (or {subprocess_id}-Ntuple-{version}-{job_id}.root)
+│           └── processing_manifest_{campaign}_{job_id}.json
 │
 └── JpsiJpsiPhi/                       ← only with --use-subprocess-naming
-    └── Ntuple-{version}/
+    └── Ntuple/ or Ntuple-{version}/
         └── {subprocess_id}/
             └── {subprocess_id}-Ntuple-{version}-{job_id}.root
 ```
@@ -241,7 +242,7 @@ Constructs the remote URL by prepending `EOS_BASE`:
 
 Full example for MiniAOD:
 ```
-root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/BLOCK000042/output_MINIAOD.root
+root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output/JJP_DPS2_CS/JOB000000_BLOCK000042/output_MINIAOD.root
 ```
 
 ### Files produced
@@ -253,6 +254,12 @@ root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output/JJP_DPS2_
 | RECO | `output_RECO.root` |
 | MiniAOD | `output_MINIAOD.root` |
 | Ntuple | `output_ntuple.root` |
+| Processing sidecar | `processing_manifest_<campaign>_<job_id>.json` |
+
+The processing sidecar records target and actual mixed/MiniAOD event counts,
+the reserved EDM EventID range, per-source shower statistics, and the final
+MiniAOD URL. MiniAOD merge nodes read these sidecars to derive their expected
+event count when all component manifests are available.
 
 ---
 
@@ -270,16 +277,18 @@ Controlled by `CUSTOM_OUTPUT_SUBPATH` and `CUSTOM_NTUPLE_BASENAME`:
 
 ```
 subprocess_id = SUBPROCESS_MAP[campaign_name]   ← e.g. "SPS-JpsiJpsiPhi-LO"
-version       = --ntuple-version or "v01_06"
+version       = --ntuple-version or "v01_06" (filename component)
 
 target_base      = --target-base-url or CHIW_EOS_OUTPUT_BASE
-output_subpath   = JpsiJpsiPhi/Ntuple-{version}/{subprocess_id}
+output_subpath   = JpsiJpsiPhi/Ntuple/{subprocess_id} by default
+                   JpsiJpsiPhi/Ntuple-{version}/{subprocess_id}
+                   when --ntuple-version is explicitly supplied
 ntuple_basename  = {subprocess_id}-Ntuple-{version}-{job_index}.root
 ```
 
 Full URL:
 ```
-root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple-v01_06/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
+root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/JpsiJpsiPhi/Ntuple/SPS-JpsiJpsiPhi-LO/SPS-JpsiJpsiPhi-LO-Ntuple-v01_06-0.root
 ```
 
 ### Ntuple-only DAG mode
@@ -328,6 +337,25 @@ $(proxy_bundle_name) $(runtime_bundle_name) $(config_name)
 ```
 {output_dir}/plan_subdags/{campaign_name}/job_{job_index}/node_configs/processing/MIX_{campaign}_{job_index}_BLOCK{idx:06d}.json
 ```
+
+Each config contains authoritative `sources[]` entries. A source entry can
+contain multiple `BLOCK:<pool>:<group_id>:<idx>` inputs accumulated up to that
+source mode's LHE-event budget. The config also contains
+`target_mixed_events`, `minimum_output_fraction`, and `edm_event_id`.
+
+### Deterministic EDM EventIDs
+
+Block processing uses event-ID scheme `run1-cantor-job-block-lumi-v1`:
+
+- run number is 1;
+- luminosity block is the one-based Cantor pairing of source-job index and
+  block index;
+- event numbers start at 1 inside each luminosity block;
+- `reserved_events` equals the processing event span.
+
+This makes block outputs disjoint within one campaign coordinator/output
+dataset. Different campaigns may reuse the same EventIDs and remain separate
+datasets. The coordinator manifest and final inventory record the scheme name.
 
 ### Ntuple configs (inside SubDAG)
 

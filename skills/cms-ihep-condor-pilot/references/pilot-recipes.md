@@ -15,8 +15,12 @@ For `JJP_DPS1` with one source file:
   block indices from the same planned source.
 - `generate-test` with existing LHEs auto-caps each PLAN node from positive
   `--max-events`, so `--max-events 20 --lhe-events-per-block 5` gives four
-  source blocks and two mixed processing blocks without splitting the whole
-  remote file into tiny blocks.
+  source blocks without splitting the whole remote file into tiny blocks.
+- Set the processing target and both source budgets to 5 for this deliberately
+  tiny pilot. Each mixed block then consumes one normal and one phi source
+  block, giving two mixed processing blocks from the four-block plan. Without
+  these overrides, the default 110/350-event budgets exhaust the small plan
+  before both repeated source occurrences can be filled.
 - `--miniaod-merge-events 10` should produce one merged MiniAOD and one ntuple
   for a 2-block pilot.
 
@@ -32,6 +36,9 @@ python3 dag_generator.py generate-test \
   --campaign JJP_DPS1 \
   --jobs 1 \
   --max-events 20 \
+  --target-mixed-events 5 \
+  --normal-max-lhe-events 5 \
+  --phi-max-lhe-events 5 \
   --enable-lhe-block-subdags \
   --skip-lhe-generation \
   --no-scan-existing \
@@ -60,6 +67,17 @@ Inspect the planner JSON before submission; it should contain:
 "events_per_block": 5,
 "max_events_per_plan": 20
 ```
+
+After coordination, each processing config should also contain:
+
+```json
+"target_mixed_events": 5,
+"event_id_span": 5,
+"minimum_output_fraction": 0.8
+```
+
+Verify that the two repeated source entries use distinct block indices and that
+each mixed block has a distinct `edm_event_id.first_luminosity_block`.
 
 Submit:
 

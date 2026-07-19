@@ -34,14 +34,25 @@ bash -n \
   tests/submit_tests.sh \
   tests/submit_lhe_matrix.sh \
   tests/mock_test_worker.sh \
+  tests/mock_test_edm_eventid.sh \
   tests/test_lhe_shuffle_split.sh
-python3 -m py_compile dag_generator.py tools/compile_node_config.py
+python3 -m py_compile \
+  dag_generator.py \
+  tools/compile_node_config.py \
+  tools/coordinate_lhe_blocks.py \
+  tools/benchmark_phi_efficiency.py \
+  tools/review_phase2_shower_efficiency.py
 python3 tests/test_coordinate_lhe_blocks.py
 python3 tests/test_lhe_planner_cap_generation.py
 ./tests/run_all_tests.sh
 ./tests/mock_test_worker.sh
 ./tests/test_lhe_shuffle_split.sh
 ```
+
+The real GEN-SIM EventID smoke requires a usable HepMC fixture and CMSSW
+environment. Run it explicitly with
+`./tests/run_all_tests.sh --with-edm-eventid-smoke` or
+`./tests/mock_test_edm_eventid.sh`.
 
 `run_all_tests.sh` runs the octet-PDG self-check, GEN-SIM vertex-smearing
 check, environment validation, and smoke DAG generation for
@@ -159,9 +170,10 @@ rg -n '^(JOB|VARS|CATEGORY|MAXJOBS|FINAL)' \
   tests/generated/pilot_exact_paths/pilot.dag
 ```
 
-For `JJP_DPS2_CS`, `max_events: 5` means each of the two LHE sources is
-showered up to five events and then mixed into **five output events**. It does
-not mean ten output events.
+For this flat-DAG `JJP_DPS2_CS` pilot, `max_events: 5` means each of the two LHE
+sources is showered up to five events and then mixed into **five output
+events**. It does not mean ten output events. Block SubDAG configs use separate
+source budgets and should not infer LHE consumption from `--max-events` alone.
 
 ## Pilot Submission and Monitoring
 
@@ -260,7 +272,10 @@ output files. Planner nodes deterministically shuffle each file and split it
 into non-overlapping blocks. Planner results may be reused by different
 subprocesses. Within one subprocess, repeated inputs such as the two
 `pool_jpsi_CSCO_g` occurrences in `JJP_DPS1` and `JJP_TPS` consume distinct
-block indices. Strict-min determines the number of mixed output blocks.
+block indices. The coordinator consumes distinct planned blocks until every
+source occurrence reaches its configured LHE-event budget. It stops when any
+required source can no longer form another complete budgeted group; this
+determines the number of mixed output blocks.
 
 Each output ID includes both the source-file index and block index:
 `JOBxxxxxx_BLOCKxxxxxx`. This prevents different planner groups from
@@ -271,7 +286,23 @@ For small existing-LHE pilots, do not combine a full-size LHE file with tiny
 `generate-test`, positive `--max-events` automatically becomes
 `--lhe-max-events-per-plan` for existing-LHE block SubDAGs. For example,
 `--max-events 20 --lhe-events-per-block 5` makes each PLAN node shuffle the
-full input ordering but emit only four 5-event source blocks.
+full input ordering but emit only four 5-event source blocks. That statement is
+only about planner output. For a repeated-pool campaign such as `JJP_DPS1`, a
+two-block processing pilot must also set `--target-mixed-events 5`,
+`--normal-max-lhe-events 5`, and `--phi-max-lhe-events 5`; otherwise the default
+110/350-event source budgets can consume the small plan before all source
+occurrences are filled.
+
+Every block processing config records:
+
+- `target_mixed_events` and `minimum_output_fraction`;
+- authoritative per-source input groups and planned LHE-event counts;
+- a deterministic, non-overlapping `edm_event_id` reservation;
+- the URL of `processing_manifest_<campaign>_<job_id>.json`.
+
+The processing sidecar records actual mixed and MiniAOD event counts plus
+per-source retry/acceptance statistics. Merge validation uses these actual
+component counts when all sidecars are available.
 
 The v4 target base is:
 
@@ -296,6 +327,11 @@ python3 dag_generator.py generate \
   --campaign JJP_ALL \
   --jobs 1000 \
   --max-events -1 \
+  --target-mixed-events 100 \
+  --normal-max-lhe-events 110 \
+  --phi-max-lhe-events 350 \
+  --phi-max-hadronization-retries 5000 \
+  --minimum-output-fraction 0.8 \
   --enable-lhe-block-subdags \
   --skip-lhe-generation \
   --scan-existing \
@@ -322,3 +358,29 @@ coordinator nodes, 6,000 block SubDAGs, and zero HELAC-generation nodes. Record
 `myschedd show` immediately before `condor_submit_dag`. The `20000` ceilings
 are deliberately above the expected workflow width and serve as non-binding
 safety bounds rather than production throttles.
+
+## Shower Efficiency Review
+
+Compare standalone shower manifests from retry-limit benchmarks:
+
+```bash
+python3 tools/benchmark_phi_efficiency.py \
+  /tmp/chiw/benchmarks/shower_*_manifest.json \
+  --json-output /tmp/chiw/phi_benchmark.json \
+  --csv-output /tmp/chiw/phi_benchmark.csv
+```
+
+Join coordinator manifests, generated processing configs, and staged processing
+sidecars for a completed pilot:
+
+```bash
+python3 tools/review_phase2_shower_efficiency.py \
+  --pilot-dir generated/<pilot> \
+  --cache-dir /tmp/chiw/phase2_shower_review_manifests \
+  --fetch-remote \
+  --json-output /tmp/chiw/phase2_shower_review.json \
+  --csv-output /tmp/chiw/phase2_shower_review.csv
+```
+
+Run `--fetch-remote` only from a normal CERN/IHEP shell or with approved
+unsandboxed network access and a valid proxy.

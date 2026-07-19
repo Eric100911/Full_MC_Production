@@ -32,6 +32,10 @@ Prefer it for small, reversible pilots and live DAGMan checks.
   It auto-caps each PLAN node through `--lhe-max-events-per-plan` after shuffle
   ordering. Do not pair full-size existing LHE files with tiny
   `--lhe-events-per-block` values and an uncapped planner.
+- Planner caps and processing budgets are independent. For tiny block pilots,
+  set `--target-mixed-events`, `--normal-max-lhe-events`, and
+  `--phi-max-lhe-events` explicitly so every repeated source occurrence can be
+  filled from the planned blocks.
 
 ## Existing-LHE MiniAOD merge pilot
 

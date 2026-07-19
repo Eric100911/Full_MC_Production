@@ -1,4 +1,10 @@
 # 色八重态MC DAG workbook
+
+> **历史物理设计记录，不是当前操作手册。** 本文保留早期 process 定义和设计背景；
+> 其中的 `MC_Production_v2` 路径、旧 IHEP URL、环境说明和作业步骤已经过时。
+> 当前生产请使用 `README_zh-cn.md`、`docs/testing.md` 和
+> `docs/directory_path_reference.md`。
+
 ## 简要流程
 Helac-Onia 2.0进行矩阵元计算，生成LHE -> 独立编译的Pythia8进行shower（standard, phi enriched） -> CMSSW进一步模拟(GEN->...->MINIAOD)
 ## 具体细节

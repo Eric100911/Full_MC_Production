@@ -3,9 +3,9 @@
 coordinate_lhe_blocks.py — Campaign-level multi-source LHE block coordinator.
 
 Runs as a Condor job after all per-pool LHE planners complete for a campaign
-job index. Reads plan manifests from each source, matches blocks across sources
-with strict-min policy, and generates a SubDAG where each MIX_BLOCK node
-processes one block from every required source.
+job index. Reads plan manifests from each source, consumes distinct blocks to
+satisfy per-source LHE-event budgets, and generates a SubDAG where each
+MIX_BLOCK node processes one budgeted input group from every required source.
 
 Usage:
   python3 coordinate_lhe_blocks.py \\
@@ -306,7 +306,7 @@ def main() -> int:
         print(f"[INFO] Source {info['pool']} (group={group_id}, primary_seed={primary_seed}): "
               f"{len(m.get('blocks', []))} blocks")
 
-    # --- 3. Resolve campaign input multiplicity and strict-min block count ---
+    # --- 3. Resolve campaign inputs and budget-derived source groups ---
     campaign_inputs = [p.strip() for p in args.campaign_inputs.split(",") if p.strip()]
     shower_modes = [m.strip() for m in args.shower_modes.split(",")]
     if len(campaign_inputs) != args.n_sources:

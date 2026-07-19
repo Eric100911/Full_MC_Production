@@ -25,16 +25,16 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 
 ### Core modules
 
-- **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, `MachineEnv` dataclasses and all subcommands (`list`, `validate`, `generate`, `generate-test`, `generate-helac-matrix`, `prepare-runtime`). Campaign/pool definitions are Python literals in this file, not loaded from external config.
+- **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, `MachineEnv` dataclasses and the `list`, `validate`, `prepare-runtime`, `scan-lhe-inventory`, `generate`, `generate-test`, `generate-helac-matrix`, and `generate-ntuple-only` subcommands. Campaign/pool definitions are Python literals in this file, not loaded from external config.
 - **`hepjob_workflow.py`** — IHEP/lxlogin HepJob backend adapter. Reuses campaign/pool definitions and bundle-building utilities from `dag_generator.py`. Generates bash job scripts instead of HTCondor submit files.
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter: translates between old `9900xxxx` codes and Pythia8 `99nqnsnrnLnJ` encoding. Also provides a `scan` subcommand for auditing LHE files.
 - **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Unpacks `helac_package.tar.gz`, builds HepMC/HELAC, generates LHE, optionally shuffle-splits into blocks, stages out to XRootD.
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 tool for stratified LHE shuffle and 1000-event block splitting. Supports `--filename-prefix` for seed-specific output naming. Pre-compiled inside cmssw/el7 container and bundled with both LHE and planner runtimes.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 tool for stratified LHE shuffle and fixed-size block splitting. Supports `--filename-prefix` for seed-specific output naming. Compiled natively on EL9 at bundle-preparation time and bundled with both LHE and planner runtimes.
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
-- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, consumes non-overlapping blocks to satisfy per-source LHE budgets, assigns deterministic EDM EventIDs, and generates `blocks_processing.dag` SubDAGs.
 - **`tools/compile_node_config.py`** — Config compiler/validator for fully expanded per-pool LHE paths. Validation happens before submission, never through worker-side layout guessing.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker to avoid glibc/ABI mismatches.
-- **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `event_mixer_multisource.cc`) with a Makefile.
+- **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `shower_sps.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type. Templates use wrapper scripts rather than inline bash.
 - **`processing/condor_wrappers/`** — Lightweight bash wrappers (`run_processing.sh`, `run_ntuple_only.sh`) invoked by submit templates.
 - **`common/compression_util.py`** — Python gzip helpers: `accepts_lhe_ext()`, `gzip_file_atomic()`, `gunzip_file_atomic()`.
@@ -72,8 +72,11 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - LHE shuffle-split (`--lhe-shuffle-split`) produces `block_NNNNNN.lhe` files and a `shuffle_split_manifest.json` in a `lhe_blocks/` subdirectory. The original single LHE is always preserved for backward-compatible processing.
 - Block SubDAG mode (`--enable-lhe-block-subdags`) introduces per-HELAC-job planners and campaign-level coordinators that generate `SUBDAG EXTERNAL` processing DAGs. Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness. Processing nodes consume blocks via `BLOCK:<pool>:<seed>:<idx>` input specs.
 - Planner: `tools/plan_lhe_blocks.py` runs after each HELAC job, compresses LHE, shuffle-splits, stages blocks, and writes `plan_manifest_<pool>_<seed>.json`.
-- Coordinator: `tools/coordinate_lhe_blocks.py` runs after all per-source planners for a multi-source campaign, matches blocks with strict-min policy, and generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
-- New DAG categories: `lhe_planning` (planner jobs), `lhe_coordination` (coordinator jobs), `block_processing` (block-level processing inside SubDAGs).
+- Coordinator: `tools/coordinate_lhe_blocks.py` runs after all per-source planners for a multi-source campaign, builds budget-derived source groups, and generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+- Processing targets default to a positive `--max-events`, otherwise 100 mixed events. Source LHE budgets default to 110 events for normal modes and 350 for phi-like modes; repeated pool occurrences consume distinct blocks and each occurrence must have enough planned input.
+- Block processing uses the `run1-cantor-job-block-lumi-v1` scheme: run 1, a Cantor-paired luminosity block derived from source-job and block indices, and event numbers starting at 1 within the reserved span.
+- Each block stages `processing_manifest_<campaign>_<job_id>.json` beside its MiniAOD. MiniAOD merge validation prefers actual event counts from these sidecars over static estimates.
+- Block workflow DAG categories: `lhe_planning`, `lhe_coordination`, `block_processing`, and optional `miniaod_merge`; ntuple nodes retain the `ntuple` category.
 - The `--filename-prefix` option on `lhe_shuffle_split` allows seed-specific block filenames (e.g. `100_block_000000.lhe`).
 - Storage configuration is centralized in `common/node_config_defaults.json` (EOS host, path base, pool subdirectory mappings). Runtime scripts read this via the JSON config pattern (`write_node_config()` in dag_generator.py). The constants `EOS_HOST`, `EOS_PATH_BASE`, `EOS_BASE`, `CHIW_EOS_OUTPUT_BASE` in `dag_generator.py` derive from this file.
 - Existing LHE pools use exact `lhe_pool_directories.<pool>.path` values with the explicit IHEP `:1094` endpoint. DAG generation copies the mapping into every relevant node config. `EOS:<pool>:...` resolution lists only that exact directory and fails if it is missing or empty.
@@ -166,14 +169,12 @@ When the submodule is updated to a new tag:
 | Zero HLT-matched muons in efficiency | `X_config` → `FiltersForJpsi` must be `["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]`. The old labels (`hltVertexmumuFilterJpsiMuon3p5`, `hltDisplacedmumuFilterDoubleMu43LowMass`) match no trigger objects. |
 
 ## Runtime Environments
-- **Image**: `cmssw/el7:x86_64` (CentOS 7, glibc 2.17)
-- **Compiler toolchain**: LCG_88b (`/cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh`) — GCC 6.2 for gfortran and C++14 builds
-- **C++ standard**: C++14 (`-std=c++14`) — GCC 6.2 predates the `-std=c++17` flag
-- Bundled C++ binaries (`lhe_shuffle_split`) are compiled inside this container at bundle-prep time and run with LCG_88b sourced
-- Python tools run on the host system (EL9, Python 3)
+- **HELAC image**: `cmssw/el7:x86_64` (CentOS 7, glibc 2.17), with LCG_88b for the HELAC/HepMC2 runtime.
+- **Processing and bundle-preparation host**: EL9. The production `lhe_shuffle_split` binary is compiled natively with `g++ -std=c++14` while runtime bundles are prepared.
+- **Python tools**: host EL9 / Python 3.
 
 ### Test environment
-- Local tests (`tests/test_lhe_shuffle_split.sh`) compile and run inside the same `cmssw/el7` + LCG_88b container via `singularity exec`
+- `tests/test_lhe_shuffle_split.sh` retains an EL7/LCG_88b compatibility build; DAG/runtime generation tests separately exercise the native EL9 bundle build.
 - Synthetic LHE generation (`tests/generate_synthetic_lhe.py`) runs on the host Python
 - Mock tests (`tests/mock_test_worker.sh`) validate the infrastructure chain (prepare-runtime → bundle → wrapper → config → execution) using the same tooling and patterns as production. **Mock tests must use the same commands, bundles, and config format as production.** If the production container image is unavailable locally, bare execution is acceptable only when the host OS matches the container OS (both el9). Never substitute a different container or alter the worker scripts for test convenience.
 

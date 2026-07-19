@@ -1,5 +1,12 @@
 # Runtime Packaging Optimization Notes
 
+> **Archived point-in-time notes (2026-05-09).** Several recommendations below,
+> including the prebuilt CMSSW15 runtime, split ntuple nodes, configurable log
+> roots, DAG categories, and native EL9 runtime-bundle preparation, have since
+> been implemented. Treat the experiment details as historical evidence, not as
+> current build or production instructions. Current procedures live in
+> `README.md`, `docs/testing.md`, and `common/packages/README.md`.
+
 This note tracks packaging changes worth making after the first T2_CN_Beijing
 DAG/runtime review. The current workflow is correct but spends substantial
 worker time rebuilding packages that can either be prebuilt once or reused from

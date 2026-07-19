@@ -21,9 +21,8 @@
 
 ## 目录结构
 
-- **`dag_generator.py`** — 主 CLI 入口。定义 `LHEPool`、`Campaign`、`MachineEnv` dataclass 及全部子命令（`list`、`validate`、`generate`、`generate-test`、`generate-helac-matrix`、`generate-ntuple-only`、`prepare-runtime`）。Campaign/pool 定义以 Python 字面量写在该文件中。
+- **`dag_generator.py`** — 主 CLI 入口。定义 `LHEPool`、`Campaign`、`MachineEnv` dataclass，以及 `list`、`validate`、`prepare-runtime`、`scan-lhe-inventory`、`generate`、`generate-test`、`generate-helac-matrix`、`generate-ntuple-only` 子命令。Campaign/pool 定义以 Python 字面量写在该文件中。
 - **`hepjob_workflow.py`** — IHEP/lxlogin HepJob 后端适配器。生成 bash 作业脚本代替 HTCondor submit 文件。
-- **`common/node_config_defaults.json`** — 集中式存储路径和 pool 目录映射。
 - **`common/octet_pdg.py`** — HELAC 八重态 PDG 编码转换/扫描工具。
 - **`common/compression_util.py`** / **`common/compression_helpers.sh`** — Python 和 bash 的 gzip 辅助函数，支持透明 `.lhe.gz` 处理。
 - **`common/cmssw_configs/`** — CMSSW Python 配置片段（GEN-SIM 及各分析类型的 ntuple 配置）。
@@ -32,10 +31,10 @@
 - **`common/packages/`** — 预构建 tarball：`helac_package.tar.gz`（必需）、`cmssw15_tpsonia2mumu_runtime.tar.gz`（可选）。
 - **`external/TPS-Onia2MuMu`** — Git submodule，ntuple 分析器源码（v2.0_patch2）。无预编译 CMSSW15 runtime tarball 时作为回退。
 - **`lhe_generation/run_helac.sh`** — Worker 端 HELAC-Onia 执行脚本。支持压缩输出、shuffle-split、block staging 和 `TARGET_EOS_BASE` 覆盖。
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 分层 LHE 洗牌与定长分块工具。在 `cmssw/el7` 容器内预编译。
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 分层 LHE 洗牌与定长分块工具。准备 runtime bundle 时在 EL9 上原生编译。
 - **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE 作业 wrapper，使用 JSON 配置（3 个位置参数）代替旧版多参数方式。
 - **`tools/plan_lhe_blocks.py`** — 单 pool LHE 分块规划器：压缩、shuffle-split、stage 分块、写出 `plan_manifest_<pool>_<seed>.json`。作为 Condor 作业在 HELAC 生成后运行。
-- **`tools/coordinate_lhe_blocks.py`** — 多源 campaign 协调器：读取各 pool 的 plan manifest，按 strict-min 策略匹配分块，生成 `blocks_processing.dag` SubDAG。
+- **`tools/coordinate_lhe_blocks.py`** — 多源 campaign 协调器：读取各 pool 的 plan manifest，按每个 source 的 LHE 预算组合互不重叠的分块，分配确定性 EDM EventID，并生成 `blocks_processing.dag` SubDAG。
 - **`tools/compress_existing_lhe.py`** — 回填工具：压缩已有的未压缩 LHE pool。
 - **`tools/compile_node_config.py`** — 在生产配置生成前编译并验证每个 pool 的精确 LHE 路径。
 - **`tools/transfer_compress_lhe.py`** — Condor worker 脚本，用于批量 LHE 压缩及 XRootD 传输。
@@ -235,9 +234,16 @@ python3 dag_generator.py generate-test \
 `--enable-lhe-block-subdags` 启用两阶段分块级工作流：
 
 1. **Planner**（`tools/plan_lhe_blocks.py`）— 每个 HELAC 作业完成后运行，压缩并 shuffle-split LHE 为分块，stage 分块，写出 plan manifest。
-2. **Coordinator**（`tools/coordinate_lhe_blocks.py`）— 对于多源 campaign，读取所有 pool 的 plan manifest，按 strict-min 策略匹配分块，生成 `blocks_processing.dag` SubDAG 含 `MIX_BLOCK` 处理节点。
+2. **Coordinator**（`tools/coordinate_lhe_blocks.py`）— 读取所有 pool 的 plan manifest，为每个 source 消耗互不重叠的 block 直到达到配置的 LHE 事例预算，分配确定性且互不重叠的 EDM EventID，并生成包含 `MIX_BLOCK` 处理节点的 `blocks_processing.dag` SubDAG。
 
 分块文件命名为 `block_<seed>_<NNNNNN>.lhe.gz` 以保证跨 seed 唯一性。
+
+每个 processing 节点以 `--target-mixed-events` 为 accepted mixed event
+目标（默认使用正数 `--max-events`，否则为 100）。Normal 与 phi-like source
+分别按 `--normal-max-lhe-events`（默认 110）和
+`--phi-max-lhe-events`（默认 350）消费 LHE。因此，小型 pilot 必须为重复
+pool 的每次出现提供足够的 planned source events；仅凭 planner block 数量
+不能推断 mixed processing 节点数。
 
 ```bash
 # Block SubDAG — 单源 SPS
@@ -268,14 +274,14 @@ python3 dag_generator.py generate \
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # 使用子过程命名输出
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
@@ -288,7 +294,7 @@ python3 dag_generator.py generate-ntuple-only \
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
   --skip-lhe-generation \
-  --existing-lhe-base root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/lhe_pools \
+  --existing-lhe-base root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/lhe_pools \
   --jobs 10 --output-dir generated/reprocess --output reprocess.dag
 ```
 
@@ -299,7 +305,7 @@ python3 dag_generator.py generate \
 ```bash
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
-  --target-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MyTestArea \
+  --target-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MyTestArea \
   --jobs 20 --output-dir generated/custom_eos --output custom.dag
 ```
 
@@ -310,7 +316,7 @@ python3 dag_generator.py generate \
 | 选项 | 适用于 | 说明 |
 |------|--------|------|
 | `--disable-ntuple` | `generate`、`generate-test` | 运行至 MiniAOD |
-| `--enable-ntuple` | `generate-test` | smoke test 中启用 ntuple |
+| `--enable-ntuple` | `generate`、`generate-test` | 启用 ntuple 阶段 |
 | `--efficiency-ntuple` | `generate`、`generate-test` | 写出 `ntuple_manifest.json` 供效率工具使用（仅 JJP） |
 | `--force-generate-lhe` | `generate`、`generate-test` | 不复用远端已有 LHE |
 | `--no-scan-existing` | `generate`、`generate-test` | 不扫描远端已有 LHE |
@@ -319,14 +325,27 @@ python3 dag_generator.py generate \
 | `--lhe-compression-level` | `generate`、`generate-test` | Gzip 压缩级别（默认：1） |
 | `--lhe-shuffle-split` | `generate`、`generate-test` | 分层洗牌切分 LHE 为分块 |
 | `--lhe-events-per-block` | `generate`、`generate-test` | 每分块事例数（默认：1000） |
+| `--target-mixed-events` | `generate`、`generate-test` | 每个 processing block 的 accepted mixed HepMC 目标（默认：正数 `--max-events`，否则 100） |
+| `--normal-max-lhe-events` | `generate`、`generate-test` | 每个 normal source 的 LHE 输入预算（默认：110） |
+| `--phi-max-lhe-events` | `generate`、`generate-test` | 每个 phi-like source 的 LHE 输入预算（默认：350） |
+| `--phi-max-hadronization-retries` | `generate`、`generate-test` | 每个 phi-like LHE 事例的 hadronization retry 上限（默认：5000） |
+| `--minimum-output-fraction` | `generate`、`generate-test` | processing block 可接受的最小完成比例（默认：0.8） |
 | `--enable-lhe-block-subdags` | `generate`、`generate-test` | Block SubDAG 工作流（planner + coordinator） |
-| `--keep-legacy-single-processing-path` | `generate` | 即使启用 `--enable-lhe-block-subdags` 仍使用扁平 DAG |
-| `--skip-lhe-generation` | `generate`、`generate-test` | 不复用已有 LHE，直接跳过生成 |
+| `--keep-legacy-single-processing-path` | `generate`、`generate-test` | 即使启用 `--enable-lhe-block-subdags` 仍使用扁平 DAG |
+| `--skip-lhe-generation` | `generate`、`generate-test` | 跳过 HELAC 生成并复用已有 LHE |
 | `--existing-lhe-base` | `generate`、`generate-test` | 已有 LHE pool 扫描的基址 URL |
 | `--target-base-url` | `generate`、`generate-test` | 覆盖所有 worker 的 EOS 输出基址 |
 | `--local-output-base` | `generate`、`generate-test` | 本地 LHE/output 根目录（hepthu） |
 | `--local-log-dir` | `generate`、`generate-test` | HTCondor stdout/stderr/log 目录（hepthu） |
 | `--use-subprocess-naming` | `generate-ntuple-only` | 子过程命名的 ntuple 输出目录结构 |
+
+Block processing 会在每个 MiniAOD 旁写出
+`processing_manifest_<campaign>_<job_id>.json`，记录目标与实际 mixed/MiniAOD
+事例数、预留的 EDM EventID 区间，以及各 source 的 shower 统计。MiniAOD
+merge 节点使用这些 sidecar 校验 expected event 数。可用
+`tools/benchmark_phi_efficiency.py` 比较 shower manifest，并用
+`tools/review_phase2_shower_efficiency.py` 联合检查 pilot 的 coordinator
+配置和 processing sidecar。
 
 ## Shower 模式
 

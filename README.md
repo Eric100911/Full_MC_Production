@@ -21,7 +21,7 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 
 ## Directory structure
 
-- **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, and `MachineEnv` dataclasses plus all subcommands (`list`, `validate`, `generate`, `generate-test`, `generate-helac-matrix`, `generate-ntuple-only`, `prepare-runtime`). Campaign/pool definitions are Python literals in this file.
+- **`dag_generator.py`** — Main CLI entry point. Defines `LHEPool`, `Campaign`, and `MachineEnv` dataclasses plus the `list`, `validate`, `prepare-runtime`, `scan-lhe-inventory`, `generate`, `generate-test`, `generate-helac-matrix`, and `generate-ntuple-only` subcommands. Campaign/pool definitions are Python literals in this file.
 - **`hepjob_workflow.py`** — IHEP/lxlogin HepJob backend adapter. Generates bash job scripts instead of HTCondor submit files.
 - **`common/node_config_defaults.json`** — Centralized storage and processing configuration, including EOS/XRootD roots, `LHE_pool` mappings, and premix/runtime defaults.
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter/scan tool.
@@ -31,10 +31,10 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional).
 - **`external/TPS-Onia2MuMu`** — Git submodule for the ntuple analyzer (v2.0_patch2). Used as fallback when the prebuilt CMSSW15 runtime tarball is unavailable.
 - **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Supports compressed output, shuffle-split, block staging, and `TARGET_EOS_BASE` override.
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 stratified LHE shuffle and fixed-size block splitter. Pre-compiled inside `cmssw/el7` container.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 stratified LHE shuffle and fixed-size block splitter. Compiled natively on EL9 while preparing the runtime bundles.
 - **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE job wrapper using JSON config (3 positional args) instead of legacy positional args.
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
-- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, applies strict-min block matching, generates `blocks_processing.dag` SubDAG.
+- **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, groups non-overlapping blocks to satisfy per-source LHE budgets, assigns deterministic EDM EventIDs, and generates `blocks_processing.dag` SubDAGs.
 - **`tools/compress_existing_lhe.py`** — Backfill utility to compress existing uncompressed LHE pools.
 - **`tools/compile_node_config.py`** — Compile and validate exact per-pool LHE paths before generating production configs.
 - **`tools/transfer_compress_lhe.py`** — Condor worker script for batch LHE compression with XRootD transfer.
@@ -204,7 +204,7 @@ LHE pool has a fully expanded and verified `path`; workers do not synthesize or
 probe layout variants. For example:
 
 ```text
-root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO/sample_pool_2jpsi_cs_60100.lhe.gz
+root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-JpsiJpsi-LO/sample_pool_2jpsi_cs_60100.lhe.gz
 ```
 
 Compile or verify exact pool paths before production:
@@ -261,9 +261,16 @@ python3 dag_generator.py generate-test \
 The `--enable-lhe-block-subdags` flag enables a two-stage block-level workflow:
 
 1. **Planner** (`tools/plan_lhe_blocks.py`) — runs after each HELAC job, compresses and shuffle-splits LHE into blocks, stages them, writes a plan manifest.
-2. **Coordinator** (`tools/coordinate_lhe_blocks.py`) — for multi-source campaigns, reads all per-pool plan manifests, matches blocks with strict-min policy, generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
+2. **Coordinator** (`tools/coordinate_lhe_blocks.py`) — reads all per-pool plan manifests, consumes distinct blocks until each source reaches its configured LHE-event budget, assigns deterministic non-overlapping EDM EventIDs, and generates a `blocks_processing.dag` SubDAG with `MIX_BLOCK` processing nodes.
 
 Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness.
+
+Each processing node targets `--target-mixed-events` accepted mixed events
+(default: a positive `--max-events`, otherwise 100). Normal and phi-like source
+slots independently consume up to `--normal-max-lhe-events` (default 110) and
+`--phi-max-lhe-events` (default 350). Consequently, a small pilot must provide
+enough planned source events for every occurrence of a repeated pool; planner
+block count alone does not determine the number of mixed processing nodes.
 
 ```bash
 # Block SubDAG — single-source SPS
@@ -294,14 +301,14 @@ The `generate-ntuple-only` subcommand produces a DAG that runs only the ntuple s
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # With subprocess-based output naming
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
@@ -314,7 +321,7 @@ Use `--skip-lhe-generation` with `--existing-lhe-base` to redirect LHE pool scan
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
   --skip-lhe-generation \
-  --existing-lhe-base root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/lhe_pools \
+  --existing-lhe-base root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/lhe_pools \
   --jobs 10 --output-dir generated/reprocess --output reprocess.dag
 ```
 
@@ -325,7 +332,7 @@ The `--target-base-url` flag overrides the default EOS output base for all worke
 ```bash
 python3 dag_generator.py generate \
   --machine-env lxplus_t2_ihep --campaign JJP_DPS1 \
-  --target-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MyTestArea \
+  --target-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MyTestArea \
   --jobs 20 --output-dir generated/custom_eos --output custom.dag
 ```
 
@@ -336,7 +343,7 @@ python3 dag_generator.py generate \
 | Flag | Applies to | Description |
 |------|-----------|-------------|
 | `--disable-ntuple` | `generate`, `generate-test` | Stop at MiniAOD |
-| `--enable-ntuple` | `generate-test` | Enable ntuple in smoke test |
+| `--enable-ntuple` | `generate`, `generate-test` | Enable the ntuple stage |
 | `--efficiency-ntuple` | `generate`, `generate-test` | Write `ntuple_manifest.json` for efficiency tool (JJP only) |
 | `--force-generate-lhe` | `generate`, `generate-test` | Skip remote LHE reuse |
 | `--no-scan-existing` | `generate`, `generate-test` | Skip remote pool scan |
@@ -345,14 +352,27 @@ python3 dag_generator.py generate \
 | `--lhe-compression-level` | `generate`, `generate-test` | Gzip compression level (default: 1) |
 | `--lhe-shuffle-split` | `generate`, `generate-test` | Stratified shuffle-split LHE into blocks |
 | `--lhe-events-per-block` | `generate`, `generate-test` | Events per shuffle-split block (default: 1000) |
+| `--target-mixed-events` | `generate`, `generate-test` | Accepted mixed HepMC target per processing block (default: positive `--max-events`, otherwise 100) |
+| `--normal-max-lhe-events` | `generate`, `generate-test` | LHE input budget per normal source slot (default: 110) |
+| `--phi-max-lhe-events` | `generate`, `generate-test` | LHE input budget per phi-like source slot (default: 350) |
+| `--phi-max-hadronization-retries` | `generate`, `generate-test` | Hadronization retry limit per phi-like LHE event (default: 5000) |
+| `--minimum-output-fraction` | `generate`, `generate-test` | Minimum accepted/target completion fraction for a processing block (default: 0.8) |
 | `--enable-lhe-block-subdags` | `generate`, `generate-test` | Block SubDAG workflow with planner/coordinator |
-| `--keep-legacy-single-processing-path` | `generate` | Flat DAG override even with `--enable-lhe-block-subdags` |
+| `--keep-legacy-single-processing-path` | `generate`, `generate-test` | Flat DAG override even with `--enable-lhe-block-subdags` |
 | `--skip-lhe-generation` | `generate`, `generate-test` | Reuse existing LHE without generation |
 | `--existing-lhe-base` | `generate`, `generate-test` | Base URL for existing LHE pool scanning |
 | `--target-base-url` | `generate`, `generate-test` | Override EOS output base for all workers |
 | `--local-output-base` | `generate`, `generate-test` | Local LHE/output root (hepthu) |
 | `--local-log-dir` | `generate`, `generate-test` | HTCondor stdout/stderr/log directory (hepthu) |
 | `--use-subprocess-naming` | `generate-ntuple-only` | Subprocess-based ntuple output directory structure |
+
+Block processing writes `processing_manifest_<campaign>_<job_id>.json` beside
+each MiniAOD. It records target and actual mixed/MiniAOD event counts, the
+reserved EDM EventID range, and per-source shower statistics. MiniAOD merge
+nodes use these sidecars for expected-event validation. Use
+`tools/benchmark_phi_efficiency.py` for shower-manifest comparisons and
+`tools/review_phase2_shower_efficiency.py` to join coordinator configs and
+processing sidecars from a pilot.
 
 ## Shower modes
 
