@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Companion file: `AGENTS.md` — short, durable reference for storage rules, XRootD
+URL conventions, testing expectations, branch scope, and PR descriptions.
+Detailed testing procedures live in `docs/testing.md`; path details in
+`docs/directory_path_reference.md`.
+
 ## Plan Mode
 
 When entering plan mode, make comprehensive plans based on careful code reading of all relevant files. Plans should include relevant code snippets with line number references to existing functions, classes, and patterns that should be reused. Do not propose new implementations when suitable ones already exist.
@@ -63,7 +68,7 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS. Proxy resolution (`detect_proxy_path`) uses `$X509_USER_PROXY` → `voms-proxy-info --path`; /tmp proxies trigger a warning (Condor workers cannot access them).
 - Ntuple output directory structure for `--use-subprocess-naming`: `JpsiJpsiPhi/Ntuple/{subprocess_id}/{subprocess_id}-Ntuple-{version}-{job_id}.root` under the target EOS base.
 - CMSSW15 runtime tarball: built with `scram b clean && scram b -j 8` (full project rebuild) to ensure `.edmplugincache` is regenerated. Validation checks for `pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so` and `.edmplugincache`.
-- LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC intermediates always remain plain text for CMSSW compatibility.
+- LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC outputs may be compressed (`.hepmc.gz`). HepMC intermediates passed to CMSSW always remain plain text.
 - LHE shuffle-split (`--lhe-shuffle-split`) produces `block_NNNNNN.lhe` files and a `shuffle_split_manifest.json` in a `lhe_blocks/` subdirectory. The original single LHE is always preserved for backward-compatible processing.
 - Block SubDAG mode (`--enable-lhe-block-subdags`) introduces per-HELAC-job planners and campaign-level coordinators that generate `SUBDAG EXTERNAL` processing DAGs. Block files are named `block_<seed>_<NNNNNN>.lhe.gz` for cross-seed uniqueness. Processing nodes consume blocks via `BLOCK:<pool>:<seed>:<idx>` input specs.
 - Planner: `tools/plan_lhe_blocks.py` runs after each HELAC job, compresses LHE, shuffle-splits, stages blocks, and writes `plan_manifest_<pool>_<seed>.json`.
@@ -83,15 +88,21 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
   Compile exact paths into `common/node_config_defaults.json`, validate them
   before submission, and make runtime resolution fail fast on missing or
   ambiguous paths.
-- Use `root://cceos.ihep.ac.cn:1094/` explicitly for IHEP XRootD access. Before
-  attributing `No route to host` or listing failures to the endpoint, check the
-  X509 proxy and reproduce with the same `xrdfs`/`xrdcp` binary and environment.
+- Use IHEP XRootD URLs with the explicit endpoint and triple slash before the
+  LFN: `root://cceos.ihep.ac.cn:1094///store/...`. Do not normalize this to
+  two slashes or drop the endpoint port. `xrdfs` listings may use the endpoint
+  plus a plain path: `xrdfs root://cceos.ihep.ac.cn:1094/ ls /store/...`.
+  Before attributing `No route to host` or listing failures to the endpoint,
+  check the X509 proxy and reproduce with the same `xrdfs`/`xrdcp` binary and
+  environment. Restricted sandboxes can cause `[FATAL] Invalid address` errors;
+  reproduce XRootD issues on a normal CERN/IHEP shell with the same proxy.
 - `cmsenv` is valid only inside an initialized CMSSW project, normally from its
   `src` directory.
 - Before every pilot or production submission, report the configured number of
-  events, source LHE files, events per block, expected blocks per source, and
-  included subprocesses. In block SubDAG mode, `--jobs` counts source files,
-  while planner manifests determine the number of processing blocks.
+  events, source LHE files, events per block, expected blocks per source,
+  merge target, and included subprocesses. In block SubDAG mode, `--jobs`
+  counts source LHE files, while planner manifests determine the number of
+  processing blocks.
 - Reuse of a source block across different subprocess classes is acceptable.
   Repeated inputs within one subprocess must consume distinct, non-overlapping
   blocks. Keep shuffling deterministic and use
@@ -113,6 +124,12 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
   A generated file does not prove an already-running process loaded it.
 - Keep generated DAGs, rescue files, logs, and campaign products out of Git.
   Stage only intentional source, test, and documentation changes.
+- For known existing-LHE pilots from environments where remote scans are
+  unreliable, prefer `--skip-lhe-generation --no-scan-existing` with configured
+  exact paths.
+- For small existing-LHE `generate-test` pilots, keep a positive `--max-events`
+  so it auto-caps each planner via `--lhe-max-events-per-plan`; otherwise tiny
+  `--lhe-events-per-block` values can split the whole full-size source file.
 
 ## Ntuple Config
 
@@ -127,6 +144,10 @@ Efficiency mode is controlled by the `analysisMode` VarParsing parameter; the
 not which cmsRun config is used.
 
 ### Syncing with upstream
+
+Do not add campaign-specific logic to the upstream
+`external/TPS-Onia2MuMu/test/ConfFile_cfg.py`; use campaign-layer configs in
+`common/cmssw_configs/` instead.
 
 When the submodule is updated to a new tag:
 
@@ -244,14 +265,14 @@ python3 dag_generator.py generate \
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --dry-run
 
 # Ntuple-only with subprocess-based output naming
 python3 dag_generator.py generate-ntuple-only \
   --machine-env lxplus_t2_ihep \
   --campaign JJP_SPS_CS --campaign JJP_SPS_G --campaign JJP_DPS2_CS --campaign JJP_DPS2_G --campaign JJP_DPS1 \
-  --miniaod-base-url root://cceos.ihep.ac.cn:1094//store/user/chiw/MC_Production_v3/output \
+  --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
 ```
@@ -263,6 +284,24 @@ python3 dag_generator.py generate-ntuple-only \
 count before submitting, verify stage-out with `xrdfs ...:1094`, download
 products under `/tmp/chiw/`, and count the ROOT `Events` entries. `cmsenv` is
 valid only from an actual CMSSW project `src` directory.
+
+**Minimum validation before committing code changes:**
+
+```bash
+bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
+python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py
+python3 tests/test_coordinate_lhe_blocks.py
+```
+
+Also run one `generate-test --dry-run` or generated-DAG inspection relevant to
+the changed workflow. If touching:
+
+- DAG staging/categories: verify emitted `CATEGORY` and `MAXJOBS` lines.
+- Block SubDAGs: verify planner/coordinator configs and generated dependencies.
+- MiniAOD merge: verify `processing → miniaod_merge → ntuple` ordering and
+  provenance manifest content.
+- Ntuple packaging: confirm `prepare-runtime --include-ntuple` uses the
+  prebuilt CMSSW15 runtime or submodule fallback.
 
 ```bash
 # Static validation + smoke DAG generation (no submit)
@@ -307,8 +346,14 @@ condor_q
 ## Coding Conventions
 
 - **Python**: PEP 8, 4-space indent, `snake_case`. Uppercase constants for site paths and fixed workflow settings.
-- **Bash**: `set -e`, long-form flags (`--campaign`, `--enable-ntuple`, `--miniaod-input`). No inline bash in submit templates — use wrapper scripts.
-- **Vocabulary**: Use the canonical names: pool names like `pool_jpsi_CSCO_g`, shower modes like `phi_mpi_off`, DAG categories `lhe`/`processing`/`ntuple`, analysis types `JJP`/`JUP`.
+- **Bash**: `set -euo pipefail` where practical; prefer the long-form flags already used by the repo (`--campaign`, `--enable-ntuple`, `--miniaod-input`). No inline bash in submit templates — use wrapper scripts.
+- **Vocabulary**: Use canonical names throughout:
+  - Pool names like `pool_jpsi_CSCO_g`
+  - Shower modes like `phi_mpi_off`
+  - Analysis types `JJP` and `JUP`
+  - DAG categories: `lhe`, `processing`, `ntuple`, `lhe_planning`, `lhe_coordination`, `block_processing`, `miniaod_merge`
+- **Product extensions**: Use `.lhe.gz` and `.hepmc.gz` for compressed products. Discovery code must handle both compressed and uncompressed LHE extensions (try `.lhe.gz` first, fall back to `.lhe`). HepMC intermediates remain plain text for CMSSW compatibility.
+- **Block identifiers**: Block processing inputs use `BLOCK:<pool>:<group_id>:<idx>`. Block output IDs must include both source-job and block indices (e.g. `JOB000123_BLOCK000045`) to avoid collisions.
 - **Commit messages**: Gitmoji-style with each line starting with a `:emoji_name:` token, or `feat:`/`fix:` prefixes. Keep messages imperative and specific to the workflow stage changed.
-- **Security**: Never commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Storage paths are centralized in `common/node_config_defaults.json`; physics constants in `dag_generator.py`.
-- **Temporary files**: Put downloads, extracted artifacts, and scratch output under `/tmp/chiw/`. Keep submit-time bundles on AFS.
+- **Security**: Never commit proxies, tokens, Kerberos artifacts, CRAB work areas, or generated ROOT outputs. Storage paths are centralized in `common/node_config_defaults.json`; physics constants and campaign definitions in `dag_generator.py`.
+- **Temporary files**: Put downloads, extracted artifacts, and scratch output under `/tmp/chiw/`. Keep submit-time bundles on AFS or another submit-visible persistent filesystem.

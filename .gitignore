@@ -33,3 +33,5 @@ checks/
 .codex/
 Helac2Ntuple.pdf
 Ntuple-only-workflow/
+/pilots/
+/subdag_inventory_*.json
