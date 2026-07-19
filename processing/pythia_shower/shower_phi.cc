@@ -23,6 +23,8 @@
 #include "Pythia8Plugins/HepMC3.h"
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <unordered_set>
@@ -214,17 +216,23 @@ int main(int argc, char* argv[]) {
         requireLheGluon = (modeArg == "1" || modeArg == "true" || modeArg == "lhegluon");
     }
     int rngSeed = (argc > 9) ? atoi(argv[9]) : 0;
+    int targetOutputEvents = (argc > 10) ? atoi(argv[10]) : nEvents;
+    string manifestFile = (argc > 11) ? argv[11] : "";
     
     cout << "\n====== Phi-Enriched Shower Processing ======" << endl;
     cout << "Input LHE:    " << inputFile << endl;
     cout << "Output HepMC: " << outputFile << endl;
     cout << "Events:       " << (nEvents > 0 ? to_string(nEvents) : "all") << endl;
+    cout << "Target output:" << (targetOutputEvents > 0 ? to_string(targetOutputEvents) : "all") << endl;
     cout << "Min phi pT:   " << minPhiPt << " GeV" << endl;
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, phi 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, phi 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << endl;
     cout << "Require LHE gluon ancestry: " << (requireLheGluon ? "yes" : "no") << endl;
     cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
+    if (!manifestFile.empty()) {
+        cout << "Manifest:     " << manifestFile << endl;
+    }
     cout << "=============================================\n" << endl;
     
     // Initialize Pythia
@@ -404,6 +412,8 @@ int main(int argc, char* argv[]) {
     int totalRetries = 0;
     int successWithPhi = 0;
     int failedToFindPhi = 0;
+    int successfulPythiaEvents = 0;
+    auto wallStart = chrono::steady_clock::now();
     
     // Particle counts
     int totalJpsi = 0, totalUpsilon = 0, totalPhi = 0, totalMuon = 0;
@@ -411,6 +421,7 @@ int main(int argc, char* argv[]) {
     cout << "Starting event processing..." << endl;
     
     while (true) {
+        if (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents) break;
         if (nEvents > 0 && iEvent >= nEvents) break;
         
         // Run parton level (without hadronization)
@@ -423,6 +434,7 @@ int main(int argc, char* argv[]) {
             cout << "Event generation aborted prematurely!" << endl;
             break;
         }
+        successfulPythiaEvents++;
         
         // Save parton level state
         Event savedEvent = pythia.event;
@@ -450,7 +462,7 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        totalRetries += nRetry + 1;
+        totalRetries += min(nRetry + 1, maxRetry);
         
         if (foundValid) {
             successWithPhi++;
@@ -480,6 +492,8 @@ int main(int argc, char* argv[]) {
     }
     
     pythia.stat();
+    auto wallEnd = chrono::steady_clock::now();
+    double wallSeconds = chrono::duration<double>(wallEnd - wallStart).count();
     
     cout << "\n======================================================" << endl;
     cout << "Phi-Enriched Processing Summary:" << endl;
@@ -491,6 +505,7 @@ int main(int argc, char* argv[]) {
          << endl;
     cout << "------------------------------------------------------" << endl;
     cout << "Total LHE events processed:   " << iEvent << endl;
+    cout << "Successful Pythia events:     " << successfulPythiaEvents << endl;
     cout << "Events written (all cuts):    " << successWithPhi 
          << " (" << 100.0*successWithPhi/max(1,iEvent) << "%)" << endl;
     cout << "Events skipped (failed cuts): " << failedToFindPhi << endl;
@@ -506,6 +521,37 @@ int main(int argc, char* argv[]) {
     cout << "Output events: " << successWithPhi << endl;
     cout << "Output file:   " << outputFile << endl;
     cout << "======================================================" << endl;
+
+    if (!manifestFile.empty()) {
+        double completion = targetOutputEvents > 0
+            ? static_cast<double>(successWithPhi) / max(1, targetOutputEvents)
+            : 1.0;
+        ofstream manifest(manifestFile);
+        if (!manifest.is_open()) {
+            cerr << "Failed to write manifest: " << manifestFile << endl;
+            return 1;
+        }
+        manifest << "{\n"
+                 << "  \"mode\": \"phi_mpi_on_gluon\",\n"
+                 << "  \"require_lhe_gluon\": " << (requireLheGluon ? "true" : "false") << ",\n"
+                 << "  \"target_events\": " << targetOutputEvents << ",\n"
+                 << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"max_hadronization_retries\": " << maxRetry << ",\n"
+                 << "  \"attempted_lhe_events\": " << iEvent << ",\n"
+                 << "  \"successful_pythia_events\": " << successfulPythiaEvents << ",\n"
+                 << "  \"accepted_hepmc_events\": " << successWithPhi << ",\n"
+                 << "  \"actual_hepmc_events\": " << successWithPhi << ",\n"
+                 << "  \"failed_phi_selections\": " << failedToFindPhi << ",\n"
+                 << "  \"total_hadronization_retries\": " << totalRetries << ",\n"
+                 << "  \"average_retries_per_accepted_event\": " << (static_cast<double>(totalRetries) / max(1, successWithPhi)) << ",\n"
+                 << "  \"average_retries_per_attempted_event\": " << (static_cast<double>(totalRetries) / max(1, iEvent)) << ",\n"
+                 << "  \"wall_time_seconds\": " << wallSeconds << ",\n"
+                 << "  \"completion_fraction\": " << completion << ",\n"
+                 << "  \"complete\": " << (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents ? "true" : "false") << ",\n"
+                 << "  \"status\": \"" << (successWithPhi > 0 ? (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents ? "ok" : "partial") : "failed") << "\",\n"
+                 << "  \"output_file\": \"" << outputFile << "\"\n"
+                 << "}\n";
+    }
     
     return 0;
 }

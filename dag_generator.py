@@ -557,6 +557,11 @@ class WorkflowOptions:
         miniaod_merge_events: int = 5000,
         miniaod_merge_validation: str = "event-count",
         maxjobs_miniaod_merge: int = 0,
+        target_mixed_events: int = 0,
+        normal_max_lhe_events: int = 110,
+        phi_max_lhe_events: int = 350,
+        phi_max_hadronization_retries: int = 5000,
+        minimum_output_fraction: float = 0.8,
         archive_subdag_logs: bool = True,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
@@ -593,6 +598,16 @@ class WorkflowOptions:
         self.miniaod_merge_events = miniaod_merge_events
         self.miniaod_merge_validation = miniaod_merge_validation
         self.maxjobs_miniaod_merge = maxjobs_miniaod_merge if maxjobs_miniaod_merge > 0 else maxjobs_ntuple
+        if target_mixed_events > 0:
+            self.target_mixed_events = target_mixed_events
+        elif max_events > 0:
+            self.target_mixed_events = max_events
+        else:
+            self.target_mixed_events = 100
+        self.normal_max_lhe_events = normal_max_lhe_events
+        self.phi_max_lhe_events = phi_max_lhe_events
+        self.phi_max_hadronization_retries = phi_max_hadronization_retries
+        self.minimum_output_fraction = minimum_output_fraction
         self.archive_subdag_logs = archive_subdag_logs
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
@@ -664,6 +679,11 @@ class WorkflowOptions:
             "miniaod_merge_events": self.miniaod_merge_events,
             "miniaod_merge_validation": self.miniaod_merge_validation,
             "maxjobs_miniaod_merge": self.maxjobs_miniaod_merge,
+            "target_mixed_events": self.target_mixed_events,
+            "normal_max_lhe_events": self.normal_max_lhe_events,
+            "phi_max_lhe_events": self.phi_max_lhe_events,
+            "phi_max_hadronization_retries": self.phi_max_hadronization_retries,
+            "minimum_output_fraction": self.minimum_output_fraction,
             "archive_subdag_logs": self.archive_subdag_logs,
         }
 
@@ -3178,6 +3198,11 @@ class DAGBuilder:
             "analysis_type": campaign.analysis_type,
             "n_sources": campaign.n_sources,
             "max_events": self.options.max_events,
+            "target_mixed_events": self.options.target_mixed_events,
+            "normal_max_lhe_events": self.options.normal_max_lhe_events,
+            "phi_max_lhe_events": self.options.phi_max_lhe_events,
+            "phi_max_hadronization_retries": self.options.phi_max_hadronization_retries,
+            "minimum_output_fraction": self.options.minimum_output_fraction,
             "enable_ntuple": self.options.enable_ntuple and not self.options.machine_env.uses_local_storage,
             "efficiency_ntuple": self.options.efficiency_ntuple,
             "cleanup": self.options.cleanup,
@@ -4566,7 +4591,12 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="LHE 节点的 unwevt；默认正式模式 100000、测试模式 100。",
     )
-    parser.add_argument("--max-events", type=int, default=-1, help="processing 节点的 max-events。")
+    parser.add_argument("--max-events", type=int, default=-1, help="兼容旧配置的 processing 事件目标/上限。")
+    parser.add_argument("--target-mixed-events", type=int, default=0, help="每个 block 的目标混合 HepMC 事件数；0 表示正数 --max-events，否则 100。")
+    parser.add_argument("--normal-max-lhe-events", type=int, default=110, help="normal source 的默认 LHE 输入预算。")
+    parser.add_argument("--phi-max-lhe-events", type=int, default=350, help="phi source 的默认 LHE 输入预算。")
+    parser.add_argument("--phi-max-hadronization-retries", type=int, default=5000, help="phi source 每个 LHE 事件的 hadronization retry 上限。")
+    parser.add_argument("--minimum-output-fraction", type=float, default=0.8, help="block 接受的最小完成比例；0 表示任何正输出均可。")
     parser.add_argument(
         "--compress-lhe",
         action="store_true",
@@ -5507,6 +5537,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             miniaod_merge_events=args.miniaod_merge_events,
             miniaod_merge_validation=args.miniaod_merge_validation,
             maxjobs_miniaod_merge=args.maxjobs_miniaod_merge,
+            target_mixed_events=args.target_mixed_events,
+            normal_max_lhe_events=args.normal_max_lhe_events,
+            phi_max_lhe_events=args.phi_max_lhe_events,
+            phi_max_hadronization_retries=args.phi_max_hadronization_retries,
+            minimum_output_fraction=args.minimum_output_fraction,
             archive_subdag_logs=args.archive_subdag_logs,
             skip_lhe_generation=args.skip_lhe_generation,
             existing_lhe_base=args.existing_lhe_base,

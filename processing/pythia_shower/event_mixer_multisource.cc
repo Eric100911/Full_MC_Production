@@ -248,11 +248,14 @@ int main(int argc, char* argv[]) {
     int nEvents = -1;
     bool shuffleSources = false;
     uint64_t shuffleSeedBase = 0;
+    string manifestFile;
 
     for (int i = 2; i < argc; ++i) {
         string arg = argv[i];
         if (arg == "--nevents" && i + 1 < argc) {
             nEvents = atoi(argv[++i]);
+        } else if (arg == "--manifest" && i + 1 < argc) {
+            manifestFile = argv[++i];
         } else if (arg == "--shuffle-sources") {
             shuffleSources = true;
         } else if (arg == "--shuffle-seed-base" && i + 1 < argc) {
@@ -278,6 +281,9 @@ int main(int argc, char* argv[]) {
         cout << "  Input " << i+1 << ": " << inputFiles[i] << endl;
     }
     cout << "N events:   " << (nEvents > 0 ? to_string(nEvents) : "all") << endl;
+    if (!manifestFile.empty()) {
+        cout << "Manifest:   " << manifestFile << endl;
+    }
     cout << "Shuffle:    " << (shuffleSources ? "on" : "off (sequential)") << endl;
     if (shuffleSources) {
         cout << "Seed base:  " << shuffleSeedBase << endl;
@@ -447,6 +453,22 @@ int main(int argc, char* argv[]) {
     cout << "----------------------------------------" << endl;
     cout << "Output file: " << outputFile << endl;
     cout << "========================================" << endl;
+
+    if (!manifestFile.empty()) {
+        ofstream manifest(manifestFile);
+        if (!manifest.is_open()) {
+            cerr << "Error: Cannot open manifest file: " << manifestFile << endl;
+            return 1;
+        }
+        manifest << "{\n"
+                 << "  \"target_events\": " << nEvents << ",\n"
+                 << "  \"actual_mixed_hepmc_events\": " << iEvent << ",\n"
+                 << "  \"events_written\": " << iEvent << ",\n"
+                 << "  \"n_sources\": " << nSources << ",\n"
+                 << "  \"output_file\": \"" << outputFile << "\",\n"
+                 << "  \"status\": \"" << (iEvent > 0 ? "ok" : "failed") << "\"\n"
+                 << "}\n";
+    }
     
     return 0;
 }

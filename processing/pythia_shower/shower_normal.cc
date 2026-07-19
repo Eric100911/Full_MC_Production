@@ -16,6 +16,8 @@
 #include "Pythia8/Pythia.h"
 #include "Pythia8Plugins/HepMC3.h"
 
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -123,15 +125,21 @@ int main(int argc, char* argv[]) {
     double maxMuonEta = (argc > 5) ? atof(argv[5]) : 2.4;
     int maxRetry = (argc > 6) ? atoi(argv[6]) : 1000;
     int rngSeed = (argc > 7) ? atoi(argv[7]) : 0;
+    int targetOutputEvents = (argc > 8) ? atoi(argv[8]) : nEvents;
+    string manifestFile = (argc > 9) ? argv[9] : "";
     
     cout << "\n=== Pythia8 Standard Shower Processing ===" << endl;
     cout << "Input LHE:    " << inputFile << endl;
     cout << "Output HepMC: " << outputFile << endl;
     cout << "Events:       " << (nEvents > 0 ? to_string(nEvents) : "all") << endl;
+    cout << "Target output:" << (targetOutputEvents > 0 ? to_string(targetOutputEvents) : "all") << endl;
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << " (legacy arg, standard 模式不使用)" << endl;
     cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
+    if (!manifestFile.empty()) {
+        cout << "Manifest:     " << manifestFile << endl;
+    }
     cout << "==========================================\n" << endl;
     
     // Initialize Pythia
@@ -303,10 +311,12 @@ int main(int argc, char* argv[]) {
     int maxAbort = 10;
     int successEvents = 0;
     int failedEvents = 0;
+    auto wallStart = chrono::steady_clock::now();
     
     cout << "Starting event processing..." << endl;
     
     while (true) {
+        if (targetOutputEvents > 0 && successEvents >= targetOutputEvents) break;
         if (nEvents > 0 && iEvent >= nEvents) break;
         
         // standard 模式直接执行完整 shower + hadronization。
@@ -332,6 +342,8 @@ int main(int argc, char* argv[]) {
     }
     
     pythia.stat();
+    auto wallEnd = chrono::steady_clock::now();
+    double wallSeconds = chrono::duration<double>(wallEnd - wallStart).count();
     
     cout << "\n======================================================" << endl;
     cout << "Processing Summary:" << endl;
@@ -343,6 +355,35 @@ int main(int argc, char* argv[]) {
     cout << "Average retries per event:  1 (standard 模式不重试)" << endl;
     cout << "Output file: " << outputFile << endl;
     cout << "======================================================" << endl;
+
+    if (!manifestFile.empty()) {
+        double completion = targetOutputEvents > 0
+            ? static_cast<double>(successEvents) / max(1, targetOutputEvents)
+            : 1.0;
+        ofstream manifest(manifestFile);
+        if (!manifest.is_open()) {
+            cerr << "Failed to write manifest: " << manifestFile << endl;
+            return 1;
+        }
+        manifest << "{\n"
+                 << "  \"mode\": \"normal\",\n"
+                 << "  \"target_events\": " << targetOutputEvents << ",\n"
+                 << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"attempted_lhe_events\": " << iEvent << ",\n"
+                 << "  \"successful_pythia_events\": " << successEvents << ",\n"
+                 << "  \"accepted_hepmc_events\": " << successEvents << ",\n"
+                 << "  \"actual_hepmc_events\": " << successEvents << ",\n"
+                 << "  \"failed_phi_selections\": 0,\n"
+                 << "  \"total_hadronization_retries\": 0,\n"
+                 << "  \"average_retries_per_accepted_event\": 0,\n"
+                 << "  \"average_retries_per_attempted_event\": 0,\n"
+                 << "  \"wall_time_seconds\": " << wallSeconds << ",\n"
+                 << "  \"completion_fraction\": " << completion << ",\n"
+                 << "  \"complete\": " << (targetOutputEvents > 0 && successEvents >= targetOutputEvents ? "true" : "false") << ",\n"
+                 << "  \"status\": \"" << (successEvents > 0 ? (targetOutputEvents > 0 && successEvents >= targetOutputEvents ? "ok" : "partial") : "failed") << "\",\n"
+                 << "  \"output_file\": \"" << outputFile << "\"\n"
+                 << "}\n";
+    }
     
     return 0;
 }

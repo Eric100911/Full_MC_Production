@@ -39,6 +39,7 @@ cat > "${WORKDIR}/worker/final_config.json" <<EOF
 {
   "campaign": "MOCK_FINAL",
   "job_index": 3,
+  "event_id_scheme": "run1-cantor-job-block-lumi-v1",
   "output_url": "${WORKDIR}/inventory/subdag_inventory.json",
   "blocks": [
     {
@@ -89,6 +90,7 @@ with open(path, encoding="utf-8") as handle:
     payload = json.load(handle)
 assert payload["campaign"] == "MOCK_FINAL"
 assert payload["job_index"] == 3
+assert payload["event_id_scheme"] == "run1-cantor-job-block-lumi-v1"
 assert payload["status"] == "partial"
 assert payload["missing_blocks"] == [2]
 assert payload["missing_merges"] == []
@@ -96,6 +98,10 @@ assert payload["missing_ntuples"] == []
 assert payload["blocks"][0]["miniaod_url_stat"]["exists"] is True
 assert payload["blocks"][2]["miniaod_url_stat"]["exists"] is False
 PY
+[[ ! -e "${WORKDIR}/worker/subdag_inventory.json" ]] || {
+    fail "Final inventory leaked into the worker directory"
+    exit 1
+}
 pass "Final inventory records local output stats and partial status"
 
 LOG_ROOT="${WORKDIR}/logs"

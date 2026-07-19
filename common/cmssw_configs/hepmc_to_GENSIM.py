@@ -30,12 +30,51 @@ options.register('nThreads',
                  VarParsing.multiplicity.singleton,
                  VarParsing.varType.int,
                  "Number of threads")
+options.register('firstRun',
+                 1,
+                 VarParsing.multiplicity.singleton,
+                 VarParsing.varType.int,
+                 "First run number for EDM EventID")
+options.register('firstLuminosityBlock',
+                 1,
+                 VarParsing.multiplicity.singleton,
+                 VarParsing.varType.int,
+                 "First luminosity block for EDM EventID")
+options.register('firstEvent',
+                 1,
+                 VarParsing.multiplicity.singleton,
+                 VarParsing.varType.int,
+                 "First event number for EDM EventID")
+options.register('numberEventsInLuminosityBlock',
+                 0,
+                 VarParsing.multiplicity.singleton,
+                 VarParsing.varType.int,
+                 "Events per luminosity block (0 = no auto-advance)")
 options.register('debugDump',
                  False,
                  VarParsing.multiplicity.singleton,
                  VarParsing.varType.bool,
                  "Dump event content and exit")
 options.parseArguments()
+
+print(f"[EDM EventID] firstRun={options.firstRun} "
+      f"firstLuminosityBlock={options.firstLuminosityBlock} "
+      f"firstEvent={options.firstEvent} "
+      f"numberEventsInLuminosityBlock={options.numberEventsInLuminosityBlock}")
+
+if options.firstRun < 1:
+    raise RuntimeError(f"firstRun must be >= 1, got {options.firstRun}")
+if options.firstLuminosityBlock < 1:
+    raise RuntimeError(
+        f"firstLuminosityBlock must be >= 1, got {options.firstLuminosityBlock}"
+    )
+if options.firstEvent < 1:
+    raise RuntimeError(f"firstEvent must be >= 1, got {options.firstEvent}")
+if options.numberEventsInLuminosityBlock < 0:
+    raise RuntimeError(
+        "numberEventsInLuminosityBlock must be >= 0, "
+        f"got {options.numberEventsInLuminosityBlock}"
+    )
 
 # Normalize inputFiles in case nested lists sneak in from CLI parsing
 normalized_inputs = []
@@ -75,6 +114,12 @@ process.maxEvents = cms.untracked.PSet(
 # Input source - HepMC format
 process.source = cms.Source("MCFileSource",
     fileNames = cms.untracked.vstring(options.inputFiles),
+    firstRun = cms.untracked.uint32(options.firstRun),
+    firstLuminosityBlock = cms.untracked.uint32(options.firstLuminosityBlock),
+    firstEvent = cms.untracked.uint64(options.firstEvent),
+    numberEventsInLuminosityBlock = cms.untracked.uint32(
+        options.numberEventsInLuminosityBlock
+    ),
     firstLuminosityBlockForEachRun = cms.untracked.VLuminosityBlockID([]),
 )
 

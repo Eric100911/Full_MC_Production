@@ -22,6 +22,7 @@ SCAN_EXISTING=1
 ENABLE_NTUPLE=0
 CMSSW15_RUNTIME_TARBALL=""
 WITH_MINIAOD_MERGE_SMOKE=0
+WITH_EDM_EVENTID_SMOKE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,9 +58,13 @@ while [[ $# -gt 0 ]]; do
             WITH_MINIAOD_MERGE_SMOKE=1
             shift
             ;;
+        --with-edm-eventid-smoke)
+            WITH_EDM_EVENTID_SMOKE=1
+            shift
+            ;;
         -h|--help)
             cat << EOF
-用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH] [--with-miniaod-merge-smoke]
+用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH] [--with-miniaod-merge-smoke] [--with-edm-eventid-smoke]
 EOF
             exit 0
             ;;
@@ -124,6 +129,11 @@ python3 "${SCRIPT_DIR}/test_dagman_config.py"
 if [[ ${WITH_MINIAOD_MERGE_SMOKE} -eq 1 ]]; then
     echo "[INFO] 运行 MiniAOD merge CMSSW/XRootD smoke"
     "${SCRIPT_DIR}/test_miniaod_merge_smoke.sh"
+fi
+
+if [[ ${WITH_EDM_EVENTID_SMOKE} -eq 1 ]]; then
+    echo "[INFO] 运行 GEN-SIM EDM EventID local smoke"
+    "${SCRIPT_DIR}/mock_test_edm_eventid.sh"
 fi
 
 "${CMD[@]}"

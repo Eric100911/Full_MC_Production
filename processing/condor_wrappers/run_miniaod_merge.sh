@@ -94,6 +94,51 @@ def stage_out(local_path, destination):
         shutil.copy2(local_path, dest)
 
 
+def read_url_text(url, workdir):
+    if not url:
+        return None
+    if url.startswith("root://"):
+        local_path = workdir / ("manifest_" + str(abs(hash(url))) + ".json")
+        proc = subprocess.run(
+            ["xrdcp", "--nopbar", "-f", url, str(local_path)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if proc.returncode != 0:
+            print(proc.stdout, file=sys.stderr)
+            return None
+        return local_path.read_text(encoding="utf-8")
+    if url.startswith("file:"):
+        path = Path(url[len("file:"):])
+    else:
+        path = Path(url)
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return None
+
+
+def expected_events_from_manifests(inputs, workdir):
+    actuals = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            return None
+        text = read_url_text(item.get("manifest_url", ""), workdir)
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if "actual_miniaod_events" not in payload:
+            return None
+        actuals.append(int(payload["actual_miniaod_events"]))
+    if len(actuals) != len(inputs):
+        return None
+    return sum(actuals)
+
+
 def cmssw_script(workdir, input_list, output_file, max_size):
     return f"""#!/bin/bash
 set -euo pipefail
@@ -187,7 +232,12 @@ def main():
     if not output_file.exists() or output_file.stat().st_size == 0:
         raise SystemExit("merged MiniAOD missing or empty")
     actual_events = merged_event_count(workdir)
-    expected_events = cfg.get("expected_events")
+    manifest_expected_events = expected_events_from_manifests(inputs, workdir)
+    expected_events = (
+        manifest_expected_events
+        if manifest_expected_events is not None
+        else cfg.get("expected_events")
+    )
     if cfg.get("validation") == "event-count":
         if actual_events is None:
             raise SystemExit("event-count validation requested but edmFileUtil event count was unavailable")
@@ -209,6 +259,7 @@ def main():
         "output_url": output_url,
         "size_bytes": size,
         "expected_events": expected_events,
+        "expected_events_source": "input_manifests" if manifest_expected_events is not None else "config",
         "actual_events": actual_events,
         "validation": cfg.get("validation"),
         "components": inputs,

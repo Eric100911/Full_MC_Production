@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -122,6 +123,7 @@ def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "campaign": cfg["campaign"],
         "job_index": cfg["job_index"],
+        "event_id_scheme": cfg.get("event_id_scheme", "unspecified"),
         "status": status,
         "expected_blocks": len(blocks),
         "missing_blocks": missing_blocks,
@@ -131,10 +133,18 @@ def main():
         "merge_groups": merge_groups,
         "ntuples": ntuples,
     }
-    local = Path.cwd() / Path(output_url).name
-    local.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    stage_out(local, output_url)
-    print(json.dumps(manifest, indent=2), flush=True)
+    manifest_text = json.dumps(manifest, indent=2) + "\n"
+    print(manifest_text, end="", flush=True)
+    fd, local_name = tempfile.mkstemp(
+        prefix="subdag_inventory_", suffix=".json", dir="/tmp"
+    )
+    os.close(fd)
+    local = Path(local_name)
+    try:
+        local.write_text(manifest_text, encoding="utf-8")
+        stage_out(local, output_url)
+    finally:
+        local.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

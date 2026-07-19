@@ -85,6 +85,22 @@ NODE_CONFIG=""
 # LHE pools on T2_CN_Beijing storage
 declare -A POOL_STORAGE_NAME=()
 declare -A EXACT_LHE_POOL_PATH=()
+USE_SOURCE_CONFIG="false"
+TARGET_MIXED_EVENTS=0
+EVENT_ID_SPAN=0
+MINIMUM_OUTPUT_FRACTION="0"
+COMMON_MIX_TARGET=0
+ACTUAL_MIXED_HEPMC_EVENTS=0
+ACTUAL_MINIAOD_EVENTS=0
+PROCESSING_MANIFEST=""
+declare -a SOURCE_SLOTS=()
+declare -a SOURCE_MODES=()
+declare -a SOURCE_INPUT_GROUPS=()
+declare -a SOURCE_TARGET_HEPMC_EVENTS=()
+declare -a SOURCE_MAX_LHE_EVENTS=()
+declare -a SOURCE_MAX_RETRIES=()
+declare -a SOURCE_HEPMC_FILES=()
+declare -a SOURCE_MANIFESTS=()
 
 # Colors
 RED='\033[0;31m'
@@ -297,6 +313,85 @@ PYHELPER
     fi
 }
 
+load_processing_sources() {
+    local config_path="$1"
+    SOURCE_SLOTS=()
+    SOURCE_MODES=()
+    SOURCE_INPUT_GROUPS=()
+    SOURCE_TARGET_HEPMC_EVENTS=()
+    SOURCE_MAX_LHE_EVENTS=()
+    SOURCE_MAX_RETRIES=()
+
+    TARGET_MIXED_EVENTS="${MAX_EVENTS}"
+    if [[ "${TARGET_MIXED_EVENTS}" -le 0 ]]; then
+        TARGET_MIXED_EVENTS=100
+    fi
+    EVENT_ID_SPAN="${RESERVED_EVENTS:-${TARGET_MIXED_EVENTS}}"
+    MINIMUM_OUTPUT_FRACTION="0"
+
+    if [[ -n "${config_path}" && -s "${config_path}" ]]; then
+        while IFS=$'\t' read -r kind slot mode target max_lhe max_retry inputs min_fraction event_span; do
+            case "${kind}" in
+                header)
+                    TARGET_MIXED_EVENTS="${target}"
+                    MINIMUM_OUTPUT_FRACTION="${min_fraction}"
+                    EVENT_ID_SPAN="${event_span}"
+                    USE_SOURCE_CONFIG="${mode}"
+                    ;;
+                source)
+                    SOURCE_SLOTS+=("${slot}")
+                    SOURCE_MODES+=("${mode}")
+                    SOURCE_TARGET_HEPMC_EVENTS+=("${target}")
+                    SOURCE_MAX_LHE_EVENTS+=("${max_lhe}")
+                    SOURCE_MAX_RETRIES+=("${max_retry}")
+                    SOURCE_INPUT_GROUPS+=("${inputs}")
+                    ;;
+            esac
+        done < <(python3 - "${config_path}" "${MAX_EVENTS}" <<'PYHELPER'
+import json
+import sys
+
+path = sys.argv[1]
+legacy_max = int(sys.argv[2])
+with open(path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+
+target = int(cfg.get("target_mixed_events") or (legacy_max if legacy_max > 0 else 100))
+event_span = int(cfg.get("event_id_span") or cfg.get("edm_event_id", {}).get("reserved_events") or target)
+min_fraction = cfg.get("minimum_output_fraction", 0.0)
+sources = cfg.get("sources")
+use_sources = isinstance(sources, list) and bool(sources)
+print(f"header\t0\t{str(use_sources).lower()}\t{target}\t0\t0\t-\t{min_fraction}\t{event_span}")
+if use_sources:
+    for index, source in enumerate(sources):
+        inputs = source.get("inputs") or []
+        if not isinstance(inputs, list) or not inputs:
+            raise SystemExit(f"sources[{index}].inputs must be a non-empty list")
+        mode = str(source.get("mode") or "")
+        if not mode:
+            raise SystemExit(f"sources[{index}].mode is required")
+        slot = int(source.get("slot", index))
+        src_target = int(source.get("target_hepmc_events") or target)
+        max_lhe = int(source.get("max_lhe_events") or src_target)
+        max_retry = int(source.get("max_hadronization_retries") or 1000)
+        print(f"source\t{slot}\t{mode}\t{src_target}\t{max_lhe}\t{max_retry}\t{';'.join(str(item) for item in inputs)}\t0\t0")
+PYHELPER
+        )
+    fi
+
+    if [[ ${#SOURCE_SLOTS[@]} -eq 0 ]]; then
+        USE_SOURCE_CONFIG="false"
+        for ((i=0; i<${#INPUT_SPECS[@]}; i++)); do
+            SOURCE_SLOTS+=("${i}")
+            SOURCE_MODES+=("${SHOWER_MODES[$i]}")
+            SOURCE_TARGET_HEPMC_EVENTS+=("${TARGET_MIXED_EVENTS}")
+            SOURCE_MAX_LHE_EVENTS+=("${TARGET_MIXED_EVENTS}")
+            SOURCE_MAX_RETRIES+=("5000")
+            SOURCE_INPUT_GROUPS+=("${INPUT_SPECS[$i]}")
+        done
+    fi
+}
+
 # Run XRootD tools from the CMSSW_15 el9 runtime. Processing jobs run in the
 # CMSSW el9 Singularity image, and IHEP EOS access needs that runtime plus the
 # installed proxy/certificate environment.
@@ -480,6 +575,153 @@ check_remote_file() {
         [[ -f "$url" ]]
         return $?
     fi
+}
+
+resolve_lhe_spec() {
+    local spec="$1"
+    local pool_name=""
+    local block_namespace=""
+    local block_idx=""
+    local storage_name=""
+    local lhe_file=""
+    local index=""
+    local job_id=""
+    local lhe_job_idx=""
+    local seed=""
+    local parts=()
+
+    if [[ "$spec" == file:* ]]; then
+        lhe_file="${spec#file:}"
+    elif [[ "$spec" == BLOCK:* ]]; then
+        IFS=':' read -ra parts <<< "$spec"
+        pool_name="${parts[1]}"
+        block_namespace="${parts[2]}"
+        block_idx="${parts[3]}"
+        storage_name="${POOL_STORAGE_NAME[$pool_name]:-$pool_name}"
+        lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/lhe_blocks/${block_namespace}/block_${block_namespace}_${block_idx}.lhe.gz"
+        if ! check_remote_file "$lhe_file"; then
+            lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/lhe_blocks/${block_namespace}/block_${block_namespace}_${block_idx}.lhe"
+            if ! check_remote_file "$lhe_file"; then
+                lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/lhe_blocks/block_${block_namespace}_${block_idx}.lhe.gz"
+                if ! check_remote_file "$lhe_file"; then
+                    lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/lhe_blocks/block_${block_namespace}_${block_idx}.lhe"
+                fi
+            fi
+        fi
+    elif [[ "$spec" == GEN:* ]]; then
+        IFS=':' read -ra parts <<< "$spec"
+        pool_name="${parts[1]}"
+        lhe_job_idx="${parts[2]}"
+        if [[ ${#parts[@]} -ge 4 ]]; then
+            seed="${parts[3]}"
+        else
+            seed="$((100 + lhe_job_idx))"
+        fi
+        storage_name="${POOL_STORAGE_NAME[$pool_name]:-$pool_name}"
+        lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/sample_${storage_name}_${seed}.lhe.gz"
+        if ! check_remote_file "$lhe_file"; then
+            lhe_file="${EOS_GENERATED_LHE_BASE}/${storage_name}/sample_${storage_name}_${seed}.lhe"
+            if ! check_remote_file "$lhe_file"; then
+                lhe_file=$(get_lhe_file "$pool_name" "$lhe_job_idx") || return 1
+            fi
+        fi
+    elif [[ "$spec" == EOS:* ]]; then
+        IFS=':' read -ra parts <<< "$spec"
+        pool_name="${parts[1]}"
+        job_id="${parts[2]}"
+        lhe_file=$(get_lhe_file "$pool_name" "$job_id") || return 1
+    else
+        pool_name="${spec%:*}"
+        index="${spec#*:}"
+        lhe_file=$(get_lhe_file "$pool_name" "$index") || return 1
+    fi
+
+    if [[ -z "$lhe_file" ]] || ! check_remote_file "$lhe_file"; then
+        msg_error "Could not resolve LHE file for: $spec (tried: ${lhe_file:-<none>})"
+        return 1
+    fi
+    printf '%s\n' "$lhe_file"
+}
+
+prepare_local_lhe_file() {
+    local source_slot="$1"
+    local input_index="$2"
+    local lhe_file="$3"
+    local local_lhe="${WORKDIR}/source_${source_slot}_${input_index}.lhe"
+
+    if [[ "$lhe_file" == root://* ]]; then
+        local download_path="${local_lhe}"
+        if is_gz_file "${lhe_file}"; then
+            download_path="${local_lhe}.gz"
+        fi
+        msg_info "Downloading LHE source slot=${source_slot} input=${input_index}..." >&2
+        run_logged "xrdcp_input_lhe_${source_slot}_${input_index}" run_xrdcp -f "${lhe_file}" "${download_path}" >&2 || return 1
+        lhe_file="${download_path}"
+    fi
+    if is_gz_file "${lhe_file}"; then
+        msg_info "Decompressing ${lhe_file} -> ${local_lhe}" >&2
+        gunzip -c "${lhe_file}" > "${local_lhe}.tmp" \
+            && mv "${local_lhe}.tmp" "${local_lhe}" \
+            || { msg_error "Failed to decompress ${lhe_file}"; return 1; }
+    elif [[ "${lhe_file}" != "${local_lhe}" ]]; then
+        cp -f "${lhe_file}" "${local_lhe}" || return 1
+    fi
+    convert_lhe_octet_codes "${local_lhe}" >&2
+    printf '%s\n' "${local_lhe}"
+}
+
+merge_lhe_inputs() {
+    local output_lhe="$1"
+    shift
+    python3 - "$output_lhe" "$@" <<'PYHELPER'
+import re
+import sys
+
+output = sys.argv[1]
+inputs = sys.argv[2:]
+event_re = re.compile(r"<event\b.*?</event>", re.DOTALL)
+header = None
+events = []
+for path in inputs:
+    text = open(path, "r", encoding="utf-8", errors="replace").read()
+    if header is None:
+        match = re.search(r"<event\b", text)
+        if not match:
+            raise SystemExit(f"No <event> block found in {path}")
+        header = text[:match.start()]
+    events.extend(event_re.findall(text))
+if header is None or not events:
+    raise SystemExit("No LHE events to merge")
+with open(output, "w", encoding="utf-8") as handle:
+    handle.write(header.rstrip() + "\n")
+    for event in events:
+        handle.write(event.rstrip() + "\n")
+    handle.write("</LesHouchesEvents>\n")
+print(output)
+PYHELPER
+}
+
+materialize_source_lhe() {
+    local source_slot="$1"
+    shift
+    local specs=("$@")
+    local local_files=()
+    local resolved=""
+    local prepared=""
+
+    for ((j=0; j<${#specs[@]}; j++)); do
+        resolved=$(resolve_lhe_spec "${specs[$j]}") || return 1
+        prepared=$(prepare_local_lhe_file "${source_slot}" "${j}" "${resolved}") || return 1
+        local_files+=("${prepared}")
+    done
+    if [[ ${#local_files[@]} -eq 1 ]]; then
+        printf '%s\n' "${local_files[0]}"
+        return 0
+    fi
+    local merged_lhe="${WORKDIR}/source_${source_slot}_merged.lhe"
+    merge_lhe_inputs "${merged_lhe}" "${local_files[@]}" >/dev/null || return 1
+    convert_lhe_octet_codes "${merged_lhe}" >&2
+    printf '%s\n' "${merged_lhe}"
 }
 
 # Ensure CMSSW_12 project exists in workdir (created on demand from CVMFS release)
@@ -1119,96 +1361,117 @@ ensure_worker_shower_tools() {
 
 # Step 1: Shower LHE files
 run_shower() {
-    local lhe_files=("$@")
-    local n_files=${#lhe_files[@]}
-    local n_modes=${#SHOWER_MODES[@]}
+    local n_files=${#SOURCE_SLOTS[@]}
     
     msg_step "Step 1: Pythia8 Shower"
     
-    if [[ $n_files -ne $n_modes ]]; then
-        msg_error "Number of LHE files ($n_files) doesn't match modes ($n_modes)"
+    if [[ $n_files -eq 0 ]]; then
+        msg_error "No source slots configured for shower"
         return 1
-    fi
-    
-    local shower_events=-1
-    if [[ "${MAX_EVENTS}" -gt 0 ]]; then
-        shower_events="${MAX_EVENTS}"
     fi
 
     HEPMC_FILES=()
+    SOURCE_HEPMC_FILES=()
+    SOURCE_MANIFESTS=()
+    for ((i=0; i<n_files; i++)); do
+        SOURCE_HEPMC_FILES+=("")
+        SOURCE_MANIFESTS+=("")
+    done
+    COMMON_MIX_TARGET="${TARGET_MIXED_EVENTS}"
     
     setup_cmssw12
     cd "${SHOWER_DIR}"
     ensure_worker_shower_tools || return 1
-    
-    for ((i=0; i<n_files; i++)); do
-        local lhe_file="${lhe_files[$i]}"
-        local mode="${SHOWER_MODES[$i]}"
+
+    run_one_source_shower() {
+        local i="$1"
+        local source_slot="${SOURCE_SLOTS[$i]}"
         local normalized_mode=""
-        local hepmc_output="${WORKDIR}/shower_${i}.hepmc"
-        local local_lhe="${WORKDIR}/input_${i}.lhe"
-        
-        msg_info "Processing source $((i+1))/${n_files}: ${lhe_file}"
+        local mode="${SOURCE_MODES[$i]}"
+        local target_events="${SOURCE_TARGET_HEPMC_EVENTS[$i]}"
+        local max_lhe_events="${SOURCE_MAX_LHE_EVENTS[$i]}"
+        local max_retries="${SOURCE_MAX_RETRIES[$i]}"
+        local hepmc_output="${WORKDIR}/shower_${source_slot}.hepmc"
+        local manifest_output="${WORKDIR}/shower_${source_slot}_manifest.json"
+        local source_seed=""
+        local source_actual=0
+        local input_group="${SOURCE_INPUT_GROUPS[$i]}"
+        local specs=()
+        local lhe_file=""
+
         if ! normalized_mode=$(normalize_shower_mode "${mode}"); then
             msg_error "Unknown shower mode: ${mode}"
             return 1
         fi
-        msg_info "Shower mode: ${mode} -> ${normalized_mode}"
-        
-        # Download remote LHE inputs first; C++ shower tools always receive a
-        # plain local .lhe file, never .lhe.gz.
-        if [[ "$lhe_file" == root://* ]]; then
-            if is_gz_file "${lhe_file}"; then
-                local_lhe="${WORKDIR}/input_${i}.lhe.gz"
-            fi
-            msg_info "Downloading LHE from XRootD..."
-            run_logged "xrdcp_input_lhe_${i}" run_xrdcp -f "${lhe_file}" "${local_lhe}"
-            if [[ $? -ne 0 ]] || [[ ! -f "${local_lhe}" ]]; then
-                msg_error "Failed to download LHE file from ${lhe_file}"
-                return 1
-            fi
-            msg_ok "Downloaded: ${local_lhe}"
-            lhe_file="${local_lhe}"
+
+        if [[ "$normalized_mode" == "normal" && "${COMMON_MIX_TARGET}" -gt 0 ]]; then
+            target_events="${COMMON_MIX_TARGET}"
         fi
-        if is_gz_file "${lhe_file}"; then
-            local plain_lhe="${WORKDIR}/input_${i}.lhe"
-            msg_info "Decompressing ${lhe_file} -> ${plain_lhe}"
-            gunzip -c "${lhe_file}" > "${plain_lhe}.tmp" \
-                && mv "${plain_lhe}.tmp" "${plain_lhe}" \
-                || { msg_error "Failed to decompress ${lhe_file}"; return 1; }
-            lhe_file="${plain_lhe}"
+        if [[ "${target_events}" -le 0 ]]; then
+            target_events="${TARGET_MIXED_EVENTS}"
         fi
 
-        # Convert HELAC 9900xxxx octet codes to OniaShower 99nqnsnrnLnJ scheme
-        # Note: With parton_shower=1 in HELAC-Onia, the *_py8.lhe files should
-        # already have correct Pythia8 PDG codes. This conversion handles any
-        # remaining HELAC-style codes that might be present.
-        convert_lhe_octet_codes "${lhe_file}"
+        IFS=';' read -ra specs <<< "${input_group}"
+        msg_info "Processing source slot=${source_slot}: mode=${mode} target=${target_events} max_lhe=${max_lhe_events} inputs=${#specs[@]}"
+        lhe_file=$(materialize_source_lhe "${source_slot}" "${specs[@]}") || return 1
 
-        local source_seed
-        source_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|source=${i}|${INPUT_SPECS[$i]}|${mode}")
-        msg_info "Pythia RNG seed for source $((i+1)): ${source_seed}"
+        source_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|source=${source_slot}|${input_group}|${mode}")
+        msg_info "Pythia RNG seed for source slot ${source_slot}: ${source_seed}"
         
         if [[ "$normalized_mode" == "phi_mpi_off" ]]; then
-            # workbook_v2 默认模式：关闭 MPI，循环 hadronize 找 phi。
             msg_info "Running phi-enriched mode-1 shower (MPI off)..."
-            run_logged "shower_sps_${i}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000 "${source_seed}"
+            run_logged "shower_sps_${source_slot}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" "${source_seed}" "${target_events}" "${manifest_output}"
         elif [[ "$normalized_mode" == "phi_mpi_on_gluon" ]]; then
-            # 扩展模式：开启 MPI，并交给 shower_phi 处理来源判定。
             msg_info "Running phi-enriched mode-2 shower (MPI on)..."
-            run_logged "shower_phi_${i}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${shower_events}" 3.0 2.5 2.4 5000 1 "${source_seed}"
+            run_logged "shower_phi_${source_slot}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" 1 "${source_seed}" "${target_events}" "${manifest_output}"
         else
-            # 普通 shower。
-            run_logged "shower_normal_${i}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${shower_events}" 2.5 2.4 1000 "${source_seed}"
+            run_logged "shower_normal_${source_slot}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 2.5 2.4 1000 "${source_seed}" "${target_events}" "${manifest_output}"
         fi
         
         if [[ ! -f "${hepmc_output}" ]]; then
             msg_error "Shower failed: ${hepmc_output} not created"
             return 1
         fi
-        
-        HEPMC_FILES+=("${hepmc_output}")
-        msg_ok "Shower complete: ${hepmc_output}"
+
+        SOURCE_HEPMC_FILES[$i]="${hepmc_output}"
+        SOURCE_MANIFESTS[$i]="${manifest_output}"
+        source_actual=$(python3 - "${manifest_output}" <<'PYHELPER'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(int(payload.get("actual_hepmc_events", 0)))
+PYHELPER
+        )
+        if [[ "${source_actual}" -le 0 ]]; then
+            msg_error "Source slot ${source_slot} produced zero accepted HepMC events"
+            return 1
+        fi
+        if [[ "$normalized_mode" != "normal" ]]; then
+            if [[ "${COMMON_MIX_TARGET}" -le 0 || "${source_actual}" -lt "${COMMON_MIX_TARGET}" ]]; then
+                COMMON_MIX_TARGET="${source_actual}"
+            fi
+        fi
+        msg_ok "Shower complete: ${hepmc_output} (${source_actual} accepted)"
+    }
+
+    for ((i=0; i<n_files; i++)); do
+        local mode_i
+        mode_i=$(normalize_shower_mode "${SOURCE_MODES[$i]}") || return 1
+        if [[ "${mode_i}" != "normal" ]]; then
+            run_one_source_shower "${i}" || return 1
+        fi
+    done
+    for ((i=0; i<n_files; i++)); do
+        local mode_i
+        mode_i=$(normalize_shower_mode "${SOURCE_MODES[$i]}") || return 1
+        if [[ "${mode_i}" == "normal" ]]; then
+            run_one_source_shower "${i}" || return 1
+        fi
+    done
+
+    for ((i=0; i<n_files; i++)); do
+        HEPMC_FILES+=("${SOURCE_HEPMC_FILES[$i]}")
     done
     
     cd "${WORKDIR}"
@@ -1220,13 +1483,18 @@ run_mix() {
     
     local n_sources=${#HEPMC_FILES[@]}
     MIXED_HEPMC="${WORKDIR}/mixed.hepmc"
+    local mixed_manifest="${WORKDIR}/mixed_manifest.json"
+    local mix_nevents="${COMMON_MIX_TARGET:-${TARGET_MIXED_EVENTS}}"
+    if [[ -z "${mix_nevents}" || "${mix_nevents}" -le 0 ]]; then
+        mix_nevents="${TARGET_MIXED_EVENTS}"
+    fi
     
     cd "${SHOWER_DIR}"
     ensure_worker_shower_tools || return 1
     
     if [[ $n_sources -eq 1 ]]; then
         msg_info "Single source - converting to HepMC2 format..."
-        run_logged "event_mixer_single" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[0]}"
+        run_logged "event_mixer_single" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[0]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}"
     else
         msg_info "Mixing ${n_sources} sources..."
         if [[ "${SHUFFLE_MIXING}" == "true" ]]; then
@@ -1235,9 +1503,10 @@ run_mix() {
             msg_info "Shuffle mixing enabled with seed base ${shuffle_seed}"
             run_logged "event_mixer_shuffle" ./event_mixer_multisource \
                 "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" \
+                --nevents "${mix_nevents}" --manifest "${mixed_manifest}" \
                 --shuffle-sources --shuffle-seed-base "${shuffle_seed}"
         else
-            run_logged "event_mixer_multi" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[@]}"
+            run_logged "event_mixer_multi" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}"
         fi
     fi
     
@@ -1245,8 +1514,35 @@ run_mix() {
         msg_error "Mixing failed: ${MIXED_HEPMC} not created"
         return 1
     fi
+    if [[ ! -s "${mixed_manifest}" ]]; then
+        msg_error "Mixing failed: ${mixed_manifest} not created"
+        return 1
+    fi
+    ACTUAL_MIXED_HEPMC_EVENTS=$(python3 - "${mixed_manifest}" <<'PYHELPER'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(int(payload.get("actual_mixed_hepmc_events", payload.get("events_written", 0))))
+PYHELPER
+    )
+    if [[ "${ACTUAL_MIXED_HEPMC_EVENTS}" -le 0 ]]; then
+        msg_error "Mixed HepMC contains zero events"
+        return 1
+    fi
+    python3 - "${ACTUAL_MIXED_HEPMC_EVENTS}" "${TARGET_MIXED_EVENTS}" "${MINIMUM_OUTPUT_FRACTION}" <<'PYHELPER'
+import sys
+actual = int(sys.argv[1])
+target = max(1, int(sys.argv[2]))
+minimum = float(sys.argv[3])
+fraction = actual / target
+if minimum > 0 and fraction < minimum:
+    raise SystemExit(
+        f"completion fraction {fraction:.6f} below minimum {minimum:.6f}"
+    )
+PYHELPER
     
-    msg_ok "Mixing complete: ${MIXED_HEPMC}"
+    msg_ok "Mixing complete: ${MIXED_HEPMC} (${ACTUAL_MIXED_HEPMC_EVENTS} events)"
     cd "${WORKDIR}"
 }
 
@@ -1267,11 +1563,19 @@ run_gensim() {
     setup_cmssw12
     
     msg_info "Running HepMC -> GEN-SIM..."
+    msg_info "EDM EventID: run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} reserved=${RESERVED_EVENTS:-?}"
+    msg_info "Campaign: ${CAMPAIGN_NAME}  Job: ${JOB_ID}"
+    msg_info "Input HepMC: ${MIXED_HEPMC}"
+    msg_info "Requested max events: -1 (actual mixed HepMC events=${ACTUAL_MIXED_HEPMC_EVENTS:-unknown})"
     run_cmssw12_command "cmsRun_hepmc_to_GENSIM" cmsRun "${CMSSW_CONFIGS_DIR}/hepmc_to_GENSIM.py" \
         inputFiles="file:${MIXED_HEPMC}" \
         outputFile="file:${GENSIM_OUTPUT}" \
-        maxEvents=${MAX_EVENTS} \
-        nThreads=4
+        maxEvents=-1 \
+        nThreads=4 \
+        firstRun=${FIRST_RUN} \
+        firstLuminosityBlock=${FIRST_LUMINOSITY_BLOCK} \
+        firstEvent=${FIRST_EVENT} \
+        numberEventsInLuminosityBlock=${N_EVENTS_IN_LUMI}
     
     if [[ ! -f "${GENSIM_OUTPUT}" ]]; then
         msg_error "GEN-SIM failed: ${GENSIM_OUTPUT} not created"
@@ -1333,7 +1637,7 @@ run_raw() {
         --beamspot Realistic25ns13p6TeVEarly2022Collision \
         --era Run3 \
         --geometry DB:Extended \
-        -n "${MAX_EVENTS}" \
+        -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
         --nThreads "${raw_threads}" --nStreams "${raw_streams}" \
         --pileup_input "${premix_input}" \
@@ -1374,7 +1678,7 @@ run_reco() {
         --beamspot Realistic25ns13p6TeVEarly2022Collision \
         --era Run3 \
         --geometry DB:Extended \
-        -n "${MAX_EVENTS}" \
+        -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
         --nThreads 4 --nStreams 4 \
         --filein "file:${RAW_OUTPUT}" \
@@ -1390,6 +1694,115 @@ run_reco() {
     fi
     
     msg_ok "RECO complete: ${RECO_OUTPUT}"
+}
+
+find_event_count_in_json() {
+    python3 - "$1" <<'PYHELPER'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    payload = json.load(open(path, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    raise SystemExit(0)
+candidates = []
+def visit(obj, path_bits):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            visit(value, path_bits + [str(key)])
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            visit(value, path_bits + [str(index)])
+    elif isinstance(obj, int) and obj >= 0:
+        lowered = "/".join(path_bits).lower()
+        if "event" in lowered and ("count" in lowered or lowered.endswith("events")):
+            candidates.append(obj)
+visit(payload, [])
+print(max(candidates) if candidates else "")
+PYHELPER
+}
+
+count_root_events() {
+    local root_file="$1"
+    local json_path="${WORKDIR}/$(basename "${root_file}").edmFileUtil.json"
+    (
+        source /cvmfs/cms.cern.ch/cmsset_default.sh
+        export SCRAM_ARCH=el8_amd64_gcc10
+        if [[ -d "${CMSSW_12_BASE}/src" ]]; then
+            cd "${CMSSW_12_BASE}/src"
+            eval "$(scramv1 runtime -sh)"
+        fi
+        edmFileUtil -j "${root_file}" > "${json_path}" 2>/dev/null
+    ) || true
+    if [[ -s "${json_path}" ]]; then
+        find_event_count_in_json "${json_path}"
+    fi
+}
+
+write_processing_manifest() {
+    local miniaod_url_value="$1"
+    PROCESSING_MANIFEST="${WORKDIR}/processing_manifest_${CAMPAIGN_NAME}_${JOB_ID}.json"
+    python3 - "${PROCESSING_MANIFEST}" \
+        "${CAMPAIGN_NAME}" "${JOB_ID}" "${TARGET_MIXED_EVENTS}" "${ACTUAL_MIXED_HEPMC_EVENTS}" \
+        "${ACTUAL_MINIAOD_EVENTS}" "${FIRST_RUN}" "${FIRST_LUMINOSITY_BLOCK}" \
+        "${FIRST_EVENT}" "${EVENT_ID_SPAN}" "${miniaod_url_value}" "${SOURCE_MANIFESTS[@]}" <<'PYHELPER'
+import json
+import sys
+from datetime import datetime, timezone
+
+(
+    output_path,
+    campaign,
+    job_id,
+    target_mixed,
+    actual_mixed,
+    actual_miniaod,
+    first_run,
+    first_lumi,
+    first_event,
+    event_id_span,
+    miniaod_url,
+    *source_manifest_paths,
+) = sys.argv[1:]
+target_mixed = int(target_mixed)
+actual_mixed = int(actual_mixed or 0)
+actual_miniaod = int(actual_miniaod or 0)
+first_event = int(first_event)
+event_id_span = int(event_id_span)
+source_statistics = []
+for path in source_manifest_paths:
+    if not path:
+        continue
+    with open(path, "r", encoding="utf-8") as handle:
+        source_statistics.append(json.load(handle))
+last_event = first_event + max(actual_miniaod, 0) - 1 if actual_miniaod > 0 else first_event - 1
+manifest = {
+    "campaign": campaign,
+    "job_id": job_id,
+    "status": "ok" if actual_miniaod > 0 else "failed",
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "target_mixed_events": target_mixed,
+    "event_id_span": event_id_span,
+    "actual_mixed_hepmc_events": actual_mixed,
+    "actual_miniaod_events": actual_miniaod,
+    "completion_fraction": actual_mixed / target_mixed if target_mixed else 0.0,
+    "complete": actual_mixed >= target_mixed,
+    "edm_event_id": {
+        "run": int(first_run),
+        "lumi": int(first_lumi),
+        "first_event": first_event,
+        "last_event": last_event,
+        "reserved_last_event": first_event + event_id_span - 1,
+    },
+    "source_statistics": source_statistics,
+    "miniaod_url": miniaod_url,
+}
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+    handle.write("\n")
+PYHELPER
 }
 
 # Step 6: MiniAOD
@@ -1412,7 +1825,7 @@ run_miniaod() {
         --conditions 124X_mcRun3_2022_realistic_v12 \
         --era Run3 \
         --geometry DB:Extended \
-        -n "${MAX_EVENTS}" \
+        -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
         --nThreads 4 --nStreams 4 \
         --filein "file:${RECO_OUTPUT}" \
@@ -1426,8 +1839,14 @@ run_miniaod() {
         msg_error "MiniAOD step failed: ${MINIAOD_OUTPUT} not created"
         return 1
     fi
+
+    ACTUAL_MINIAOD_EVENTS=$(count_root_events "${MINIAOD_OUTPUT}")
+    if [[ -z "${ACTUAL_MINIAOD_EVENTS}" ]]; then
+        ACTUAL_MINIAOD_EVENTS="${ACTUAL_MIXED_HEPMC_EVENTS:-0}"
+        msg_warn "Could not count MiniAOD events with edmFileUtil; using mixed HepMC count ${ACTUAL_MINIAOD_EVENTS}"
+    fi
     
-    msg_ok "MiniAOD complete: ${MINIAOD_OUTPUT}"
+    msg_ok "MiniAOD complete: ${MINIAOD_OUTPUT} (${ACTUAL_MINIAOD_EVENTS} events)"
 }
 
 # Step 7: Ntuple
@@ -1505,6 +1924,8 @@ transfer_output() {
             local miniaod_basename
             miniaod_basename=$(basename "${MINIAOD_OUTPUT}")
             run_logged "copy_local_miniaod_${JOB_ID}" cp -f "${MINIAOD_OUTPUT}" "${local_output_dir}/${miniaod_basename}" || return 1
+            write_processing_manifest "${local_output_dir}/${miniaod_basename}" || return 1
+            run_logged "copy_local_processing_manifest_${JOB_ID}" cp -f "${PROCESSING_MANIFEST}" "${local_output_dir}/$(basename "${PROCESSING_MANIFEST}")" || return 1
         fi
 
         if [[ -f "${NTUPLE_OUTPUT:-}" ]]; then
@@ -1547,6 +1968,8 @@ MANIFESTEOF
     if [[ "${TRANSFER_MINIAOD}" == "true" && -f "${MINIAOD_OUTPUT}" ]]; then
         local miniaod_basename=$(basename "${MINIAOD_OUTPUT}")
         stage_out "${MINIAOD_OUTPUT}" "${output_subpath}/${miniaod_basename}" || return 1
+        write_processing_manifest "${EOS_BASE}/${output_subpath}/${miniaod_basename}" || return 1
+        stage_out "${PROCESSING_MANIFEST}" "${output_subpath}/$(basename "${PROCESSING_MANIFEST}")" || return 1
     fi
     
     if [[ -f "${NTUPLE_OUTPUT:-}" ]]; then
@@ -1606,6 +2029,10 @@ Optional:
   --miniaod-input PATH    Existing MiniAOD input for standalone ntuple nodes
   --transfer-miniaod BOOL Whether transfer step should upload MiniAOD (true|false)
   --max-events N          Limit events for fast local test (default: -1 = all)
+  --first-run N           First run number for GEN-SIM EventID assignment
+  --first-luminosity-block N First luminosity block for GEN-SIM EventID assignment
+  --first-event N         First event number for GEN-SIM EventID assignment
+  --number-events-in-lumi N Events per lumi for MCFileSource (0 = no auto-advance)
   --config PATH           Node JSON config with exact storage paths
   -h, --help              Show this help
 
@@ -1638,6 +2065,10 @@ STOP_AT=""
 MAX_EVENTS=-1
 MINIAOD_INPUT=""
 TRANSFER_MINIAOD="true"
+FIRST_RUN=1
+FIRST_LUMINOSITY_BLOCK=1
+FIRST_EVENT=1
+N_EVENTS_IN_LUMI=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -1705,6 +2136,22 @@ while [[ $# -gt 0 ]]; do
             TRANSFER_MINIAOD="$2"
             shift 2
             ;;
+        --first-run)
+            FIRST_RUN="$2"
+            shift 2
+            ;;
+        --first-luminosity-block)
+            FIRST_LUMINOSITY_BLOCK="$2"
+            shift 2
+            ;;
+        --first-event)
+            FIRST_EVENT="$2"
+            shift 2
+            ;;
+        --number-events-in-lumi)
+            N_EVENTS_IN_LUMI="$2"
+            shift 2
+            ;;
         --config)
             NODE_CONFIG="$2"
             shift 2
@@ -1762,6 +2209,26 @@ if ! [[ "${MAX_EVENTS}" =~ ^-?[0-9]+$ ]]; then
     exit 1
 fi
 
+if ! [[ "${FIRST_RUN}" =~ ^[0-9]+$ ]] || [[ "${FIRST_RUN}" -lt 1 ]]; then
+    msg_error "--first-run must be a positive integer"
+    exit 1
+fi
+
+if ! [[ "${FIRST_LUMINOSITY_BLOCK}" =~ ^[0-9]+$ ]] || [[ "${FIRST_LUMINOSITY_BLOCK}" -lt 1 ]]; then
+    msg_error "--first-luminosity-block must be a positive integer"
+    exit 1
+fi
+
+if ! [[ "${FIRST_EVENT}" =~ ^[0-9]+$ ]] || [[ "${FIRST_EVENT}" -lt 1 ]]; then
+    msg_error "--first-event must be a positive integer"
+    exit 1
+fi
+
+if ! [[ "${N_EVENTS_IN_LUMI}" =~ ^[0-9]+$ ]]; then
+    msg_error "--number-events-in-lumi must be a non-negative integer"
+    exit 1
+fi
+
 if ! load_node_config "${NODE_CONFIG}"; then
     exit 1
 fi
@@ -1776,6 +2243,7 @@ mkdir -p "${WORKDIR}"
 # Parse inputs and modes
 IFS=',' read -ra INPUT_SPECS <<< "$INPUTS"
 IFS=',' read -ra SHOWER_MODES <<< "$MODES"
+load_processing_sources "${NODE_CONFIG}"
 
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
 ensure_voms_proxy
@@ -1783,6 +2251,8 @@ ensure_voms_proxy
 LHE_FILES=()
 if [[ "${SKIP_TO}" == "ntuple" ]]; then
     msg_info "Skipping LHE input resolution for standalone ntuple node"
+elif [[ "${USE_SOURCE_CONFIG}" == "true" ]]; then
+    msg_info "Using source-slot config; LHE inputs will be resolved per source during shower"
 else
     # Resolve LHE files from input specs.
     # Supports: file:/path/to.lhe, GEN:pool:idx, EOS:pool:idx:usage, pool:idx.
@@ -1875,12 +2345,14 @@ echo "Analysis:     ${ANALYSIS_TYPE}"
 echo "Work dir:     ${WORKDIR}"
 echo "Do ntuple:    ${ENABLE_NTUPLE}"
 echo "Eff ntuple:   ${EFFICIENCY_NTUPLE}"
-echo "N sources:    ${#LHE_FILES[@]}"
-for ((i=0; i<${#LHE_FILES[@]}; i++)); do
-    mode_str="${SHOWER_MODES[$i]:-N/A}"
-    echo "  Source $((i+1)): ${LHE_FILES[$i]} (mode: ${mode_str})"
+echo "N sources:    ${#SOURCE_SLOTS[@]}"
+for ((i=0; i<${#SOURCE_SLOTS[@]}; i++)); do
+    mode_str="${SOURCE_MODES[$i]:-N/A}"
+    echo "  Source slot ${SOURCE_SLOTS[$i]}: ${SOURCE_INPUT_GROUPS[$i]} (mode: ${mode_str}, target=${SOURCE_TARGET_HEPMC_EVENTS[$i]}, max_lhe=${SOURCE_MAX_LHE_EVENTS[$i]})"
 done
 echo "Max events:   ${MAX_EVENTS}"
+echo "Target mixed: ${TARGET_MIXED_EVENTS}"
+echo "EDM EventID:  run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} eventsPerLumi=${N_EVENTS_IN_LUMI}"
 echo "=============================================="
 echo ""
 

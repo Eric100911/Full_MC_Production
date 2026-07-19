@@ -55,8 +55,6 @@ with open(config_path, "r", encoding="utf-8") as handle:
     cfg = json.load(handle)
 
 required = [
-    "inputs",
-    "modes",
     "analysis",
     "campaign",
     "job_id",
@@ -69,10 +67,21 @@ required = [
 missing = [key for key in required if key not in cfg or cfg[key] is None]
 if missing:
     raise SystemExit(f"Missing processing config keys: {', '.join(missing)}")
-if not isinstance(cfg["inputs"], list) or not cfg["inputs"]:
-    raise SystemExit("Processing config key inputs must be a non-empty list")
-if not isinstance(cfg["modes"], list) or not cfg["modes"]:
-    raise SystemExit("Processing config key modes must be a non-empty list")
+sources = cfg.get("sources")
+if sources is not None:
+    if not isinstance(sources, list) or not sources:
+        raise SystemExit("Processing config key sources must be a non-empty list")
+    inputs = [str(source.get("inputs", [""])[0]) for source in sources]
+    modes = [str(source.get("mode", "")) for source in sources]
+elif "inputs" in cfg and "modes" in cfg:
+    inputs = list(cfg["inputs"])
+    modes = list(cfg["modes"])
+else:
+    raise SystemExit("Processing config needs either sources[] or inputs/modes")
+if not inputs or any(not item for item in inputs):
+    raise SystemExit("Processing inputs must be a non-empty list")
+if not modes or any(not item for item in modes):
+    raise SystemExit("Processing modes must be a non-empty list")
 
 def bool_text(value):
     return "true" if bool(value) else "false"
@@ -115,8 +124,8 @@ for cfg_key, env_key in env_mapping.items():
 cmd = [
     "bash",
     "run_chain.sh",
-    "--inputs", ",".join(str(item) for item in cfg["inputs"]),
-    "--modes", ",".join(str(item) for item in cfg["modes"]),
+    "--inputs", ",".join(str(item) for item in inputs),
+    "--modes", ",".join(str(item) for item in modes),
     "--analysis", str(cfg["analysis"]),
     "--campaign", str(cfg["campaign"]),
     "--job-id", str(cfg["job_id"]),
@@ -127,6 +136,22 @@ cmd = [
     "--cleanup", bool_text(cfg["cleanup"]),
     "--config", config_path,
 ]
+edm = cfg.get("edm_event_id")
+if edm is not None:
+    if not isinstance(edm, dict):
+        raise SystemExit(
+            "Processing config key edm_event_id must be an object when provided"
+        )
+    cmd.extend([
+        "--first-run", str(edm.get("first_run", 1)),
+        "--first-luminosity-block", str(edm.get("first_luminosity_block", 1)),
+        "--first-event", str(edm.get("first_event", 1)),
+        "--number-events-in-lumi",
+        str(edm.get("number_events_in_luminosity_block", 0)),
+    ])
+    reserved_events = edm.get("reserved_events")
+    if reserved_events is not None:
+        env["RESERVED_EVENTS"] = str(reserved_events)
 if cfg.get("skip_to"):
     cmd.extend(["--skip-to", str(cfg["skip_to"])])
 if cfg.get("stop_at"):

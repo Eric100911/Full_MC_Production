@@ -25,6 +25,15 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+DEFAULT_TARGET_MIXED_EVENTS = 100
+DEFAULT_NORMAL_MAX_LHE_EVENTS = 110
+DEFAULT_PHI_MAX_LHE_EVENTS = 350
+DEFAULT_PHI_MAX_HADRONIZATION_RETRIES = 5000
+DEFAULT_MINIMUM_OUTPUT_FRACTION = 0.8
+EDM_EVENT_ID_SCHEME = "run1-cantor-job-block-lumi-v1"
+UINT32_MAX = 2**32 - 1
+UINT64_MAX = 2**64 - 1
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-source LHE block coordinator")
@@ -38,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--analysis-type", required=True, help="JJP or JUP")
     p.add_argument("--n-sources", type=int, required=True)
     p.add_argument("--max-events", type=int, default=-1)
+    p.add_argument("--target-mixed-events", type=int, default=0,
+                   help="Target accepted mixed HepMC events per processing block")
+    p.add_argument("--normal-max-lhe-events", type=int, default=DEFAULT_NORMAL_MAX_LHE_EVENTS)
+    p.add_argument("--phi-max-lhe-events", type=int, default=DEFAULT_PHI_MAX_LHE_EVENTS)
+    p.add_argument("--phi-max-hadronization-retries", type=int,
+                   default=DEFAULT_PHI_MAX_HADRONIZATION_RETRIES)
+    p.add_argument("--minimum-output-fraction", type=float,
+                   default=DEFAULT_MINIMUM_OUTPUT_FRACTION)
     p.add_argument("--enable-ntuple", action="store_true")
     p.add_argument("--efficiency-ntuple", action="store_true")
     p.add_argument("--cleanup", action="store_true")
@@ -133,8 +150,118 @@ def miniaod_url(base: str, campaign: str, job_id: str) -> str:
     return f"{base}/output/{campaign}/{job_id}/output_MINIAOD.root"
 
 
+def processing_manifest_url(base: str, campaign: str, job_id: str) -> str:
+    return (
+        f"{base}/output/{campaign}/{job_id}/"
+        f"processing_manifest_{campaign}_{job_id}.json"
+    )
+
+
 def ntuple_url(base: str, campaign: str, job_id: str) -> str:
     return f"{base}/output/{campaign}/{job_id}/output_ntuple.root"
+
+
+def is_phi_mode(mode: str) -> bool:
+    return mode.strip() in {
+        "phi",
+        "phi_default",
+        "phi_mode1",
+        "phi_mpi_off",
+        "sps",
+        "phi_mode2",
+        "phi_mpi_on_gluon",
+        "phi_gluon",
+    }
+
+
+def edm_luminosity_block(job_index: int, block_index: int) -> int:
+    """Map one campaign job/block pair injectively into a uint32 lumi."""
+    if job_index < 0 or block_index < 0:
+        raise ValueError(
+            f"EventID indices must be non-negative: "
+            f"job_index={job_index} block_index={block_index}"
+        )
+    diagonal = job_index + block_index
+    paired = diagonal * (diagonal + 1) // 2 + block_index
+    luminosity_block = paired + 1
+    if luminosity_block > UINT32_MAX:
+        raise OverflowError(
+            "Cantor-paired luminosity block exceeds uint32: "
+            f"job_index={job_index} block_index={block_index} "
+            f"luminosity_block={luminosity_block} limit={UINT32_MAX}"
+        )
+    return luminosity_block
+
+
+def compute_edm_event_ids(
+    job_index: int,
+    block_indices,
+    block_event_count_fn,
+    processing_max_events: int,
+) -> dict:
+    """Return deterministic EventID metadata unique within one campaign."""
+    event_ids = {}
+    for block_index in block_indices:
+        raw_events = int(block_event_count_fn(block_index) or 0)
+        reserved_events = raw_events
+        if processing_max_events > 0:
+            reserved_events = min(reserved_events, processing_max_events)
+        if reserved_events <= 0:
+            raise ValueError(
+                f"Block {block_index}: reserved_events={reserved_events} "
+                "cannot assign an empty EventID span"
+            )
+        if reserved_events > UINT64_MAX:
+            raise OverflowError(
+                f"Block {block_index}: reserved_events={reserved_events} "
+                f"exceeds uint64 limit {UINT64_MAX}"
+            )
+        event_ids[block_index] = {
+            "first_run": 1,
+            "first_luminosity_block": edm_luminosity_block(
+                job_index, block_index
+            ),
+            "first_event": 1,
+            "reserved_events": reserved_events,
+            "number_events_in_luminosity_block": 0,
+        }
+    return event_ids
+
+
+def validate_edm_event_ids(block_records: list) -> None:
+    """Validate full run/lumi/event ranges are bounded and non-overlapping."""
+    seen_ranges = defaultdict(list)
+    for record in block_records:
+        eid = record["edm_event_id"]
+        run = int(eid["first_run"])
+        lumi = int(eid["first_luminosity_block"])
+        first = int(eid["first_event"])
+        reserved = int(eid["reserved_events"])
+        last = first + reserved - 1
+        if run < 1 or run > UINT32_MAX or lumi < 1 or lumi > UINT32_MAX:
+            raise ValueError(
+                f"Block {record['block_index']}: run/luminosityBlock outside "
+                f"uint32 range: run={run} luminosityBlock={lumi}"
+            )
+        if first < 1 or reserved <= 0:
+            raise ValueError(
+                f"Block {record['block_index']}: invalid EventID span "
+                f"first_event={first} reserved_events={reserved}"
+            )
+        if last > UINT64_MAX:
+            raise ValueError(
+                f"Block {record['block_index']}: EventID span ends above uint64: "
+                f"last_event={last}"
+            )
+        stream = (run, lumi)
+        for prev_first, prev_last in seen_ranges[stream]:
+            if first <= prev_last and last >= prev_first:
+                raise ValueError(
+                    f"EventID overlap: block {record['block_index']} "
+                    f"run={run} lumi={lumi} [{first}, {last}] overlaps "
+                    f"[{prev_first}, {prev_last}]"
+                )
+        seen_ranges[stream].append((first, last))
 
 
 def main() -> int:
@@ -190,6 +317,15 @@ def main() -> int:
         print(f"[ERROR] --shower-modes count ({len(shower_modes)}) != --n-sources ({args.n_sources})",
               file=sys.stderr)
         return 1
+    if args.target_mixed_events > 0:
+        target_mixed_events = args.target_mixed_events
+    elif args.max_events > 0:
+        target_mixed_events = args.max_events
+    else:
+        target_mixed_events = DEFAULT_TARGET_MIXED_EVENTS
+    if target_mixed_events <= 0:
+        print("[ERROR] target_mixed_events must be positive", file=sys.stderr)
+        return 1
 
     # Build pool→source lookup for block generation
     pool_lookup: dict = {}
@@ -212,27 +348,88 @@ def main() -> int:
         )
         return 1
 
-    input_multiplicity = Counter(campaign_inputs)
     n_blocks_by_pool = {pool: len(source["blocks"]) for pool, source in pool_lookup.items()}
-    n_mixed = min(
-        n_blocks_by_pool[pool] // input_multiplicity[pool]
-        for pool in input_multiplicity
-    )
+    input_multiplicity = Counter(campaign_inputs)
+
+    source_templates = []
+    occurrence_seen = defaultdict(int)
+    for slot, (pool_name, mode) in enumerate(zip(campaign_inputs, shower_modes)):
+        occurrence = occurrence_seen[pool_name]
+        occurrence_seen[pool_name] += 1
+        phi_like = is_phi_mode(mode)
+        source_templates.append({
+            "slot": slot,
+            "pool": pool_name,
+            "mode": mode,
+            "occurrence": occurrence,
+            "target_hepmc_events": target_mixed_events,
+            "max_lhe_events": (
+                args.phi_max_lhe_events if phi_like else args.normal_max_lhe_events
+            ),
+            "max_hadronization_retries": (
+                args.phi_max_hadronization_retries if phi_like else 1000
+            ),
+        })
+
+    pool_cursors = defaultdict(int)
+    mixed_source_slots = []
+    while True:
+        block_sources = []
+        next_cursors = dict(pool_cursors)
+        can_build = True
+        for tmpl in source_templates:
+            pool_name = tmpl["pool"]
+            source = pool_lookup[pool_name]
+            blocks = source["blocks"]
+            cursor = next_cursors.get(pool_name, 0)
+            chosen = []
+            accumulated = 0
+            while cursor < len(blocks) and (not chosen or accumulated < tmpl["max_lhe_events"]):
+                block = blocks[cursor]
+                n_events = int(block.get("n_events", 0) or 0)
+                chosen.append({
+                    "pool": pool_name,
+                    "group_id": source["group_id"],
+                    "primary_seed": source["primary_seed"],
+                    "seeds": source["seeds"],
+                    "block_index": cursor,
+                    "n_events": n_events,
+                    "path": block.get("path", ""),
+                })
+                accumulated += max(0, n_events)
+                cursor += 1
+            if not chosen:
+                can_build = False
+                break
+            block_source = dict(tmpl)
+            block_source["inputs"] = [
+                f"BLOCK:{item['pool']}:{item['group_id']}:{item['block_index']:06d}"
+                for item in chosen
+            ]
+            block_source["blocks"] = chosen
+            block_source["planned_lhe_events"] = accumulated
+            block_sources.append(block_source)
+            next_cursors[pool_name] = cursor
+        if not can_build:
+            break
+        mixed_source_slots.append(block_sources)
+        pool_cursors = defaultdict(int, next_cursors)
+
+    n_mixed = len(mixed_source_slots)
     if n_mixed == 0:
-        msg = "no common blocks across campaign inputs ("
+        msg = "no common blocks across campaign source slots ("
         msg += ", ".join(
-            f"{pool}={n_blocks_by_pool[pool]} blocks/{input_multiplicity[pool]} uses"
+            f"{pool}={n_blocks_by_pool[pool]} blocks/{input_multiplicity.get(pool, 0)} uses"
             for pool in input_multiplicity
         )
         msg += ")"
         print(f"[ERROR] {msg}", file=sys.stderr)
         return 1
-    print(f"[INFO] Strict-min with duplicate inputs: {n_mixed} mixed blocks")
+    print(f"[INFO] Budget-derived source slots: {n_mixed} mixed blocks")
 
-    # Record unused blocks after duplicate source offsets are consumed.
     unused = []
     for pool, group_id, primary_seed, seeds, blocks in source_blocks:
-        used_count = n_mixed * input_multiplicity.get(pool, 0)
+        used_count = pool_cursors.get(pool, 0)
         leftover = list(range(used_count, len(blocks)))
         if leftover:
             unused.append({"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
@@ -240,34 +437,17 @@ def main() -> int:
                            "unused_count": len(leftover)})
             print(f"[INFO] {pool}: {len(leftover)} unused blocks (indices {leftover[0]}-{leftover[-1]})")
 
+    def mixed_block_sources(block_index: int) -> list:
+        return mixed_source_slots[block_index]
+
     def mixed_block_inputs(block_index: int) -> list:
-        occurrence_seen = defaultdict(int)
         inputs = []
-        for pool_name in campaign_inputs:
-            occurrence = occurrence_seen[pool_name]
-            occurrence_seen[pool_name] += 1
-            source = pool_lookup[pool_name]
-            source_block_index = block_index * input_multiplicity[pool_name] + occurrence
-            block = source["blocks"][source_block_index]
-            inputs.append({
-                "pool": pool_name,
-                "group_id": source["group_id"],
-                "primary_seed": source["primary_seed"],
-                "seeds": source["seeds"],
-                "block_index": source_block_index,
-                "occurrence": occurrence,
-                "n_events": int(block.get("n_events", 0) or 0),
-                "path": block.get("path", ""),
-            })
+        for source in mixed_block_sources(block_index):
+            inputs.extend(source["blocks"])
         return inputs
 
     def mixed_block_event_count(block_index: int) -> int:
-        counts = [
-            int(item.get("n_events", 0) or 0)
-            for item in mixed_block_inputs(block_index)
-            if int(item.get("n_events", 0) or 0) > 0
-        ]
-        return min(counts) if counts else 0
+        return target_mixed_events
 
     # --- 4. Generate SubDAG ---
     os.makedirs(os.path.dirname(args.subdag_output_path), exist_ok=True)
@@ -311,16 +491,37 @@ def main() -> int:
     if args.enable_ntuple and args.ntuple_sub_template_path:
         os.makedirs(ntuple_config_dir, exist_ok=True)
 
+    try:
+        edm_ids = compute_edm_event_ids(
+            args.job_index,
+            range(n_mixed),
+            mixed_block_event_count,
+            -1,
+        )
+    except (OverflowError, ValueError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     block_records = []
     for i in range(n_mixed):
         jid = block_job_id(args.job_index, i)
         block_records.append({
             "block_index": i,
             "job_id": jid,
-            "expected_events": mixed_block_event_count(i),
+            "expected_events": target_mixed_events,
+            "target_mixed_events": target_mixed_events,
+            "event_id_span": target_mixed_events,
+            "edm_event_id": edm_ids[i],
             "inputs": mixed_block_inputs(i),
+            "sources": mixed_block_sources(i),
             "miniaod_url": miniaod_url(target_base, args.campaign, jid),
+            "processing_manifest_url": processing_manifest_url(target_base, args.campaign, jid),
         })
+    try:
+        validate_edm_event_ids(block_records)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
 
     merge_groups = []
     if merge_enabled:
@@ -373,7 +574,7 @@ def main() -> int:
         dag.write(f"# Campaign: {args.campaign}  Job index: {args.job_index}\n")
         dag.write(f"# Generated: {datetime.now(timezone.utc).isoformat()}\n")
         dag.write(f"# Tool: coordinate_lhe_blocks.py\n")
-        dag.write(f"# Strict-min: {n_mixed} mixed blocks from "
+        dag.write(f"# Budget-derived: {n_mixed} mixed blocks from "
                   f"{' + '.join(f'{pool}({n_blocks_by_pool[pool]}/{input_multiplicity.get(pool, 0)} uses)' for pool, _, _, _, _ in source_blocks)}\n")
         dag.write("# ================================================\n")
         dag.write("\n")
@@ -383,10 +584,10 @@ def main() -> int:
         dag.write("\n")
 
         for i in range(n_mixed):
-            # Build inputs string from campaign inputs (with duplicates)
+            # Legacy inputs/modes stay for old wrappers; sources[] is authoritative.
             input_parts = [
-                f"BLOCK:{item['pool']}:{item['group_id']}:{item['block_index']:06d}"
-                for item in mixed_block_inputs(i)
+                source["inputs"][0]
+                for source in mixed_block_sources(i)
             ]
             modes = [mode.strip() for mode in args.shower_modes.split(",") if mode.strip()]
 
@@ -402,6 +603,11 @@ def main() -> int:
                 "campaign": args.campaign,
                 "job_id": block_job_id_value,
                 "max_events": args.max_events,
+                "target_mixed_events": target_mixed_events,
+                "event_id_span": target_mixed_events,
+                "minimum_output_fraction": args.minimum_output_fraction,
+                "sources": mixed_block_sources(i),
+                "edm_event_id": edm_ids[i],
                 "enable_ntuple": processing_enable_ntuple,
                 "efficiency_ntuple": args.efficiency_ntuple,
                 "cleanup": args.cleanup,
@@ -516,8 +722,10 @@ def main() -> int:
                             "block_index": component["block_index"],
                             "job_id": component["job_id"],
                             "url": component["miniaod_url"],
+                            "manifest_url": component["processing_manifest_url"],
                             "expected_events": component["expected_events"],
                             "inputs": component["inputs"],
+                            "sources": component["sources"],
                         }
                         for component in record["components"]
                     ],
@@ -606,6 +814,7 @@ def main() -> int:
         final_config = {
             "campaign": args.campaign,
             "job_index": args.job_index,
+            "event_id_scheme": EDM_EVENT_ID_SCHEME,
             "output_url": final_output_url,
             "blocks": block_records,
             "merge_groups": merge_records,
@@ -642,19 +851,23 @@ def main() -> int:
     # --- 5. Write coordinator manifest ---
     coord_manifest = {
         "tool": "coordinate_lhe_blocks",
-        "version": "1.0",
+        "version": "1.1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "campaign": args.campaign,
         "job_index": args.job_index,
+        "event_id_scheme": EDM_EVENT_ID_SCHEME,
         "n_mixed_blocks": n_mixed,
-        "events_per_block": args.max_events,
+        "processing_max_events": args.max_events,
+        "target_mixed_events": target_mixed_events,
+        "event_id_span": target_mixed_events,
+        "minimum_output_fraction": args.minimum_output_fraction,
         "miniaod_merge_enabled": merge_enabled,
         "miniaod_merge_events": args.miniaod_merge_events,
         "miniaod_merge_validation": args.miniaod_merge_validation,
         "sources": [
             {"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
              "seeds": seeds, "n_blocks": len(blocks),
-             "n_used": n_mixed * input_multiplicity.get(pool, 0),
+             "n_used": pool_cursors.get(pool, 0),
              "multiplicity": input_multiplicity.get(pool, 0)}
             for pool, group_id, primary_seed, seeds, blocks in source_blocks
         ],
@@ -662,8 +875,13 @@ def main() -> int:
             {
                 "index": i,
                 "expected_events": mixed_block_event_count(i),
+                "target_mixed_events": target_mixed_events,
+                "event_id_span": target_mixed_events,
+                "edm_event_id": edm_ids[i],
                 "miniaod_url": miniaod_url(target_base, args.campaign, block_job_id(args.job_index, i)),
+                "processing_manifest_url": processing_manifest_url(target_base, args.campaign, block_job_id(args.job_index, i)),
                 "inputs": mixed_block_inputs(i),
+                "sources": mixed_block_sources(i),
             }
             for i in range(n_mixed)
         ],

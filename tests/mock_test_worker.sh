@@ -76,6 +76,13 @@ cfg = {
     'efficiency_ntuple': False,
     'cleanup': False,
     'shuffle_mixing': False,
+    'edm_event_id': {
+        'first_run': 1,
+        'first_luminosity_block': 1,
+        'first_event': 42,
+        'reserved_events': 5,
+        'number_events_in_luminosity_block': 0,
+    },
     'stop_at': 'shower',
     'local_output_base': '${OUTPUT_DIR}',
 }
@@ -125,6 +132,10 @@ grep -q 'Extracting processing bundle' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
 grep -q 'MC Production Chain' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
     && pass "run_chain.sh launched with config" \
     || fail "run_chain.sh did not launch"
+
+grep -q 'EDM EventID:  run=1 lumi=1 firstEvent=42 eventsPerLumi=0' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
+    && pass "EDM EventID config propagated to run_chain.sh" \
+    || fail "EDM EventID config was not propagated"
 
 # Check LHE files were resolved
 grep -q 'Source 1:.*sample_jpsi_g_100.lhe.gz' "${MOCK_DIR}/wrapper.log" 2>/dev/null \

@@ -120,6 +120,15 @@ cmd = [
     "--final-sub-template-path", str(cfg["final_sub_template_path"]),
     "--final-wrapper-path", str(cfg["final_wrapper_path"]),
 ]
+for key, flag in [
+    ("target_mixed_events", "--target-mixed-events"),
+    ("normal_max_lhe_events", "--normal-max-lhe-events"),
+    ("phi_max_lhe_events", "--phi-max-lhe-events"),
+    ("phi_max_hadronization_retries", "--phi-max-hadronization-retries"),
+    ("minimum_output_fraction", "--minimum-output-fraction"),
+]:
+    if cfg.get(key) not in (None, ""):
+        cmd.extend([flag, str(cfg[key])])
 if cfg.get("enable_ntuple", False):
     cmd.append("--enable-ntuple")
 if cfg.get("efficiency_ntuple", False):
