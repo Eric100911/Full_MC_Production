@@ -54,6 +54,11 @@ def main() -> int:
         dag_text = (output_dir / "planner_cap_test.dag").read_text(encoding="utf-8")
         assert "JOB PLAN_" in dag_text
         assert "JOB LHE_" not in dag_text
+        assert "SCRIPT POST " in dag_text
+        assert (
+            f"--proxy-bundle {output_dir / 'proxy_bundle.tar.gz'}"
+            in dag_text
+        )
 
     print("[OK] generate-test existing-LHE planner cap auto-follows --max-events")
     return 0

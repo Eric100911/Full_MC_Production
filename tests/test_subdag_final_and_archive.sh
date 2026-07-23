@@ -21,9 +21,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${WORKDIR}/proxy/credentials" "${WORKDIR}/worker"
+mkdir -p "${WORKDIR}/proxy/credentials" "${WORKDIR}/worker" "${WORKDIR}/mock_bin"
 touch "${WORKDIR}/proxy/credentials/x509_user_proxy"
-tar -czf "${WORKDIR}/proxy_bundle.tar.gz" -C "${WORKDIR}/proxy" credentials
+
+cat > "${WORKDIR}/mock_bin/voms-proxy-info" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ "${MOCK_PROXY_EXPIRED:-0}" == "1" ]]; then
+    exit 1
+fi
+for argument in "$@"; do
+    if [[ "${argument}" == "--timeleft" ]]; then
+        echo 7200
+        exit 0
+    fi
+done
+exit 0
+EOF
+chmod +x "${WORKDIR}/mock_bin/voms-proxy-info"
+
+python3 - "${BASE_DIR}" "${WORKDIR}/proxy/credentials/x509_user_proxy" \
+    "${WORKDIR}" <<'PY'
+import os
+import stat
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import dag_generator
+
+bundle_path, bundle_name = dag_generator.build_proxy_bundle(sys.argv[3], sys.argv[2])
+assert bundle_name == "proxy_bundle.tar.gz"
+assert stat.S_IMODE(os.stat(bundle_path).st_mode) == 0o600
+PY
+pass "Proxy bundle is built atomically with private permissions"
 
 touch_nonempty() {
     mkdir -p "$(dirname "$1")"
@@ -110,11 +140,13 @@ for stage in processing miniaod_merge ntuple final; do
     printf '%s log\n' "${stage}" > "${LOG_ROOT}/MOCK_FINAL/${stage}/job_000003/${stage}.stdout"
 done
 
+PATH="${WORKDIR}/mock_bin:${PATH}" \
 bash "${BASE_DIR}/tools/archive_subdag_logs.sh" \
     --campaign MOCK_FINAL \
     --job-index 3 \
     --log-root "${LOG_ROOT}" \
     --target-eos-base "${WORKDIR}/archive_target" \
+    --proxy-bundle "${WORKDIR}/proxy_bundle.tar.gz" \
     > "${WORKDIR}/archive.log" 2>&1
 
 ARCHIVE_DIR="${WORKDIR}/archive_target/output/MOCK_FINAL/job_000003_logs"
@@ -136,8 +168,73 @@ assert payload["campaign"] == "MOCK_FINAL"
 assert payload["job_index"] == 3
 assert payload["job_component"] == "job_000003"
 assert payload["size_bytes"] > 0
+assert payload["proxy_timeleft_seconds"] == 7200
 PY
 pass "Log archive manifest is valid"
+
+STATUS="${LOG_ROOT}/MOCK_FINAL/final/job_000003/log_archive_status.json"
+python3 - "${STATUS}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert payload["status"] == "ok"
+assert payload["phase"] == "complete"
+assert payload["proxy_timeleft_seconds"] == 7200
+PY
+pass "Log archive writes a persistent success status"
+
+set +e
+MOCK_PROXY_EXPIRED=1 PATH="${WORKDIR}/mock_bin:${PATH}" \
+bash "${BASE_DIR}/tools/archive_subdag_logs.sh" \
+    --campaign MOCK_EXPIRED \
+    --job-index 4 \
+    --log-root "${LOG_ROOT}" \
+    --target-eos-base "${WORKDIR}/expired_target" \
+    --proxy-bundle "${WORKDIR}/proxy_bundle.tar.gz" \
+    > "${WORKDIR}/expired.log" 2>&1
+expired_rc=$?
+set -e
+[[ "${expired_rc}" -ne 0 ]] || {
+    fail "Expired proxy did not make the POST script fail"
+    exit 1
+}
+[[ ! -e "${WORKDIR}/expired_target" ]] || {
+    fail "Expired proxy unexpectedly reached archive upload"
+    exit 1
+}
+python3 - "${LOG_ROOT}/MOCK_EXPIRED/final/job_000004/log_archive_status.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert payload["status"] == "failed"
+assert payload["phase"] == "proxy_validation"
+assert payload["exit_code"] == 2
+PY
+pass "Expired proxy is a hard failure with persistent diagnostics"
+
+PATH="${WORKDIR}/mock_bin:${PATH}" \
+bash "${BASE_DIR}/tools/archive_subdag_logs.sh" \
+    --campaign MOCK_NO_LOGS \
+    --job-index 5 \
+    --log-root "${LOG_ROOT}" \
+    --target-eos-base "${WORKDIR}/no_logs_target" \
+    --proxy-bundle "${WORKDIR}/proxy_bundle.tar.gz" \
+    > "${WORKDIR}/no_logs.log" 2>&1
+python3 - "${LOG_ROOT}/MOCK_NO_LOGS/final/job_000005/log_archive_status.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert payload["status"] == "failed"
+assert payload["phase"] == "log_discovery"
+assert payload["exit_code"] == 1
+PY
+pass "Non-credential archival errors remain fail-soft and are recorded"
 
 echo "[INFO] ${PASS} checks passed, ${FAIL} failed"
 [[ "${FAIL}" -eq 0 ]]

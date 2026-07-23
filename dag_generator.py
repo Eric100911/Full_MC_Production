@@ -1944,7 +1944,23 @@ def build_proxy_bundle(output_dir: str, proxy_path: str) -> Tuple[str, str]:
 
     bundle_name = BUNDLE_NAMES["proxy"]
     bundle_path = os.path.join(output_dir, bundle_name)
-    build_bundle(bundle_path, ((proxy_path, os.path.join("credentials", "x509_user_proxy")),))
+    ensure_dir(output_dir)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{bundle_name}.",
+        suffix=".tmp",
+        dir=output_dir,
+    )
+    os.close(descriptor)
+    try:
+        build_bundle(
+            temporary_path,
+            ((proxy_path, os.path.join("credentials", "x509_user_proxy")),),
+        )
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, bundle_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
     return bundle_path, bundle_name
 
 
@@ -3313,13 +3329,17 @@ class DAGBuilder:
             self.dag_lines.append(
                 "SCRIPT POST {node} {script} "
                 "--campaign {campaign} --job-index {job_index} "
-                "--log-root {log_root} --target-eos-base {target}".format(
+                "--log-root {log_root} --target-eos-base {target} "
+                "--proxy-bundle {proxy_bundle}".format(
                     node=subdag_name,
                     script=dag_escape(SUBDAG_LOG_ARCHIVE_SCRIPT),
                     campaign=dag_escape(campaign_name),
                     job_index=dag_escape(job_index),
                     log_root=dag_escape(self.options.log_root),
                     target=dag_escape(self.options.target_base_url or EOS_BASE),
+                    proxy_bundle=dag_escape(
+                        self.runtime_assets["proxy_bundle_path"]
+                    ),
                 )
             )
         return subdag_name
