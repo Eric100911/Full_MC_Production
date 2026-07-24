@@ -1,0 +1,4 @@
+interface:
+  display_name: "CMS Condor Job Operator"
+  short_description: "Triage and operate DAGMan jobs safely"
+  default_prompt: "Use $cms-condor-job-operator to inspect and safely operate this HTCondor DAG."
