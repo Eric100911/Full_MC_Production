@@ -1,12 +1,27 @@
 ---
 name: cms-ihep-condor-pilot
-description: Generate, submit, monitor, and triage small Full_MC_Production pilot DAGs for the CMS T2_CN_Beijing/IHEP workflow. Use when working in this repository on existing-LHE block SubDAG pilots, MiniAOD merge pilots, ntuple-from-merged-MiniAOD pilots, HTCondor DAGMan submission/monitoring, IHEP XRootD URL handling, or sandbox-vs-live XRootD diagnosis.
+description: Generate, submit, rerun, and validate small Full_MC_Production pilot DAGs for the CMS T2_CN_Beijing/IHEP workflow. Use when choosing a representative pilot, preparing its runtime, inspecting generated block SubDAG topology, running the worker mock, submitting a pilot, or checking its physics outputs and event accounting. Delegate general schedd selection, myschedd bump, HTCondor triage, DAG progress, removal, and transfer audit to the sibling cms-condor-job-operator skill.
 ---
 
 # CMS IHEP Condor Pilot
 
-Use this skill for operational pilot work in the `Full_MC_Production` repo.
-Prefer it for small, reversible pilots and live DAGMan checks.
+Use this skill for pilot-specific work in the `Full_MC_Production` repo.
+Prefer small, reversible pilots that exercise the production path end to end.
+
+## Use the general Condor skill
+
+Before selecting a schedd, submitting, monitoring, triaging, auditing transfer,
+or removing a pilot, read and follow
+[`../cms-condor-job-operator/SKILL.md`](../cms-condor-job-operator/SKILL.md).
+Let that skill own `myschedd bump`, explicit schedd/cluster identity, live queue
+interpretation, history, rescue, and mutation safeguards.
+
+Keep this skill responsible for:
+
+- representative campaign and source selection;
+- event, file, block, merge, and subprocess coverage;
+- worker mock and generated-DAG inspection;
+- pilot-specific output and event-accounting acceptance.
 
 ## Core rules
 
@@ -49,9 +64,22 @@ Before submission, state:
 - MiniAOD merge target;
 - expected merged MiniAOD/ntuple count.
 
-Use the recipe and triage commands in
+Use the generation and inspection recipe in
 [`references/pilot-recipes.md`](references/pilot-recipes.md) when generating or
 submitting the pilot.
+
+## Test before submission
+
+For worker-runtime changes, run the production-style local mock:
+
+```bash
+./tests/mock_test_worker.sh
+```
+
+Make the mock reproduce the worker container, transferred bundle, proxy,
+working directory, CMSSW project initialization, and staged configuration.
+Also run the repository checks required by `AGENTS.md` for the changed paths.
+Do not accept a host-only shortcut as proof of worker compatibility.
 
 ## Required inspection before submission
 
@@ -75,13 +103,8 @@ Check for:
 
 ## Live monitoring
 
-After submission, verify live state rather than relying on generated configs:
-
-```bash
-condor_q <dag-cluster> -nobatch
-tail -80 <dag>.dagman.out
-tail -80 <dag>.nodes.log
-```
+Use the general Condor skill with the recorded schedd and DAGMan cluster ID.
+Verify live state rather than relying on generated configs.
 
 For generated block SubDAGs, inspect the coordinator output after the
 coordinator node finishes:
@@ -104,3 +127,20 @@ python3 -m json.tool <output-dir>/plan_subdags/<campaign>/job_0/coord_manifest_<
   positive `--max-events` or explicit `--lhe-max-events-per-plan`.
 - Large remote MiniAOD merge smoke is slow: prefer a small pilot DAG that
   produces tiny MiniAODs, then merges those.
+
+## Pilot acceptance
+
+After completion, verify:
+
+- expected processing, merge, ntuple, final, and summary nodes succeeded;
+- output manifests and provenance were retained;
+- declared HepMC, MiniAOD, and Ntuple products exist;
+- event counts come from the appropriate product-aware tool, not filenames;
+- `report-and-truncate` warnings and unused-source accounting are present when
+  exercised;
+- stdout, stderr, worker logs, POST logs, and final inventory are transferred
+  or their absence is explicitly reported;
+- source files and repeated source slots consumed distinct planned blocks.
+
+For source-efficiency and LHE-budget conclusions, use the sibling
+[`../cms-lhe-capacity-planner/SKILL.md`](../cms-lhe-capacity-planner/SKILL.md).

@@ -82,16 +82,23 @@ each mixed block has a distinct `edm_event_id.first_luminosity_block`.
 Submit:
 
 ```bash
+myschedd bump
+myschedd show
 condor_submit_dag "$out/miniaod_merge_existing_pilot.dag"
 ```
+
+Record the hostname printed by `myschedd show` and the top-level DAGMan cluster
+ID printed by `condor_submit_dag` as one identity pair.
 
 Monitor:
 
 ```bash
-condor_q <dag-cluster> -nobatch
-tail -80 "$out/miniaod_merge_existing_pilot.dag.dagman.out"
-tail -80 "$out/miniaod_merge_existing_pilot.dag.nodes.log"
+python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py \
+  <dag-cluster> --schedd <schedd>
 ```
+
+Use the general Condor skill for detailed diagnosis, live-log inspection, or
+any queue mutation.
 
 After coordinator completion:
 
