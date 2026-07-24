@@ -119,24 +119,55 @@ def read_url_text(url, workdir):
     return None
 
 
-def expected_events_from_manifests(inputs, workdir):
+def expected_events_from_manifests(inputs, workdir, strict=False):
     actuals = []
+    provenance = []
     for item in inputs:
         if not isinstance(item, dict):
-            return None
+            if strict:
+                raise SystemExit("strict merge requires object input records")
+            return None, []
         text = read_url_text(item.get("manifest_url", ""), workdir)
         if not text:
-            return None
+            if strict:
+                raise SystemExit(f"required processing manifest unavailable: {item.get('manifest_url', '')}")
+            return None, []
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            return None
+            if strict:
+                raise SystemExit(f"invalid processing manifest JSON: {item.get('manifest_url', '')}")
+            return None, []
+        if strict:
+            if payload.get("status") != "ok" or not payload.get("complete"):
+                raise SystemExit(f"processing manifest is not successful: {item.get('manifest_url', '')}")
+            if payload.get("miniaod_url") != item.get("url"):
+                raise SystemExit(
+                    f"processing manifest URL mismatch: {payload.get('miniaod_url')} != {item.get('url')}"
+                )
+            if payload.get("miniaod_count_source") != "edmFileUtil":
+                raise SystemExit("strict merge requires an edmFileUtil MiniAOD count")
+            actual_miniaod = int(payload.get("actual_miniaod_events", 0))
+            actual_mixed = int(payload.get("actual_mixed_hepmc_events", 0))
+            if actual_miniaod <= 0 or actual_miniaod != actual_mixed:
+                raise SystemExit(
+                    f"invalid processing counts: mixed={actual_mixed} miniaod={actual_miniaod}"
+                )
         if "actual_miniaod_events" not in payload:
-            return None
-        actuals.append(int(payload["actual_miniaod_events"]))
+            return None, []
+        actual_miniaod = int(payload["actual_miniaod_events"])
+        actuals.append(actual_miniaod)
+        provenance.append({
+            "job_id": item.get("job_id"),
+            "manifest_url": item.get("manifest_url"),
+            "miniaod_url": item.get("url"),
+            "actual_mixed_hepmc_events": int(payload.get("actual_mixed_hepmc_events", 0)),
+            "actual_miniaod_events": actual_miniaod,
+            "miniaod_count_source": payload.get("miniaod_count_source"),
+        })
     if len(actuals) != len(inputs):
-        return None
-    return sum(actuals)
+        return None, []
+    return sum(actuals), provenance
 
 
 def cmssw_script(workdir, input_list, output_file, max_size):
@@ -221,6 +252,16 @@ def main():
             else:
                 handle.write("file:" + url + "\n")
 
+    strict_manifests = bool(cfg.get("require_processing_manifests", False))
+    manifest_expected_events, processing_manifest_counts = expected_events_from_manifests(
+        inputs, workdir, strict=strict_manifests
+    )
+    expected_events = (
+        manifest_expected_events
+        if manifest_expected_events is not None
+        else cfg.get("expected_events")
+    )
+
     output_file = workdir / "merged_MINIAOD.root"
     script = workdir / "run_edmCopyPickMerge.sh"
     script.write_text(
@@ -232,12 +273,6 @@ def main():
     if not output_file.exists() or output_file.stat().st_size == 0:
         raise SystemExit("merged MiniAOD missing or empty")
     actual_events = merged_event_count(workdir)
-    manifest_expected_events = expected_events_from_manifests(inputs, workdir)
-    expected_events = (
-        manifest_expected_events
-        if manifest_expected_events is not None
-        else cfg.get("expected_events")
-    )
     if cfg.get("validation") == "event-count":
         if actual_events is None:
             raise SystemExit("event-count validation requested but edmFileUtil event count was unavailable")
@@ -260,9 +295,12 @@ def main():
         "size_bytes": size,
         "expected_events": expected_events,
         "expected_events_source": "input_manifests" if manifest_expected_events is not None else "config",
+        "require_processing_manifests": strict_manifests,
+        "packing_weight_events": cfg.get("packing_weight_events"),
         "actual_events": actual_events,
         "validation": cfg.get("validation"),
         "components": inputs,
+        "processing_manifest_counts": processing_manifest_counts,
     }
     manifest_path = workdir / f"merge_manifest_{cfg['campaign']}_{cfg['job_id']}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

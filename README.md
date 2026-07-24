@@ -27,6 +27,7 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/octet_pdg.py`** — HELAC octet PDG encoding converter/scan tool.
 - **`common/compression_util.py`** / **`common/compression_helpers.sh`** — Python and bash gzip helpers for transparent `.lhe.gz` handling.
 - **`common/cmssw_configs/`** — Python CMSSW configuration fragments for GEN-SIM and per-analysis-type ntuples.
+- **`common/campaign_job_specs/`** — Versioned, checksum-bound source selections and per-campaign LHE budgets for inventory-driven recovery campaigns.
 - **`common/paths.sh`** — Workspace-relative path definitions; no hardcoded usernames.
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional).
 - **`external/TPS-Onia2MuMu`** — Git submodule for the ntuple analyzer (v2.0_patch2). Used as fallback when the prebuilt CMSSW15 runtime tarball is unavailable.
@@ -35,10 +36,13 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE job wrapper using JSON config (3 positional args) instead of legacy positional args.
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
 - **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, groups non-overlapping blocks to satisfy per-source LHE budgets, assigns deterministic EDM EventIDs, and generates `blocks_processing.dag` SubDAGs.
+- **`tools/dag_progress.py`** — Root-cluster progress dashboard that combines live queue records with completed DAGMan logs and can render full or campaign-collapsed nested DAG topology.
+- **`tools/migrate_cap700_job_spec.py`** — Reproducibly converts the legacy cap700 planning artifacts and a counted inventory into exact full and pilot campaign job specs.
 - **`tools/compress_existing_lhe.py`** — Backfill utility to compress existing uncompressed LHE pools.
 - **`tools/compile_node_config.py`** — Compile and validate exact per-pool LHE paths before generating production configs.
 - **`tools/transfer_compress_lhe.py`** — Condor worker script for batch LHE compression with XRootD transfer.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker.
+- **`processing/cmssw_helpers/`** — Small executable helpers used by the worker to enter CMSSW12/15 runtimes and create or rename CMSSW15 projects without fragile nested shell quoting.
 - **`processing/condor_wrappers/`** — Lightweight bash wrappers invoked by submit templates (`run_processing.sh`, `run_ntuple_only.sh`, `run_plan_lhe_blocks.sh`, `run_coordinate_lhe_blocks.sh`). Wrappers take only bootstrap bundle/config arguments; node settings are read from JSON.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `shower_sps.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type (including `plan_lhe_blocks.sub`, `coordinate_lhe_blocks.sub`, `compress.sub`, `transfer_compress.sub`).
@@ -358,6 +362,9 @@ python3 dag_generator.py generate \
 | `--phi-max-hadronization-retries` | `generate`, `generate-test` | Hadronization retry limit per phi-like LHE event (default: 5000) |
 | `--minimum-output-fraction` | `generate`, `generate-test` | Minimum accepted/target completion fraction for a processing block (default: 0.8) |
 | `--enable-lhe-block-subdags` | `generate`, `generate-test` | Block SubDAG workflow with planner/coordinator |
+| `--campaign-job-spec` | `generate`, `generate-test` | Load a versioned inventory selection, source budgets, and storage limits; required by the `MC_v4_1` recovery campaigns |
+| `--phi-consumption-mode exhaustive` | `generate`, `generate-test` | Consume the full configured phi-like LHE exposure instead of stopping at the mixed-event target |
+| `--normal-shortfall-policy report-and-truncate` | `generate`, `generate-test` | Preserve and report the valid common mixed-event prefix when a normal source falls short |
 | `--keep-legacy-single-processing-path` | `generate`, `generate-test` | Flat DAG override even with `--enable-lhe-block-subdags` |
 | `--skip-lhe-generation` | `generate`, `generate-test` | Reuse existing LHE without generation |
 | `--existing-lhe-base` | `generate`, `generate-test` | Base URL for existing LHE pool scanning |
@@ -435,7 +442,7 @@ verification, ROOT event counting, and cleanup.
 # PDG encoding self-check
 ./tests/test_octet_pdg_tool.sh
 
-# Worker-bundle/config mock through the Pythia shower stop point
+# One-event worker mock through MiniAOD, edmFileUtil, and local stage-out
 ./tests/mock_test_worker.sh
 
 # Local HTCondor test
@@ -443,7 +450,7 @@ verification, ROOT event counting, and cleanup.
 ./run_local_test.sh --campaign JJP_DPS1 --jobs 2 --max-events 10 --submit --enable-ntuple
 ```
 
-Default test coverage: `JJP_DPS2_CS`, `JJP_DPS2_G`, `JUP_DPS1`, plus `test_octet_pdg_tool.sh`. `mock_test_worker.sh` builds a production processing bundle, transfers a dummy proxy and JSON config into a temporary worker directory, runs `run_processing.sh`, and stops after the shower step. It validates config parsing, bundle extraction, local `.lhe.gz` decompression, CMSSW setup, Pythia startup, and non-empty `shower_*.hepmc` outputs without requiring HTCondor submission.
+Default test coverage: `JJP_DPS2_CS`, `JJP_DPS2_G`, `JUP_DPS1`, plus `test_octet_pdg_tool.sh`. `mock_test_worker.sh` builds a production processing bundle, transfers a valid proxy and JSON config into a temporary worker directory, and runs `run_processing.sh` inside the production-style EL9 container. Its one-event chain validates showering, mixing, GEN-SIM, RAW, RECO, MiniAOD, containerized `edmFileUtil` counting, processing-manifest fields, and local stage-out without requiring HTCondor submission.
 
 For a one-job `JJP_DPS2_CS` pilot with `--max-events 5`, both source showers
 are capped at five events and the mixer produces **five output events**. Record
@@ -459,7 +466,7 @@ The LHE matrix test covers: `pool_jpsi_CSCO_g`, `pool_upsilon_CSCO_g`, `pool_gg`
 - `condor_submit` warns that `MaxRetries` in submit templates is "unused" — this is cosmetic; retry control lives in DAGMan `RETRY` directives.
 - LHE files with `<event>` or `<init>` substrings inside `<header>` blocks (e.g. `<event_info>`) are handled correctly by `lhe_shuffle_split.cc` v2.1+ but may confuse naive parsers.
 - Ntuple-only DAGs (`generate-ntuple-only`) discover MiniAOD files via XRootD listing. If the remote directory structure doesn't match the expected `<campaign>/<job_id>/` pattern, discovery may miss files.
-- `mock_test_worker.sh` intentionally uses `normal,normal` shower modes and `stop_at: shower`; phi-enriched `shower_sps` / `shower_phi` behavior is still covered by production/container or component tests because bare lxplus/el9 hosts may not match the bundled binary ABI.
+- `mock_test_worker.sh` intentionally uses `normal,normal` shower modes and one mixed event to keep the full CMSSW chain bounded. Phi-enriched exhaustive-consumption behavior remains covered by coordinator tests and production pilots.
 
 ## Typical workflow
 

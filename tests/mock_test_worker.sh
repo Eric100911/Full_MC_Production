@@ -7,12 +7,13 @@
 #   2. Bundle + proxy + JSON config copied to worker working directory
 #   3. run_processing.sh executes with those inputs
 #
-# Validates the worker infrastructure layer (bundles, wrapper, config, LHE
-# resolution) through a short standard Pythia shower. It stops before CMSSW
-# GEN-SIM/RAW/RECO/MiniAOD so the test does not require pileup access or full
-# HTCondor production runtime.
+# Validates the worker infrastructure layer and the full production chain
+# through MiniAOD, local stage-out, and the edmFileUtil event-count manifest.
+# This requires CVMFS, a valid CMS proxy, premix access, and the nested EL8
+# compatibility container used by CMSSW_12 on production EL9 workers.
 #
-# Host is el9 = production cmssw/el9 container OS, so bare execution is ABI-identical.
+# Run the wrapper inside cmssw/el9 so an uncontainerized EL8 edmFileUtil call
+# fails here in the same way it fails on a production worker.
 # ==============================================================================
 
 set -euo pipefail
@@ -28,7 +29,11 @@ info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
 
 cleanup() {
     if [[ -n "${MOCK_DIR:-}" && -d "${MOCK_DIR}" ]]; then
-        rm -rf "${MOCK_DIR}"
+        if [[ "${KEEP_MOCK_WORKDIR:-0}" == "1" || "${FAIL:-0}" -gt 0 || "${WRAPPER_RC:-0}" -ne 0 ]]; then
+            info "Preserving mock workdir for diagnostics: ${MOCK_DIR}"
+        else
+            rm -rf "${MOCK_DIR}"
+        fi
     fi
 }
 trap cleanup EXIT
@@ -53,12 +58,25 @@ PROCESSING_BUNDLE="${BUNDLE_DIR}/processing_runtime_bundle.tar.gz"
 [[ -f "${PROCESSING_BUNDLE}" ]] || { fail "Processing bundle not created"; exit 1; }
 pass "Processing bundle ready ($(du -h "${PROCESSING_BUNDLE}" | cut -f1))"
 
-# ── 3. Dummy proxy bundle ──────────────────────────────────────────────────
+# ── 3. Proxy bundle ──────────────────────────────────────────────────
 mkdir -p "${BUNDLE_DIR}/proxy/credentials"
-touch "${BUNDLE_DIR}/proxy/credentials/x509_user_proxy"
+PROXY_SOURCE="${X509_USER_PROXY:-}"
+if [[ -z "${PROXY_SOURCE}" || ! -s "${PROXY_SOURCE}" ]]; then
+    PROXY_SOURCE="${BASE_DIR}/../x509up"
+fi
+if [[ ! -s "${PROXY_SOURCE}" ]]; then
+    fail "A valid proxy is required; set X509_USER_PROXY"
+    exit 1
+fi
+PROXY_TIMELEFT=$(voms-proxy-info --file "${PROXY_SOURCE}" --timeleft 2>/dev/null || echo 0)
+if [[ ! "${PROXY_TIMELEFT}" =~ ^[0-9]+$ || "${PROXY_TIMELEFT}" -le 0 ]]; then
+    fail "Proxy is invalid or expired: ${PROXY_SOURCE}"
+    exit 1
+fi
+cp "${PROXY_SOURCE}" "${BUNDLE_DIR}/proxy/credentials/x509_user_proxy"
 PROXY_BUNDLE="${BUNDLE_DIR}/proxy_bundle.tar.gz"
 tar -czf "${PROXY_BUNDLE}" -C "${BUNDLE_DIR}/proxy" credentials/
-pass "Proxy bundle ready"
+pass "Proxy bundle ready (${PROXY_TIMELEFT}s remaining)"
 
 # ── 4. JSON config (same format as dag_generator.py write_node_config()) ────
 OUTPUT_DIR="${MOCK_DIR}/output"
@@ -71,7 +89,8 @@ cfg = {
     'analysis': 'JJP',
     'campaign': 'MOCK_TEST',
     'job_id': '0',
-    'max_events': 5,
+    'max_events': 1,
+    'target_mixed_events': 1,
     'enable_ntuple': False,
     'efficiency_ntuple': False,
     'cleanup': False,
@@ -80,10 +99,9 @@ cfg = {
         'first_run': 1,
         'first_luminosity_block': 1,
         'first_event': 42,
-        'reserved_events': 5,
+        'reserved_events': 1,
         'number_events_in_luminosity_block': 0,
     },
-    'stop_at': 'shower',
     'local_output_base': '${OUTPUT_DIR}',
 }
 with open('${CONFIG_JSON}', 'w') as f:
@@ -98,15 +116,15 @@ cp "${PROXY_BUNDLE}" "${PROCESSING_BUNDLE}" "${CONFIG_JSON}" "${WORK_DIR}/"
 info "Bundles + config copied to worker area"
 
 # ── 6. Execute worker wrapper ──────────────────────────────────────────────
-info "Executing run_processing.sh (production worker entry point)..."
+info "Executing full worker chain inside the production-style EL9 container..."
 
 set +e
 (
     cd "${WORK_DIR}"
-    bash "${BASE_DIR}/processing/condor_wrappers/run_processing.sh" \
-        "$(basename "${PROXY_BUNDLE}")" \
-        "$(basename "${PROCESSING_BUNDLE}")" \
-        "$(basename "${CONFIG_JSON}")" \
+    /cvmfs/cms.cern.ch/common/cmssw-el9 \
+        -B "${MOCK_DIR}" \
+        --command-to-run \
+        "/bin/bash ${BASE_DIR}/processing/condor_wrappers/run_processing.sh $(basename "${PROXY_BUNDLE}") $(basename "${PROCESSING_BUNDLE}") $(basename "${CONFIG_JSON}")" \
         2>&1 | tee "${MOCK_DIR}/wrapper.log"
 )
 WRAPPER_RC=$?
@@ -138,10 +156,10 @@ grep -q 'EDM EventID:  run=1 lumi=1 firstEvent=42 eventsPerLumi=0' "${MOCK_DIR}/
     || fail "EDM EventID config was not propagated"
 
 # Check LHE files were resolved
-grep -q 'Source 1:.*sample_jpsi_g_100.lhe.gz' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
+grep -q 'Source slot 0:.*sample_jpsi_g_100.lhe.gz' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
     && pass "LHE source 1 resolved" \
     || fail "LHE source 1 not resolved"
-grep -q 'Source 2:.*sample_jpsi_g_101.lhe.gz' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
+grep -q 'Source slot 1:.*sample_jpsi_g_101.lhe.gz' "${MOCK_DIR}/wrapper.log" 2>/dev/null \
     && pass "LHE source 2 resolved" \
     || fail "LHE source 2 not resolved"
 
@@ -170,15 +188,53 @@ else
     fail "Pythia 8 did not start"
 fi
 
-# With --stop-at shower, the mock should produce both shower outputs locally.
+# The full mock retains worker intermediates for inspection.
 find "${WORK_DIR}" -path '*/shower_0.hepmc' -type f -size +0c | grep -q . \
     && find "${WORK_DIR}" -path '*/shower_1.hepmc' -type f -size +0c | grep -q . \
     && pass "Shower outputs produced" \
     || fail "Shower outputs missing"
 
 [[ ${WRAPPER_RC} -eq 0 ]] \
-    && pass "Wrapper completed through shower stop point" \
-    || fail "Wrapper failed before shower stop point"
+    && pass "Wrapper completed through MiniAOD and local transfer" \
+    || fail "Wrapper failed before completing the full chain"
+
+MINIAOD_OUTPUT="${OUTPUT_DIR}/output/MOCK_TEST/0/output_MINIAOD.root"
+PROCESSING_MANIFEST="${OUTPUT_DIR}/output/MOCK_TEST/0/processing_manifest_MOCK_TEST_0.json"
+[[ -s "${MINIAOD_OUTPUT}" ]] \
+    && pass "MiniAOD output produced and copied locally" \
+    || fail "MiniAOD output missing: ${MINIAOD_OUTPUT}"
+[[ -s "${PROCESSING_MANIFEST}" ]] \
+    && pass "Processing manifest produced" \
+    || fail "Processing manifest missing: ${PROCESSING_MANIFEST}"
+
+if [[ -s "${PROCESSING_MANIFEST}" ]]; then
+    if python3 - "${PROCESSING_MANIFEST}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+assert manifest["status"] == "ok", manifest
+assert manifest["complete"] is True, manifest
+assert manifest["actual_mixed_hepmc_events"] == 1, manifest
+assert manifest["actual_miniaod_events"] == 1, manifest
+assert manifest["miniaod_count_source"] == "edmFileUtil", manifest
+assert manifest["unused_hepmc_warning_fraction"] == 0.15, manifest
+assert manifest["maximum_unused_event_fraction"] == 0.0, manifest
+assert len(manifest["source_event_balance"]) == 2, manifest
+assert all(
+    item["assessment"] == "within_threshold"
+    and item["unused_hepmc_events"] == 0
+    for item in manifest["source_event_balance"]
+), manifest
+PY
+    then
+        pass "Manifest records verified MiniAOD count and source-event balance"
+    else
+        fail "Processing manifest does not contain the verified edmFileUtil count"
+    fi
+fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""
@@ -186,8 +242,7 @@ echo "========================================"
 echo -e "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}"
 echo "========================================"
 echo ""
-echo "NOTE: This mock test validates prepare-runtime → bundle → wrapper → config"
-echo "through the standard Pythia shower stop point. Phi-enriched shower modes"
-echo "and full CMSSW production validation still belong in container/Condor tests."
+echo "NOTE: This mock validates prepare-runtime → bundle → wrapper → shower"
+echo "→ mix → GEN-SIM → RAW → RECO → MiniAOD → edmFileUtil → local transfer."
 
 exit $(( FAIL > 0 ? 1 : 0 ))

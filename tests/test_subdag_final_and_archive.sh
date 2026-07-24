@@ -105,11 +105,14 @@ cat > "${WORKDIR}/worker/final_config.json" <<EOF
 EOF
 
 cp "${WORKDIR}/proxy_bundle.tar.gz" "${WORKDIR}/worker/"
-(
+if (
     cd "${WORKDIR}/worker"
     bash "${BASE_DIR}/processing/condor_wrappers/run_subdag_final_inventory.sh" \
         proxy_bundle.tar.gz final_config.json > "${WORKDIR}/final.log" 2>&1
-)
+); then
+    fail "Partial final inventory unexpectedly returned success"
+    exit 1
+fi
 
 python3 - "${WORKDIR}/inventory/subdag_inventory.json" <<'PY'
 import json
@@ -132,7 +135,49 @@ PY
     fail "Final inventory leaked into the worker directory"
     exit 1
 }
-pass "Final inventory records local output stats and partial status"
+pass "Final inventory records partial status and fails the verification node"
+
+python3 - "${WORKDIR}/worker/final_config.json" \
+    "${WORKDIR}/worker/cleanup_config.json" \
+    "${WORKDIR}/inventory/cleanup_inventory.json" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+payload["blocks"] = payload["blocks"][:2]
+for index, block in enumerate(payload["blocks"]):
+    manifest = pathlib.Path(sys.argv[2]).parent / f"processing_{index}.json"
+    manifest.write_text(
+        json.dumps({"status": "ok", "actual_miniaod_events": 1}),
+        encoding="utf-8",
+    )
+    block["processing_manifest_url"] = str(manifest)
+payload["cleanup_components"] = True
+payload["output_url"] = sys.argv[3]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle)
+PY
+(
+    cd "${WORKDIR}/worker"
+    bash "${BASE_DIR}/processing/condor_wrappers/run_subdag_final_inventory.sh" \
+        proxy_bundle.tar.gz cleanup_config.json > "${WORKDIR}/cleanup.log" 2>&1
+)
+python3 - "${WORKDIR}/inventory/cleanup_inventory.json" \
+    "${WORKDIR}/outputs/block0/output_MINIAOD.root" \
+    "${WORKDIR}/outputs/block1/output_MINIAOD.root" <<'PY'
+import json
+import os
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["status"] == "ok"
+assert payload["component_cleanup"]["performed"] is True
+assert payload["component_cleanup"]["post_cleanup_missing"] == []
+assert not os.path.exists(sys.argv[2])
+assert not os.path.exists(sys.argv[3])
+PY
+pass "Verified merged outputs permit component MiniAOD cleanup and retained audit"
 
 LOG_ROOT="${WORKDIR}/logs"
 for stage in processing miniaod_merge ntuple final; do
@@ -196,8 +241,8 @@ bash "${BASE_DIR}/tools/archive_subdag_logs.sh" \
     > "${WORKDIR}/expired.log" 2>&1
 expired_rc=$?
 set -e
-[[ "${expired_rc}" -ne 0 ]] || {
-    fail "Expired proxy did not make the POST script fail"
+[[ "${expired_rc}" -eq 0 ]] || {
+    fail "Expired proxy incorrectly failed the physics DAG"
     exit 1
 }
 [[ ! -e "${WORKDIR}/expired_target" ]] || {
@@ -214,7 +259,7 @@ assert payload["status"] == "failed"
 assert payload["phase"] == "proxy_validation"
 assert payload["exit_code"] == 2
 PY
-pass "Expired proxy is a hard failure with persistent diagnostics"
+pass "Expired proxy is fail-soft with persistent diagnostics"
 
 PATH="${WORKDIR}/mock_bin:${PATH}" \
 bash "${BASE_DIR}/tools/archive_subdag_logs.sh" \

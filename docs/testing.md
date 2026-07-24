@@ -7,8 +7,10 @@ plans and investigation notes under `docs/` are not operational instructions.
 
 1. Static checks validate syntax, Python imports, configuration rendering, and
    DAG structure without submitting jobs.
-2. Local mock checks exercise the production runtime bundle, wrapper, JSON
-   config, compressed LHE normalization, and Pythia shower stop point.
+2. The local worker mock exercises the production runtime bundle and wrapper
+   through one-event MiniAOD production, containerized `edmFileUtil` counting,
+   manifest validation, and local stage-out. It requires a valid CMS proxy and
+   premix network access.
 3. Component checks cover PDG conversion and LHE shuffle-split behavior.
 4. Pilot DAG checks run the real chain through MiniAOD and IHEP stage-out.
 5. Ntuple pilots are separate and require the CMSSW15 runtime or initialized
@@ -40,9 +42,13 @@ python3 -m py_compile \
   dag_generator.py \
   tools/compile_node_config.py \
   tools/coordinate_lhe_blocks.py \
+  tools/dag_progress.py \
+  tools/migrate_cap700_job_spec.py \
   tools/benchmark_phi_efficiency.py \
   tools/review_phase2_shower_efficiency.py
+python3 -m unittest tests.test_dag_progress
 python3 tests/test_coordinate_lhe_blocks.py
+python3 tests/test_campaign_job_specs.py
 python3 tests/test_lhe_planner_cap_generation.py
 ./tests/run_all_tests.sh
 ./tests/mock_test_worker.sh
@@ -175,6 +181,90 @@ sources is showered up to five events and then mixed into **five output
 events**. It does not mean ten output events. Block SubDAG configs use separate
 source budgets and should not infer LHE consumption from `--max-events` alone.
 
+## MC_v4_1 Efficiency-balanced pilot
+
+The v2 pilot is inventory-driven. Its job spec freezes the counted inventory
+hash, selected nonconsecutive seeds, 1,000-event block layout, source
+efficiencies, per-slot LHE budgets, capacity limits, and storage estimate.
+
+Before submitting the pilot, record these production dimensions:
+
+- campaigns: `JJP_DPS1_MC_v4_1` and `JJP_TPS_MC_v4_1`;
+- pilot processing products: 10 per campaign (20 total);
+- unique pilot source files: 10 `pool_jpsi_CSCO_g` plus 10 `pool_gg`;
+- planner exposure: 2,000 events per selected J/psi file and 1,000 per gg file,
+  split into 1,000-event blocks;
+- DPS1 LHE budgets: normal 860, phi 1,000;
+- TPS LHE budgets: normal 1,000 + normal 1,000 + phi 977;
+- MiniAOD merge target: 5,000 events, packed statically with a 350-event
+  exposure weight and the closest-boundary rule;
+- current topology: one processing product per outer job, so retain one-input
+  merge nodes and do not cross job boundaries;
+- subprocess coverage: `DPS-Jpsi-JpsiPhi` and `TPS-JpsiJpsiPhi`.
+
+Generate the 10+10 pilot on an AFS submit-visible directory with the existing
+counted inventory and a new campaign output prefix:
+
+```bash
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep \
+  --campaign JJP_DPS1_MC_v4_1 \
+  --campaign JJP_TPS_MC_v4_1 \
+  --campaign-job-spec common/campaign_job_specs/jjp_efficiency_balanced_pilot_v2.json \
+  --skip-lhe-generation \
+  --no-scan-existing \
+  --existing-lhe-inventory generated/lhe_inventory_jjp_20260717_184812.json \
+  --enable-lhe-block-subdags \
+  --lhe-shuffle-split \
+  --phi-consumption-mode exhaustive \
+  --normal-shortfall-policy report-and-truncate \
+  --miniaod-merge-events 5000 \
+  --miniaod-merge-validation event-count \
+  --enable-ntuple \
+  --archive-subdag-logs \
+  --proxy-path /afs/cern.ch/user/c/chiw/condor/x509up \
+  --cmssw15-runtime-tarball common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz \
+  --target-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/JpsiJpsiPhi_MC_Production_v4 \
+  --output-dir generated/JpsiJpsiPhi_MC_Production_v4_1_exhaustive_pilot \
+  --output JpsiJpsiPhi_MC_Production_v4_1_exhaustive_pilot.dag
+```
+
+The pilot IDs must be exactly:
+
+```text
+100 1095 1191 1287 1383 1479 1575 1670 1767 1862
+```
+
+Accept the pilot only if all 20 complete chains succeed. For every processing
+sidecar require `status: ok`, `complete: true`, positive and equal
+mixed/MiniAOD counts, and `miniaod_count_source: edmFileUtil`. Confirm the
+consumed LHE exposure matches the slot budget recorded in its processing
+config. Require every merge manifest to report
+`expected_events_source: input_manifests`. A positive normal-source shortfall
+is recorded and lowers the common mixed yield; zero normal output still fails.
+Also inspect `source_event_balance`: an `unused_fraction` above the fixed 0.15
+threshold emits a warning. It is always reported and never halts an otherwise
+valid chain. The 15% value is a diagnostic threshold, not a configurable
+production target.
+
+The normal shower continues past recoverable `pythia.next()` failures until it
+reaches its accepted-event target, its configured LHE budget, or EOF. Do not
+increase the normal budget merely to compensate for an early ten-error abort.
+After the pilot, recompute the normal:phi ratio from measured efficiencies and
+freeze the accepted values and inventory/layout hash in the production v2
+spec.
+
+Generated MiniAOD merge nodes request one CPU and 3 GB memory. Submit-side log
+archival uses a copy of `archive_subdag_logs.sh` snapshotted under the generated
+output directory. This prevents edits to the repository helper from changing
+the POST behavior of an in-flight DAG.
+
+The generated metadata contains `production_capacity_signals`: bottleneck
+block counts, available and selected processing nodes, predicted event yields,
+and retained-storage projection. Generation rejects a projection above 5 TB
+and marks projections above 4 TB as warnings. Only after the pilot gate passes
+should a full v2 spec be created with the measured efficiencies.
+
 ## Pilot Submission and Monitoring
 
 Record the schedd before submission because cluster IDs are schedd-local:
@@ -192,6 +282,34 @@ condor_q -name bigbirdNN.cern.ch <dag-cluster> -nobatch
 condor_q -name bigbirdNN.cern.ch \
   -constraint 'DAGManJobId == <dag-cluster>' -nobatch
 ```
+
+Use the progress helper to include nested SubDAG workers under the root
+`JobBatchId` and combine live queue state with completed DAGMan node logs:
+
+```bash
+# Progress plus adaptive topology (full through 150 known nodes).
+./tools/dag_progress.py <dag-cluster> \
+  --schedd bigbirdNN.cern.ch \
+  --structure
+
+# One aggregated lane per campaign for a large production.
+./tools/dag_progress.py <dag-cluster> \
+  --schedd bigbirdNN.cern.ch \
+  --structure=collapsed \
+  --color=auto
+
+# Exact layered topology with an explicit terminal width.
+./tools/dag_progress.py <dag-cluster> \
+  --schedd bigbirdNN.cern.ch \
+  --structure=full \
+  --width 160 \
+  --details
+```
+
+Color defaults to `auto`; use `--color=always` when preserving ANSI colors
+through a compatible pager or `--color=never` for plain logs. If the root
+DAGMan job has already left the queue, also pass the persistent root DAG path
+with `--dag-file`.
 
 A pilot is accepted only when:
 

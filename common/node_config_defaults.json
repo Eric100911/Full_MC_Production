@@ -21,16 +21,18 @@
     "JJP_SPS_G":   "SPS-JpsiJpsiPhi-NLOstar",
     "JJP_DPS2_CS": "DPS-JpsiJpsi-Phi-LO",
     "JJP_DPS2_G":  "DPS-JpsiJpsi-Phi-NLOstar",
-    "JJP_DPS1":    "DPS-Jpsi-JpsiPhi",
-    "JJP_TPS":     "TPS-JpsiJpsiPhi"
+    "JJP_DPS1":         "DPS-Jpsi-JpsiPhi",
+    "JJP_TPS":          "TPS-JpsiJpsiPhi",
+    "JJP_DPS1_MC_v4_1": "DPS-Jpsi-JpsiPhi",
+    "JJP_TPS_MC_v4_1":  "TPS-JpsiJpsiPhi"
   },
   "processing_environment": {
     "premix_input_mode": "eoscms",
     "premix_redirector": "root://eoscms.cern.ch",
     "premix_cache_files": "1",
     "premix_cache_redirector": "root://eoscms.cern.ch",
-    "raw_threads": "1",
-    "raw_streams": "1",
+    "raw_threads": "2",
+    "raw_streams": "2",
     "raw_watchdog_timeout": "7200s",
     "raw_watchdog_kill_after": "300s",
     "raw_cmsdriver_timeout": "600s",

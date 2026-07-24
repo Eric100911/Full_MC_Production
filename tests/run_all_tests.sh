@@ -111,6 +111,12 @@ echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
 python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
 
+echo "[INFO] 检查 exposure recovery 的非连续 inventory job spec"
+python3 "${SCRIPT_DIR}/test_campaign_job_specs.py"
+
+echo "[INFO] 检查 CMSSW worker entrypoints 与 runtime bundle"
+"${SCRIPT_DIR}/test_cmssw_helpers.sh"
+
 echo "[INFO] 检查 existing-LHE generate-test 的 planner 事件上限"
 python3 "${SCRIPT_DIR}/test_lhe_planner_cap_generation.py"
 

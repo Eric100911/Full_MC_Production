@@ -97,6 +97,47 @@ def stage_out(local_path, destination):
         shutil.copy2(local_path, dest)
 
 
+def remove_url(url):
+    parts = remote_parts(url)
+    if parts is None:
+        path = Path(url[len("file:"):] if url.startswith("file:") else url)
+        path.unlink(missing_ok=True)
+        return
+    host, path = parts
+    subprocess.run(["xrdfs", host, "rm", path], check=True)
+
+
+def read_json_url(url):
+    if not url:
+        return None
+    parts = remote_parts(url)
+    if parts is None:
+        path = Path(url[len("file:"):] if url.startswith("file:") else url)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    fd, local_name = tempfile.mkstemp(prefix="inventory_manifest_", suffix=".json", dir="/tmp")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            ["xrdcp", "--nopbar", "-f", url, local_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return json.loads(Path(local_name).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        Path(local_name).unlink(missing_ok=True)
+
+
 def annotate(records, key):
     annotated = []
     for record in records:
@@ -106,17 +147,54 @@ def annotate(records, key):
     return annotated
 
 
+def annotate_actual_counts(blocks):
+    annotated = []
+    for block in blocks:
+        item = dict(block)
+        payload = read_json_url(item.get("processing_manifest_url", ""))
+        item["processing_manifest"] = payload
+        item["actual_miniaod_events"] = (
+            payload.get("actual_miniaod_events") if isinstance(payload, dict) else None
+        )
+        annotated.append(item)
+    return annotated
+
+
 def main():
     cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     output_url = cfg["output_url"]
-    blocks = annotate(cfg.get("blocks", []), "miniaod_url")
+    blocks = annotate_actual_counts(annotate(cfg.get("blocks", []), "miniaod_url"))
     merge_groups = annotate(cfg.get("merge_groups", []), "merged_miniaod_url")
     ntuples = annotate(cfg.get("ntuples", []), "ntuple_url")
 
     missing_blocks = [item["block_index"] for item in blocks if not item["miniaod_url_stat"]["exists"]]
+    missing_processing_manifests = [
+        item["block_index"] for item in blocks
+        if not isinstance(item.get("processing_manifest"), dict)
+        or item["processing_manifest"].get("status") != "ok"
+    ]
     missing_merges = [item["merge_index"] for item in merge_groups if not item["merged_miniaod_url_stat"]["exists"]]
     missing_ntuples = [item["job_id"] for item in ntuples if not item["ntuple_url_stat"]["exists"]]
-    status = "ok" if not missing_blocks and not missing_merges and not missing_ntuples else "partial"
+    status = "ok" if not missing_blocks and not missing_processing_manifests and not missing_merges and not missing_ntuples else "partial"
+
+    cleanup = {
+        "requested": bool(cfg.get("cleanup_components", False)),
+        "performed": False,
+        "removed_component_miniaods": [],
+        "post_cleanup_missing": [],
+    }
+    if cleanup["requested"] and status == "ok":
+        for item in blocks:
+            remove_url(item["miniaod_url"])
+            cleanup["removed_component_miniaods"].append(item["miniaod_url"])
+        cleanup["performed"] = True
+        cleanup["post_cleanup_missing"] = [
+            item["block_index"]
+            for item in blocks
+            if stat_url(item["miniaod_url"])["exists"]
+        ]
+        if cleanup["post_cleanup_missing"]:
+            status = "cleanup_failed"
 
     manifest = {
         "tool": "run_subdag_final_inventory",
@@ -127,8 +205,13 @@ def main():
         "status": status,
         "expected_blocks": len(blocks),
         "missing_blocks": missing_blocks,
+        "missing_processing_manifests": missing_processing_manifests,
+        "actual_miniaod_events": sum(
+            int(item.get("actual_miniaod_events") or 0) for item in blocks
+        ),
         "missing_merges": missing_merges,
         "missing_ntuples": missing_ntuples,
+        "component_cleanup": cleanup,
         "blocks": blocks,
         "merge_groups": merge_groups,
         "ntuples": ntuples,
@@ -145,6 +228,8 @@ def main():
         stage_out(local, output_url)
     finally:
         local.unlink(missing_ok=True)
+    if status != "ok":
+        raise SystemExit(f"final retained-output audit failed with status={status}")
 
 
 if __name__ == "__main__":

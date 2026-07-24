@@ -135,13 +135,13 @@ ivars.register('doPriVtxFit',
 )
 # ------ Multi-threading options ------
 ivars.register('numThreads',
-    default=1,
+    default=2,
     mult=VarParsing.VarParsing.multiplicity.singleton,
     mytype=VarParsing.VarParsing.varType.int,
     info='Number of threads to use (default: 1). Note: Multi-threading must also be enabled in the JobType configuration when running with CRAB.'
 )
 ivars.register('numStreams',
-    default=0,
+    default=2,
     mult=VarParsing.VarParsing.multiplicity.singleton,
     mytype=VarParsing.VarParsing.varType.int,
     info='Number of streams to use (default: 0, which means automatic). Note: Multi-threading must also be enabled in the JobType configuration when running with CRAB.'

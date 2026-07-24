@@ -30,6 +30,7 @@ DEFAULT_NORMAL_MAX_LHE_EVENTS = 110
 DEFAULT_PHI_MAX_LHE_EVENTS = 350
 DEFAULT_PHI_MAX_HADRONIZATION_RETRIES = 5000
 DEFAULT_MINIMUM_OUTPUT_FRACTION = 0.8
+DEFAULT_UNUSED_HEPMC_WARNING_FRACTION = 0.15
 EDM_EVENT_ID_SCHEME = "run1-cantor-job-block-lumi-v1"
 UINT32_MAX = 2**32 - 1
 UINT64_MAX = 2**64 - 1
@@ -55,6 +56,25 @@ def parse_args() -> argparse.Namespace:
                    default=DEFAULT_PHI_MAX_HADRONIZATION_RETRIES)
     p.add_argument("--minimum-output-fraction", type=float,
                    default=DEFAULT_MINIMUM_OUTPUT_FRACTION)
+    p.add_argument("--phi-consumption-mode", choices=("target", "exhaustive"),
+                   default="target")
+    p.add_argument("--normal-shortfall-policy",
+                   choices=("fail", "report-and-truncate"), default="fail")
+    p.add_argument(
+        "--unused-hepmc-warning-fraction",
+        type=float,
+        default=DEFAULT_UNUSED_HEPMC_WARNING_FRACTION,
+        help="Report a warning when a source exceeds this unused accepted-HepMC fraction",
+    )
+    p.add_argument("--source-lhe-budgets", default="[]",
+                   help="JSON list with one LHE-event budget per campaign source slot")
+    p.add_argument("--processing-start-index", type=int, default=0,
+                   help="First node in the deterministic global pool stream")
+    p.add_argument("--max-processing-nodes", type=int, default=0,
+                   help="Maximum nodes emitted by this shard; 0 emits the remainder")
+    p.add_argument("--physics-campaign", default="")
+    p.add_argument("--source-rng-seeds", default="[]")
+    p.add_argument("--mixing-rng-seed", type=int, default=0)
     p.add_argument("--enable-ntuple", action="store_true")
     p.add_argument("--efficiency-ntuple", action="store_true")
     p.add_argument("--cleanup", action="store_true")
@@ -276,6 +296,8 @@ def main() -> int:
     try:
         storage_config = json.loads(args.storage_config)
         processing_environment_config = json.loads(args.processing_environment_config)
+        source_rng_seeds = json.loads(args.source_rng_seeds)
+        source_lhe_budgets = json.loads(args.source_lhe_budgets)
     except json.JSONDecodeError as e:
         print(f"[ERROR] Invalid node config JSON: {e}", file=sys.stderr)
         return 1
@@ -284,6 +306,18 @@ def main() -> int:
         return 1
     if not isinstance(processing_environment_config, dict):
         print("[ERROR] --processing-environment-config must be a JSON object", file=sys.stderr)
+        return 1
+    if not isinstance(source_rng_seeds, list) or not isinstance(source_lhe_budgets, list):
+        print("[ERROR] source RNG seeds and LHE budgets must be JSON lists", file=sys.stderr)
+        return 1
+    if not 0.0 <= args.unused_hepmc_warning_fraction < 1.0:
+        print(
+            "[ERROR] unused HepMC warning fraction must satisfy 0 <= warning < 1",
+            file=sys.stderr,
+        )
+        return 1
+    if args.processing_start_index < 0 or args.max_processing_nodes < 0:
+        print("[ERROR] processing shard indices must be non-negative", file=sys.stderr)
         return 1
 
     if len(source_infos) == 0:
@@ -317,6 +351,14 @@ def main() -> int:
         print(f"[ERROR] --shower-modes count ({len(shower_modes)}) != --n-sources ({args.n_sources})",
               file=sys.stderr)
         return 1
+    if source_rng_seeds and len(source_rng_seeds) != args.n_sources:
+        print("[ERROR] --source-rng-seeds count must match --n-sources", file=sys.stderr)
+        return 1
+    if args.phi_consumption_mode == "exhaustive" and not any(
+        is_phi_mode(mode) for mode in shower_modes
+    ):
+        print("[ERROR] exhaustive mode requires at least one phi source", file=sys.stderr)
+        return 1
     if args.target_mixed_events > 0:
         target_mixed_events = args.target_mixed_events
     elif args.max_events > 0:
@@ -327,18 +369,32 @@ def main() -> int:
         print("[ERROR] target_mixed_events must be positive", file=sys.stderr)
         return 1
 
-    # Build pool→source lookup for block generation
+    if source_lhe_budgets and len(source_lhe_budgets) != args.n_sources:
+        print("[ERROR] --source-lhe-budgets count must match --n-sources", file=sys.stderr)
+        return 1
+    if source_lhe_budgets and any(int(value) <= 0 for value in source_lhe_budgets):
+        print("[ERROR] --source-lhe-budgets entries must be positive", file=sys.stderr)
+        return 1
+
+    # Build a pool-level global block stream. Each item retains the original
+    # manifest group and local block index used by BLOCK: resolution.
     pool_lookup: dict = {}
     for pool, group_id, primary_seed, seeds, blocks in source_blocks:
-        if pool in pool_lookup:
-            print(f"[ERROR] Duplicate source manifest for pool: {pool}", file=sys.stderr)
-            return 1
-        pool_lookup[pool] = {
+        source = pool_lookup.setdefault(pool, {"blocks": [], "manifests": []})
+        source["manifests"].append({
             "group_id": group_id,
             "primary_seed": primary_seed,
             "seeds": seeds,
-            "blocks": blocks,
-        }
+            "n_blocks": len(blocks),
+        })
+        for local_index, block in enumerate(blocks):
+            source["blocks"].append({
+                **block,
+                "group_id": group_id,
+                "primary_seed": primary_seed,
+                "seeds": seeds,
+                "block_index": local_index,
+            })
 
     missing_pools = sorted(set(campaign_inputs) - set(pool_lookup))
     if missing_pools:
@@ -362,13 +418,17 @@ def main() -> int:
             "pool": pool_name,
             "mode": mode,
             "occurrence": occurrence,
-            "target_hepmc_events": target_mixed_events,
-            "max_lhe_events": (
+            "target_hepmc_events": (
+                0 if phi_like and args.phi_consumption_mode == "exhaustive"
+                else target_mixed_events
+            ),
+            "max_lhe_events": int(source_lhe_budgets[slot]) if source_lhe_budgets else (
                 args.phi_max_lhe_events if phi_like else args.normal_max_lhe_events
             ),
             "max_hadronization_retries": (
                 args.phi_max_hadronization_retries if phi_like else 1000
             ),
+            "rng_seed": int(source_rng_seeds[slot]) if source_rng_seeds else 0,
         })
 
     pool_cursors = defaultdict(int)
@@ -389,10 +449,11 @@ def main() -> int:
                 n_events = int(block.get("n_events", 0) or 0)
                 chosen.append({
                     "pool": pool_name,
-                    "group_id": source["group_id"],
-                    "primary_seed": source["primary_seed"],
-                    "seeds": source["seeds"],
-                    "block_index": cursor,
+                    "group_id": block["group_id"],
+                    "primary_seed": block["primary_seed"],
+                    "seeds": block["seeds"],
+                    "block_index": block["block_index"],
+                    "global_block_index": cursor,
                     "n_events": n_events,
                     "path": block.get("path", ""),
                 })
@@ -408,6 +469,17 @@ def main() -> int:
             ]
             block_source["blocks"] = chosen
             block_source["planned_lhe_events"] = accumulated
+            if (
+                args.phi_consumption_mode == "exhaustive"
+                and is_phi_mode(tmpl["mode"])
+                and accumulated < tmpl["max_lhe_events"]
+            ):
+                print(
+                    f"[ERROR] Exhaustive phi source {pool_name} has only "
+                    f"{accumulated} planned events; requires {tmpl['max_lhe_events']}",
+                    file=sys.stderr,
+                )
+                return 1
             block_sources.append(block_source)
             next_cursors[pool_name] = cursor
         if not can_build:
@@ -415,8 +487,8 @@ def main() -> int:
         mixed_source_slots.append(block_sources)
         pool_cursors = defaultdict(int, next_cursors)
 
-    n_mixed = len(mixed_source_slots)
-    if n_mixed == 0:
+    total_mixed = len(mixed_source_slots)
+    if total_mixed == 0:
         msg = "no common blocks across campaign source slots ("
         msg += ", ".join(
             f"{pool}={n_blocks_by_pool[pool]} blocks/{input_multiplicity.get(pool, 0)} uses"
@@ -425,15 +497,34 @@ def main() -> int:
         msg += ")"
         print(f"[ERROR] {msg}", file=sys.stderr)
         return 1
-    print(f"[INFO] Budget-derived source slots: {n_mixed} mixed blocks")
+    shard_stop = total_mixed
+    if args.max_processing_nodes:
+        shard_stop = min(
+            total_mixed,
+            args.processing_start_index + args.max_processing_nodes,
+        )
+    mixed_source_slots = mixed_source_slots[args.processing_start_index:shard_stop]
+    n_mixed = len(mixed_source_slots)
+    if n_mixed == 0:
+        print(
+            f"[ERROR] processing shard [{args.processing_start_index}, {shard_stop}) "
+            f"is empty for global stream of {total_mixed} nodes",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"[INFO] Budget-derived global stream: {total_mixed} nodes; "
+        f"emitting [{args.processing_start_index}, {shard_stop})"
+    )
 
     unused = []
-    for pool, group_id, primary_seed, seeds, blocks in source_blocks:
+    for pool, source in pool_lookup.items():
+        blocks = source["blocks"]
         used_count = pool_cursors.get(pool, 0)
         leftover = list(range(used_count, len(blocks)))
         if leftover:
-            unused.append({"pool": pool, "group_id": group_id, "primary_seed": primary_seed,
-                           "seeds": seeds, "unused_indices": leftover,
+            unused.append({"pool": pool,
+                           "unused_global_indices": leftover,
                            "unused_count": len(leftover)})
             print(f"[INFO] {pool}: {len(leftover)} unused blocks (indices {leftover[0]}-{leftover[-1]})")
 
@@ -479,6 +570,20 @@ def main() -> int:
         return 1
 
     target_base = output_base(args, storage_config)
+    event_id_span = (
+        max(int(source["max_lhe_events"]) for source in source_templates)
+        if args.phi_consumption_mode == "exhaustive"
+        else target_mixed_events
+    )
+    phi_exposure_events = next(
+        (
+            int(source["max_lhe_events"])
+            for source in source_templates
+            if is_phi_mode(source["mode"])
+        ),
+        0,
+    )
+    packing_weight_events = event_id_span
     node_config_dir = os.path.join(args.output_dir, "node_configs")
     processing_config_dir = os.path.join(node_config_dir, "processing")
     merge_config_dir = os.path.join(node_config_dir, "miniaod_merge")
@@ -495,7 +600,7 @@ def main() -> int:
         edm_ids = compute_edm_event_ids(
             args.job_index,
             range(n_mixed),
-            mixed_block_event_count,
+            lambda _index: event_id_span,
             -1,
         )
     except (OverflowError, ValueError) as exc:
@@ -508,9 +613,10 @@ def main() -> int:
         block_records.append({
             "block_index": i,
             "job_id": jid,
-            "expected_events": target_mixed_events,
-            "target_mixed_events": target_mixed_events,
-            "event_id_span": target_mixed_events,
+            "expected_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
+            "packing_weight_events": packing_weight_events,
+            "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
+            "event_id_span": event_id_span,
             "edm_event_id": edm_ids[i],
             "inputs": mixed_block_inputs(i),
             "sources": mixed_block_sources(i),
@@ -528,12 +634,17 @@ def main() -> int:
         current = []
         current_events = 0
         for record in block_records:
-            if current and current_events >= args.miniaod_merge_events:
+            weight = int(record.get("packing_weight_events", 0) or 0)
+            if (
+                current
+                and abs(current_events - args.miniaod_merge_events)
+                <= abs(current_events + weight - args.miniaod_merge_events)
+            ):
                 merge_groups.append(current)
                 current = []
                 current_events = 0
             current.append(record)
-            current_events += int(record.get("expected_events", 0) or 0)
+            current_events += weight
         if current:
             merge_groups.append(current)
     merge_records = []
@@ -545,7 +656,13 @@ def main() -> int:
             merge_records.append({
                 "merge_index": merge_index,
                 "job_id": jid,
-                "expected_events": sum(int(item.get("expected_events", 0) or 0) for item in components),
+                "expected_events": (
+                    None if args.phi_consumption_mode == "exhaustive"
+                    else sum(int(item.get("expected_events", 0) or 0) for item in components)
+                ),
+                "packing_weight_events": sum(
+                    int(item.get("packing_weight_events", 0) or 0) for item in components
+                ),
                 "component_block_ids": [item["job_id"] for item in components],
                 "components": components,
                 "merged_miniaod_url": merged_url,
@@ -601,11 +718,19 @@ def main() -> int:
                 "modes": modes,
                 "analysis": args.analysis_type,
                 "campaign": args.campaign,
+                "physics_campaign": args.physics_campaign or args.campaign,
                 "job_id": block_job_id_value,
                 "max_events": args.max_events,
-                "target_mixed_events": target_mixed_events,
-                "event_id_span": target_mixed_events,
-                "minimum_output_fraction": args.minimum_output_fraction,
+                "phi_consumption_mode": args.phi_consumption_mode,
+                "normal_shortfall_policy": args.normal_shortfall_policy,
+                "unused_hepmc_warning_fraction": args.unused_hepmc_warning_fraction,
+                "phi_exposure_events": phi_exposure_events if args.phi_consumption_mode == "exhaustive" else None,
+                "minimum_accepted_events": 1 if args.phi_consumption_mode == "exhaustive" else None,
+                "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
+                "event_id_span": event_id_span,
+                "minimum_output_fraction": None if args.phi_consumption_mode == "exhaustive" else args.minimum_output_fraction,
+                "mixing_rng_seed": args.mixing_rng_seed,
+                "require_processing_manifests": args.phi_consumption_mode == "exhaustive",
                 "sources": mixed_block_sources(i),
                 "edm_event_id": edm_ids[i],
                 "enable_ntuple": processing_enable_ntuple,
@@ -724,12 +849,15 @@ def main() -> int:
                             "url": component["miniaod_url"],
                             "manifest_url": component["processing_manifest_url"],
                             "expected_events": component["expected_events"],
+                            "packing_weight_events": component["packing_weight_events"],
                             "inputs": component["inputs"],
                             "sources": component["sources"],
                         }
                         for component in record["components"]
                     ],
                     "expected_events": record["expected_events"],
+                    "packing_weight_events": record["packing_weight_events"],
+                    "require_processing_manifests": args.phi_consumption_mode == "exhaustive",
                     "output_url": record["merged_miniaod_url"],
                     "max_size": 5000000,
                     "validation": args.miniaod_merge_validation,
@@ -744,7 +872,7 @@ def main() -> int:
                     f'VARS {merge_name} '
                     f'campaign="{dag_escape(args.campaign)}" '
                     f'job_id="{dag_escape(record["job_id"])}" '
-                    f'request_cpus="2" request_memory="12GB" request_disk="20GB" '
+                    f'request_cpus="1" request_memory="3GB" request_disk="20GB" '
                     f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
                     f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
                     f'miniaod_merge_wrapper_path="{dag_escape(args.miniaod_merge_wrapper_path)}" '
@@ -819,6 +947,9 @@ def main() -> int:
             "blocks": block_records,
             "merge_groups": merge_records,
             "ntuples": ntuple_records,
+            "cleanup_components": bool(
+                args.cleanup and merge_records and ntuple_records
+            ),
         }
         final_config_name = f"{final_name}.json"
         final_config_path = os.path.join(final_config_dir, final_config_name)
@@ -858,9 +989,18 @@ def main() -> int:
         "event_id_scheme": EDM_EVENT_ID_SCHEME,
         "n_mixed_blocks": n_mixed,
         "processing_max_events": args.max_events,
-        "target_mixed_events": target_mixed_events,
-        "event_id_span": target_mixed_events,
-        "minimum_output_fraction": args.minimum_output_fraction,
+        "physics_campaign": args.physics_campaign or args.campaign,
+        "phi_consumption_mode": args.phi_consumption_mode,
+        "normal_shortfall_policy": args.normal_shortfall_policy,
+        "unused_hepmc_warning_fraction": args.unused_hepmc_warning_fraction,
+        "source_lhe_budgets": [int(value) for value in source_lhe_budgets],
+        "global_processing_nodes": total_mixed,
+        "processing_start_index": args.processing_start_index,
+        "processing_stop_index": shard_stop,
+        "phi_exposure_events": phi_exposure_events if args.phi_consumption_mode == "exhaustive" else None,
+        "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
+        "event_id_span": event_id_span,
+        "minimum_output_fraction": None if args.phi_consumption_mode == "exhaustive" else args.minimum_output_fraction,
         "miniaod_merge_enabled": merge_enabled,
         "miniaod_merge_events": args.miniaod_merge_events,
         "miniaod_merge_validation": args.miniaod_merge_validation,
@@ -874,9 +1014,10 @@ def main() -> int:
         "mixed_blocks": [
             {
                 "index": i,
-                "expected_events": mixed_block_event_count(i),
-                "target_mixed_events": target_mixed_events,
-                "event_id_span": target_mixed_events,
+                "expected_events": None if args.phi_consumption_mode == "exhaustive" else mixed_block_event_count(i),
+                "packing_weight_events": packing_weight_events,
+                "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
+                "event_id_span": event_id_span,
                 "edm_event_id": edm_ids[i],
                 "miniaod_url": miniaod_url(target_base, args.campaign, block_job_id(args.job_index, i)),
                 "processing_manifest_url": processing_manifest_url(target_base, args.campaign, block_job_id(args.job_index, i)),

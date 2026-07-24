@@ -1,8 +1,8 @@
 #!/bin/bash
 # Archive submit-side Condor logs for one block SubDAG.  This script is meant
 # to be used as a DAGMan SCRIPT POST. Packaging and upload failures remain
-# fail-soft, but missing, malformed, unverifiable, or expired credentials are
-# hard failures so the DAG cannot silently lose every log archive.
+# fail-soft, including credential problems. The status JSON is the durable
+# signal for operators; physics products must not be invalidated by archival.
 
 set -u
 
@@ -91,8 +91,8 @@ fail_soft() {
 fail_proxy() {
     local message="$*"
     write_status "failed" "proxy_validation" "${message}" 2
-    echo "ERROR: ${message}" >&2
-    exit 2
+    echo "WARN: ${message}" >&2
+    exit 0
 }
 
 [[ -n "${proxy_bundle}" ]] || fail_proxy "missing --proxy-bundle"

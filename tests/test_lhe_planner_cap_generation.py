@@ -59,6 +59,12 @@ def main() -> int:
             f"--proxy-bundle {output_dir / 'proxy_bundle.tar.gz'}"
             in dag_text
         )
+        archived_helper = (
+            output_dir / "runtime_scripts" / "archive_subdag_logs.sh"
+        )
+        assert archived_helper.is_file()
+        assert str(archived_helper) in dag_text
+        assert str(BASE_DIR / "tools" / "archive_subdag_logs.sh") not in dag_text
 
     print("[OK] generate-test existing-LHE planner cap auto-follows --max-events")
     return 0

@@ -308,7 +308,6 @@ int main(int argc, char* argv[]) {
     // Statistics
     int iEvent = 0;
     int iAbort = 0;
-    int maxAbort = 10;
     int successEvents = 0;
     int failedEvents = 0;
     auto wallStart = chrono::steady_clock::now();
@@ -325,9 +324,13 @@ int main(int argc, char* argv[]) {
                 cout << "Reached end of LHE file." << endl;
                 break;
             }
-            if (++iAbort < maxAbort) continue;
-            cout << "Event generation aborted prematurely!" << endl;
-            break;
+            ++iEvent;
+            ++iAbort;
+            ++failedEvents;
+            // A failed LHE record is recoverable.  Keep consuming the bounded
+            // input budget so a handful of Pythia failures cannot masquerade
+            // as exhaustion of the normal source.
+            continue;
         }
         
         successEvents++;
@@ -369,6 +372,8 @@ int main(int argc, char* argv[]) {
                  << "  \"mode\": \"normal\",\n"
                  << "  \"target_events\": " << targetOutputEvents << ",\n"
                  << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"consumed_lhe_events\": " << iEvent << ",\n"
+                 << "  \"pythia_next_failures\": " << iAbort << ",\n"
                  << "  \"attempted_lhe_events\": " << iEvent << ",\n"
                  << "  \"successful_pythia_events\": " << successEvents << ",\n"
                  << "  \"accepted_hepmc_events\": " << successEvents << ",\n"

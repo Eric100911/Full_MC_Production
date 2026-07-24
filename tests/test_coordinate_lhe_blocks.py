@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -60,6 +61,15 @@ def run_coordinator(
     source_infos: list[dict[str, object]],
     miniaod_merge_events: int = 0,
     max_events: int = -1,
+    phi_consumption_mode: str = "target",
+    normal_max_lhe_events: int = 110,
+    normal_shortfall_policy: str = "fail",
+    source_rng_seeds: Optional[list[int]] = None,
+    mixing_rng_seed: int = 0,
+    physics_campaign: str = "",
+    source_lhe_budgets: Optional[list[int]] = None,
+    processing_start_index: int = 0,
+    max_processing_nodes: int = 0,
 ) -> Path:
     output_dir = workdir / campaign
     log_root = workdir / "logs"
@@ -83,6 +93,24 @@ def run_coordinator(
         str(len(campaign_inputs)),
         "--max-events",
         str(max_events),
+        "--phi-consumption-mode",
+        phi_consumption_mode,
+        "--normal-max-lhe-events",
+        str(normal_max_lhe_events),
+        "--normal-shortfall-policy",
+        normal_shortfall_policy,
+        "--source-rng-seeds",
+        json.dumps(source_rng_seeds or []),
+        "--mixing-rng-seed",
+        str(mixing_rng_seed),
+        "--physics-campaign",
+        physics_campaign or campaign,
+        "--source-lhe-budgets",
+        json.dumps(source_lhe_budgets or []),
+        "--processing-start-index",
+        str(processing_start_index),
+        "--max-processing-nodes",
+        str(max_processing_nodes),
         "--log-root",
         str(log_root),
         "--enable-ntuple",
@@ -242,6 +270,55 @@ def main() -> int:
         assert ntuple_log.is_dir()
         assert f'log_root="{processing_log}"' in tps_dag
         assert f'log_root="{ntuple_log}"' in tps_dag
+
+        jpsi_manifest_b = workdir / "jpsi_manifest_b.json"
+        make_manifest(jpsi_manifest_b, "pool_jpsi_CSCO_g", "jpsi_group_b", 2)
+        shard_subdag = run_coordinator(
+            workdir,
+            "JJP_DPS1_SHARD",
+            0,
+            ["pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"],
+            ["normal", "phi_mpi_off"],
+            [
+                {
+                    "pool": "pool_jpsi_CSCO_g",
+                    "group_id": "jpsi_group",
+                    "primary_seed": 100,
+                    "seeds": [100],
+                    "path": str(jpsi_manifest),
+                },
+                {
+                    "pool": "pool_jpsi_CSCO_g",
+                    "group_id": "jpsi_group_b",
+                    "primary_seed": 101,
+                    "seeds": [101],
+                    "path": str(jpsi_manifest_b),
+                },
+            ],
+            source_lhe_budgets=[860, 1000],
+            processing_start_index=3,
+            max_processing_nodes=1,
+        )
+        shard_dag = shard_subdag.read_text(encoding="utf-8")
+        assert shard_dag.count("\nJOB MIX_JJP_DPS1_SHARD_0_BLOCK") == 1
+        shard_config = json.loads(
+            (
+                workdir
+                / "JJP_DPS1_SHARD"
+                / "node_configs"
+                / "processing"
+                / "MIX_JJP_DPS1_SHARD_0_BLOCK000000.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert [source["max_lhe_events"] for source in shard_config["sources"]] == [
+            860,
+            1000,
+        ]
+        assert {
+            block["group_id"]
+            for source in shard_config["sources"]
+            for block in source["blocks"]
+        } == {"jpsi_group_b"}
 
         first_config = workdir / "JJP_TPS" / "node_configs" / "processing" / (
             "MIX_JJP_TPS_7_BLOCK000000.json"
@@ -419,11 +496,92 @@ def main() -> int:
         assert len(first_merge["input_miniaods"]) == 6
         assert first_merge["expected_events"] == 600
 
+        exhaustive_manifest = workdir / "exhaustive_manifest.json"
+        make_manifest(
+            exhaustive_manifest,
+            "pool_jpsi_CSCO_g",
+            "exhaustive_group",
+            30,
+        )
+        exhaustive_subdag = run_coordinator(
+            workdir,
+            "JJP_DPS1_MC_v4_1",
+            1095,
+            ["pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"],
+            ["normal", "phi_mpi_off"],
+            [
+                {
+                    "pool": "pool_jpsi_CSCO_g",
+                    "group_id": "exhaustive_group",
+                    "primary_seed": 1095,
+                    "seeds": [1095],
+                    "path": str(exhaustive_manifest),
+                }
+            ],
+            miniaod_merge_events=5000,
+            phi_consumption_mode="exhaustive",
+            normal_max_lhe_events=350,
+            normal_shortfall_policy="report-and-truncate",
+            source_rng_seeds=[555065741, 500135243],
+            mixing_rng_seed=272465745,
+            physics_campaign="JJP_DPS1",
+        )
+        exhaustive_dag = exhaustive_subdag.read_text(encoding="utf-8")
+        assert exhaustive_dag.count("\nJOB MIX_JJP_DPS1_MC_v4_1_1095_BLOCK") == 15
+        assert exhaustive_dag.count("\nJOB MERGE_JJP_DPS1_MC_v4_1_1095_GROUP") == 2
+        exhaustive_config = json.loads(
+            (
+                workdir / "JJP_DPS1_MC_v4_1" / "node_configs" / "processing" /
+                "MIX_JJP_DPS1_MC_v4_1_1095_BLOCK000000.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert exhaustive_config["phi_consumption_mode"] == "exhaustive"
+        assert exhaustive_config["normal_shortfall_policy"] == "report-and-truncate"
+        assert exhaustive_config["unused_hepmc_warning_fraction"] == 0.15
+        assert exhaustive_config["physics_campaign"] == "JJP_DPS1"
+        assert exhaustive_config["phi_exposure_events"] == 350
+        assert exhaustive_config["minimum_accepted_events"] == 1
+        assert exhaustive_config["target_mixed_events"] is None
+        assert exhaustive_config["minimum_output_fraction"] is None
+        assert exhaustive_config["event_id_span"] == 350
+        assert exhaustive_config["require_processing_manifests"] is True
+        assert [source["target_hepmc_events"] for source in exhaustive_config["sources"]] == [100, 0]
+        assert [source["max_lhe_events"] for source in exhaustive_config["sources"]] == [350, 350]
+        assert [source["rng_seed"] for source in exhaustive_config["sources"]] == [
+            555065741,
+            500135243,
+        ]
+        assert exhaustive_config["mixing_rng_seed"] == 272465745
+        first_exhaustive_merge = json.loads(
+            (
+                workdir / "JJP_DPS1_MC_v4_1" / "node_configs" /
+                "miniaod_merge" / "MERGE_JJP_DPS1_MC_v4_1_1095_GROUP000000.json"
+            ).read_text(encoding="utf-8")
+        )
+        second_exhaustive_merge = json.loads(
+            (
+                workdir / "JJP_DPS1_MC_v4_1" / "node_configs" /
+                "miniaod_merge" / "MERGE_JJP_DPS1_MC_v4_1_1095_GROUP000001.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert len(first_exhaustive_merge["input_miniaods"]) == 14
+        assert first_exhaustive_merge["packing_weight_events"] == 4900
+        assert first_exhaustive_merge["expected_events"] is None
+        assert first_exhaustive_merge["require_processing_manifests"] is True
+        assert len(second_exhaustive_merge["input_miniaods"]) == 1
+        assert second_exhaustive_merge["packing_weight_events"] == 350
+        assert (
+            'request_cpus="1" request_memory="3GB" request_disk="20GB"'
+            in exhaustive_dag
+        )
+
     print("[OK] Block coordinator TPS multiplicity and unique output IDs")
     print("[OK] Block coordinator single-source SPS SubDAG generation")
     print("[OK] Block processing and ntuple logs use per-job, per-block directories")
     print("[OK] MiniAOD merge mode emits merge-group ntuple nodes and provenance configs")
     print("[OK] Block coordinator emits deterministic, non-overlapping EDM EventIDs")
+    print("[OK] Exhaustive mode reserves 350 EventIDs and uses closest-boundary static packing")
+    print("[OK] Global pool streams concatenate manifests and shard without overlap")
     return 0
 
 

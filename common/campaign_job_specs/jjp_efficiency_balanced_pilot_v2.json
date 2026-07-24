@@ -1,0 +1,77 @@
+{
+  "version": 2,
+  "description": "Efficiency-balanced DPS1/TPS pilot using shared global LHE block streams.",
+  "source_inventory": "generated/lhe_inventory_jjp_20260717_184812.json",
+  "source_inventory_sha256": "9c393a706aa3ad4368a3ca3c10a822cdd65f7c4daee86950df3e4e9044369e68",
+  "planning": {
+    "block_events": 1000,
+    "shard_processing_nodes": 2000,
+    "shuffle_mode": "stratified",
+    "n_strata": "auto",
+    "drop_incomplete_last_block": false,
+    "pool_seeds": {
+      "pool_jpsi_CSCO_g": [
+        100,
+        1095,
+        1191,
+        1287,
+        1383,
+        1479,
+        1575,
+        1670,
+        1767,
+        1862
+      ],
+      "pool_gg": [
+        40100,
+        40205,
+        40311,
+        40416,
+        40522,
+        40627,
+        40733,
+        40838,
+        40944,
+        41049
+      ]
+    },
+    "max_events_per_file": {
+      "pool_jpsi_CSCO_g": 2000,
+      "pool_gg": 1000
+    }
+  },
+  "storage": {
+    "warning_bytes": 4000000000000,
+    "hard_limit_bytes": 5000000000000,
+    "bytes_per_final_event": 100000,
+    "existing_retained_bytes": 0
+  },
+  "campaigns": {
+    "JJP_DPS1_MC_v4_1": {
+      "physics_campaign": "JJP_DPS1",
+      "source_lhe_budgets": [
+        860,
+        1000
+      ],
+      "source_efficiencies": [
+        0.932862,
+        0.802286
+      ],
+      "max_processing_nodes": 10
+    },
+    "JJP_TPS_MC_v4_1": {
+      "physics_campaign": "JJP_TPS",
+      "source_lhe_budgets": [
+        1000,
+        1000,
+        977
+      ],
+      "source_efficiencies": [
+        0.932862,
+        0.932862,
+        0.955143
+      ],
+      "max_processing_nodes": 10
+    }
+  }
+}

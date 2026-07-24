@@ -48,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMMON_DIR="${BASE_DIR}/common"
 SHOWER_DIR="${SCRIPT_DIR}/pythia_shower"
+CMSSW_HELPERS_DIR="${SCRIPT_DIR}/cmssw_helpers"
 
 if [[ -f "${COMMON_DIR}/compression_helpers.sh" ]]; then
     source "${COMMON_DIR}/compression_helpers.sh"
@@ -60,6 +61,7 @@ if [[ ! -d "${COMMON_DIR}" && -d "${SCRIPT_DIR}/common" ]]; then
     BASE_DIR="${SCRIPT_DIR}"
     COMMON_DIR="${BASE_DIR}/common"
     SHOWER_DIR="${BASE_DIR}/pythia_shower"
+    CMSSW_HELPERS_DIR="${BASE_DIR}/cmssw_helpers"
     CMSSW_CONFIGS_DIR="${COMMON_DIR}/cmssw_configs"
     PACKAGES_DIR="${COMMON_DIR}/packages"
 fi
@@ -89,9 +91,17 @@ USE_SOURCE_CONFIG="false"
 TARGET_MIXED_EVENTS=0
 EVENT_ID_SPAN=0
 MINIMUM_OUTPUT_FRACTION="0"
+PHI_CONSUMPTION_MODE="target"
+NORMAL_SHORTFALL_POLICY="fail"
+UNUSED_HEPMC_WARNING_FRACTION="0.15"
+PHI_EXPOSURE_EVENTS=0
+MINIMUM_ACCEPTED_EVENTS=0
+MIXING_RNG_SEED=0
+PROCESSING_FAILURE_REASON=""
 COMMON_MIX_TARGET=0
 ACTUAL_MIXED_HEPMC_EVENTS=0
 ACTUAL_MINIAOD_EVENTS=0
+MINIAOD_COUNT_SOURCE="unavailable"
 PROCESSING_MANIFEST=""
 declare -a SOURCE_SLOTS=()
 declare -a SOURCE_MODES=()
@@ -99,6 +109,7 @@ declare -a SOURCE_INPUT_GROUPS=()
 declare -a SOURCE_TARGET_HEPMC_EVENTS=()
 declare -a SOURCE_MAX_LHE_EVENTS=()
 declare -a SOURCE_MAX_RETRIES=()
+declare -a SOURCE_RNG_SEEDS=()
 declare -a SOURCE_HEPMC_FILES=()
 declare -a SOURCE_MANIFESTS=()
 
@@ -321,6 +332,7 @@ load_processing_sources() {
     SOURCE_TARGET_HEPMC_EVENTS=()
     SOURCE_MAX_LHE_EVENTS=()
     SOURCE_MAX_RETRIES=()
+    SOURCE_RNG_SEEDS=()
 
     TARGET_MIXED_EVENTS="${MAX_EVENTS}"
     if [[ "${TARGET_MIXED_EVENTS}" -le 0 ]]; then
@@ -330,13 +342,19 @@ load_processing_sources() {
     MINIMUM_OUTPUT_FRACTION="0"
 
     if [[ -n "${config_path}" && -s "${config_path}" ]]; then
-        while IFS=$'\t' read -r kind slot mode target max_lhe max_retry inputs min_fraction event_span; do
+        while IFS=$'\t' read -r kind slot mode target max_lhe max_retry inputs min_fraction event_span consumption_mode exposure_events minimum_events rng_seed shortfall_policy unused_warning; do
             case "${kind}" in
                 header)
                     TARGET_MIXED_EVENTS="${target}"
                     MINIMUM_OUTPUT_FRACTION="${min_fraction}"
                     EVENT_ID_SPAN="${event_span}"
                     USE_SOURCE_CONFIG="${mode}"
+                    PHI_CONSUMPTION_MODE="${consumption_mode}"
+                    NORMAL_SHORTFALL_POLICY="${shortfall_policy}"
+                    UNUSED_HEPMC_WARNING_FRACTION="${unused_warning}"
+                    PHI_EXPOSURE_EVENTS="${exposure_events}"
+                    MINIMUM_ACCEPTED_EVENTS="${minimum_events}"
+                    MIXING_RNG_SEED="${rng_seed}"
                     ;;
                 source)
                     SOURCE_SLOTS+=("${slot}")
@@ -344,6 +362,7 @@ load_processing_sources() {
                     SOURCE_TARGET_HEPMC_EVENTS+=("${target}")
                     SOURCE_MAX_LHE_EVENTS+=("${max_lhe}")
                     SOURCE_MAX_RETRIES+=("${max_retry}")
+                    SOURCE_RNG_SEEDS+=("${rng_seed}")
                     SOURCE_INPUT_GROUPS+=("${inputs}")
                     ;;
             esac
@@ -356,12 +375,22 @@ legacy_max = int(sys.argv[2])
 with open(path, "r", encoding="utf-8") as handle:
     cfg = json.load(handle)
 
-target = int(cfg.get("target_mixed_events") or (legacy_max if legacy_max > 0 else 100))
+consumption_mode = str(cfg.get("phi_consumption_mode") or "target")
+if consumption_mode == "exhaustive":
+    target = 0
+else:
+    target = int(cfg.get("target_mixed_events") or (legacy_max if legacy_max > 0 else 100))
 event_span = int(cfg.get("event_id_span") or cfg.get("edm_event_id", {}).get("reserved_events") or target)
-min_fraction = cfg.get("minimum_output_fraction", 0.0)
+min_fraction = cfg.get("minimum_output_fraction")
+min_fraction = 0.0 if min_fraction is None else min_fraction
+exposure_events = int(cfg.get("phi_exposure_events") or 0)
+minimum_events = int(cfg.get("minimum_accepted_events") or 0)
+mixing_rng_seed = int(cfg.get("mixing_rng_seed") or 0)
+normal_shortfall_policy = str(cfg.get("normal_shortfall_policy") or "fail")
+unused_warning = float(cfg.get("unused_hepmc_warning_fraction", 0.15))
 sources = cfg.get("sources")
 use_sources = isinstance(sources, list) and bool(sources)
-print(f"header\t0\t{str(use_sources).lower()}\t{target}\t0\t0\t-\t{min_fraction}\t{event_span}")
+print(f"header\t0\t{str(use_sources).lower()}\t{target}\t0\t0\t-\t{min_fraction}\t{event_span}\t{consumption_mode}\t{exposure_events}\t{minimum_events}\t{mixing_rng_seed}\t{normal_shortfall_policy}\t{unused_warning}")
 if use_sources:
     for index, source in enumerate(sources):
         inputs = source.get("inputs") or []
@@ -371,10 +400,12 @@ if use_sources:
         if not mode:
             raise SystemExit(f"sources[{index}].mode is required")
         slot = int(source.get("slot", index))
-        src_target = int(source.get("target_hepmc_events") or target)
+        raw_target = source.get("target_hepmc_events")
+        src_target = int(target if raw_target is None else raw_target)
         max_lhe = int(source.get("max_lhe_events") or src_target)
         max_retry = int(source.get("max_hadronization_retries") or 1000)
-        print(f"source\t{slot}\t{mode}\t{src_target}\t{max_lhe}\t{max_retry}\t{';'.join(str(item) for item in inputs)}\t0\t0")
+        rng_seed = int(source.get("rng_seed") or 0)
+        print(f"source\t{slot}\t{mode}\t{src_target}\t{max_lhe}\t{max_retry}\t{';'.join(str(item) for item in inputs)}\t0\t0\t-\t0\t0\t{rng_seed}\t-\t-")
 PYHELPER
         )
     fi
@@ -387,6 +418,7 @@ PYHELPER
             SOURCE_TARGET_HEPMC_EVENTS+=("${TARGET_MIXED_EVENTS}")
             SOURCE_MAX_LHE_EVENTS+=("${TARGET_MIXED_EVENTS}")
             SOURCE_MAX_RETRIES+=("5000")
+            SOURCE_RNG_SEEDS+=("0")
             SOURCE_INPUT_GROUPS+=("${INPUT_SPECS[$i]}")
         done
     fi
@@ -777,21 +809,13 @@ ensure_cmssw15_project() {
     # Use stderr for info messages to avoid polluting function return value
     msg_info "Creating CMSSW_15_0_15 project from CVMFS in el9 container..." >&2
     
-    local tmp_script=$(mktemp --suffix=_create_cmssw15.sh)
-    cat > "${tmp_script}" << CREATEEOF
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-cd "${WORKDIR}"
-scramv1 project CMSSW CMSSW_15_0_15
-CREATEEOF
-    chmod +x "${tmp_script}"
-    
-    run_el9_script_logged "create_CMSSW_15_0_15" "${tmp_script}" >&2
-    
+    run_el9_script_logged \
+        "create_CMSSW_15_0_15" \
+        "${CMSSW_HELPERS_DIR}/cmssw15_project_create.sh" \
+        "${WORKDIR}" \
+        "CMSSW_15_0_15" >&2
+
     local rc=$?
-    rm -f "${tmp_script}"
     
     if [[ $rc -ne 0 ]]; then
         msg_error "Failed to create CMSSW_15_0_15 project" >&2
@@ -831,9 +855,10 @@ running_on_el9() {
 run_el9_script_logged() {
     local label="$1"
     local script_path="$2"
+    shift 2
 
     if running_on_el9; then
-        run_logged "${label}" /bin/bash "${script_path}"
+        run_logged "${label}" /bin/bash "${script_path}" "$@"
         return $?
     fi
 
@@ -844,7 +869,7 @@ run_el9_script_logged() {
         --env "X509_USER_PROXY=${X509_USER_PROXY:-}" \
         --env "HOME=${HOME}" \
         "${EL9_CONTAINER}" \
-        /bin/bash "${script_path}"
+        /bin/bash "${script_path}" "$@"
 }
 
 container_runtime() {
@@ -871,26 +896,18 @@ host_needs_cmssw12_container() {
 }
 
 run_in_cmssw12_container() {
-    local script_content="$1"
-    local tmp_script=""
+    local script_path="$1"
+    shift
     local scratch_root=""
     local siteconf_overlay=""
-    tmp_script=$(mktemp --suffix=_cmssw12_cmd.sh)
+    local command_text=""
     scratch_root=$(dirname "${WORKDIR}")
     siteconf_overlay="${scratch_root}/cms_siteconf_overlay"
     rm -rf "${siteconf_overlay}"
     mkdir -p "${siteconf_overlay}"
     cp -a /cvmfs/cms.cern.ch/SITECONF/T2_CN_Beijing "${siteconf_overlay}/"
     ln -s T2_CN_Beijing "${siteconf_overlay}/local"
-    cat > "${tmp_script}" <<'SCRIPT_HEADER'
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el8_amd64_gcc10
-SCRIPT_HEADER
-
-    echo "${script_content}" >> "${tmp_script}"
-    chmod +x "${tmp_script}"
+    command_text=$(quote_shell_words /bin/bash "${script_path}" "$@")
 
     UNPACKED_IMAGE="${CMSSW12_CONTAINER}" \
     X509_USER_PROXY="${X509_USER_PROXY:-}" \
@@ -899,11 +916,9 @@ SCRIPT_HEADER
         -B "${scratch_root}" \
         -B /tmp \
         -B "${siteconf_overlay}:/cvmfs/cms.cern.ch/SITECONF" \
-        --command-to-run "/bin/bash ${tmp_script}"
+        --command-to-run "${command_text}"
 
-    local rc=$?
-    rm -f "${tmp_script}"
-    return ${rc}
+    return $?
 }
 
 quote_shell_words() {
@@ -915,21 +930,17 @@ quote_shell_words() {
 run_cmssw12_command() {
     local label="$1"
     shift
+    local entrypoint="${CMSSW_HELPERS_DIR}/cmssw12_exec.sh"
 
     if host_needs_cmssw12_container; then
-        local cmd_text=""
-        cmd_text=$(quote_shell_words "$@")
         msg_info "Running ${label} inside el8 container for CMSSW_12 compatibility..."
-        run_logged "${label}" run_in_cmssw12_container "
-cd '${CMSSW_12_BASE}/src'
-eval \$(scramv1 runtime -sh)
-cd - >/dev/null
-${cmd_text}
-"
+        run_logged "${label}" run_in_cmssw12_container \
+            "${entrypoint}" "${CMSSW_12_BASE}" "$@"
         return $?
     fi
 
-    run_logged "${label}" "$@"
+    run_logged "${label}" /bin/bash \
+        "${entrypoint}" "${CMSSW_12_BASE}" "$@"
 }
 
 validate_root_file() {
@@ -966,37 +977,6 @@ sys.exit(0)
 PYCHECK
 
     run_cmssw12_command "validate_root_${label}" python3 "${checker}" "${file_path}"
-}
-
-# Run command inside el9 container using apptainer
-run_in_el9_container() {
-    local script_content="$1"
-    local tmp_script=$(mktemp --suffix=_el9_cmd.sh)
-    
-    cat > "${tmp_script}" << 'SCRIPT_HEADER'
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-SCRIPT_HEADER
-    
-    echo "${script_content}" >> "${tmp_script}"
-    chmod +x "${tmp_script}"
-    
-    if running_on_el9; then
-        /bin/bash "${tmp_script}"
-    else
-        apptainer exec \
-            --bind /cvmfs:/cvmfs \
-            --bind /tmp:/tmp \
-            --bind "${WORKDIR}:${WORKDIR}" \
-            "${EL9_CONTAINER}" \
-            /bin/bash "${tmp_script}"
-    fi
-    
-    local rc=$?
-    rm -f "${tmp_script}"
-    return ${rc}
 }
 
 prepare_premix_filelist() {
@@ -1147,26 +1127,11 @@ run_cmsrun_cmssw15() {
     shift
     
     msg_info "Running cmsRun in el9 container for CMSSW_15..."
-    
-    # Build the full command with arguments
-    local tmp_script=$(mktemp --suffix=_cmsrun.sh)
-    cat > "${tmp_script}" << SCRIPT_EOF
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-cd "${CMSSW_15_BASE}/src"
-eval \$(scramv1 runtime -sh)
-cmsRun "${cfg}" $@
-SCRIPT_EOF
-    
-    chmod +x "${tmp_script}"
-    
-    run_el9_script_logged "cmsRun_$(basename "${cfg}")" "${tmp_script}"
-    
-    local rc=$?
-    rm -f "${tmp_script}"
-    return ${rc}
+    run_el9_script_logged \
+        "cmsRun_$(basename "${cfg}")" \
+        "${CMSSW_HELPERS_DIR}/cmssw15_exec.sh" \
+        "${CMSSW_15_BASE}" \
+        cmsRun "${cfg}" "$@"
 }
 
 ensure_voms_proxy() {
@@ -1211,20 +1176,11 @@ prepare_cmssw15_from_package() {
     
     if [[ ! -d "${project_dir}/src" ]]; then
         msg_info "Creating CMSSW_15_0_15 project in el9 container at ${project_dir}..."
-
-        local tmp_script=$(mktemp --suffix=_create_cmssw15.sh)
-        cat > "${tmp_script}" << CREATEEOF
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-cd "${WORKDIR}"
-scramv1 project CMSSW CMSSW_15_0_15
-CREATEEOF
-        chmod +x "${tmp_script}"
-        
-        run_el9_script_logged "create_CMSSW_15_0_15_pkg" "${tmp_script}"
-        rm -f "${tmp_script}"
+        run_el9_script_logged \
+            "create_CMSSW_15_0_15_pkg" \
+            "${CMSSW_HELPERS_DIR}/cmssw15_project_create.sh" \
+            "${WORKDIR}" \
+            "CMSSW_15_0_15"
     fi
 
     local pkg_check_dir="${project_dir}/src/HeavyFlavorAnalysis/TPS-Onia2MuMu"
@@ -1237,22 +1193,12 @@ CREATEEOF
     local stamp="${project_dir}/.built_${analysis,,}"
     if [[ ! -f "${stamp}" ]]; then
         msg_info "Compiling ntuple code for ${analysis} in el9 container..."
-        
-        local tmp_script=$(mktemp --suffix=_build_cmssw15.sh)
-        cat > "${tmp_script}" << BUILDEOF
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-cd "${project_dir}/src"
-eval \$(scramv1 runtime -sh)
-scram b -j 4 HeavyFlavorAnalysis/TPS-Onia2MuMu
-BUILDEOF
-        chmod +x "${tmp_script}"
-        
-        run_el9_script_logged "scram_b_${ANALYSIS_TYPE}" "${tmp_script}"
-        rm -f "${tmp_script}"
-        
+        run_el9_script_logged \
+            "scram_b_${ANALYSIS_TYPE}" \
+            "${CMSSW_HELPERS_DIR}/cmssw15_exec.sh" \
+            "${project_dir}" \
+            scram b -j 4 HeavyFlavorAnalysis/TPS-Onia2MuMu
+
         touch "${stamp}"
     else
         msg_info "Reusing existing CMSSW_15_0_15 build for ${analysis}"
@@ -1280,22 +1226,12 @@ prepare_cmssw15_from_runtime() {
     fi
 
     if [[ ! -f "${project_dir}/.project_renamed" ]]; then
-        local tmp_script=$(mktemp --suffix=_rename_cmssw15.sh)
-        cat > "${tmp_script}" << RENAMEEOF
-#!/bin/bash
-set -e
-source /cvmfs/cms.cern.ch/cmsset_default.sh
-export SCRAM_ARCH=el9_amd64_gcc12
-cd "${project_dir}/src"
-eval $(scramv1 runtime -sh)
-scram build ProjectRename
-RENAMEEOF
-        chmod +x "${tmp_script}"
-        run_el9_script_logged "scram_ProjectRename_CMSSW_15_0_15" "${tmp_script}" || {
-            rm -f "${tmp_script}"
+        run_el9_script_logged \
+            "scram_ProjectRename_CMSSW_15_0_15" \
+            "${CMSSW_HELPERS_DIR}/cmssw15_project_rename.sh" \
+            "${project_dir}" || {
             return 1
         }
-        rm -f "${tmp_script}"
         touch "${project_dir}/.project_renamed"
     fi
 
@@ -1333,8 +1269,9 @@ ensure_worker_shower_tools() {
     local tool=""
     if host_needs_cmssw12_container; then
         msg_info "Rebuilding shower/mixer tools inside CMSSW_12 el8 container for ABI compatibility..."
-        run_in_cmssw12_container \
-            "cd \"${CMSSW_12_BASE}/src\" && eval \$(scramv1 runtime -sh) && cd \"${SHOWER_DIR}\" && make -B all" \
+        run_cmssw12_command \
+            "build_pythia_shower_tools" \
+            make -C "${SHOWER_DIR}" -B all \
             || return 1
         SHOWER_BUILD_DONE="true"
         return 0
@@ -1415,7 +1352,10 @@ run_shower() {
         msg_info "Processing source slot=${source_slot}: mode=${mode} target=${target_events} max_lhe=${max_lhe_events} inputs=${#specs[@]}"
         lhe_file=$(materialize_source_lhe "${source_slot}" "${specs[@]}") || return 1
 
-        source_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|source=${source_slot}|${input_group}|${mode}")
+        source_seed="${SOURCE_RNG_SEEDS[$i]:-0}"
+        if [[ "${source_seed}" -le 0 ]]; then
+            source_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|source=${source_slot}|${input_group}|${mode}")
+        fi
         msg_info "Pythia RNG seed for source slot ${source_slot}: ${source_seed}"
         
         if [[ "$normalized_mode" == "phi_mpi_off" ]]; then
@@ -1444,8 +1384,41 @@ print(int(payload.get("actual_hepmc_events", 0)))
 PYHELPER
         )
         if [[ "${source_actual}" -le 0 ]]; then
+            if [[ "${normalized_mode}" == "normal" ]]; then
+                PROCESSING_FAILURE_REASON="zero_normal_source_output"
+            else
+                PROCESSING_FAILURE_REASON="zero_phi_yield"
+            fi
             msg_error "Source slot ${source_slot} produced zero accepted HepMC events"
             return 1
+        fi
+        if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${normalized_mode}" != "normal" ]]; then
+            local consumed_lhe
+            consumed_lhe=$(python3 - "${manifest_output}" <<'PYHELPER'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(int(payload.get("consumed_lhe_events", payload.get("attempted_lhe_events", 0))))
+PYHELPER
+            )
+            if [[ "${consumed_lhe}" -ne "${max_lhe_events}" ]]; then
+                PROCESSING_FAILURE_REASON="incomplete_phi_exposure"
+                msg_error "Source slot ${source_slot} consumed ${consumed_lhe}/${max_lhe_events} LHE records"
+                return 1
+            fi
+        fi
+        if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${normalized_mode}" == "normal" ]]; then
+            if [[ "${source_actual}" -lt "${COMMON_MIX_TARGET}" ]]; then
+                if [[ "${NORMAL_SHORTFALL_POLICY}" == "report-and-truncate" ]]; then
+                    msg_warn "Normal source slot ${source_slot} produced ${source_actual}/${COMMON_MIX_TARGET} events; reducing common mix target to ${source_actual}"
+                    COMMON_MIX_TARGET="${source_actual}"
+                else
+                    PROCESSING_FAILURE_REASON="normal_source_exhausted_before_target"
+                    msg_error "Normal source slot ${source_slot} produced ${source_actual}/${COMMON_MIX_TARGET} events"
+                    return 1
+                fi
+            fi
         fi
         if [[ "$normalized_mode" != "normal" ]]; then
             if [[ "${COMMON_MIX_TARGET}" -le 0 || "${source_actual}" -lt "${COMMON_MIX_TARGET}" ]]; then
@@ -1499,7 +1472,10 @@ run_mix() {
         msg_info "Mixing ${n_sources} sources..."
         if [[ "${SHUFFLE_MIXING}" == "true" ]]; then
             local shuffle_seed
-            shuffle_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|shuffle|${INPUTS}|${MODES}")
+            shuffle_seed="${MIXING_RNG_SEED:-0}"
+            if [[ "${shuffle_seed}" -le 0 ]]; then
+                shuffle_seed=$(stable_seed "${CAMPAIGN_NAME}|${JOB_ID}|shuffle|${INPUTS}|${MODES}")
+            fi
             msg_info "Shuffle mixing enabled with seed base ${shuffle_seed}"
             run_logged "event_mixer_shuffle" ./event_mixer_multisource \
                 "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" \
@@ -1527,20 +1503,58 @@ print(int(payload.get("actual_mixed_hepmc_events", payload.get("events_written",
 PYHELPER
     )
     if [[ "${ACTUAL_MIXED_HEPMC_EVENTS}" -le 0 ]]; then
+        PROCESSING_FAILURE_REASON="zero_mixed_output"
         msg_error "Mixed HepMC contains zero events"
         return 1
     fi
-    python3 - "${ACTUAL_MIXED_HEPMC_EVENTS}" "${TARGET_MIXED_EVENTS}" "${MINIMUM_OUTPUT_FRACTION}" <<'PYHELPER'
+    python3 - "${ACTUAL_MIXED_HEPMC_EVENTS}" "${TARGET_MIXED_EVENTS}" "${MINIMUM_OUTPUT_FRACTION}" "${PHI_CONSUMPTION_MODE}" "${mix_nevents}" <<'PYHELPER'
 import sys
 actual = int(sys.argv[1])
 target = max(1, int(sys.argv[2]))
 minimum = float(sys.argv[3])
+mode = sys.argv[4]
+mix_target = int(sys.argv[5])
+if mode == "exhaustive":
+    if actual != mix_target:
+        raise SystemExit(f"mixed event count {actual} != exposure-derived target {mix_target}")
+    raise SystemExit(0)
 fraction = actual / target
 if minimum > 0 and fraction < minimum:
     raise SystemExit(
         f"completion fraction {fraction:.6f} below minimum {minimum:.6f}"
     )
 PYHELPER
+
+    while IFS=$'\t' read -r severity slot mode actual unused fraction; do
+        case "${severity}" in
+            warning)
+                msg_warn "Source slot ${slot} (${mode}) left ${unused}/${actual} accepted HepMC events unused (${fraction}); warning threshold=${UNUSED_HEPMC_WARNING_FRACTION}"
+                ;;
+        esac
+    done < <(python3 - "${ACTUAL_MIXED_HEPMC_EVENTS}" \
+        "${UNUSED_HEPMC_WARNING_FRACTION}" \
+        "${SOURCE_MANIFESTS[@]}" <<'PYHELPER'
+import json
+import os
+import sys
+
+mixed = int(sys.argv[1])
+warning = float(sys.argv[2])
+for slot, path in enumerate(sys.argv[3:]):
+    if not path or not os.path.isfile(path):
+        continue
+    with open(path, encoding="utf-8") as handle:
+        item = json.load(handle)
+    actual = int(item.get("actual_hepmc_events") or 0)
+    unused = max(0, actual - mixed)
+    fraction = unused / actual if actual else 0.0
+    severity = "warning" if fraction > warning else "within_threshold"
+    print(
+        f"{severity}\t{slot}\t{item.get('mode', 'unknown')}\t"
+        f"{actual}\t{unused}\t{fraction:.1%}"
+    )
+PYHELPER
+    )
     
     msg_ok "Mixing complete: ${MIXED_HEPMC} (${ACTUAL_MIXED_HEPMC_EVENTS} events)"
     cd "${WORKDIR}"
@@ -1571,7 +1585,7 @@ run_gensim() {
         inputFiles="file:${MIXED_HEPMC}" \
         outputFile="file:${GENSIM_OUTPUT}" \
         maxEvents=-1 \
-        nThreads=4 \
+        nThreads=2 \
         firstRun=${FIRST_RUN} \
         firstLuminosityBlock=${FIRST_LUMINOSITY_BLOCK} \
         firstEvent=${FIRST_EVENT} \
@@ -1594,8 +1608,8 @@ run_raw() {
     setup_cmssw12
     
     local cfg_file=$(mktemp --suffix=_raw_cfg.py)
-    local raw_threads="${RAW_THREADS:-1}"
-    local raw_streams="${RAW_STREAMS:-1}"
+    local raw_threads="${RAW_THREADS:-2}"
+    local raw_streams="${RAW_STREAMS:-2}"
     local raw_watchdog_timeout="${RAW_WATCHDOG_TIMEOUT:-7200s}"
     local raw_watchdog_kill_after="${RAW_WATCHDOG_KILL_AFTER:-300s}"
 
@@ -1680,7 +1694,7 @@ run_reco() {
         --geometry DB:Extended \
         -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
-        --nThreads 4 --nStreams 4 \
+        --nThreads 2 --nStreams 2 \
         --filein "file:${RAW_OUTPUT}" \
         --fileout "file:${RECO_OUTPUT}"
     
@@ -1727,15 +1741,10 @@ PYHELPER
 count_root_events() {
     local root_file="$1"
     local json_path="${WORKDIR}/$(basename "${root_file}").edmFileUtil.json"
-    (
-        source /cvmfs/cms.cern.ch/cmsset_default.sh
-        export SCRAM_ARCH=el8_amd64_gcc10
-        if [[ -d "${CMSSW_12_BASE}/src" ]]; then
-            cd "${CMSSW_12_BASE}/src"
-            eval "$(scramv1 runtime -sh)"
-        fi
-        edmFileUtil -j "${root_file}" > "${json_path}" 2>/dev/null
-    ) || true
+    rm -f "${json_path}"
+    run_cmssw12_command "edmFileUtil_miniaod" \
+        bash -c 'edmFileUtil -j -f "$1" > "$2"' \
+        _ "${root_file}" "${json_path}" >&2 || true
     if [[ -s "${json_path}" ]]; then
         find_event_count_in_json "${json_path}"
     fi
@@ -1747,8 +1756,13 @@ write_processing_manifest() {
     python3 - "${PROCESSING_MANIFEST}" \
         "${CAMPAIGN_NAME}" "${JOB_ID}" "${TARGET_MIXED_EVENTS}" "${ACTUAL_MIXED_HEPMC_EVENTS}" \
         "${ACTUAL_MINIAOD_EVENTS}" "${FIRST_RUN}" "${FIRST_LUMINOSITY_BLOCK}" \
-        "${FIRST_EVENT}" "${EVENT_ID_SPAN}" "${miniaod_url_value}" "${SOURCE_MANIFESTS[@]}" <<'PYHELPER'
+        "${FIRST_EVENT}" "${EVENT_ID_SPAN}" "${miniaod_url_value}" \
+        "${PHI_CONSUMPTION_MODE}" "${PHI_EXPOSURE_EVENTS}" "${MINIMUM_ACCEPTED_EVENTS}" \
+        "${NORMAL_SHORTFALL_POLICY}" "${UNUSED_HEPMC_WARNING_FRACTION}" \
+        "${PROCESSING_FAILURE_REASON}" \
+        "${MINIAOD_COUNT_SOURCE}" "${SOURCE_MANIFESTS[@]}" <<'PYHELPER'
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -1764,6 +1778,13 @@ from datetime import datetime, timezone
     first_event,
     event_id_span,
     miniaod_url,
+    consumption_mode,
+    exposure_target,
+    minimum_accepted,
+    normal_shortfall_policy,
+    unused_warning_fraction,
+    failure_reason,
+    miniaod_count_source,
     *source_manifest_paths,
 ) = sys.argv[1:]
 target_mixed = int(target_mixed)
@@ -1771,24 +1792,82 @@ actual_mixed = int(actual_mixed or 0)
 actual_miniaod = int(actual_miniaod or 0)
 first_event = int(first_event)
 event_id_span = int(event_id_span)
+exposure_target = int(exposure_target or 0)
+minimum_accepted = int(minimum_accepted or 0)
+unused_warning_fraction = float(unused_warning_fraction)
 source_statistics = []
 for path in source_manifest_paths:
-    if not path:
+    if not path or not os.path.isfile(path):
         continue
     with open(path, "r", encoding="utf-8") as handle:
         source_statistics.append(json.load(handle))
 last_event = first_event + max(actual_miniaod, 0) - 1 if actual_miniaod > 0 else first_event - 1
+normal_shortfalls = [
+    {
+        "mode": item.get("mode"),
+        "target_events": int(item.get("target_events") or 0),
+        "actual_hepmc_events": int(item.get("actual_hepmc_events") or 0),
+        "shortfall_events": max(
+            0,
+            int(item.get("target_events") or 0)
+            - int(item.get("actual_hepmc_events") or 0),
+        ),
+    }
+    for item in source_statistics
+    if item.get("mode") == "normal"
+    and int(item.get("actual_hepmc_events") or 0) < int(item.get("target_events") or 0)
+]
+unmixed_phi_events = [
+    max(0, int(item.get("actual_hepmc_events") or 0) - actual_mixed)
+    for item in source_statistics if item.get("mode") != "normal"
+]
+source_event_balance = []
+for index, item in enumerate(source_statistics):
+    actual = int(item.get("actual_hepmc_events") or 0)
+    unused = max(0, actual - actual_mixed)
+    unused_fraction = unused / actual if actual else 0.0
+    assessment = (
+        "warning" if unused_fraction > unused_warning_fraction
+        else "within_threshold"
+    )
+    source_event_balance.append({
+        "source_index": index,
+        "mode": item.get("mode"),
+        "accepted_hepmc_events": actual,
+        "mixed_hepmc_events": min(actual, actual_mixed),
+        "unused_hepmc_events": unused,
+        "unused_fraction": unused_fraction,
+        "assessment": assessment,
+    })
 manifest = {
     "campaign": campaign,
     "job_id": job_id,
-    "status": "ok" if actual_miniaod > 0 else "failed",
+    "status": "ok" if actual_miniaod > 0 and not failure_reason else "failed",
     "timestamp": datetime.now(timezone.utc).isoformat(),
-    "target_mixed_events": target_mixed,
+    "phi_consumption_mode": consumption_mode,
+    "phi_exposure_events": exposure_target if consumption_mode == "exhaustive" else None,
+    "consumed_phi_lhe_events": [
+        item.get("consumed_lhe_events", item.get("attempted_lhe_events"))
+        for item in source_statistics if item.get("mode") != "normal"
+    ],
+    "minimum_accepted_events": minimum_accepted if consumption_mode == "exhaustive" else None,
+    "normal_shortfall_policy": normal_shortfall_policy,
+    "unused_hepmc_warning_fraction": unused_warning_fraction,
+    "source_event_balance": source_event_balance,
+    "maximum_unused_event_fraction": max(
+        (item["unused_fraction"] for item in source_event_balance),
+        default=0.0,
+    ),
+    "normal_source_shortfalls": normal_shortfalls,
+    "unmixed_phi_hepmc_events": unmixed_phi_events,
+    "target_mixed_events": None if consumption_mode == "exhaustive" else target_mixed,
     "event_id_span": event_id_span,
     "actual_mixed_hepmc_events": actual_mixed,
     "actual_miniaod_events": actual_miniaod,
-    "completion_fraction": actual_mixed / target_mixed if target_mixed else 0.0,
-    "complete": actual_mixed >= target_mixed,
+    "completion_fraction": None if consumption_mode == "exhaustive" else (actual_mixed / target_mixed if target_mixed else 0.0),
+    "complete": actual_miniaod > 0 and not failure_reason,
+    "failure_reason": failure_reason or None,
+    "miniaod_count_source": miniaod_count_source,
     "edm_event_id": {
         "run": int(first_run),
         "lumi": int(first_lumi),
@@ -1799,10 +1878,33 @@ manifest = {
     "source_statistics": source_statistics,
     "miniaod_url": miniaod_url,
 }
+
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, indent=2)
     handle.write("\n")
 PYHELPER
+}
+
+stage_failed_processing_manifest() {
+    local step_name="$1"
+    if [[ "${PHI_CONSUMPTION_MODE}" != "exhaustive" ]]; then
+        return 0
+    fi
+    PROCESSING_FAILURE_REASON="${PROCESSING_FAILURE_REASON:-${step_name}_failed}"
+    MINIAOD_COUNT_SOURCE="${MINIAOD_COUNT_SOURCE:-unavailable}"
+    local output_subpath="${CUSTOM_OUTPUT_SUBPATH:-output/${CAMPAIGN_NAME}/${JOB_ID}}"
+    local expected_miniaod_url="${EOS_BASE}/${output_subpath}/output_MINIAOD.root"
+    if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
+        local output_dir="${LOCAL_OUTPUT_BASE}/${output_subpath}"
+        expected_miniaod_url="${output_dir}/output_MINIAOD.root"
+        write_processing_manifest "${expected_miniaod_url}" || return 0
+        mkdir -p "${output_dir}" || return 0
+        cp -f "${PROCESSING_MANIFEST}" "${output_dir}/$(basename "${PROCESSING_MANIFEST}")" || true
+    else
+        write_processing_manifest "${expected_miniaod_url}" || return 0
+        make_remote_dir "${output_subpath}" || return 0
+        stage_out "${PROCESSING_MANIFEST}" "${output_subpath}/$(basename "${PROCESSING_MANIFEST}")" || true
+    fi
 }
 
 # Step 6: MiniAOD
@@ -1827,7 +1929,7 @@ run_miniaod() {
         --geometry DB:Extended \
         -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
-        --nThreads 4 --nStreams 4 \
+        --nThreads 2 --nStreams 2 \
         --filein "file:${RECO_OUTPUT}" \
         --fileout "file:${MINIAOD_OUTPUT}"
     
@@ -1842,8 +1944,22 @@ run_miniaod() {
 
     ACTUAL_MINIAOD_EVENTS=$(count_root_events "${MINIAOD_OUTPUT}")
     if [[ -z "${ACTUAL_MINIAOD_EVENTS}" ]]; then
+        if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" ]]; then
+            PROCESSING_FAILURE_REASON="miniaod_event_count_unavailable"
+            msg_error "Could not count MiniAOD events with edmFileUtil in exhaustive mode"
+            return 1
+        fi
         ACTUAL_MINIAOD_EVENTS="${ACTUAL_MIXED_HEPMC_EVENTS:-0}"
+        MINIAOD_COUNT_SOURCE="mixed_hepmc_fallback"
         msg_warn "Could not count MiniAOD events with edmFileUtil; using mixed HepMC count ${ACTUAL_MINIAOD_EVENTS}"
+    fi
+    if [[ "${MINIAOD_COUNT_SOURCE}" == "unavailable" ]]; then
+        MINIAOD_COUNT_SOURCE="edmFileUtil"
+    fi
+    if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${ACTUAL_MINIAOD_EVENTS}" -ne "${ACTUAL_MIXED_HEPMC_EVENTS}" ]]; then
+        PROCESSING_FAILURE_REASON="miniaod_mixed_event_count_mismatch"
+        msg_error "MiniAOD count ${ACTUAL_MINIAOD_EVENTS} != mixed count ${ACTUAL_MIXED_HEPMC_EVENTS}"
+        return 1
     fi
     
     msg_ok "MiniAOD complete: ${MINIAOD_OUTPUT} (${ACTUAL_MINIAOD_EVENTS} events)"
@@ -2244,6 +2360,20 @@ mkdir -p "${WORKDIR}"
 IFS=',' read -ra INPUT_SPECS <<< "$INPUTS"
 IFS=',' read -ra SHOWER_MODES <<< "$MODES"
 load_processing_sources "${NODE_CONFIG}"
+if [[ "${NORMAL_SHORTFALL_POLICY}" != "fail" ]] && \
+   [[ "${NORMAL_SHORTFALL_POLICY}" != "report-and-truncate" ]]; then
+    msg_error "normal_shortfall_policy must be fail or report-and-truncate"
+    exit 1
+fi
+if ! python3 - "${UNUSED_HEPMC_WARNING_FRACTION}" <<'PYHELPER'
+import sys
+warning = float(sys.argv[1])
+raise SystemExit(0 if 0 <= warning < 1 else 1)
+PYHELPER
+then
+    msg_error "unused HepMC warning fraction must satisfy 0 <= warning < 1"
+    exit 1
+fi
 
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
 ensure_voms_proxy
@@ -2352,6 +2482,8 @@ for ((i=0; i<${#SOURCE_SLOTS[@]}; i++)); do
 done
 echo "Max events:   ${MAX_EVENTS}"
 echo "Target mixed: ${TARGET_MIXED_EVENTS}"
+echo "Normal shortfall policy: ${NORMAL_SHORTFALL_POLICY}"
+echo "Unused-event warning threshold: >${UNUSED_HEPMC_WARNING_FRACTION}"
 echo "EDM EventID:  run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} eventsPerLumi=${N_EVENTS_IN_LUMI}"
 echo "=============================================="
 echo ""
@@ -2412,28 +2544,28 @@ msg_info "Planned steps: ${SELECTED_STEPS[*]}"
 for step in "${SELECTED_STEPS[@]}"; do
     case "$step" in
         shower)
-            run_shower "${LHE_FILES[@]}"
+            run_shower "${LHE_FILES[@]}" || { stage_failed_processing_manifest shower; exit 1; }
             ;;
         mix)
-            run_mix
+            run_mix || { stage_failed_processing_manifest mix; exit 1; }
             ;;
         gensim)
-            run_gensim
+            run_gensim || { stage_failed_processing_manifest gensim; exit 1; }
             ;;
         raw)
-            run_raw
+            run_raw || { stage_failed_processing_manifest raw; exit 1; }
             ;;
         reco)
-            run_reco
+            run_reco || { stage_failed_processing_manifest reco; exit 1; }
             ;;
         miniaod)
-            run_miniaod
+            run_miniaod || { stage_failed_processing_manifest miniaod; exit 1; }
             ;;
         ntuple)
-            run_ntuple
+            run_ntuple || { stage_failed_processing_manifest ntuple; exit 1; }
             ;;
         transfer)
-            transfer_output
+            transfer_output || { stage_failed_processing_manifest transfer; exit 1; }
             ;;
     esac
 done

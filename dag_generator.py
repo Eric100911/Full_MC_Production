@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -83,6 +84,15 @@ NTUPLE_VERSION = "v01_06"  # Should track the TPS-Onia2MuMu submodule tag (curre
 SUBPROCESS_MAP = OrderedDict(
     NODE_CONFIG_DEFAULTS.get("subprocess_ids_by_campaign", {})
 )
+SUBPROCESS_MAP.setdefault("JJP_DPS1_MC_v4_1", SUBPROCESS_MAP.get("JJP_DPS1", ""))
+SUBPROCESS_MAP.setdefault("JJP_TPS_MC_v4_1", SUBPROCESS_MAP.get("JJP_TPS", ""))
+
+UNUSED_HEPMC_WARNING_FRACTION = 0.15
+DEFAULT_STORAGE_WARNING_BYTES = 4_000_000_000_000
+DEFAULT_STORAGE_HARD_LIMIT_BYTES = 5_000_000_000_000
+DEFAULT_STORAGE_BYTES_PER_EVENT = 100_000
+DEFAULT_GLOBAL_BLOCK_EVENTS = 1000
+DEFAULT_PROCESSING_SHARD_NODES = 2000
 
 LHE_POOL_DIRECTORY_CONFIG = NODE_CONFIG_DEFAULTS.get("lhe_pool_directories", {})
 if not isinstance(LHE_POOL_DIRECTORY_CONFIG, dict):
@@ -480,6 +490,8 @@ class Campaign:
         shower_modes: Sequence[str],
         description: str,
         notes: str = "",
+        aggregate: bool = True,
+        physics_campaign: str = "",
     ):
         if len(inputs) != len(shower_modes):
             raise ValueError(f"{name}: inputs 与 shower_modes 数量不一致")
@@ -489,6 +501,8 @@ class Campaign:
         self.shower_modes = [canonical_mode(mode) for mode in shower_modes]
         self.description = description
         self.notes = notes
+        self.aggregate = aggregate
+        self.physics_campaign = physics_campaign or name
 
     @property
     def n_sources(self) -> int:
@@ -502,6 +516,8 @@ class Campaign:
             "shower_modes": self.shower_modes,
             "description": self.description,
             "notes": self.notes,
+            "aggregate": self.aggregate,
+            "physics_campaign": self.physics_campaign,
         }
 
 
@@ -562,6 +578,9 @@ class WorkflowOptions:
         phi_max_lhe_events: int = 350,
         phi_max_hadronization_retries: int = 5000,
         minimum_output_fraction: float = 0.8,
+        phi_consumption_mode: str = "target",
+        normal_shortfall_policy: str = "fail",
+        campaign_job_spec: str = "",
         archive_subdag_logs: bool = True,
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
@@ -608,6 +627,10 @@ class WorkflowOptions:
         self.phi_max_lhe_events = phi_max_lhe_events
         self.phi_max_hadronization_retries = phi_max_hadronization_retries
         self.minimum_output_fraction = minimum_output_fraction
+        self.phi_consumption_mode = phi_consumption_mode
+        self.normal_shortfall_policy = normal_shortfall_policy
+        self.unused_hepmc_warning_fraction = UNUSED_HEPMC_WARNING_FRACTION
+        self.campaign_job_spec = campaign_job_spec
         self.archive_subdag_logs = archive_subdag_logs
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
@@ -661,6 +684,13 @@ class WorkflowOptions:
             "cmssw15_runtime_tarball": self.cmssw15_runtime_tarball,
             "shuffle_mixing": self.shuffle_mixing,
             "strict_vtx_smearing_check": self.strict_vtx_smearing_check,
+            "compress_lhe": self.compress_lhe,
+            "lhe_compression_level": self.lhe_compression_level,
+            "lhe_shuffle_split": self.lhe_shuffle_split,
+            "lhe_events_per_block": self.lhe_events_per_block,
+            "lhe_shuffle_mode": self.lhe_shuffle_mode,
+            "lhe_n_strata": self.lhe_n_strata,
+            "lhe_drop_incomplete_last_block": self.lhe_drop_incomplete_last_block,
             "use_subprocess_naming": self.use_subprocess_naming,
             "target_base_url": self.target_base_url,
             "ntuple_version": self.ntuple_version,
@@ -672,6 +702,10 @@ class WorkflowOptions:
             "skip_lhe_generation": self.skip_lhe_generation,
             "existing_lhe_base": self.existing_lhe_base,
             "existing_lhe_inventory": self.existing_lhe_inventory,
+            "existing_lhe_inventory_sha256": (
+                sha256_file(self.existing_lhe_inventory)
+                if self.existing_lhe_inventory else ""
+            ),
             "allow_incomplete_lhe_inventory": self.allow_incomplete_lhe_inventory,
             "lhe_group_min_events": self.lhe_group_min_events,
             "lhe_group_max_events": self.lhe_group_max_events,
@@ -684,6 +718,14 @@ class WorkflowOptions:
             "phi_max_lhe_events": self.phi_max_lhe_events,
             "phi_max_hadronization_retries": self.phi_max_hadronization_retries,
             "minimum_output_fraction": self.minimum_output_fraction,
+            "phi_consumption_mode": self.phi_consumption_mode,
+            "normal_shortfall_policy": self.normal_shortfall_policy,
+            "unused_hepmc_warning_fraction": self.unused_hepmc_warning_fraction,
+            "campaign_job_spec": self.campaign_job_spec,
+            "campaign_job_spec_sha256": (
+                sha256_file(self.campaign_job_spec)
+                if self.campaign_job_spec else ""
+            ),
             "archive_subdag_logs": self.archive_subdag_logs,
         }
 
@@ -824,6 +866,30 @@ CAMPAIGNS: "OrderedDict[str, Campaign]" = OrderedDict(
                 inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g", "pool_gg"),
                 shower_modes=("normal", "normal", "phi_mpi_off"),
                 description="三源混合的 JJP TPS 方案。",
+            ),
+        ),
+        (
+            "JJP_DPS1_MC_v4_1",
+            Campaign(
+                name="JJP_DPS1_MC_v4_1",
+                analysis_type="JJP",
+                inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"),
+                shower_modes=("normal", "phi_mpi_off"),
+                description="Inventory-driven exhaustive recovery of JJP_DPS1 cap700.",
+                aggregate=False,
+                physics_campaign="JJP_DPS1",
+            ),
+        ),
+        (
+            "JJP_TPS_MC_v4_1",
+            Campaign(
+                name="JJP_TPS_MC_v4_1",
+                analysis_type="JJP",
+                inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g", "pool_gg"),
+                shower_modes=("normal", "normal", "phi_mpi_off"),
+                description="Inventory-driven exhaustive recovery of JJP_TPS cap700.",
+                aggregate=False,
+                physics_campaign="JJP_TPS",
             ),
         ),
         (
@@ -971,6 +1037,10 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
         "common/node_config_defaults.json",
         "lhe_generation/run_helac.sh",
         "processing/run_chain.sh",
+        "processing/cmssw_helpers/cmssw12_exec.sh",
+        "processing/cmssw_helpers/cmssw15_exec.sh",
+        "processing/cmssw_helpers/cmssw15_project_create.sh",
+        "processing/cmssw_helpers/cmssw15_project_rename.sh",
         machine_env.lhe_submit_template,
         machine_env.processing_submit_template,
         machine_env.summary_submit_template,
@@ -1226,6 +1296,413 @@ def load_existing_lhe_inventory(
         ]
         inventory[str(pool_name)] = sorted(clean, key=lambda entry: entry.path)
     return inventory
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def deterministic_seed(material: str) -> int:
+    value = int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:4], "big")
+    return value % 900000000 + 1
+
+
+def load_campaign_planning_spec(
+    path: str,
+    campaign_names: Sequence[str],
+    existing_inventory_path: str = "",
+) -> Optional[Dict[str, object]]:
+    """Load and validate the global-pool campaign job-spec v2 format."""
+
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict) or int(raw.get("version", 0)) != 2:
+        return None
+
+    expected_hash = str(raw.get("source_inventory_sha256", ""))
+    if not existing_inventory_path:
+        raise ValueError("campaign job spec v2 requires --existing-lhe-inventory")
+    actual_hash = sha256_file(existing_inventory_path)
+    if expected_hash != actual_hash:
+        raise ValueError(
+            "campaign job spec v2 inventory hash mismatch: "
+            f"expected {expected_hash or '<missing>'}, got {actual_hash}"
+        )
+
+    inventory = load_existing_lhe_inventory(existing_inventory_path)
+    inventory_by_seed = {
+        pool: {
+            int(entry.seed): entry
+            for entry in entries
+            if entry.seed is not None and entry.actual_events is not None
+        }
+        for pool, entries in inventory.items()
+    }
+
+    planning = raw.get("planning")
+    campaigns = raw.get("campaigns")
+    if not isinstance(planning, dict) or not isinstance(campaigns, dict):
+        raise ValueError("campaign job spec v2 requires planning and campaigns objects")
+
+    block_events = int(planning.get("block_events", DEFAULT_GLOBAL_BLOCK_EVENTS))
+    shard_nodes = int(
+        planning.get("shard_processing_nodes", DEFAULT_PROCESSING_SHARD_NODES)
+    )
+    if block_events <= 0 or shard_nodes <= 0:
+        raise ValueError("block_events and shard_processing_nodes must be positive")
+    if bool(planning.get("drop_incomplete_last_block", False)):
+        raise ValueError("campaign job spec v2 must retain incomplete final blocks")
+
+    pool_seeds = planning.get("pool_seeds")
+    if not isinstance(pool_seeds, dict) or not pool_seeds:
+        raise ValueError("campaign job spec v2 requires planning.pool_seeds")
+    max_events_per_file = planning.get("max_events_per_file", {})
+    if not isinstance(max_events_per_file, dict):
+        raise ValueError("planning.max_events_per_file must be an object")
+
+    selected_inventory: Dict[str, List[Dict[str, object]]] = OrderedDict()
+    for pool_name, seeds_raw in pool_seeds.items():
+        if pool_name not in inventory_by_seed:
+            raise ValueError(f"inventory does not contain pool {pool_name}")
+        if not isinstance(seeds_raw, list) or not seeds_raw:
+            raise ValueError(f"planning.pool_seeds.{pool_name} must be a non-empty list")
+        seen: Set[int] = set()
+        records: List[Dict[str, object]] = []
+        for value in seeds_raw:
+            seed = int(value)
+            if seed in seen:
+                raise ValueError(f"duplicate seed {seed} in pool {pool_name}")
+            seen.add(seed)
+            entry = inventory_by_seed[pool_name].get(seed)
+            if entry is None or entry.actual_events is None:
+                raise ValueError(f"uncounted or missing seed {seed} in pool {pool_name}")
+            file_cap = int(max_events_per_file.get(pool_name, 0) or 0)
+            planned_events = min(int(entry.actual_events), file_cap) if file_cap > 0 else int(entry.actual_events)
+            if planned_events <= 0:
+                raise ValueError(f"seed {seed} in pool {pool_name} has no plannable events")
+            records.append({
+                "pool": pool_name,
+                "seed": seed,
+                "path": entry.path,
+                "actual_events": int(entry.actual_events),
+                "planned_events": planned_events,
+                "planned_blocks": (planned_events + block_events - 1) // block_events,
+            })
+        selected_inventory[pool_name] = records
+
+    campaign_specs: Dict[str, Dict[str, object]] = OrderedDict()
+    for campaign_name in campaign_names:
+        cfg = campaigns.get(campaign_name)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"campaign job spec v2 has no config for {campaign_name}")
+        campaign = CAMPAIGNS[campaign_name]
+        if str(cfg.get("physics_campaign", "")) != campaign.physics_campaign:
+            raise ValueError(
+                f"{campaign_name}: physics_campaign must be {campaign.physics_campaign}"
+            )
+        budgets = cfg.get("source_lhe_budgets")
+        efficiencies = cfg.get("source_efficiencies")
+        if not isinstance(budgets, list) or len(budgets) != campaign.n_sources:
+            raise ValueError(
+                f"{campaign_name}: source_lhe_budgets must have {campaign.n_sources} entries"
+            )
+        if not isinstance(efficiencies, list) or len(efficiencies) != campaign.n_sources:
+            raise ValueError(
+                f"{campaign_name}: source_efficiencies must have {campaign.n_sources} entries"
+            )
+        budgets = [int(value) for value in budgets]
+        efficiencies = [float(value) for value in efficiencies]
+        if any(value <= 0 for value in budgets):
+            raise ValueError(f"{campaign_name}: source LHE budgets must be positive")
+        if any(not 0.0 < value <= 1.0 for value in efficiencies):
+            raise ValueError(f"{campaign_name}: source efficiencies must be in (0, 1]")
+        missing_pools = sorted(set(campaign.inputs) - set(selected_inventory))
+        if missing_pools:
+            raise ValueError(
+                f"{campaign_name}: planning.pool_seeds misses {', '.join(missing_pools)}"
+            )
+
+        blocks_by_pool = {
+            pool: sum(int(item["planned_blocks"]) for item in records)
+            for pool, records in selected_inventory.items()
+        }
+        required_blocks = Counter()
+        for pool_name, budget in zip(campaign.inputs, budgets):
+            required_blocks[pool_name] += (budget + block_events - 1) // block_events
+        available_nodes = min(
+            blocks_by_pool[pool] // block_count
+            for pool, block_count in required_blocks.items()
+        )
+        configured_cap = int(cfg.get("max_processing_nodes", 0) or 0)
+        processing_nodes = (
+            min(available_nodes, configured_cap)
+            if configured_cap > 0 else available_nodes
+        )
+        if processing_nodes <= 0:
+            raise ValueError(f"{campaign_name}: selected inventory produces no processing nodes")
+        expected_events_per_node = min(
+            budget * efficiency
+            for budget, efficiency in zip(budgets, efficiencies)
+        )
+        campaign_specs[campaign_name] = {
+            **copy.deepcopy(cfg),
+            "source_lhe_budgets": budgets,
+            "source_efficiencies": efficiencies,
+            "available_processing_nodes": available_nodes,
+            "processing_nodes": processing_nodes,
+            "expected_events_per_node": expected_events_per_node,
+            "expected_final_events": expected_events_per_node * processing_nodes,
+            "required_blocks_by_pool": dict(required_blocks),
+        }
+
+    storage = copy.deepcopy(raw.get("storage", {}))
+    if not isinstance(storage, dict):
+        raise ValueError("campaign job spec v2 storage must be an object")
+    storage.setdefault("warning_bytes", DEFAULT_STORAGE_WARNING_BYTES)
+    storage.setdefault("hard_limit_bytes", DEFAULT_STORAGE_HARD_LIMIT_BYTES)
+    storage.setdefault("bytes_per_final_event", DEFAULT_STORAGE_BYTES_PER_EVENT)
+    storage.setdefault("existing_retained_bytes", 0)
+    for key in (
+        "warning_bytes",
+        "hard_limit_bytes",
+        "bytes_per_final_event",
+        "existing_retained_bytes",
+    ):
+        storage[key] = int(storage[key])
+    if not (
+        0 <= storage["existing_retained_bytes"]
+        < storage["hard_limit_bytes"]
+        and 0 < storage["warning_bytes"] < storage["hard_limit_bytes"]
+        and storage["bytes_per_final_event"] > 0
+    ):
+        raise ValueError("campaign job spec v2 has invalid storage limits")
+
+    predicted_new_bytes = int(sum(
+        float(cfg["expected_final_events"]) * storage["bytes_per_final_event"]
+        for cfg in campaign_specs.values()
+    ))
+    predicted_total_bytes = storage["existing_retained_bytes"] + predicted_new_bytes
+    storage["predicted_new_bytes"] = predicted_new_bytes
+    storage["predicted_total_bytes"] = predicted_total_bytes
+    if predicted_total_bytes > storage["hard_limit_bytes"]:
+        details = ", ".join(
+            f"{name}={int(cfg['expected_final_events'])} events"
+            for name, cfg in campaign_specs.items()
+        )
+        raise ValueError(
+            "projected retained output exceeds storage hard limit: "
+            f"{predicted_total_bytes} > {storage['hard_limit_bytes']} bytes "
+            f"({details}); reduce max_processing_nodes in the authoritative spec"
+        )
+    storage["capacity_status"] = (
+        "warning"
+        if predicted_total_bytes > storage["warning_bytes"]
+        else "within_warning_limit"
+    )
+
+    layout_material = json.dumps(
+        {
+            "inventory_sha256": actual_hash,
+            "block_events": block_events,
+            "shuffle_mode": planning.get("shuffle_mode", "stratified"),
+            "n_strata": planning.get("n_strata", "auto"),
+            "pool_seeds": pool_seeds,
+            "max_events_per_file": max_events_per_file,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    layout_id = "poolv2-" + hashlib.sha256(layout_material.encode("utf-8")).hexdigest()[:12]
+
+    return {
+        "version": 2,
+        "path": path,
+        "source_inventory_sha256": actual_hash,
+        "planning": {
+            **copy.deepcopy(planning),
+            "block_events": block_events,
+            "shard_processing_nodes": shard_nodes,
+            "layout_id": layout_id,
+        },
+        "storage": storage,
+        "campaigns": campaign_specs,
+        "selected_inventory": selected_inventory,
+    }
+
+
+def load_campaign_job_spec(
+    path: str,
+    campaign_names: Sequence[str],
+    existing_inventory_path: str = "",
+) -> Dict[str, List[Dict[str, object]]]:
+    """Load exact, nonconsecutive campaign jobs without seed/range inference."""
+
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict) or int(raw.get("version", 0)) != 1:
+        raise ValueError(f"Invalid campaign job spec version in {path}")
+    spec_campaigns = raw.get("campaigns")
+    if not isinstance(spec_campaigns, dict):
+        raise ValueError(f"Campaign job spec {path} requires a campaigns object")
+    if existing_inventory_path:
+        expected_hash = str(raw.get("source_inventory_sha256", ""))
+        actual_hash = sha256_file(existing_inventory_path)
+        if expected_hash and expected_hash != actual_hash:
+            raise ValueError(
+                f"Campaign job spec inventory hash mismatch: expected {expected_hash}, "
+                f"got {actual_hash} for {existing_inventory_path}"
+            )
+    inventory = load_existing_lhe_inventory(existing_inventory_path) if existing_inventory_path else {}
+    inventory_entries = {
+        pool: {entry.path: entry for entry in entries}
+        for pool, entries in inventory.items()
+    }
+    inventory_by_seed = {
+        pool: {entry.seed: entry for entry in entries if entry.seed is not None}
+        for pool, entries in inventory.items()
+    }
+    compact = raw.get("compact_jobs")
+
+    def expand_compact(campaign_name: str) -> List[Dict[str, object]]:
+        if not isinstance(compact, dict):
+            return []
+        job_ids = compact.get("job_ids", [])
+        legacy_indices = compact.get("legacy_outer_indices", [])
+        pool_seeds = compact.get("pool_seeds", {})
+        if not isinstance(job_ids, list) or not isinstance(legacy_indices, list):
+            raise ValueError("compact_jobs requires job_ids and legacy_outer_indices lists")
+        if len(job_ids) != len(legacy_indices) or not isinstance(pool_seeds, dict):
+            raise ValueError("compact_jobs arrays have inconsistent lengths")
+        campaign = CAMPAIGNS[campaign_name]
+        jobs = []
+        for position, (job_id_value, legacy_value) in enumerate(zip(job_ids, legacy_indices)):
+            job_id = int(job_id_value)
+            legacy_index = int(legacy_value)
+            if job_id < 0 or legacy_index < 0:
+                raise ValueError("compact_jobs IDs and legacy indices must be non-negative")
+            pools = {}
+            legacy_groups = {}
+            for pool_name in set(campaign.inputs):
+                seeds = pool_seeds.get(pool_name)
+                if not isinstance(seeds, list) or len(seeds) != len(job_ids):
+                    raise ValueError(f"compact_jobs has no aligned seeds for {pool_name}")
+                seed = int(seeds[position])
+                authoritative = inventory_by_seed.get(pool_name, {}).get(seed)
+                if authoritative is None or authoritative.actual_events is None:
+                    raise ValueError(
+                        f"compact_jobs seed {seed} for {pool_name} is absent or uncounted"
+                    )
+                legacy_seed = 100 + LHE_POOLS[pool_name].seed_offset + legacy_index
+                legacy_groups[pool_name] = str(legacy_seed)
+                pools[pool_name] = {
+                    "path": authoritative.path,
+                    "seed": seed,
+                    "actual_events": int(authoritative.actual_events),
+                    "shuffle_seed": legacy_seed * 1000 + 37,
+                    "legacy_group_id": str(legacy_seed),
+                    "group_id": f"INV{job_id:06d}",
+                }
+            legacy_job = f"JOB{legacy_index:06d}_BLOCK000000"
+            inputs = []
+            rng_seeds = []
+            for slot, (pool_name, mode) in enumerate(zip(campaign.inputs, campaign.shower_modes)):
+                block_index = sum(1 for prior in campaign.inputs[:slot] if prior == pool_name)
+                input_group = f"BLOCK:{pool_name}:{legacy_groups[pool_name]}:{block_index:06d}"
+                inputs.append(input_group)
+                rng_seeds.append(deterministic_seed(
+                    f"{campaign.physics_campaign}|{legacy_job}|source={slot}|{input_group}|{mode}"
+                ))
+            jobs.append({
+                "job_id": job_id,
+                "legacy_outer_index": legacy_index,
+                "pools": pools,
+                "source_rng_seeds": rng_seeds,
+                "mixing_rng_seed": deterministic_seed(
+                    f"{campaign.physics_campaign}|{legacy_job}|shuffle|"
+                    f"{','.join(inputs)}|{','.join(campaign.shower_modes)}"
+                ),
+            })
+        return jobs
+    result: Dict[str, List[Dict[str, object]]] = OrderedDict()
+    for campaign_name in campaign_names:
+        entry = spec_campaigns.get(campaign_name)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Campaign job spec {path} has no jobs for {campaign_name}")
+        raw_jobs = entry.get("jobs")
+        if raw_jobs is None:
+            raw_jobs = expand_compact(campaign_name)
+        if not isinstance(raw_jobs, list) or not raw_jobs:
+            raise ValueError(f"Campaign job spec {path} has no jobs for {campaign_name}")
+        campaign = CAMPAIGNS[campaign_name]
+        if str(entry.get("physics_campaign", "")) != campaign.physics_campaign:
+            raise ValueError(
+                f"{campaign_name}: physics_campaign must be {campaign.physics_campaign}"
+            )
+        required_pools = set(campaign.inputs)
+        jobs: List[Dict[str, object]] = []
+        seen_ids: Set[int] = set()
+        for raw_job in raw_jobs:
+            if not isinstance(raw_job, dict):
+                raise ValueError(f"{campaign_name}: job entries must be objects")
+            job_id = int(raw_job.get("job_id", -1))
+            if job_id < 0 or job_id in seen_ids:
+                raise ValueError(f"{campaign_name}: invalid or duplicate job_id {job_id}")
+            seen_ids.add(job_id)
+            pools = raw_job.get("pools")
+            if not isinstance(pools, dict) or not required_pools.issubset(pools):
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: pools must include {sorted(required_pools)}"
+                )
+            for pool_name in required_pools:
+                source = pools[pool_name]
+                if not isinstance(source, dict):
+                    raise ValueError(f"{campaign_name} job {job_id}: invalid {pool_name} entry")
+                source_path = str(source.get("path", ""))
+                source_seed = int(source.get("seed", -1))
+                source_events = int(source.get("actual_events", 0))
+                if not source_path or source_seed < 0 or source_events <= 0:
+                    raise ValueError(
+                        f"{campaign_name} job {job_id}: incomplete inventory entry for {pool_name}"
+                    )
+                if inventory:
+                    authoritative = inventory_entries.get(pool_name, {}).get(source_path)
+                    if authoritative is None:
+                        raise ValueError(
+                            f"{campaign_name} job {job_id}: {source_path} is absent from inventory"
+                        )
+                    if authoritative.seed != source_seed or authoritative.actual_events != source_events:
+                        raise ValueError(
+                            f"{campaign_name} job {job_id}: seed/count mismatch for {source_path}"
+                        )
+            if (
+                not campaign.aggregate
+                and int(pools["pool_jpsi_CSCO_g"]["seed"]) != job_id
+            ):
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: job_id must equal the authoritative "
+                    "pool_jpsi_CSCO_g inventory seed"
+                )
+            rng_seeds = raw_job.get("source_rng_seeds", [])
+            if not isinstance(rng_seeds, list) or len(rng_seeds) != campaign.n_sources:
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: source_rng_seeds must have "
+                    f"{campaign.n_sources} entries"
+                )
+            if any(int(seed) <= 0 for seed in rng_seeds):
+                raise ValueError(f"{campaign_name} job {job_id}: invalid source RNG seed")
+            if int(raw_job.get("mixing_rng_seed", 0)) <= 0:
+                raise ValueError(f"{campaign_name} job {job_id}: invalid mixing RNG seed")
+            jobs.append(copy.deepcopy(raw_job))
+        result[campaign_name] = jobs
+    return result
 
 
 def check_proxy_valid(proxy_path: str) -> Tuple[bool, Optional[int], Optional[str]]:
@@ -1705,11 +2182,17 @@ def expand_campaign_selection(items: Sequence[str]) -> List[str]:
     for item in items:
         for token in [part.strip() for part in item.split(",") if part.strip()]:
             if token == "ALL":
-                resolved.extend(CAMPAIGNS.keys())
+                resolved.extend(name for name, campaign in CAMPAIGNS.items() if campaign.aggregate)
             elif token == "JJP_ALL":
-                resolved.extend(name for name in CAMPAIGNS if name.startswith("JJP"))
+                resolved.extend(
+                    name for name, campaign in CAMPAIGNS.items()
+                    if name.startswith("JJP") and campaign.aggregate
+                )
             elif token == "JUP_ALL":
-                resolved.extend(name for name in CAMPAIGNS if name.startswith("JUP"))
+                resolved.extend(
+                    name for name, campaign in CAMPAIGNS.items()
+                    if name.startswith("JUP") and campaign.aggregate
+                )
             elif token in CAMPAIGNS:
                 resolved.append(token)
             else:
@@ -2279,6 +2762,10 @@ def prepare_runtime_assets(
     processing_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
         (
+            os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+            "runtime/processing/cmssw_helpers",
+        ),
+        (
             os.path.join(BASE_DIR, "processing", "pythia_shower"),
             "runtime/processing/pythia_shower",
         ),
@@ -2357,6 +2844,10 @@ def prepare_runtime_assets(
 
         ntuple_items: List[Tuple[str, str]] = [
             (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
+            (
+                os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+                "runtime/processing/cmssw_helpers",
+            ),
             (
                 os.path.join(BASE_DIR, "common", "cmssw_configs"),
                 "runtime/common/cmssw_configs",
@@ -2463,6 +2954,10 @@ def prepare_ntuple_only_assets(
     ntuple_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
         (
+            os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+            "runtime/processing/cmssw_helpers",
+        ),
+        (
             os.path.join(BASE_DIR, "common", "cmssw_configs"),
             "runtime/common/cmssw_configs",
         ),
@@ -2499,6 +2994,7 @@ class DAGBuilder:
         self.generated_specs_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_planners_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_group_planners_by_pool: Dict[str, Dict[str, str]] = OrderedDict()
+        self.generated_spec_planners: Dict[Tuple[str, int], Tuple[str, Dict[str, object]]] = {}
         self.generated_lhe_groups_by_pool: Dict[str, List[LHEGroup]] = OrderedDict()
         self.allocations_by_pool: Dict[str, int] = OrderedDict()
         self.dag_lines: List[str] = []
@@ -2508,6 +3004,8 @@ class DAGBuilder:
             self.options.existing_lhe_inventory,
             allow_incomplete=self.options.allow_incomplete_lhe_inventory,
         )
+        self.campaign_jobs: Dict[str, List[Dict[str, object]]] = {}
+        self.planning_spec: Optional[Dict[str, object]] = None
 
     def write_node_config(
         self,
@@ -2544,10 +3042,10 @@ class DAGBuilder:
 
     def processing_resource_request(self) -> Tuple[str, str, str]:
         if os.environ.get("PREMIX_INPUT_MODE") == "localcache":
-            return "2", "12GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
+            return "2", "6GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
         if self.options.test_mode:
-            return "2", "8GB", "4GB"
-        return "2", "12GB", "8GB"
+            return "2", "6GB", "4GB"
+        return "2", "6GB", "8GB"
 
     def ntuple_resource_request(self, is_ntuple_only: bool = False) -> Tuple[str, str, str]:
         if self.options.test_mode:
@@ -2867,6 +3365,44 @@ class DAGBuilder:
         planners[job_index] = plan_job
         return plan_job
 
+    def _ensure_spec_planning_job(
+        self,
+        pool_name: str,
+        job_record: Dict[str, object],
+    ) -> Tuple[str, Dict[str, object]]:
+        """Create one planner from an exact campaign job-spec inventory entry."""
+
+        job_id = int(job_record["job_id"])
+        source = copy.deepcopy(job_record["pools"][pool_name])
+        key = (pool_name, job_id)
+        if key in self.generated_spec_planners:
+            plan_job, previous = self.generated_spec_planners[key]
+            comparable_keys = ("path", "seed", "actual_events", "shuffle_seed")
+            if any(previous.get(name) != source.get(name) for name in comparable_keys):
+                raise ValueError(
+                    f"Conflicting job-spec entries for {pool_name} job_id={job_id}"
+                )
+            return plan_job, copy.deepcopy(previous)
+        seed = int(source["seed"])
+        group_id = str(source.get("group_id") or f"INV{job_id:06d}")
+        shuffle_seed = int(source["shuffle_seed"])
+        plan_job = self.add_planning_job(
+            pool_name,
+            job_id,
+            seed,
+            group_id=group_id,
+            seeds=[seed],
+            lhe_paths=[str(source["path"])],
+            lhe_event_counts=[int(source["actual_events"])],
+            shuffle_seed_override=shuffle_seed,
+        )
+        source["group_id"] = group_id
+        source["manifest_path"] = self._resolve_group_plan_manifest_path(
+            pool_name, group_id
+        )
+        self.generated_spec_planners[key] = (plan_job, source)
+        return plan_job, source
+
     def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
         """Discover and return an LHE file from the exact configured pool directory."""
         storage = pool_storage_name(pool_name)
@@ -3071,6 +3607,9 @@ class DAGBuilder:
         seeds: Optional[List[int]] = None,
         lhe_paths: Optional[List[str]] = None,
         lhe_event_counts: Optional[List[int]] = None,
+        shuffle_seed_override: Optional[int] = None,
+        events_per_block_override: Optional[int] = None,
+        max_events_per_plan_override: Optional[int] = None,
     ) -> str:
         """Emit a per-pool LHE block planner DAG node."""
         pool_label = pool_dag_label(pool_name)
@@ -3086,7 +3625,11 @@ class DAGBuilder:
         else:
             plan_manifest_path = self._resolve_group_plan_manifest_path(pool_name, group_id)
         output_dir = os.path.dirname(plan_manifest_path)
-        shuffle_seed = self.options.lhe_shuffle_seed_base or (seed * 1000 + 37)
+        shuffle_seed = (
+            shuffle_seed_override
+            if shuffle_seed_override is not None
+            else self.options.lhe_shuffle_seed_base or (seed * 1000 + 37)
+        )
         plan_config = {
             "pool_name": pool_name,
             "group_id": group_id,
@@ -3095,8 +3638,16 @@ class DAGBuilder:
             "lhe_paths": lhe_paths,
             "lhe_event_counts": lhe_event_counts,
             "output_dir": output_dir,
-            "events_per_block": self.options.lhe_events_per_block,
-            "max_events_per_plan": self.options.lhe_max_events_per_plan,
+            "events_per_block": (
+                events_per_block_override
+                if events_per_block_override is not None
+                else self.options.lhe_events_per_block
+            ),
+            "max_events_per_plan": (
+                max_events_per_plan_override
+                if max_events_per_plan_override is not None
+                else self.options.lhe_max_events_per_plan
+            ),
             "shuffle_seed": shuffle_seed,
             "shuffle_mode": self.options.lhe_shuffle_mode,
             "n_strata": self.options.lhe_n_strata,
@@ -3150,6 +3701,10 @@ class DAGBuilder:
         job_index: int,
         source_infos: List[object],
         campaign_inputs: Tuple[str, ...],
+        job_record: Optional[Dict[str, object]] = None,
+        source_lhe_budgets: Optional[List[int]] = None,
+        processing_start_index: int = 0,
+        max_processing_nodes: int = 0,
     ) -> str:
         """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
         campaign = CAMPAIGNS[campaign_name]
@@ -3209,6 +3764,7 @@ class DAGBuilder:
             "campaign": campaign_name,
             "job_index": job_index,
             "source_manifests_path": source_manifests_path,
+            "source_manifests": source_manifest_entries,
             "shower_modes": list(campaign.shower_modes),
             "campaign_inputs": list(campaign_inputs),
             "analysis_type": campaign.analysis_type,
@@ -3219,6 +3775,17 @@ class DAGBuilder:
             "phi_max_lhe_events": self.options.phi_max_lhe_events,
             "phi_max_hadronization_retries": self.options.phi_max_hadronization_retries,
             "minimum_output_fraction": self.options.minimum_output_fraction,
+            "phi_consumption_mode": self.options.phi_consumption_mode,
+            "normal_shortfall_policy": self.options.normal_shortfall_policy,
+            "unused_hepmc_warning_fraction": (
+                self.options.unused_hepmc_warning_fraction
+            ),
+            "source_lhe_budgets": list(source_lhe_budgets or []),
+            "processing_start_index": processing_start_index,
+            "max_processing_nodes": max_processing_nodes,
+            "physics_campaign": campaign.physics_campaign,
+            "source_rng_seeds": list((job_record or {}).get("source_rng_seeds", [])),
+            "mixing_rng_seed": int((job_record or {}).get("mixing_rng_seed", 0) or 0),
             "enable_ntuple": self.options.enable_ntuple and not self.options.machine_env.uses_local_storage,
             "efficiency_ntuple": self.options.efficiency_ntuple,
             "cleanup": self.options.cleanup,
@@ -3326,13 +3893,20 @@ class DAGBuilder:
             f"SUBDAG EXTERNAL {subdag_name} {subdag_path}"
         )
         if self.options.archive_subdag_logs:
+            archive_script = os.path.join(
+                self.output_dir,
+                "runtime_scripts",
+                os.path.basename(SUBDAG_LOG_ARCHIVE_SCRIPT),
+            )
+            ensure_dir(os.path.dirname(archive_script))
+            shutil.copy2(SUBDAG_LOG_ARCHIVE_SCRIPT, archive_script)
             self.dag_lines.append(
                 "SCRIPT POST {node} {script} "
                 "--campaign {campaign} --job-index {job_index} "
                 "--log-root {log_root} --target-eos-base {target} "
                 "--proxy-bundle {proxy_bundle}".format(
                     node=subdag_name,
-                    script=dag_escape(SUBDAG_LOG_ARCHIVE_SCRIPT),
+                    script=dag_escape(archive_script),
                     campaign=dag_escape(campaign_name),
                     job_index=dag_escape(job_index),
                     log_root=dag_escape(self.options.log_root),
@@ -3344,16 +3918,167 @@ class DAGBuilder:
             )
         return subdag_name
 
+    def _build_planning_spec_v2(
+        self,
+        campaign_names: Sequence[str],
+        dag_filename: str,
+        dagman_config_path: str,
+    ) -> str:
+        """Emit planners and deterministic processing shards from a v2 spec."""
+
+        assert self.planning_spec is not None
+        planning = self.planning_spec["planning"]
+        layout_id = str(planning["layout_id"])
+        block_events = int(planning["block_events"])
+        shard_nodes = int(planning["shard_processing_nodes"])
+        source_infos: List[Dict[str, object]] = []
+        planner_nodes: List[Tuple[str, str]] = []
+
+        for pool_name, records in self.planning_spec["selected_inventory"].items():
+            for record_index, record in enumerate(records):
+                seed = int(record["seed"])
+                group_id = f"{layout_id}_{pool_dag_label(pool_name)}_{seed}"
+                shuffle_seed = deterministic_seed(
+                    f"{layout_id}|{pool_name}|{seed}|block-shuffle"
+                )
+                planner = self.add_planning_job(
+                    pool_name,
+                    record_index,
+                    seed,
+                    group_id=group_id,
+                    seeds=[seed],
+                    lhe_paths=[str(record["path"])],
+                    lhe_event_counts=[int(record["actual_events"])],
+                    shuffle_seed_override=shuffle_seed,
+                    events_per_block_override=block_events,
+                    max_events_per_plan_override=int(record["planned_events"]),
+                )
+                planner_nodes.append((pool_name, planner))
+                source_infos.append({
+                    "source_id": f"{pool_name}:{group_id}",
+                    "pool": pool_name,
+                    "group_id": group_id,
+                    "primary_seed": seed,
+                    "seed": seed,
+                    "seeds": [seed],
+                    "path": self._resolve_group_plan_manifest_path(
+                        pool_name, group_id
+                    ),
+                })
+
+        processing_jobs: List[str] = []
+        for campaign_name in campaign_names:
+            campaign = CAMPAIGNS[campaign_name]
+            campaign_spec = self.planning_spec["campaigns"][campaign_name]
+            processing_nodes = int(campaign_spec["processing_nodes"])
+            budgets = list(campaign_spec["source_lhe_budgets"])
+            campaign_pools = set(campaign.inputs)
+            campaign_sources = [
+                source for source in source_infos
+                if str(source["pool"]) in campaign_pools
+            ]
+            campaign_planners = [
+                planner for pool, planner in planner_nodes
+                if pool in campaign_pools
+            ]
+            for start_index in range(0, processing_nodes, shard_nodes):
+                shard_index = start_index // shard_nodes
+                node_count = min(shard_nodes, processing_nodes - start_index)
+                coord_job = self.add_coordinator_job(
+                    campaign_name,
+                    shard_index,
+                    campaign_sources,
+                    campaign.inputs,
+                    source_lhe_budgets=budgets,
+                    processing_start_index=start_index,
+                    max_processing_nodes=node_count,
+                )
+                for planner in campaign_planners:
+                    self.dag_lines.append(f"PARENT {planner} CHILD {coord_job}")
+                subdag_name = self.add_block_subdag_node(
+                    campaign_name,
+                    shard_index,
+                    is_single_source=False,
+                )
+                self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                processing_jobs.append(subdag_name)
+
+        if processing_jobs:
+            summary_log_root = self.log_directory("_shared", "summary")
+            self.dag_lines.extend([
+                "",
+                "# -------- 汇总节点 --------",
+                (
+                    "FINAL SUMMARY "
+                    f"{os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}"
+                ),
+                (
+                    "VARS SUMMARY "
+                    f'summary_bundle_path="{dag_escape(self.runtime_assets["summary_bundle_path"])}" '
+                    f'summary_bundle_name="{dag_escape(self.runtime_assets["summary_bundle_name"])}" '
+                    f'log_dir="{dag_escape(self.options.local_log_dir)}" '
+                    f'log_root="{dag_escape(summary_log_root)}"'
+                ),
+            ])
+
+        self.metadata = OrderedDict([
+            ("created_at", datetime.now().isoformat()),
+            ("dag_path", os.path.join(self.output_dir, dag_filename)),
+            ("dagman_config_path", dagman_config_path),
+            ("options", self.options.to_dict()),
+            ("runtime_assets", self.runtime_assets),
+            ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
+            ("campaign_planning_spec", self.planning_spec),
+            ("production_capacity_signals", {
+                "layout_id": layout_id,
+                "block_events": block_events,
+                "selected_source_files": sum(
+                    len(records)
+                    for records in self.planning_spec["selected_inventory"].values()
+                ),
+                "blocks_by_pool": {
+                    pool: sum(int(record["planned_blocks"]) for record in records)
+                    for pool, records in self.planning_spec["selected_inventory"].items()
+                },
+                "campaigns": {
+                    name: {
+                        "available_processing_nodes": cfg["available_processing_nodes"],
+                        "selected_processing_nodes": cfg["processing_nodes"],
+                        "required_blocks_by_pool": cfg["required_blocks_by_pool"],
+                        "expected_events_per_node": cfg["expected_events_per_node"],
+                        "expected_final_events": cfg["expected_final_events"],
+                    }
+                    for name, cfg in self.planning_spec["campaigns"].items()
+                },
+                "storage": self.planning_spec["storage"],
+            }),
+        ])
+        return "\n".join(self.dag_lines)
+
     def build(self, campaign_names: Sequence[str], dag_filename: str) -> str:
         dagman_config_path = os.path.join(self.output_dir, "dagman.config")
         processing_jobs: List[str] = []
+        self.planning_spec = load_campaign_planning_spec(
+            self.options.campaign_job_spec,
+            campaign_names,
+            self.options.existing_lhe_inventory,
+        )
+        self.campaign_jobs = (
+            {}
+            if self.planning_spec is not None
+            else load_campaign_job_spec(
+                self.options.campaign_job_spec,
+                campaign_names,
+                self.options.existing_lhe_inventory,
+            )
+        )
 
         self.dag_lines = [
             "# ================================================",
             "# workbook_v2 MC 生产 DAG",
             f"# 生成时间: {datetime.now().isoformat()}",
             f"# Campaigns: {', '.join(campaign_names)}",
-            f"# 每个 campaign 作业数: {self.options.jobs_per_campaign}",
+            f"# 每个 campaign 作业数: {'job-spec' if self.campaign_jobs else self.options.jobs_per_campaign}",
             f"# 测试模式: {bool_string(self.options.test_mode)}",
             "# ================================================",
             "",
@@ -3372,6 +4097,13 @@ class DAGBuilder:
             if self.options.maxjobs_miniaod_merge > 0:
                 self.dag_lines.append(f"MAXJOBS miniaod_merge {self.options.maxjobs_miniaod_merge}")
         self.dag_lines.append("")
+
+        if self.planning_spec is not None:
+            return self._build_planning_spec_v2(
+                campaign_names,
+                dag_filename,
+                dagman_config_path,
+            )
 
         if (
             self.options.enable_lhe_block_subdags
@@ -3423,7 +4155,44 @@ class DAGBuilder:
             if use_block_subdags and self.options.skip_lhe_generation:
                 # Short-circuit: skip HELAC generation, use existing LHE files.
                 # Planners are deduplicated across campaigns (same pool+index → one node).
-                if self.options.lhe_grouping_enabled:
+                if self.campaign_jobs:
+                    for job_record in self.campaign_jobs[campaign_name]:
+                        job_id = int(job_record["job_id"])
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: Set[str] = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            plan_job, source = self._ensure_spec_planning_job(
+                                pool_name, job_record
+                            )
+                            plan_jobs.append(plan_job)
+                            source_infos.append({
+                                "source_id": f"{pool_name}:{source['group_id']}",
+                                "pool": pool_name,
+                                "group_id": source["group_id"],
+                                "primary_seed": int(source["seed"]),
+                                "seed": int(source["seed"]),
+                                "seeds": [int(source["seed"])],
+                                "path": source["manifest_path"],
+                            })
+                        coord_job = self.add_coordinator_job(
+                            campaign_name,
+                            job_id,
+                            source_infos,
+                            campaign.inputs,
+                            job_record=job_record,
+                        )
+                        for plan_job in plan_jobs:
+                            self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_id, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                elif self.options.lhe_grouping_enabled:
                     for group_index in range(self.options.jobs_per_campaign):
                         plan_jobs = []
                         source_infos = []
@@ -3572,6 +4341,13 @@ class DAGBuilder:
                 ("options", self.options.to_dict()),
                 ("runtime_assets", self.runtime_assets),
                 ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
+                (
+                    "campaign_job_ids",
+                    OrderedDict(
+                        (name, [int(job["job_id"]) for job in self.campaign_jobs.get(name, [])])
+                        for name in campaign_names
+                    ) if self.campaign_jobs else OrderedDict(),
+                ),
                 (
                     "pool_plan",
                     OrderedDict(
@@ -4132,6 +4908,86 @@ def execute_generation(
     options: WorkflowOptions,
     dry_run: bool,
 ) -> int:
+    recovery_campaigns = [name for name in campaign_names if not CAMPAIGNS[name].aggregate]
+    planning_spec = None
+    if options.campaign_job_spec:
+        try:
+            planning_spec = load_campaign_planning_spec(
+                options.campaign_job_spec,
+                campaign_names,
+                options.existing_lhe_inventory,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"Error: invalid campaign planning spec: {exc}", file=sys.stderr)
+            return 1
+    if options.campaign_job_spec and (
+        not options.skip_lhe_generation or not options.enable_lhe_block_subdags
+    ):
+        print(
+            "Error: --campaign-job-spec requires --skip-lhe-generation and "
+            "--enable-lhe-block-subdags",
+            file=sys.stderr,
+        )
+        return 1
+    if recovery_campaigns and not options.campaign_job_spec:
+        print("Error: recovery campaigns require --campaign-job-spec", file=sys.stderr)
+        return 1
+    if recovery_campaigns and options.phi_consumption_mode != "exhaustive":
+        print("Error: recovery campaigns require --phi-consumption-mode exhaustive", file=sys.stderr)
+        return 1
+    if recovery_campaigns and planning_spec is None:
+        recovery_contract = {
+            "--lhe-shuffle-split": options.lhe_shuffle_split is True,
+            "--lhe-events-per-block 350": options.lhe_events_per_block == 350,
+            "--lhe-max-events-per-plan 700": options.lhe_max_events_per_plan == 700,
+            "--lhe-shuffle-mode stratified": options.lhe_shuffle_mode == "stratified",
+            "--lhe-n-strata auto": options.lhe_n_strata == "auto",
+            "keep incomplete final LHE block": (
+                options.lhe_drop_incomplete_last_block is False
+            ),
+            "--normal-max-lhe-events 350": options.normal_max_lhe_events == 350,
+            "--phi-max-lhe-events 350": options.phi_max_lhe_events == 350,
+            "--phi-max-hadronization-retries 5000": (
+                options.phi_max_hadronization_retries == 5000
+            ),
+            "--miniaod-merge-events 5000": options.miniaod_merge_events == 5000,
+            "--miniaod-merge-validation event-count": (
+                options.miniaod_merge_validation == "event-count"
+            ),
+            "--no-shuffle-mixing": options.shuffle_mixing is False,
+            "--normal-shortfall-policy report-and-truncate": (
+                options.normal_shortfall_policy == "report-and-truncate"
+            ),
+            "fixed unused HepMC warning threshold 0.15": (
+                options.unused_hepmc_warning_fraction == 0.15
+            ),
+            "block SubDAG path (no legacy fallback)": (
+                options.keep_legacy_single_processing_path is False
+            ),
+        }
+        invalid_contract = [
+            setting for setting, valid in recovery_contract.items() if not valid
+        ]
+        if invalid_contract:
+            print(
+                "Error: MC_v4_1 recovery contract mismatch: "
+                + ", ".join(invalid_contract),
+                file=sys.stderr,
+            )
+            return 1
+    if options.campaign_job_spec and options.lhe_grouping_enabled:
+        print("Error: --campaign-job-spec is incompatible with LHE grouping", file=sys.stderr)
+        return 1
+    try:
+        if planning_spec is None:
+            load_campaign_job_spec(
+                options.campaign_job_spec,
+                campaign_names,
+                options.existing_lhe_inventory,
+            )
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Error: invalid campaign job spec: {exc}", file=sys.stderr)
+        return 1
     if options.lhe_grouping_enabled and not options.skip_lhe_generation:
         print("Error: --lhe-group-min-events requires --skip-lhe-generation in this implementation", file=sys.stderr)
         return 1
@@ -4603,6 +5459,11 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
     )
     parser.add_argument("--jobs", type=int, default=1, help="每个 campaign 的 job 数。")
+    parser.add_argument(
+        "--campaign-job-spec",
+        default="",
+        help="Authoritative campaign-level job spec; replaces consecutive --jobs generation.",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录。")
     parser.add_argument("--output", default="mc_production.dag", help="输出 DAG 文件名。")
     parser.add_argument(
@@ -4616,6 +5477,21 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--normal-max-lhe-events", type=int, default=110, help="normal source 的默认 LHE 输入预算。")
     parser.add_argument("--phi-max-lhe-events", type=int, default=350, help="phi source 的默认 LHE 输入预算。")
     parser.add_argument("--phi-max-hadronization-retries", type=int, default=5000, help="phi source 每个 LHE 事件的 hadronization retry 上限。")
+    parser.add_argument(
+        "--phi-consumption-mode",
+        choices=("target", "exhaustive"),
+        default="target",
+        help="target keeps the fixed accepted-event target; exhaustive consumes the full phi LHE exposure.",
+    )
+    parser.add_argument(
+        "--normal-shortfall-policy",
+        choices=("fail", "report-and-truncate"),
+        default="fail",
+        help=(
+            "In exhaustive mode, either fail when a normal source misses the "
+            "phi-derived target or report the shortfall and mix the common positive yield."
+        ),
+    )
     parser.add_argument("--minimum-output-fraction", type=float, default=0.8, help="block 接受的最小完成比例；0 表示任何正输出均可。")
     parser.add_argument(
         "--compress-lhe",
@@ -5562,6 +6438,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             phi_max_lhe_events=args.phi_max_lhe_events,
             phi_max_hadronization_retries=args.phi_max_hadronization_retries,
             minimum_output_fraction=args.minimum_output_fraction,
+            phi_consumption_mode=args.phi_consumption_mode,
+            normal_shortfall_policy=args.normal_shortfall_policy,
+            campaign_job_spec=args.campaign_job_spec,
             archive_subdag_logs=args.archive_subdag_logs,
             skip_lhe_generation=args.skip_lhe_generation,
             existing_lhe_base=args.existing_lhe_base,

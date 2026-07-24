@@ -397,7 +397,9 @@ int main(int argc, char* argv[]) {
                 cout << "Reached end of LHE file." << endl;
                 break;
             }
-            if (++iAbort < maxAbort) continue;
+            ++iEvent;
+            ++iAbort;
+            if (targetOutputEvents <= 0 || iAbort < maxAbort) continue;
             cout << "Event generation aborted prematurely!" << endl;
             break;
         }
@@ -489,9 +491,11 @@ int main(int argc, char* argv[]) {
     cout << "======================================================" << endl;
 
     if (!manifestFile.empty()) {
+        bool exhaustive = targetOutputEvents <= 0;
+        bool exposureComplete = nEvents <= 0 || iEvent == nEvents;
         double completion = targetOutputEvents > 0
             ? static_cast<double>(successWithPhi) / max(1, targetOutputEvents)
-            : 1.0;
+            : 0.0;
         ofstream manifest(manifestFile);
         if (!manifest.is_open()) {
             cerr << "Failed to write manifest: " << manifestFile << endl;
@@ -499,8 +503,12 @@ int main(int argc, char* argv[]) {
         }
         manifest << "{\n"
                  << "  \"mode\": \"phi_mpi_off\",\n"
-                 << "  \"target_events\": " << targetOutputEvents << ",\n"
+                 << "  \"consumption_mode\": \"" << (exhaustive ? "exhaustive" : "target") << "\",\n"
+                 << "  \"target_events\": " << (exhaustive ? "null" : to_string(targetOutputEvents)) << ",\n"
                  << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"exposure_target_lhe_events\": " << (exhaustive ? to_string(nEvents) : "null") << ",\n"
+                 << "  \"consumed_lhe_events\": " << iEvent << ",\n"
+                 << "  \"pythia_next_failures\": " << iAbort << ",\n"
                  << "  \"max_hadronization_retries\": " << maxRetry << ",\n"
                  << "  \"attempted_lhe_events\": " << iEvent << ",\n"
                  << "  \"successful_pythia_events\": " << successfulPythiaEvents << ",\n"
@@ -511,9 +519,11 @@ int main(int argc, char* argv[]) {
                  << "  \"average_retries_per_accepted_event\": " << (static_cast<double>(totalRetries) / max(1, successWithPhi)) << ",\n"
                  << "  \"average_retries_per_attempted_event\": " << (static_cast<double>(totalRetries) / max(1, iEvent)) << ",\n"
                  << "  \"wall_time_seconds\": " << wallSeconds << ",\n"
-                 << "  \"completion_fraction\": " << completion << ",\n"
-                 << "  \"complete\": " << (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents ? "true" : "false") << ",\n"
-                 << "  \"status\": \"" << (successWithPhi > 0 ? (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents ? "ok" : "partial") : "failed") << "\",\n"
+                 << "  \"completion_fraction\": " << (exhaustive ? "null" : to_string(completion)) << ",\n"
+                 << "  \"complete\": " << ((exhaustive ? exposureComplete && successWithPhi > 0 : successWithPhi >= targetOutputEvents) ? "true" : "false") << ",\n"
+                 << "  \"status\": \"" << (exhaustive
+                        ? (exposureComplete && successWithPhi > 0 ? "ok" : "failed")
+                        : (successWithPhi > 0 ? (successWithPhi >= targetOutputEvents ? "ok" : "partial") : "failed")) << "\",\n"
                  << "  \"output_file\": \"" << outputFile << "\"\n"
                  << "}\n";
     }

@@ -126,9 +126,21 @@ for key, flag in [
     ("phi_max_lhe_events", "--phi-max-lhe-events"),
     ("phi_max_hadronization_retries", "--phi-max-hadronization-retries"),
     ("minimum_output_fraction", "--minimum-output-fraction"),
+    ("phi_consumption_mode", "--phi-consumption-mode"),
+    ("normal_shortfall_policy", "--normal-shortfall-policy"),
+    ("unused_hepmc_warning_fraction", "--unused-hepmc-warning-fraction"),
+    ("source_lhe_budgets", "--source-lhe-budgets"),
+    ("processing_start_index", "--processing-start-index"),
+    ("max_processing_nodes", "--max-processing-nodes"),
+    ("physics_campaign", "--physics-campaign"),
+    ("source_rng_seeds", "--source-rng-seeds"),
+    ("mixing_rng_seed", "--mixing-rng-seed"),
 ]:
     if cfg.get(key) not in (None, ""):
-        cmd.extend([flag, str(cfg[key])])
+        value = cfg[key]
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, separators=(",", ":"))
+        cmd.extend([flag, str(value)])
 if cfg.get("enable_ntuple", False):
     cmd.append("--enable-ntuple")
 if cfg.get("efficiency_ntuple", False):

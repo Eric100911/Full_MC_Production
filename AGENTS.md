@@ -12,12 +12,32 @@ durable; detailed procedures belong in `docs/testing.md` and path details in
   MiniAOD; ntuple is usually a separate DAG node.
 - `tools/plan_lhe_blocks.py` and `tools/coordinate_lhe_blocks.py` implement the
   LHE block planner/coordinator and generated block SubDAGs.
+- Exact counted LHE inventories, together with versioned specs under
+  `common/campaign_job_specs/`, are authoritative for inventory-driven
+  campaigns; preserve their checksums and selected source IDs.
+- `tools/dag_progress.py` reports live and completed progress for nested DAGMan
+  and block SubDAG workflows.
 - Shared storage paths and processing defaults live in
   `common/node_config_defaults.json`.
 - Campaign CMSSW configs live under `common/cmssw_configs/`.
 - The upstream ntuple analyzer is the `external/TPS-Onia2MuMu` submodule; use
   the prebuilt `common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz` when
   available.
+
+## Repository Skills
+
+Repository skill sources live under `skills/`. Explicit `$skill-name`
+invocation may not be available, so read the matching `SKILL.md` directly when
+the task matches:
+
+- Use `skills/cms-ihep-condor-pilot/SKILL.md` to generate, rerun, and validate
+  Full_MC_Production pilots.
+- Use `skills/cms-condor-job-operator/SKILL.md` for `myschedd bump`, DAGMan
+  progress, idle/held triage, transfer audits, rescue, recovery, and removal.
+- Use `skills/cms-lhe-capacity-planner/SKILL.md` for inventory-based source
+  ratios, utilization, block capacity, and retained-storage estimates.
+- Pilot operations must reuse the Condor skill for live queue inspection and
+  mutations.
 
 ## Development Commands
 
@@ -78,8 +98,10 @@ For code changes, run at minimum:
 
 ```bash
 bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
-python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py
+python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py tools/dag_progress.py
+python3 -m unittest tests.test_dag_progress
 python3 tests/test_coordinate_lhe_blocks.py
+python3 tests/test_campaign_job_specs.py
 ```
 
 Also run one `generate-test --dry-run` or generated-DAG inspection relevant to
@@ -106,10 +128,24 @@ the changed workflow. If touching:
   `--lhe-events-per-block` values can split the whole full-size source file.
 - Repeated inputs within one subprocess must consume distinct non-overlapping
   blocks. Deterministic shuffling must be preserved.
+- Treat counted inventory events and the campaign job-spec checksum as
+  authoritative. Do not infer event counts from filenames or file sizes, and
+  distinguish selected-inventory capacity from the whole remote pool.
+- Keep HTCondor CPU requests consistent with the CMSSW configuration actually
+  loaded by workers. A 2-CPU processing request requires the relevant CMSSW
+  steps to use the intended two-thread/two-stream settings; verify this in live
+  worker logs.
+- `report-and-truncate` may preserve a valid common mixed-event prefix while
+  reporting source shortfalls. The current 0.15 unused-HepMC threshold is a
+  warning and planning diagnostic, not a hard production target or halt
+  condition.
 - Treat DAGMan queue controls independently:
   `DAGMAN_MAX_JOBS_SUBMITTED`/`DAGMAN_MAX_JOBS_IDLE` bound queue width,
   `DAGMAN_MAX_SUBMITS_PER_INTERVAL` controls batch size, and
   `DAGMAN_SUBMIT_DELAY` adds per-node delay.
+- Record the schedd and top DAGMan cluster ID together. Query progress from
+  that root ID on the recorded schedd rather than using a recent time window;
+  completed jobs normally leave the live `condor_q` total.
 - Before removing or forcing a DAG, inspect completed nodes, active children,
   deterministic outputs, and rescue files. Prefer rescue/recovery resubmission.
 - Verify operational changes in live DAGMan and worker logs; generated configs
