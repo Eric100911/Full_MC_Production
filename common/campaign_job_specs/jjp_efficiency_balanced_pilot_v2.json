@@ -43,7 +43,7 @@
   "storage": {
     "warning_bytes": 4000000000000,
     "hard_limit_bytes": 5000000000000,
-    "bytes_per_final_event": 100000,
+    "bytes_per_final_event": 90000,
     "existing_retained_bytes": 0
   },
   "campaigns": {
