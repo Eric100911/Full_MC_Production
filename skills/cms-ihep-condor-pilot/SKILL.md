@@ -138,8 +138,8 @@ After completion, verify:
 - event counts come from the appropriate product-aware tool, not filenames;
 - `report-and-truncate` warnings and unused-source accounting are present when
   exercised;
-- stdout, stderr, worker logs, POST logs, and final inventory are transferred
-  or their absence is explicitly reported;
+- stdout, stderr, worker logs, top-level FINAL archive status, and final
+  inventory are transferred or their absence is explicitly reported;
 - source files and repeated source slots consumed distinct planned blocks.
 
 For source-efficiency and LHE-budget conclusions, use the sibling

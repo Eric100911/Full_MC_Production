@@ -160,6 +160,18 @@ def annotate_actual_counts(blocks):
     return annotated
 
 
+def processing_manifest_is_eligible(payload):
+    if not isinstance(payload, dict) or payload.get("failure_reason"):
+        return False
+    if payload.get("status") == "ok":
+        return True
+    return (
+        payload.get("status") == "partial"
+        and payload.get("merge_eligible") is True
+        and int(payload.get("actual_miniaod_events") or 0) > 0
+    )
+
+
 def main():
     cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     output_url = cfg["output_url"]
@@ -170,12 +182,27 @@ def main():
     missing_blocks = [item["block_index"] for item in blocks if not item["miniaod_url_stat"]["exists"]]
     missing_processing_manifests = [
         item["block_index"] for item in blocks
-        if not isinstance(item.get("processing_manifest"), dict)
-        or item["processing_manifest"].get("status") != "ok"
+        if not processing_manifest_is_eligible(item.get("processing_manifest"))
+    ]
+    partial_processing_manifests = [
+        item["block_index"] for item in blocks
+        if isinstance(item.get("processing_manifest"), dict)
+        and item["processing_manifest"].get("status") == "partial"
+        and processing_manifest_is_eligible(item["processing_manifest"])
     ]
     missing_merges = [item["merge_index"] for item in merge_groups if not item["merged_miniaod_url_stat"]["exists"]]
     missing_ntuples = [item["job_id"] for item in ntuples if not item["ntuple_url_stat"]["exists"]]
-    status = "ok" if not missing_blocks and not missing_processing_manifests and not missing_merges and not missing_ntuples else "partial"
+    audit_passed = not (
+        missing_blocks
+        or missing_processing_manifests
+        or missing_merges
+        or missing_ntuples
+    )
+    status = (
+        "partial" if partial_processing_manifests or not audit_passed
+        else "ok" if audit_passed
+        else "partial"
+    )
 
     cleanup = {
         "requested": bool(cfg.get("cleanup_components", False)),
@@ -183,7 +210,7 @@ def main():
         "removed_component_miniaods": [],
         "post_cleanup_missing": [],
     }
-    if cleanup["requested"] and status == "ok":
+    if cleanup["requested"] and audit_passed:
         for item in blocks:
             remove_url(item["miniaod_url"])
             cleanup["removed_component_miniaods"].append(item["miniaod_url"])
@@ -206,6 +233,8 @@ def main():
         "expected_blocks": len(blocks),
         "missing_blocks": missing_blocks,
         "missing_processing_manifests": missing_processing_manifests,
+        "partial_processing_manifests": partial_processing_manifests,
+        "audit_passed": audit_passed,
         "actual_miniaod_events": sum(
             int(item.get("actual_miniaod_events") or 0) for item in blocks
         ),
@@ -228,7 +257,7 @@ def main():
         stage_out(local, output_url)
     finally:
         local.unlink(missing_ok=True)
-    if status != "ok":
+    if not audit_passed or status == "cleanup_failed":
         raise SystemExit(f"final retained-output audit failed with status={status}")
 
 

@@ -33,6 +33,11 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
 - **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, consumes non-overlapping blocks to satisfy per-source LHE budgets, assigns deterministic EDM EventIDs, and generates `blocks_processing.dag` SubDAGs.
 - **`tools/compile_node_config.py`** — Config compiler/validator for fully expanded per-pool LHE paths. Validation happens before submission, never through worker-side layout guessing.
+- **`tools/dag_progress.py`** — HTCondor DAG progress visualizer for nested DAGMan and block SubDAG workflows (adaptive/full/collapsed topology from a root cluster ID on a recorded schedd).
+- **`tools/allocate_campaign_shards.py`** — Post-planner `ALLOCATE_CAMPAIGN_SHARDS` worker: scans the shared planner-manifest index once and writes `plan_subdags/campaign_shard_allocation.json`; every coordinator reads its own shard cursor from that file.
+- **`tools/migrate_cap700_job_spec.py`** — Migration helper for campaign job specs (e.g. cap700 production job-spec conversion).
+- **`tools/review_phase2_shower_efficiency.py`** — Phase-2 shower-efficiency review: joins coordinator manifests, generated processing configs, and staged processing sidecars for a completed pilot.
+- **`common/campaign_job_specs/`** — Versioned campaign job specs (`jjp_efficiency_balanced_pilot_v2.json`, `jjp_efficiency_balanced_full_v2.json`, etc.) that freeze counted-inventory hashes, selected source IDs, block layout, source efficiencies, budgets, and storage limits for inventory-driven campaigns.
 - **`processing/run_chain.sh`** — Worker-side processing chain: shower → mix → CMSSW steps → optional ntuple → stage-out. Recompiles Pythia shower tools on the worker to avoid glibc/ABI mismatches.
 - **`processing/pythia_shower/`** — C++ Pythia8+HepMC3 shower tools (`shower_normal.cc`, `shower_phi.cc`, `shower_sps.cc`, `event_mixer_multisource.cc`) with a Makefile.
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type. Templates use wrapper scripts rather than inline bash.
@@ -45,6 +50,18 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred for ntuple).
 - **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus legacy component-level test scripts.
 - **`tools/`** — Utilities: `check_gensim_vtxsmeared_config.py`, `summarize_helac_finished.py`, `compress_existing_lhe.py` (backfill LHE compression), `run_compress_lhe.sh` (batch compression worker wrapper).
+
+### Repository skills
+
+Skill sources live under `skills/`. Explicit `$skill-name` invocation may not be
+available, so read the matching `SKILL.md` directly when the task matches:
+
+- **`skills/cms-ihep-condor-pilot/SKILL.md`** — Generate, submit, rerun, and validate small Full_MC_Production pilot DAGs; pilot-specific output and event-accounting acceptance. Delegates schedd/Condor operations to the job-operator skill.
+- **`skills/cms-condor-job-operator/SKILL.md`** — Inspect, triage, audit, and safely operate HTCondor/DAGMan jobs: `myschedd bump`, DAG progress by cluster ID, idle/held/eviction triage, transfer audits, rescue/recovery, and removal. One-shot snapshots use `skills/cms-condor-job-operator/scripts/dag_snapshot.py <dag-cluster> --schedd <schedd>`.
+- **`skills/cms-lhe-capacity-planner/SKILL.md`** — Plan source ratios, per-source LHE budgets, block sizes, processing-node counts, and retained-storage estimates from counted inventory event counts and pilot efficiency measurements. The current unused-HepMC threshold of 0.15 is a diagnostic, not a hard target.
+
+Pilot operations must reuse the Condor skill for live queue inspection and
+mutations.
 
 ### Machine environments
 
@@ -78,6 +95,8 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Each block stages `processing_manifest_<campaign>_<job_id>.json` beside its MiniAOD. MiniAOD merge validation prefers actual event counts from these sidecars over static estimates.
 - Block workflow DAG categories: `lhe_planning`, `lhe_coordination`, `block_processing`, and optional `miniaod_merge`; ntuple nodes retain the `ntuple` category.
 - The `--filename-prefix` option on `lhe_shuffle_split` allows seed-specific block filenames (e.g. `100_block_000000.lhe`).
+- Inventory-driven v2 campaigns are authoritative from counted inventories and versioned job specs: exact counted LHE inventories plus `common/campaign_job_specs/*.json` freeze the inventory checksum, selected source IDs, block layout, source efficiencies, budgets, capacity limits, and storage estimate. Preserve checksums and selected source IDs; do not infer event counts from filenames or file sizes.
+- In inventory-driven production, pre-generation block counts are capacity estimates only; stratified splitting can create partial tail blocks, so exact cross-campaign/shard boundaries are computed after all planners finish. `ALLOCATE_CAMPAIGN_SHARDS` writes `plan_subdags/campaign_shard_allocation.json`; coordinators read a shard cursor from it instead of embedding a `source_manifests` array.
 - Storage configuration is centralized in `common/node_config_defaults.json` (EOS host, path base, pool subdirectory mappings). Runtime scripts read this via the JSON config pattern (`write_node_config()` in dag_generator.py). The constants `EOS_HOST`, `EOS_PATH_BASE`, `EOS_BASE`, `CHIW_EOS_OUTPUT_BASE` in `dag_generator.py` derive from this file.
 - Existing LHE pools use exact `lhe_pool_directories.<pool>.path` values with the explicit IHEP `:1094` endpoint. DAG generation copies the mapping into every relevant node config. `EOS:<pool>:...` resolution lists only that exact directory and fails if it is missing or empty.
 - `TARGET_EOS_BASE` environment variable overrides the default EOS base in all worker scripts (`run_chain.sh`, `run_helac.sh`). Set via `--target-base-url` in dag_generator.py CLI, which flows through submit template VARS → wrapper script → environment.
@@ -113,6 +132,13 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Full JJP production must explicitly include TPS through `JJP_ALL`. The
   `JpsiJpsiPhi_MC_Production_v4` MiniAOD and ntuple products belong under
   `/store/user/chiw/JpsiJpsiPhi_MC_Production_v4/`.
+- Record the schedd and top DAGMan cluster ID together (`myschedd show` right
+  before `condor_submit_dag`). Query progress from that root ID on the recorded
+  schedd rather than by a recent time window; completed jobs normally leave the
+  live `condor_q` total.
+- `report-and-truncate` may preserve a valid common mixed-event prefix while
+  reporting source shortfalls. The 0.15 unused-HepMC threshold is a warning and
+  planning diagnostic, not a hard production target or halt condition.
 - DAGMan throttles have separate meanings:
   `DAGMAN_MAX_JOBS_SUBMITTED`/`DAGMAN_MAX_JOBS_IDLE` bound queue width,
   `DAGMAN_MAX_SUBMITS_PER_INTERVAL` controls submission batches, and
@@ -290,8 +316,11 @@ valid only from an actual CMSSW project `src` directory.
 
 ```bash
 bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
-python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py
+python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py tools/dag_progress.py
+python3 -m unittest tests.test_dag_progress
 python3 tests/test_coordinate_lhe_blocks.py
+python3 tests/test_campaign_job_specs.py
+python3 tests/test_lhe_planner_cap_generation.py
 ```
 
 Also run one `generate-test --dry-run` or generated-DAG inspection relevant to
@@ -342,6 +371,14 @@ cd processing/pythia_shower && make -B all
 ```bash
 condor_submit_dag tests/generated/smoke/smoke.dag
 condor_q
+
+# One-shot DAG progress snapshot (recorded schedd + root DAGMan cluster ID)
+python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py \
+  <dag-cluster> --schedd <schedd>
+
+# Collapsed progress view including nested block SubDAG workers
+./tools/dag_progress.py <dag-cluster> \
+  --schedd <schedd> --structure=collapsed
 ```
 
 ## Coding Conventions

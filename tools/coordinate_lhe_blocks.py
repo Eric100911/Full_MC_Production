@@ -40,8 +40,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-source LHE block coordinator")
     p.add_argument("--campaign", required=True)
     p.add_argument("--job-index", type=int, required=True)
-    p.add_argument("--source-manifests", required=True,
-                   help="JSON string: [{'pool':'A','seed':100,'path':'...'}, ...]")
+    source_manifests = p.add_mutually_exclusive_group(required=True)
+    source_manifests.add_argument(
+        "--source-manifests",
+        help="JSON string: [{'pool':'A','seed':100,'path':'...'}, ...]",
+    )
+    source_manifests.add_argument(
+        "--source-manifests-file",
+        help="JSON file containing the source manifest list",
+    )
     p.add_argument("--shower-modes", required=True, help="Comma-separated shower modes")
     p.add_argument("--campaign-inputs", required=True,
                    help="Comma-separated campaign input pool names (with duplicates)")
@@ -68,10 +75,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--source-lhe-budgets", default="[]",
                    help="JSON list with one LHE-event budget per campaign source slot")
+    p.add_argument("--pool-start-blocks", default="{}",
+                   help="JSON pool-to-block cursor map for exclusive campaign allocation")
     p.add_argument("--processing-start-index", type=int, default=0,
                    help="First node in the deterministic global pool stream")
     p.add_argument("--max-processing-nodes", type=int, default=0,
                    help="Maximum nodes emitted by this shard; 0 emits the remainder")
+    p.add_argument(
+        "--allocation-manifest",
+        default="",
+        help="Authoritative campaign/shard allocation manifest",
+    )
+    p.add_argument(
+        "--allocation-shard-index",
+        type=int,
+        default=-1,
+        help="Shard index to load from --allocation-manifest",
+    )
     p.add_argument("--physics-campaign", default="")
     p.add_argument("--source-rng-seeds", default="[]")
     p.add_argument("--mixing-rng-seed", type=int, default=0)
@@ -289,15 +309,20 @@ def main() -> int:
 
     # --- 1. Parse source manifests ---
     try:
-        source_infos = json.loads(args.source_manifests)
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Invalid --source-manifests JSON: {e}", file=sys.stderr)
+        if args.source_manifests_file:
+            with open(args.source_manifests_file, "r", encoding="utf-8") as handle:
+                source_infos = json.load(handle)
+        else:
+            source_infos = json.loads(args.source_manifests)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[ERROR] Invalid source manifests: {e}", file=sys.stderr)
         return 1
     try:
         storage_config = json.loads(args.storage_config)
         processing_environment_config = json.loads(args.processing_environment_config)
         source_rng_seeds = json.loads(args.source_rng_seeds)
         source_lhe_budgets = json.loads(args.source_lhe_budgets)
+        pool_start_blocks = json.loads(args.pool_start_blocks)
     except json.JSONDecodeError as e:
         print(f"[ERROR] Invalid node config JSON: {e}", file=sys.stderr)
         return 1
@@ -310,6 +335,57 @@ def main() -> int:
     if not isinstance(source_rng_seeds, list) or not isinstance(source_lhe_budgets, list):
         print("[ERROR] source RNG seeds and LHE budgets must be JSON lists", file=sys.stderr)
         return 1
+    if not isinstance(pool_start_blocks, dict):
+        print("[ERROR] --pool-start-blocks must be a JSON object", file=sys.stderr)
+        return 1
+    try:
+        pool_start_blocks = {
+            str(pool): int(cursor)
+            for pool, cursor in pool_start_blocks.items()
+        }
+    except (TypeError, ValueError):
+        print("[ERROR] --pool-start-blocks values must be integers", file=sys.stderr)
+        return 1
+    if any(cursor < 0 for cursor in pool_start_blocks.values()):
+        print("[ERROR] --pool-start-blocks values must be non-negative", file=sys.stderr)
+        return 1
+    allocation_record = None
+    if args.allocation_manifest:
+        if args.allocation_shard_index < 0:
+            print(
+                "[ERROR] --allocation-shard-index is required with "
+                "--allocation-manifest",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            with open(args.allocation_manifest, "r", encoding="utf-8") as handle:
+                allocation = json.load(handle)
+            campaign_allocation = allocation["campaigns"][args.campaign]
+            shards = campaign_allocation["shards"]
+            allocation_record = next(
+                shard
+                for shard in shards
+                if int(shard["shard_index"]) == args.allocation_shard_index
+            )
+            pool_start_blocks = {
+                str(pool): int(cursor)
+                for pool, cursor
+                in allocation_record["pool_start_blocks"].items()
+            }
+            args.processing_start_index = 0
+            args.max_processing_nodes = int(allocation_record["node_count"])
+        except (OSError, json.JSONDecodeError, KeyError, StopIteration, TypeError, ValueError) as e:
+            print(f"[ERROR] Invalid shard allocation: {e}", file=sys.stderr)
+            return 1
+        if args.max_processing_nodes <= 0:
+            print("[ERROR] Allocated shard contains no processing nodes", file=sys.stderr)
+            return 1
+        print(
+            f"[INFO] Loaded authoritative allocation for {args.campaign} "
+            f"shard {args.allocation_shard_index}: "
+            f"{args.max_processing_nodes} nodes, starts={pool_start_blocks}"
+        )
     if not 0.0 <= args.unused_hepmc_warning_fraction < 1.0:
         print(
             "[ERROR] unused HepMC warning fraction must satisfy 0 <= warning < 1",
@@ -403,8 +479,24 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    unknown_start_pools = sorted(set(pool_start_blocks) - set(pool_lookup))
+    if unknown_start_pools:
+        print(
+            "[ERROR] --pool-start-blocks references missing pools: "
+            + ",".join(unknown_start_pools),
+            file=sys.stderr,
+        )
+        return 1
 
     n_blocks_by_pool = {pool: len(source["blocks"]) for pool, source in pool_lookup.items()}
+    for pool_name, cursor in pool_start_blocks.items():
+        if cursor > n_blocks_by_pool[pool_name]:
+            print(
+                f"[ERROR] --pool-start-blocks cursor {cursor} exceeds "
+                f"{pool_name} capacity {n_blocks_by_pool[pool_name]}",
+                file=sys.stderr,
+            )
+            return 1
     input_multiplicity = Counter(campaign_inputs)
 
     source_templates = []
@@ -431,9 +523,12 @@ def main() -> int:
             "rng_seed": int(source_rng_seeds[slot]) if source_rng_seeds else 0,
         })
 
-    pool_cursors = defaultdict(int)
+    pool_cursors = defaultdict(int, pool_start_blocks)
     mixed_source_slots = []
-    while True:
+    build_limit = None
+    if args.max_processing_nodes:
+        build_limit = args.processing_start_index + args.max_processing_nodes
+    while build_limit is None or len(mixed_source_slots) < build_limit:
         block_sources = []
         next_cursors = dict(pool_cursors)
         can_build = True
@@ -994,6 +1089,15 @@ def main() -> int:
         "normal_shortfall_policy": args.normal_shortfall_policy,
         "unused_hepmc_warning_fraction": args.unused_hepmc_warning_fraction,
         "source_lhe_budgets": [int(value) for value in source_lhe_budgets],
+        "pool_start_blocks": pool_start_blocks,
+        "allocation": {
+            "manifest_path": args.allocation_manifest,
+            "shard_index": (
+                args.allocation_shard_index
+                if args.allocation_manifest else None
+            ),
+            "record": allocation_record,
+        },
         "global_processing_nodes": total_mixed,
         "processing_start_index": args.processing_start_index,
         "processing_stop_index": shard_stop,

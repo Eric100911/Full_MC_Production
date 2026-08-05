@@ -110,12 +110,20 @@ echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 
 echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
 python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
+python3 "${SCRIPT_DIR}/test_allocate_campaign_shards.py"
+python3 "${SCRIPT_DIR}/test_coordinate_wrapper_large_manifest.py"
 
 echo "[INFO] 检查 exposure recovery 的非连续 inventory job spec"
 python3 "${SCRIPT_DIR}/test_campaign_job_specs.py"
 
 echo "[INFO] 检查 CMSSW worker entrypoints 与 runtime bundle"
 "${SCRIPT_DIR}/test_cmssw_helpers.sh"
+
+echo "[INFO] 检查 worker 命令日志封装的退出码传播"
+"${SCRIPT_DIR}/test_run_logged_status.sh"
+"${SCRIPT_DIR}/test_stage_out_verification.sh"
+"${SCRIPT_DIR}/test_stageout_recovery.sh"
+"${SCRIPT_DIR}/test_processing_recovery_fallback.sh"
 
 echo "[INFO] 检查 existing-LHE generate-test 的 planner 事件上限"
 python3 "${SCRIPT_DIR}/test_lhe_planner_cap_generation.py"
@@ -128,6 +136,11 @@ python3 "${SCRIPT_DIR}/test_condor_lhe_inventory.py"
 
 echo "[INFO] 检查 block SubDAG final inventory 与日志归档 mock"
 "${SCRIPT_DIR}/test_subdag_final_and_archive.sh"
+"${SCRIPT_DIR}/test_miniaod_merge_partial.sh"
+
+echo "[INFO] 检查顶层 FINAL worker 日志归档"
+python3 "${SCRIPT_DIR}/test_workflow_log_archive.py"
+python3 "${SCRIPT_DIR}/test_summary_final_status.py"
 
 echo "[INFO] 检查 DAGMan 提交批次配置"
 python3 "${SCRIPT_DIR}/test_dagman_config.py"

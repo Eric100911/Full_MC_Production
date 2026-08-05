@@ -32,6 +32,7 @@ echo "Running coordinate_lhe_blocks.py..."
 cd runtime/tools
 if ! python3 - "${CONFIG_PATH}" <<'PY'
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -74,15 +75,22 @@ if missing:
 
 if "source_manifests" in cfg:
     source_manifests = cfg["source_manifests"]
+    runtime_manifest_path = Path.cwd() / "source_manifests.runtime.json"
+    runtime_manifest_path.write_text(
+        json.dumps(source_manifests, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    source_manifests_path = str(runtime_manifest_path)
 else:
-    manifest_path = cfg.get("source_manifests_path")
-    if not manifest_path:
+    source_manifests_path = cfg.get("source_manifests_path")
+    if not source_manifests_path:
         raise SystemExit("Missing coordinator config key: source_manifests_path")
-    with open(manifest_path, "r", encoding="utf-8") as handle:
-        source_manifests = json.load(handle)
+    source_manifests_path = str(source_manifests_path)
 
+with open(source_manifests_path, "r", encoding="utf-8") as handle:
+    source_manifests = json.load(handle)
 if not isinstance(source_manifests, list) or not source_manifests:
-    raise SystemExit("Coordinator source manifests must be a non-empty list")
+    raise SystemExit("Coordinator source manifests file must contain a non-empty list")
 if not isinstance(cfg["shower_modes"], list) or not cfg["shower_modes"]:
     raise SystemExit("Coordinator config key shower_modes must be a non-empty list")
 if not isinstance(cfg["campaign_inputs"], list) or not cfg["campaign_inputs"]:
@@ -93,7 +101,7 @@ cmd = [
     "coordinate_lhe_blocks.py",
     "--campaign", str(cfg["campaign"]),
     "--job-index", str(cfg["job_index"]),
-    "--source-manifests", json.dumps(source_manifests, separators=(",", ":")),
+    "--source-manifests-file", source_manifests_path,
     "--shower-modes", ",".join(str(item) for item in cfg["shower_modes"]),
     "--campaign-inputs", ",".join(str(item) for item in cfg["campaign_inputs"]),
     "--analysis-type", str(cfg["analysis_type"]),
@@ -130,8 +138,11 @@ for key, flag in [
     ("normal_shortfall_policy", "--normal-shortfall-policy"),
     ("unused_hepmc_warning_fraction", "--unused-hepmc-warning-fraction"),
     ("source_lhe_budgets", "--source-lhe-budgets"),
+    ("pool_start_blocks", "--pool-start-blocks"),
     ("processing_start_index", "--processing-start-index"),
     ("max_processing_nodes", "--max-processing-nodes"),
+    ("allocation_manifest_path", "--allocation-manifest"),
+    ("allocation_shard_index", "--allocation-shard-index"),
     ("physics_campaign", "--physics-campaign"),
     ("source_rng_seeds", "--source-rng-seeds"),
     ("mixing_rng_seed", "--mixing-rng-seed"),

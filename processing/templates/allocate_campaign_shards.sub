@@ -1,0 +1,27 @@
+Universe = vanilla
+
+Executable = $(allocation_wrapper_path)
+transfer_executable = True
+Arguments = "$(coord_bundle_name) $(config_name)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+Transfer_Input_Files = $(coord_bundle_path), $(config_path)
+transfer_output_files =
+
+Output = $(log_root)/allocation_$(Cluster)_$(Process).stdout
+Error  = $(log_root)/allocation_$(Cluster)_$(Process).stderr
+Log    = $(log_root)/allocation_$(Cluster).log
+
+request_cpus   = 1
+request_memory = 2GB
+request_disk   = 5GB
+
++MaxRuntime = 86400
+
+OnExitHold = (ExitCode != 0)
+OnExitHoldReason = "Campaign shard allocation failed"
+OnExitHoldSubCode = 1
+PeriodicRelease = (JobRunCount < 2) && (HoldReasonCode == 3)
+
+Queue 1

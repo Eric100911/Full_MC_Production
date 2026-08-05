@@ -222,9 +222,10 @@ run_logged() {
         stderr_size=$(wc -c < "${stderr_log}" 2>/dev/null || echo 0)
         msg_info "${label} 完成 (stdout=${stdout_size} B, stderr=${stderr_size} B)"
         return 0
+    else
+        rc=$?
     fi
 
-    rc=$?
     msg_error "${label} 失败 (rc=${rc})"
     show_log_tail "${label} stderr" "${stderr_log}" 80 >&2
     show_log_tail "${label} stdout" "${stdout_log}" 40

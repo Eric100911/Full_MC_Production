@@ -254,10 +254,41 @@ After the pilot, recompute the normal:phi ratio from measured efficiencies and
 freeze the accepted values and inventory/layout hash in the production v2
 spec.
 
-Generated MiniAOD merge nodes request one CPU and 3 GB memory. Submit-side log
-archival uses a copy of `archive_subdag_logs.sh` snapshotted under the generated
-output directory. This prevents edits to the repository helper from changing
-the POST behavior of an in-flight DAG.
+Generated MiniAOD merge nodes request one CPU and 3 GB memory. With
+`--archive-subdag-logs`, the existing top-level `FINAL SUMMARY` becomes a
+one-CPU EL9 worker that scans the configured `log_root`, groups the
+`processing`, `miniaod_merge`, `ntuple`, and `final` logs by campaign/job, and
+uploads one structured archive plus manifest for each group. The helper is
+snapshotted in `summary_runtime_bundle.tar.gz`; no network or credential work
+runs as a DAGMan POST script on the schedd.
+
+The FINAL worker uses the proxy frozen into `proxy_bundle.tar.gz`. An expired
+proxy makes log archival fail-soft and writes
+`_shared/summary/workflow_log_archive_status_<workflow-id>.json`; it does not
+invalidate successful physics work. The FINAL wrapper propagates
+`DAG_STATUS`/`FAILED_COUNT`, so an upstream DAG failure is not hidden by a
+successful summary or archive.
+
+Remote archives use:
+
+```text
+<target>/output/<campaign>/<job_component>_logs/<workflow-id>/
+<target>/output/_log_archives/<workflow-id>/archive_index.json
+```
+
+`tools/archive_subdag_logs.sh` remains available only for manual recovery of
+older generated DAGs.
+
+For a processing job whose CMSSW chain completed but whose stageout manifest
+reports `transfer_failed`, set
+`PROCESSING_STAGEOUT_RECOVERY=validate-existing-or-rerun` in a recovery submit
+file. The worker first checks the remote ROOT and manifest sizes, opens the
+ROOT with `edmFileUtil`, and compares its event count with the manifest. A
+valid product keeps the original manifest under the job's `recovery/`
+directory and replaces the canonical manifest with recovery provenance. Any
+missing, empty, unreadable, or event-mismatched product automatically falls
+back to the full processing chain. Acceptance requires a final
+`size-verified` log line for both the ROOT product and canonical manifest.
 
 The generated metadata contains `production_capacity_signals`: bottleneck
 block counts, available and selected processing nodes, predicted event yields,
@@ -394,6 +425,16 @@ block indices. The coordinator consumes distinct planned blocks until every
 source occurrence reaches its configured LHE-event budget. It stops when any
 required source can no longer form another complete budgeted group; this
 determines the number of mixed output blocks.
+
+In inventory-driven v2 production, pre-generation block counts are capacity
+estimates only. Stratified splitting can create several partial tail blocks
+per source file, so exact cross-campaign and shard boundaries are calculated
+after every planner finishes. `ALLOCATE_CAMPAIGN_SHARDS` scans the shared
+planner-manifest index once and writes
+`plan_subdags/campaign_shard_allocation.json`. Every coordinator then loads its
+own shard cursor from that file. Check that coordinator configs do not contain
+an embedded `source_manifests` array; they should reference the shared
+campaign-level JSON file instead.
 
 Each output ID includes both the source-file index and block index:
 `JOBxxxxxx_BLOCKxxxxxx`. This prevents different planner groups from

@@ -138,6 +138,55 @@ PY
 pass "Final inventory records partial status and fails the verification node"
 
 python3 - "${WORKDIR}/worker/final_config.json" \
+    "${WORKDIR}/worker/partial_config.json" \
+    "${WORKDIR}/inventory/partial_inventory.json" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+payload["blocks"] = payload["blocks"][:2]
+for index, block in enumerate(payload["blocks"]):
+    manifest = pathlib.Path(sys.argv[2]).parent / f"partial_processing_{index}.json"
+    manifest_payload = {
+        "status": "ok",
+        "complete": True,
+        "actual_miniaod_events": 10,
+    }
+    if index == 1:
+        manifest_payload.update({
+            "status": "partial",
+            "complete": False,
+            "merge_eligible": True,
+            "actual_mixed_hepmc_events": 20,
+            "actual_miniaod_events": 10,
+            "partial_reason": "miniaod_event_count_shortfall",
+        })
+    manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    block["processing_manifest_url"] = str(manifest)
+payload["output_url"] = sys.argv[3]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle)
+PY
+(
+    cd "${WORKDIR}/worker"
+    bash "${BASE_DIR}/processing/condor_wrappers/run_subdag_final_inventory.sh" \
+        proxy_bundle.tar.gz partial_config.json > "${WORKDIR}/partial.log" 2>&1
+)
+python3 - "${WORKDIR}/inventory/partial_inventory.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["status"] == "partial"
+assert payload["audit_passed"] is True
+assert payload["missing_processing_manifests"] == []
+assert payload["partial_processing_manifests"] == [1]
+assert payload["actual_miniaod_events"] == 20
+PY
+pass "Merge-eligible partial processing manifests pass the retained-output audit"
+
+python3 - "${WORKDIR}/worker/final_config.json" \
     "${WORKDIR}/worker/cleanup_config.json" \
     "${WORKDIR}/inventory/cleanup_inventory.json" <<'PY'
 import json

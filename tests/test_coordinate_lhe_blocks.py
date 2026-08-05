@@ -68,8 +68,11 @@ def run_coordinator(
     mixing_rng_seed: int = 0,
     physics_campaign: str = "",
     source_lhe_budgets: Optional[list[int]] = None,
+    pool_start_blocks: Optional[dict[str, int]] = None,
     processing_start_index: int = 0,
     max_processing_nodes: int = 0,
+    allocation_manifest: Optional[Path] = None,
+    allocation_shard_index: int = -1,
 ) -> Path:
     output_dir = workdir / campaign
     log_root = workdir / "logs"
@@ -107,6 +110,8 @@ def run_coordinator(
         physics_campaign or campaign,
         "--source-lhe-budgets",
         json.dumps(source_lhe_budgets or []),
+        "--pool-start-blocks",
+        json.dumps(pool_start_blocks or {}),
         "--processing-start-index",
         str(processing_start_index),
         "--max-processing-nodes",
@@ -154,6 +159,13 @@ def run_coordinator(
         "--storage-config",
         json.dumps({"target_eos_base": TARGET_BASE}),
     ]
+    if allocation_manifest is not None:
+        command.extend([
+            "--allocation-manifest",
+            str(allocation_manifest),
+            "--allocation-shard-index",
+            str(allocation_shard_index),
+        ])
     subprocess.run(command, check=True, cwd=BASE_DIR)
     return subdag_path
 
@@ -319,6 +331,95 @@ def main() -> int:
             for source in shard_config["sources"]
             for block in source["blocks"]
         } == {"jpsi_group_b"}
+
+        offset_subdag = run_coordinator(
+            workdir,
+            "JJP_DPS1_OFFSET",
+            0,
+            ["pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"],
+            ["normal", "phi_mpi_off"],
+            [{
+                "pool": "pool_jpsi_CSCO_g",
+                "group_id": "jpsi_group",
+                "primary_seed": 100,
+                "seeds": [100],
+                "path": str(jpsi_manifest),
+            }],
+            source_lhe_budgets=[860, 1000],
+            pool_start_blocks={"pool_jpsi_CSCO_g": 2},
+            max_processing_nodes=1,
+        )
+        assert offset_subdag.read_text(encoding="utf-8").count(
+            "\nJOB MIX_JJP_DPS1_OFFSET_0_BLOCK"
+        ) == 1
+        offset_config = json.loads(
+            (
+                workdir / "JJP_DPS1_OFFSET" / "node_configs" / "processing"
+                / "MIX_JJP_DPS1_OFFSET_0_BLOCK000000.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert [
+            source["inputs"] for source in offset_config["sources"]
+        ] == [
+            ["BLOCK:pool_jpsi_CSCO_g:jpsi_group:000002"],
+            ["BLOCK:pool_jpsi_CSCO_g:jpsi_group:000003"],
+        ]
+
+        allocation_manifest = workdir / "campaign_shard_allocation.json"
+        write_json(
+            allocation_manifest,
+            {
+                "campaigns": {
+                    "JJP_DPS1_ALLOCATED": {
+                        "shards": [{
+                            "shard_index": 3,
+                            "node_count": 1,
+                            "pool_start_blocks": {
+                                "pool_jpsi_CSCO_g": 4
+                            },
+                            "pool_end_blocks": {
+                                "pool_jpsi_CSCO_g": 6
+                            },
+                        }]
+                    }
+                }
+            },
+        )
+        allocated_subdag = run_coordinator(
+            workdir,
+            "JJP_DPS1_ALLOCATED",
+            3,
+            ["pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"],
+            ["normal", "phi_mpi_off"],
+            [{
+                "pool": "pool_jpsi_CSCO_g",
+                "group_id": "jpsi_group",
+                "primary_seed": 100,
+                "seeds": [100],
+                "path": str(jpsi_manifest),
+            }],
+            source_lhe_budgets=[860, 1000],
+            pool_start_blocks={"pool_jpsi_CSCO_g": 0},
+            max_processing_nodes=99,
+            allocation_manifest=allocation_manifest,
+            allocation_shard_index=3,
+        )
+        assert allocated_subdag.read_text(encoding="utf-8").count(
+            "\nJOB MIX_JJP_DPS1_ALLOCATED_3_BLOCK"
+        ) == 1
+        allocated_config = json.loads(
+            (
+                workdir / "JJP_DPS1_ALLOCATED" / "node_configs"
+                / "processing"
+                / "MIX_JJP_DPS1_ALLOCATED_3_BLOCK000000.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert [
+            source["inputs"] for source in allocated_config["sources"]
+        ] == [
+            ["BLOCK:pool_jpsi_CSCO_g:jpsi_group:000004"],
+            ["BLOCK:pool_jpsi_CSCO_g:jpsi_group:000005"],
+        ]
 
         first_config = workdir / "JJP_TPS" / "node_configs" / "processing" / (
             "MIX_JJP_TPS_7_BLOCK000000.json"
@@ -582,6 +683,7 @@ def main() -> int:
     print("[OK] Block coordinator emits deterministic, non-overlapping EDM EventIDs")
     print("[OK] Exhaustive mode reserves 350 EventIDs and uses closest-boundary static packing")
     print("[OK] Global pool streams concatenate manifests and shard without overlap")
+    print("[OK] Explicit pool cursors isolate cross-campaign block allocations")
     return 0
 
 

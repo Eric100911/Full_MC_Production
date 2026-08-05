@@ -6,18 +6,25 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "-lc 'set -euo pipefail; tar -xzf $(summary_bundle_name); cd runtime/processing/templates; bash summary.sh'"
+Arguments = "$(summary_script_name) $(summary_bundle_name) $(proxy_bundle_name) $(log_source_root) $(target_base_url) $(workflow_archive_id) $(archive_enabled) $(DAG_STATUS) $(FAILED_COUNT)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT
-Transfer_Input_Files = $(summary_bundle_path)
+Transfer_Input_Files = $(summary_script_path), $(summary_bundle_path), $(proxy_bundle_path)
+
+transfer_output_files =
 
 Output = $(log_root)/summary_$(Cluster)_$(Process).stdout
 Error  = $(log_root)/summary_$(Cluster)_$(Process).stderr
 Log    = $(log_root)/summary_$(Cluster).log
 
 request_cpus = 1
-request_memory = 1GB
-request_disk = 1GB
+request_memory = 2GB
+request_disk = 10GB
+
++MaxRuntime = 21600
++SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el9:x86_64"
+
+Environment = "HOME=/srv"
 
 Queue 1
