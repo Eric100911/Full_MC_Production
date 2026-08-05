@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--physics-campaign", default="")
     p.add_argument("--source-rng-seeds", default="[]")
     p.add_argument("--mixing-rng-seed", type=int, default=0)
+    p.add_argument(
+        "--output-mode",
+        choices=("full", "mix-only"),
+        default="full",
+        help="Emit the full SubDAG or MIX nodes only while retaining downstream planning",
+    )
     p.add_argument("--enable-ntuple", action="store_true")
     p.add_argument("--efficiency-ntuple", action="store_true")
     p.add_argument("--cleanup", action="store_true")
@@ -637,11 +643,12 @@ def main() -> int:
 
     # --- 4. Generate SubDAG ---
     os.makedirs(os.path.dirname(args.subdag_output_path), exist_ok=True)
-    merge_enabled = (
+    merge_planned = (
         args.enable_ntuple
         and bool(args.ntuple_sub_template_path)
         and args.miniaod_merge_events > 0
     )
+    merge_enabled = merge_planned and args.output_mode == "full"
     if args.enable_ntuple and args.ntuple_sub_template_path:
         ntuple_target_base = (
             args.target_eos_base
@@ -660,7 +667,9 @@ def main() -> int:
     ):
         print("[ERROR] MiniAOD merge mode requires merge submit template and wrapper paths", file=sys.stderr)
         return 1
-    if not args.final_sub_template_path or not args.final_wrapper_path:
+    if args.output_mode == "full" and (
+        not args.final_sub_template_path or not args.final_wrapper_path
+    ):
         print("[ERROR] Final inventory requires final submit template and wrapper paths", file=sys.stderr)
         return 1
 
@@ -725,7 +734,7 @@ def main() -> int:
         return 1
 
     merge_groups = []
-    if merge_enabled:
+    if merge_planned:
         current = []
         current_events = 0
         for record in block_records:
@@ -744,7 +753,7 @@ def main() -> int:
             merge_groups.append(current)
     merge_records = []
     ntuple_records = []
-    if merge_enabled:
+    if merge_planned:
         for merge_index, components in enumerate(merge_groups):
             jid = merge_job_id(args.job_index, merge_index)
             merged_url = miniaod_url(target_base, args.campaign, jid)
@@ -873,7 +882,12 @@ def main() -> int:
             dag.write(f"RETRY {node_name} 1\n")
 
             # Ntuple node (if enabled)
-            if args.enable_ntuple and args.ntuple_sub_template_path and not merge_enabled:
+            if (
+                args.output_mode == "full"
+                and args.enable_ntuple
+                and args.ntuple_sub_template_path
+                and not merge_enabled
+            ):
                 ntuple_name = f"NTUPLE_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
                 miniaod_input = miniaod_url(target_base, args.campaign, block_job_id_value)
                 ntuple_config = {
@@ -1055,20 +1069,22 @@ def main() -> int:
             "final",
             f"job_{args.job_index:06d}",
         )
-        dag.write(f"FINAL {final_name} {args.final_sub_template_path}\n")
-        dag.write(
-            f'VARS {final_name} '
-            f'campaign="{dag_escape(args.campaign)}" '
-            f'job_id="{dag_escape(final_job_id)}" '
-            f'request_cpus="1" request_memory="2GB" request_disk="2GB" '
-            f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
-            f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
-            f'final_wrapper_path="{dag_escape(args.final_wrapper_path)}" '
-            f'final_wrapper_name="{dag_escape(os.path.basename(args.final_wrapper_path))}" '
-            f'log_root="{dag_escape(final_log_root)}" '
-            f'config_path="{dag_escape(final_config_path)}" '
-            f'config_name="{dag_escape(final_config_name)}"\n'
-        )
+        if args.output_mode == "full":
+            dag.write(f"FINAL {final_name} {args.final_sub_template_path}\n")
+        if args.output_mode == "full":
+            dag.write(
+                f'VARS {final_name} '
+                f'campaign="{dag_escape(args.campaign)}" '
+                f'job_id="{dag_escape(final_job_id)}" '
+                f'request_cpus="1" request_memory="2GB" request_disk="2GB" '
+                f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
+                f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
+                f'final_wrapper_path="{dag_escape(args.final_wrapper_path)}" '
+                f'final_wrapper_name="{dag_escape(os.path.basename(args.final_wrapper_path))}" '
+                f'log_root="{dag_escape(final_log_root)}" '
+                f'config_path="{dag_escape(final_config_path)}" '
+                f'config_name="{dag_escape(final_config_name)}"\n'
+            )
 
     # Atomic rename
     os.rename(dag_tmp, args.subdag_output_path)
@@ -1081,6 +1097,12 @@ def main() -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "campaign": args.campaign,
         "job_index": args.job_index,
+        "output_mode": args.output_mode,
+        "analysis_type": args.analysis_type,
+        "efficiency_ntuple": args.efficiency_ntuple,
+        "cleanup": args.cleanup,
+        "target_eos_base": args.target_eos_base,
+        "storage": storage_config,
         "event_id_scheme": EDM_EVENT_ID_SCHEME,
         "n_mixed_blocks": n_mixed,
         "processing_max_events": args.max_events,
@@ -1105,7 +1127,7 @@ def main() -> int:
         "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
         "event_id_span": event_id_span,
         "minimum_output_fraction": None if args.phi_consumption_mode == "exhaustive" else args.minimum_output_fraction,
-        "miniaod_merge_enabled": merge_enabled,
+        "miniaod_merge_enabled": merge_planned,
         "miniaod_merge_events": args.miniaod_merge_events,
         "miniaod_merge_validation": args.miniaod_merge_validation,
         "sources": [

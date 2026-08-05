@@ -543,3 +543,53 @@ python3 tools/review_phase2_shower_efficiency.py \
 
 Run `--fetch-remote` only from a normal CERN/IHEP shell or with approved
 unsandboxed network access and a valid proxy.
+
+## CERN MIX / IHEP MERGE+NTUPLE split
+
+Generate the CERN DAG with the normal campaign and block-planning options, plus
+`--output-mode mix-only`.  Coordinator SubDAGs then contain only MIX nodes;
+their manifests retain the frozen merge groups and ntuple destinations.
+
+```bash
+python3 dag_generator.py generate \
+  --campaign <campaign> \
+  --output-mode mix-only \
+  <normal production options> \
+  --output-dir generated/<cern-workspace> \
+  --output mix-only.dag
+```
+
+After the CERN DAG has completed, export the handoff manifest.  This gate reads
+processing sidecars only; it does not download or checksum ROOT files.  Worker
+scripts retain their normal EDM validation.
+
+```bash
+python3 dag_generator.py audit-split \
+  --stage mix \
+  --workspace generated/<cern-workspace> \
+  --output /path/on/ihep/split-manifest.json
+```
+
+On an IHEP login node, use a repository checkout and an IHEP-visible persistent
+output directory.  This creates two explicit HepJob submit scripts per campaign:
+MERGE first, then NTUPLE after the merge audit gate exists.
+
+```bash
+python3 dag_generator.py generate \
+  --output-mode merge-ntuple \
+  --split-manifest /path/on/ihep/split-manifest.json \
+  --output-dir /scratchfs/cms/<user>/split-workspace
+
+bash /scratchfs/cms/<user>/split-workspace/submit_merge_<campaign>.sh
+python3 dag_generator.py audit-split --stage merge \
+  --workspace /scratchfs/cms/<user>/split-workspace
+bash /scratchfs/cms/<user>/split-workspace/submit_ntuple_<campaign>.sh
+python3 dag_generator.py audit-split --stage ntuple \
+  --workspace /scratchfs/cms/<user>/split-workspace
+```
+
+An incomplete audit writes a compact `*_retry_tasks.json` and matching
+`submit_*_retry.sh`.  Cleanup is explicit and dry-run by default:
+
+```bash
+python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace

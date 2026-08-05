@@ -73,6 +73,7 @@ def run_coordinator(
     max_processing_nodes: int = 0,
     allocation_manifest: Optional[Path] = None,
     allocation_shard_index: int = -1,
+    output_mode: str = "full",
 ) -> Path:
     output_dir = workdir / campaign
     log_root = workdir / "logs"
@@ -96,6 +97,8 @@ def run_coordinator(
         str(len(campaign_inputs)),
         "--max-events",
         str(max_events),
+        "--output-mode",
+        output_mode,
         "--phi-consumption-mode",
         phi_consumption_mode,
         "--normal-max-lhe-events",
@@ -515,6 +518,29 @@ def main() -> int:
         assert merge_dag.count("\nJOB MERGE_JJP_TPS_8_GROUP") == 1
         assert merge_dag.count("\nJOB NTUPLE_JJP_TPS_8_MERGE") == 1
         assert "\nJOB NTUPLE_JJP_TPS_8_BLOCK" not in merge_dag
+        mix_only_subdag = run_coordinator(
+            workdir, "JJP_TPS_MIX_ONLY", 8,
+            ["pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g", "pool_gg"],
+            ["normal", "normal", "phi_mpi_off"],
+            [
+                {"pool": "pool_jpsi_CSCO_g", "group_id": "jpsi_group",
+                 "primary_seed": 100, "seeds": [100], "path": str(jpsi_manifest)},
+                {"pool": "pool_gg", "group_id": "gg_group",
+                 "primary_seed": 40100, "seeds": [40100], "path": str(gg_manifest)},
+            ],
+            miniaod_merge_events=5000, output_mode="mix-only",
+        )
+        mix_only_dag = mix_only_subdag.read_text(encoding="utf-8")
+        assert "\nJOB MIX_JJP_TPS_MIX_ONLY_8_BLOCK" in mix_only_dag
+        assert "\nJOB MERGE_" not in mix_only_dag
+        assert "\nJOB NTUPLE_" not in mix_only_dag
+        assert "\nFINAL " not in mix_only_dag
+        mix_manifest = json.loads(
+            (workdir / "JJP_TPS_MIX_ONLY" / "coord_manifest_JJP_TPS_MIX_ONLY_8.json")
+            .read_text(encoding="utf-8")
+        )
+        assert mix_manifest["output_mode"] == "mix-only"
+        assert mix_manifest["merge_groups"] and mix_manifest["ntuples"]
         job8_first = json.loads(
             (
                 workdir / "JJP_TPS" / "node_configs" / "processing" /

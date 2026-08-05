@@ -110,6 +110,7 @@ echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 
 echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
 python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
+python3 "${SCRIPT_DIR}/test_split_workflow.py"
 python3 "${SCRIPT_DIR}/test_allocate_campaign_shards.py"
 python3 "${SCRIPT_DIR}/test_coordinate_wrapper_large_manifest.py"
 

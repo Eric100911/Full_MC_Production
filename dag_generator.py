@@ -41,6 +41,12 @@ from tools.lhe_inventory_condor import (  # noqa: E402
     submit_workspace as submit_lhe_inventory_workspace,
     summarize_workspace as summarize_lhe_inventory_workspace,
 )
+from tools.split_workflow import (  # noqa: E402
+    audit_stage as audit_split_stage,
+    export_mix_manifest,
+    finalize as finalize_split_workspace,
+    prepare_workspace as prepare_split_workspace,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 NODE_CONFIG_DEFAULTS_PATH = os.path.join(BASE_DIR, "common", "node_config_defaults.json")
@@ -154,6 +160,7 @@ REQUIRED_FILES = (
     "tools/archive_workflow_logs.py",
     "processing/templates/allocate_campaign_shards.sub",
     "processing/condor_wrappers/run_allocate_campaign_shards.sh",
+    "processing/condor_wrappers/run_ihep_split_task.sh",
     "tools/allocate_campaign_shards.py",
     "processing/templates/count_lhe_inventory.sub",
     "tools/lhe_inventory_condor.py",
@@ -593,6 +600,7 @@ class WorkflowOptions:
         normal_shortfall_policy: str = "fail",
         campaign_job_spec: str = "",
         archive_subdag_logs: bool = True,
+        output_mode: str = "full",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -643,6 +651,7 @@ class WorkflowOptions:
         self.unused_hepmc_warning_fraction = UNUSED_HEPMC_WARNING_FRACTION
         self.campaign_job_spec = campaign_job_spec
         self.archive_subdag_logs = archive_subdag_logs
+        self.output_mode = output_mode
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -738,6 +747,7 @@ class WorkflowOptions:
                 if self.campaign_job_spec else ""
             ),
             "archive_subdag_logs": self.archive_subdag_logs,
+            "output_mode": self.output_mode,
         }
 
 
@@ -4082,6 +4092,7 @@ class DAGBuilder:
             "physics_campaign": campaign.physics_campaign,
             "source_rng_seeds": list((job_record or {}).get("source_rng_seeds", [])),
             "mixing_rng_seed": int((job_record or {}).get("mixing_rng_seed", 0) or 0),
+            "output_mode": self.options.output_mode,
             "enable_ntuple": self.options.enable_ntuple and not self.options.machine_env.uses_local_storage,
             "efficiency_ntuple": self.options.efficiency_ntuple,
             "cleanup": self.options.cleanup,
@@ -5834,9 +5845,18 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--campaign",
         action="append",
-        required=True,
+        default=None,
         help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
     )
+    parser.add_argument("--output-mode", choices=("full", "mix-only", "merge-ntuple"),
+                        default="full", help="全链、CERN MIX-only 或 IHEP merge/ntuple 工作区。")
+    parser.add_argument("--split-manifest", default="")
+    parser.add_argument("--hepjob-merge-walltime", default="short",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-ntuple-walltime", default="mid",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-merge-memory-mb", type=int, default=0)
+    parser.add_argument("--hepjob-ntuple-memory-mb", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=1, help="每个 campaign 的 job 数。")
     parser.add_argument(
         "--campaign-job-spec",
@@ -6373,6 +6393,16 @@ def build_parser() -> argparse.ArgumentParser:
         force_generate_lhe=False,
         test_mode=True,
     )
+    audit_split_parser = subparsers.add_parser("audit-split")
+    audit_split_parser.add_argument("--stage", required=True, choices=("mix", "merge", "ntuple"))
+    audit_split_parser.add_argument("--workspace", required=True)
+    audit_split_parser.add_argument("--output", default="")
+    audit_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser = subparsers.add_parser("finalize-split")
+    finalize_split_parser.add_argument("--workspace", required=True)
+    finalize_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser.add_argument("--apply", action="store_true")
+
 
     matrix_parser = subparsers.add_parser(
         "generate-helac-matrix",
@@ -6565,6 +6595,8 @@ def normalize_args(argv: Sequence[str]) -> Sequence[str]:
         "generate",
         "generate-test",
         "generate-helac-matrix",
+        "audit-split",
+        "finalize-split",
         "generate-ntuple-only",
     }:
         return argv
@@ -6586,6 +6618,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "audit-split":
+        try:
+            if args.stage == "mix":
+                if not args.output:
+                    parser.error("--stage mix requires --output")
+                result = export_mix_manifest(args.workspace, args.output, args.campaign)
+            else:
+                result = audit_split_stage(args.workspace, args.stage, args.campaign)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("complete", True) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "finalize-split":
+        try:
+            result = finalize_split_workspace(args.workspace, args.campaign, args.apply)
+            print(json.dumps(result, indent=2))
+            return 0 if not any(x["action"] == "failed" for x in result["records"]) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "list":
         if args.kind in ("all", "campaigns"):
@@ -6682,7 +6736,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.output:
                 parser.error("fresh --run-on-condor preparation requires --output")
             try:
-                campaign_names = expand_campaign_selection(args.campaign)
+                campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
                 local_output_base = args.local_output_base or (
                     machine_env.local_output_base if machine_env.uses_local_storage else ""
                 )
@@ -6712,7 +6766,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.output:
             parser.error("direct scan-lhe-inventory requires --output")
         try:
-            campaign_names = expand_campaign_selection(args.campaign)
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
         except ValueError as exc:
             parser.error(str(exc))
         return execute_lhe_inventory_scan(
@@ -6752,7 +6806,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env = resolve_machine_env(requested_machine_env_name(args))
         except ValueError as exc:
             parser.error(str(exc))
-        campaign_names = expand_campaign_selection(args.campaign)
+        campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
+        if args.output_mode == "merge-ntuple":
+            if args.command != "generate" or not args.split_manifest:
+                parser.error("merge-ntuple requires generate and --split-manifest")
+            try:
+                bundle_dir = os.path.join(os.path.abspath(args.output_dir), "bundles")
+                assets = prepare_ntuple_only_assets(
+                    bundle_dir, cmssw15_runtime_tarball=args.cmssw15_runtime_tarball
+                )
+                names = expand_campaign_selection(args.campaign) if args.campaign else None
+                result = prepare_split_workspace(
+                    args.split_manifest, args.output_dir, BASE_DIR,
+                    assets["ntuple_bundle_path"], names, args.hepjob_group,
+                    args.hepjob_merge_walltime, args.hepjob_ntuple_walltime,
+                    args.hepjob_merge_memory_mb, args.hepjob_ntuple_memory_mb,
+                    args.proxy_path,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            except (OSError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        if not args.campaign:
+            parser.error("--campaign is required unless --output-mode merge-ntuple")
         if args.efficiency_ntuple:
             try:
                 validate_efficiency_campaigns(campaign_names)
@@ -6828,6 +6905,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             use_subprocess_naming=args.use_subprocess_naming,
             target_base_url=args.target_base_url,
             lhe_group_min_events=args.lhe_group_min_events,
+            output_mode=args.output_mode,
             lhe_group_max_events=args.lhe_group_max_events,
             lhe_group_max_files=args.lhe_group_max_files,
         )
@@ -6847,7 +6925,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Resolve campaign names
         if args.campaign:
-            campaign_names = expand_campaign_selection(args.campaign)
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
         elif args.miniaod_dir:
             # Auto-discover campaigns from directory
             if not os.path.isdir(args.miniaod_dir):

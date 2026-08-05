@@ -107,6 +107,7 @@ cmd = [
     "--analysis-type", str(cfg["analysis_type"]),
     "--n-sources", str(cfg["n_sources"]),
     "--max-events", str(cfg["max_events"]),
+    "--output-mode", str(cfg.get("output_mode", "full")),
     "--log-root", str(cfg["log_root"]),
     "--request-cpus", str(cfg["request_cpus"]),
     "--request-memory", str(cfg["request_memory"]),
