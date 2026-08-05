@@ -546,6 +546,30 @@ unsandboxed network access and a valid proxy.
 
 ## CERN MIX / IHEP MERGE+NTUPLE split
 
+### Preconditions and invariants
+
+- Use block SubDAG generation with MiniAOD merge planning enabled. In
+  `mix-only`, coordinator manifests freeze merge groups even though the CERN
+  SubDAG emits no MERGE, NTUPLE, or per-SubDAG FINAL nodes.
+- Keep `target_eos_base` and storage settings centralized in
+  `common/node_config_defaults.json`. IHEP full URLs must retain
+  `root://cceos.ihep.ac.cn:1094///store/...`.
+- Run IHEP preparation from an IHEP-visible repository checkout and place the
+  generated workspace on persistent IHEP-visible storage.
+- A valid CMS proxy is rebuilt into `bundles/proxy_bundle.tar.gz` immediately
+  before each stage submission. Submission stops if less than ten minutes remain.
+- Split audits intentionally validate sidecar manifests only. They do not
+  checksum or download ROOT files. Existing worker-side EDM validation remains
+  authoritative.
+
+| Stage | Success evidence | Enables |
+|---|---|---|
+| MIX | Every processing sidecar is complete or explicitly merge-eligible | Frozen split manifest |
+| MERGE | Every merge sidecar is merge-eligible and names the planned output | Per-campaign merge gate |
+| NTUPLE | Every split ntuple sidecar names the planned output | Per-campaign ntuple gate and cleanup |
+
+### Generate and run the CERN stage
+
 Generate the CERN DAG with the normal campaign and block-planning options, plus
 `--output-mode mix-only`.  Coordinator SubDAGs then contain only MIX nodes;
 their manifests retain the frozen merge groups and ntuple destinations.
@@ -570,6 +594,8 @@ python3 dag_generator.py audit-split \
   --output /path/on/ihep/split-manifest.json
 ```
 
+### Prepare and run the IHEP stages
+
 On an IHEP login node, use a repository checkout and an IHEP-visible persistent
 output directory.  This creates two explicit HepJob submit scripts per campaign:
 MERGE first, then NTUPLE after the merge audit gate exists.
@@ -589,7 +615,31 @@ python3 dag_generator.py audit-split --stage ntuple \
 ```
 
 An incomplete audit writes a compact `*_retry_tasks.json` and matching
-`submit_*_retry.sh`.  Cleanup is explicit and dry-run by default:
+`submit_*_retry.sh`. Inspect the failed count and worker logs, submit only
+that retry script, and repeat the same audit. A successful audit removes stale
+retry metadata and writes `gates/<stage>_<campaign>.json`.
+
+The generated HepJob scripts use one array-style cluster per campaign and pass
+`%{ProcId}` as the task index. Default resource classes are `short` for
+MERGE and `mid` for NTUPLE. Override them during workspace generation with
+`--hepjob-merge-walltime`, `--hepjob-ntuple-walltime`,
+`--hepjob-merge-memory-mb`, and `--hepjob-ntuple-memory-mb`.
+
+### Finalize component cleanup
+
+Cleanup is explicit and dry-run by default:
 
 ```bash
 python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace
+python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace --apply
+```
+
+Finalize requires a successful ntuple audit gate and removes component MiniAODs
+only; merged MiniAODs, ntuples, and sidecars are retained. Each invocation
+writes a timestamped cleanup report under `logs/cleanup/`. Review the dry-run
+report before using `--apply`.
+
+The legacy polling workflow remains available for existing deployments, but new
+split production should use these explicit stage commands. Workspace generation
+does not submit jobs: record the IHEP campaign, task count, HepJob submission
+output, and stage gate before proceeding.
