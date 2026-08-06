@@ -287,9 +287,15 @@ def valid_manifest(stage, task, payload):
     if not isinstance(payload, dict) or payload.get("failure_reason"):
         return False
     if stage == "merge":
-        return (payload.get("status") in {"ok", "partial"}
-                and payload.get("merge_eligible") is True
-                and payload.get("output_url") == task["config"]["output_url"])
+        if payload.get("output_url") != task["config"]["output_url"]:
+            return False
+        if payload.get("status") == "ok":
+            # Successful merge manifests written before split workflow v1 did
+            # not include merge_eligible. An explicit false value must still
+            # fail the gate, while the missing legacy field is accepted.
+            return payload.get("merge_eligible") is not False
+        return (payload.get("status") == "partial"
+                and payload.get("merge_eligible") is True)
     return payload.get("status") == "ok" and payload.get("ntuple_url") == task["ntuple_url"]
 
 

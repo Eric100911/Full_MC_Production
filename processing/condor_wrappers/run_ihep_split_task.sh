@@ -37,6 +37,10 @@ cp "${WRAPPER_DIR}/run_ntuple_only.sh" "${WORKDIR}/"
 cp "${NTUPLE_BUNDLE}" "${WORKDIR}/ntuple_runtime_bundle.tar.gz"
 COMMAND=$(printf 'cd %q && bash run_ntuple_only.sh proxy_bundle.tar.gz ntuple_runtime_bundle.tar.gz task_config.json' "${WORKDIR}")
 /cvmfs/cms.cern.ch/common/cmssw-el9 -B /tmp -B /scratchfs2 --command-to-run "${COMMAND}"
+tar -xzf "${WORKDIR}/proxy_bundle.tar.gz" -C "${WORKDIR}"
+PROXY_TARGET="${WORKDIR}/credentials/x509_user_proxy"
+[[ -s "${PROXY_TARGET}" ]] || { echo "ERROR: missing extracted proxy after ntuple container" >&2; exit 2; }
+export X509_USER_PROXY="${PROXY_TARGET}"
 python3 - "${META}" "${WORKDIR}" <<'PY'
 import json
 from pathlib import Path

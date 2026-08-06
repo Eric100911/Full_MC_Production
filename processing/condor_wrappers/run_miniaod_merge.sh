@@ -66,7 +66,7 @@ def xrd_stat_size(url):
     proc = subprocess.run(
         ["xrdfs", host, "stat", path],
         check=False,
-        text=True,
+        universal_newlines=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -102,7 +102,7 @@ def read_url_text(url, workdir):
         proc = subprocess.run(
             ["xrdcp", "--nopbar", "-f", url, str(local_path)],
             check=False,
-            text=True,
+            universal_newlines=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )

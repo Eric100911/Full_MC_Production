@@ -76,7 +76,17 @@ def main():
         assert retry_submit.is_file()
         merge_task = split["campaigns"][campaign]["merge_tasks"][0]
         write_json(Path(merge_task["manifest_url"]), {
-            "status": "ok", "merge_eligible": True,
+            "status": "ok",
+            "output_url": merge_task["config"]["output_url"],
+        })
+        assert audit_stage(str(ihep), "merge")["complete"]
+        write_json(Path(merge_task["manifest_url"]), {
+            "status": "partial",
+            "output_url": merge_task["config"]["output_url"],
+        })
+        assert not audit_stage(str(ihep), "merge")["complete"]
+        write_json(Path(merge_task["manifest_url"]), {
+            "status": "partial", "merge_eligible": True,
             "output_url": merge_task["config"]["output_url"],
         })
         assert audit_stage(str(ihep), "merge")["complete"]

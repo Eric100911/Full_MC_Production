@@ -625,6 +625,45 @@ MERGE and `mid` for NTUPLE. Override them during workspace generation with
 `--hepjob-merge-walltime`, `--hepjob-ntuple-walltime`,
 `--hepjob-merge-memory-mb`, and `--hepjob-ntuple-memory-mb`.
 
+### DPS1 split architecture validation (2026-08-06)
+
+The split workflow was exercised end to end with HepJob on IHEP using an
+isolated CERN pilot and production groups 71--74. The production canary merged
+group 71 while accepting the existing successful group 74 merge sidecar, then
+produced both ntuples. Groups 72 and 73 were submitted only after the canary
+ntuple gate passed. The CERN pilot produced two five-event component MiniAODs,
+which IHEP merged into one approximately ten-event MiniAOD before running the
+ntuple stage.
+
+| Scope | MERGE cluster | NTUPLE cluster | Result |
+|---|---:|---:|---|
+| Production canary, groups 71/74 | `80201258`, retry `80201270` | `80201303` | Both gates complete |
+| Production batch, groups 72/73 | `80201381` | `80201413` | Both gates complete |
+| Isolated CERN pilot | `80201291` | `80201305`, retry `80201359` | Both gates complete |
+
+Each production merge contained 4,300 events, matching the five processing
+sidecars at 860 valid events each. The resulting ntuple sizes were 43,832,169,
+43,736,625, 43,832,653, and 43,790,526 bytes for groups 71--74 respectively;
+the pilot ntuple was 229,098 bytes. The files were checked with `xrdfs stat`,
+and every split ntuple sidecar named its planned triple-slash IHEP URL.
+
+The test exposed four operational compatibility requirements:
+
+- IHEP login-node Python 3.6 requires `universal_newlines=True` rather than the
+  newer `subprocess.run(..., text=True)` spelling in the merge wrapper.
+- The `test` HepJob walltime is only five minutes and is too short for this
+  ntuple workload; use `short` or longer even for the small pilot.
+- The outer split wrapper must extract and export the bundled proxy again after
+  the ntuple container exits so that post-container sidecar stage-out is
+  authenticated independently of host and container UID differences.
+- Create the configured HepJob log directory before submission. If a cluster
+  is held only for that missing directory, create the exact path and release
+  the affected processes with `hep_release`.
+
+All recorded clusters had left the queue at completion. Cleanup was previewed
+for the canary, batch, and pilot workspaces with `finalize-split` in dry-run
+mode only; no component MiniAOD was deleted.
+
 ### Finalize component cleanup
 
 Cleanup is explicit and dry-run by default:
