@@ -56,6 +56,39 @@ def main() -> int:
     assert planning["campaigns"]["JJP_TPS_MC_v4_1"]["processing_nodes"] == 10
     assert planning["storage"]["hard_limit_bytes"] == 5_000_000_000_000
     assert planning["storage"]["capacity_status"] == "within_warning_limit"
+    full_planning = load_campaign_planning_spec(
+        str(
+            BASE_DIR
+            / "common/campaign_job_specs/jjp_efficiency_balanced_full_v2.json"
+        ),
+        ["JJP_DPS1_MC_v4_1", "JJP_TPS_MC_v4_1"],
+        str(BASE_DIR / "generated/lhe_inventory_jjp_20260717_184812.json"),
+    )
+    assert full_planning is not None
+    full_dps = full_planning["campaigns"]["JJP_DPS1_MC_v4_1"]
+    full_tps = full_planning["campaigns"]["JJP_TPS_MC_v4_1"]
+    assert full_tps["processing_nodes"] == 24_143
+    assert full_dps["processing_nodes"] == 4_591
+    assert full_tps["estimated_pool_start_blocks"]["pool_jpsi_CSCO_g"] == 0
+    assert full_tps["estimated_pool_end_blocks"]["pool_jpsi_CSCO_g"] == 49_069
+    assert full_dps["estimated_pool_start_blocks"]["pool_jpsi_CSCO_g"] == 49_069
+    assert full_dps["estimated_pool_end_blocks"]["pool_jpsi_CSCO_g"] == 58_404
+    assert len(full_tps["estimated_processing_shards"]) == 13
+    assert len(full_dps["estimated_processing_shards"]) == 3
+    assert sum(
+        shard["node_count"] for shard in full_tps["estimated_processing_shards"]
+    ) == 24_143
+    assert sum(
+        shard["node_count"] for shard in full_dps["estimated_processing_shards"]
+    ) == 4_591
+    for campaign in (full_tps, full_dps):
+        for left, right in zip(
+            campaign["estimated_processing_shards"],
+            campaign["estimated_processing_shards"][1:],
+        ):
+            assert left["pool_end_blocks"] == right["pool_start_blocks"]
+    assert full_planning["storage"]["predicted_total_bytes"] == 3_657_164_687_623
+    assert full_planning["storage"]["capacity_status"] == "within_warning_limit"
 
     assert len(full_jobs["job_ids"]) == 950
     assert len(set(full_jobs["job_ids"])) == 950
@@ -71,6 +104,10 @@ def main() -> int:
     assert pilot_jobs["job_ids"] == [
         full_jobs["job_ids"][position] for position in PILOT_POSITIONS
     ]
+    assert (
+        full_planning["planning"]["pool_seeds"]
+        == full_jobs["pool_seeds"]
+    )
 
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="campaign_spec_", dir=TMP_ROOT) as tmp:
@@ -144,6 +181,7 @@ def main() -> int:
     print("[OK] Pilot selects the locked ten manifest positions and pool seeds")
     print("[OK] Compact specs require the authoritative inventory hash")
     print("[OK] V2 spec freezes efficiency budgets, global blocks, and storage gate")
+    print("[OK] Full V2 spec records clearly labelled pre-planner estimates")
     return 0
 
 

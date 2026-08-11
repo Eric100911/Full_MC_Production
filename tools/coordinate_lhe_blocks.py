@@ -40,8 +40,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-source LHE block coordinator")
     p.add_argument("--campaign", required=True)
     p.add_argument("--job-index", type=int, required=True)
-    p.add_argument("--source-manifests", required=True,
-                   help="JSON string: [{'pool':'A','seed':100,'path':'...'}, ...]")
+    source_manifests = p.add_mutually_exclusive_group(required=True)
+    source_manifests.add_argument(
+        "--source-manifests",
+        help="JSON string: [{'pool':'A','seed':100,'path':'...'}, ...]",
+    )
+    source_manifests.add_argument(
+        "--source-manifests-file",
+        help="JSON file containing the source manifest list",
+    )
     p.add_argument("--shower-modes", required=True, help="Comma-separated shower modes")
     p.add_argument("--campaign-inputs", required=True,
                    help="Comma-separated campaign input pool names (with duplicates)")
@@ -68,13 +75,32 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--source-lhe-budgets", default="[]",
                    help="JSON list with one LHE-event budget per campaign source slot")
+    p.add_argument("--pool-start-blocks", default="{}",
+                   help="JSON pool-to-block cursor map for exclusive campaign allocation")
     p.add_argument("--processing-start-index", type=int, default=0,
                    help="First node in the deterministic global pool stream")
     p.add_argument("--max-processing-nodes", type=int, default=0,
                    help="Maximum nodes emitted by this shard; 0 emits the remainder")
+    p.add_argument(
+        "--allocation-manifest",
+        default="",
+        help="Authoritative campaign/shard allocation manifest",
+    )
+    p.add_argument(
+        "--allocation-shard-index",
+        type=int,
+        default=-1,
+        help="Shard index to load from --allocation-manifest",
+    )
     p.add_argument("--physics-campaign", default="")
     p.add_argument("--source-rng-seeds", default="[]")
     p.add_argument("--mixing-rng-seed", type=int, default=0)
+    p.add_argument(
+        "--output-mode",
+        choices=("full", "mix-only"),
+        default="full",
+        help="Emit the full SubDAG or MIX nodes only while retaining downstream planning",
+    )
     p.add_argument("--enable-ntuple", action="store_true")
     p.add_argument("--efficiency-ntuple", action="store_true")
     p.add_argument("--cleanup", action="store_true")
@@ -289,15 +315,20 @@ def main() -> int:
 
     # --- 1. Parse source manifests ---
     try:
-        source_infos = json.loads(args.source_manifests)
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Invalid --source-manifests JSON: {e}", file=sys.stderr)
+        if args.source_manifests_file:
+            with open(args.source_manifests_file, "r", encoding="utf-8") as handle:
+                source_infos = json.load(handle)
+        else:
+            source_infos = json.loads(args.source_manifests)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[ERROR] Invalid source manifests: {e}", file=sys.stderr)
         return 1
     try:
         storage_config = json.loads(args.storage_config)
         processing_environment_config = json.loads(args.processing_environment_config)
         source_rng_seeds = json.loads(args.source_rng_seeds)
         source_lhe_budgets = json.loads(args.source_lhe_budgets)
+        pool_start_blocks = json.loads(args.pool_start_blocks)
     except json.JSONDecodeError as e:
         print(f"[ERROR] Invalid node config JSON: {e}", file=sys.stderr)
         return 1
@@ -310,6 +341,57 @@ def main() -> int:
     if not isinstance(source_rng_seeds, list) or not isinstance(source_lhe_budgets, list):
         print("[ERROR] source RNG seeds and LHE budgets must be JSON lists", file=sys.stderr)
         return 1
+    if not isinstance(pool_start_blocks, dict):
+        print("[ERROR] --pool-start-blocks must be a JSON object", file=sys.stderr)
+        return 1
+    try:
+        pool_start_blocks = {
+            str(pool): int(cursor)
+            for pool, cursor in pool_start_blocks.items()
+        }
+    except (TypeError, ValueError):
+        print("[ERROR] --pool-start-blocks values must be integers", file=sys.stderr)
+        return 1
+    if any(cursor < 0 for cursor in pool_start_blocks.values()):
+        print("[ERROR] --pool-start-blocks values must be non-negative", file=sys.stderr)
+        return 1
+    allocation_record = None
+    if args.allocation_manifest:
+        if args.allocation_shard_index < 0:
+            print(
+                "[ERROR] --allocation-shard-index is required with "
+                "--allocation-manifest",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            with open(args.allocation_manifest, "r", encoding="utf-8") as handle:
+                allocation = json.load(handle)
+            campaign_allocation = allocation["campaigns"][args.campaign]
+            shards = campaign_allocation["shards"]
+            allocation_record = next(
+                shard
+                for shard in shards
+                if int(shard["shard_index"]) == args.allocation_shard_index
+            )
+            pool_start_blocks = {
+                str(pool): int(cursor)
+                for pool, cursor
+                in allocation_record["pool_start_blocks"].items()
+            }
+            args.processing_start_index = 0
+            args.max_processing_nodes = int(allocation_record["node_count"])
+        except (OSError, json.JSONDecodeError, KeyError, StopIteration, TypeError, ValueError) as e:
+            print(f"[ERROR] Invalid shard allocation: {e}", file=sys.stderr)
+            return 1
+        if args.max_processing_nodes <= 0:
+            print("[ERROR] Allocated shard contains no processing nodes", file=sys.stderr)
+            return 1
+        print(
+            f"[INFO] Loaded authoritative allocation for {args.campaign} "
+            f"shard {args.allocation_shard_index}: "
+            f"{args.max_processing_nodes} nodes, starts={pool_start_blocks}"
+        )
     if not 0.0 <= args.unused_hepmc_warning_fraction < 1.0:
         print(
             "[ERROR] unused HepMC warning fraction must satisfy 0 <= warning < 1",
@@ -403,8 +485,24 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    unknown_start_pools = sorted(set(pool_start_blocks) - set(pool_lookup))
+    if unknown_start_pools:
+        print(
+            "[ERROR] --pool-start-blocks references missing pools: "
+            + ",".join(unknown_start_pools),
+            file=sys.stderr,
+        )
+        return 1
 
     n_blocks_by_pool = {pool: len(source["blocks"]) for pool, source in pool_lookup.items()}
+    for pool_name, cursor in pool_start_blocks.items():
+        if cursor > n_blocks_by_pool[pool_name]:
+            print(
+                f"[ERROR] --pool-start-blocks cursor {cursor} exceeds "
+                f"{pool_name} capacity {n_blocks_by_pool[pool_name]}",
+                file=sys.stderr,
+            )
+            return 1
     input_multiplicity = Counter(campaign_inputs)
 
     source_templates = []
@@ -431,9 +529,12 @@ def main() -> int:
             "rng_seed": int(source_rng_seeds[slot]) if source_rng_seeds else 0,
         })
 
-    pool_cursors = defaultdict(int)
+    pool_cursors = defaultdict(int, pool_start_blocks)
     mixed_source_slots = []
-    while True:
+    build_limit = None
+    if args.max_processing_nodes:
+        build_limit = args.processing_start_index + args.max_processing_nodes
+    while build_limit is None or len(mixed_source_slots) < build_limit:
         block_sources = []
         next_cursors = dict(pool_cursors)
         can_build = True
@@ -542,11 +643,12 @@ def main() -> int:
 
     # --- 4. Generate SubDAG ---
     os.makedirs(os.path.dirname(args.subdag_output_path), exist_ok=True)
-    merge_enabled = (
+    merge_planned = (
         args.enable_ntuple
         and bool(args.ntuple_sub_template_path)
         and args.miniaod_merge_events > 0
     )
+    merge_enabled = merge_planned and args.output_mode == "full"
     if args.enable_ntuple and args.ntuple_sub_template_path:
         ntuple_target_base = (
             args.target_eos_base
@@ -565,7 +667,9 @@ def main() -> int:
     ):
         print("[ERROR] MiniAOD merge mode requires merge submit template and wrapper paths", file=sys.stderr)
         return 1
-    if not args.final_sub_template_path or not args.final_wrapper_path:
+    if args.output_mode == "full" and (
+        not args.final_sub_template_path or not args.final_wrapper_path
+    ):
         print("[ERROR] Final inventory requires final submit template and wrapper paths", file=sys.stderr)
         return 1
 
@@ -630,7 +734,7 @@ def main() -> int:
         return 1
 
     merge_groups = []
-    if merge_enabled:
+    if merge_planned:
         current = []
         current_events = 0
         for record in block_records:
@@ -649,7 +753,7 @@ def main() -> int:
             merge_groups.append(current)
     merge_records = []
     ntuple_records = []
-    if merge_enabled:
+    if merge_planned:
         for merge_index, components in enumerate(merge_groups):
             jid = merge_job_id(args.job_index, merge_index)
             merged_url = miniaod_url(target_base, args.campaign, jid)
@@ -778,7 +882,12 @@ def main() -> int:
             dag.write(f"RETRY {node_name} 1\n")
 
             # Ntuple node (if enabled)
-            if args.enable_ntuple and args.ntuple_sub_template_path and not merge_enabled:
+            if (
+                args.output_mode == "full"
+                and args.enable_ntuple
+                and args.ntuple_sub_template_path
+                and not merge_enabled
+            ):
                 ntuple_name = f"NTUPLE_{args.campaign}_{args.job_index}_BLOCK{i:06d}"
                 miniaod_input = miniaod_url(target_base, args.campaign, block_job_id_value)
                 ntuple_config = {
@@ -960,20 +1069,22 @@ def main() -> int:
             "final",
             f"job_{args.job_index:06d}",
         )
-        dag.write(f"FINAL {final_name} {args.final_sub_template_path}\n")
-        dag.write(
-            f'VARS {final_name} '
-            f'campaign="{dag_escape(args.campaign)}" '
-            f'job_id="{dag_escape(final_job_id)}" '
-            f'request_cpus="1" request_memory="2GB" request_disk="2GB" '
-            f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
-            f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
-            f'final_wrapper_path="{dag_escape(args.final_wrapper_path)}" '
-            f'final_wrapper_name="{dag_escape(os.path.basename(args.final_wrapper_path))}" '
-            f'log_root="{dag_escape(final_log_root)}" '
-            f'config_path="{dag_escape(final_config_path)}" '
-            f'config_name="{dag_escape(final_config_name)}"\n'
-        )
+        if args.output_mode == "full":
+            dag.write(f"FINAL {final_name} {args.final_sub_template_path}\n")
+        if args.output_mode == "full":
+            dag.write(
+                f'VARS {final_name} '
+                f'campaign="{dag_escape(args.campaign)}" '
+                f'job_id="{dag_escape(final_job_id)}" '
+                f'request_cpus="1" request_memory="2GB" request_disk="2GB" '
+                f'proxy_bundle_path="{dag_escape(args.proxy_bundle_path)}" '
+                f'proxy_bundle_name="{dag_escape(args.proxy_bundle_name)}" '
+                f'final_wrapper_path="{dag_escape(args.final_wrapper_path)}" '
+                f'final_wrapper_name="{dag_escape(os.path.basename(args.final_wrapper_path))}" '
+                f'log_root="{dag_escape(final_log_root)}" '
+                f'config_path="{dag_escape(final_config_path)}" '
+                f'config_name="{dag_escape(final_config_name)}"\n'
+            )
 
     # Atomic rename
     os.rename(dag_tmp, args.subdag_output_path)
@@ -986,6 +1097,12 @@ def main() -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "campaign": args.campaign,
         "job_index": args.job_index,
+        "output_mode": args.output_mode,
+        "analysis_type": args.analysis_type,
+        "efficiency_ntuple": args.efficiency_ntuple,
+        "cleanup": args.cleanup,
+        "target_eos_base": args.target_eos_base,
+        "storage": storage_config,
         "event_id_scheme": EDM_EVENT_ID_SCHEME,
         "n_mixed_blocks": n_mixed,
         "processing_max_events": args.max_events,
@@ -994,6 +1111,15 @@ def main() -> int:
         "normal_shortfall_policy": args.normal_shortfall_policy,
         "unused_hepmc_warning_fraction": args.unused_hepmc_warning_fraction,
         "source_lhe_budgets": [int(value) for value in source_lhe_budgets],
+        "pool_start_blocks": pool_start_blocks,
+        "allocation": {
+            "manifest_path": args.allocation_manifest,
+            "shard_index": (
+                args.allocation_shard_index
+                if args.allocation_manifest else None
+            ),
+            "record": allocation_record,
+        },
         "global_processing_nodes": total_mixed,
         "processing_start_index": args.processing_start_index,
         "processing_stop_index": shard_stop,
@@ -1001,7 +1127,7 @@ def main() -> int:
         "target_mixed_events": None if args.phi_consumption_mode == "exhaustive" else target_mixed_events,
         "event_id_span": event_id_span,
         "minimum_output_fraction": None if args.phi_consumption_mode == "exhaustive" else args.minimum_output_fraction,
-        "miniaod_merge_enabled": merge_enabled,
+        "miniaod_merge_enabled": merge_planned,
         "miniaod_merge_events": args.miniaod_merge_events,
         "miniaod_merge_validation": args.miniaod_merge_validation,
         "sources": [

@@ -66,7 +66,7 @@ def xrd_stat_size(url):
     proc = subprocess.run(
         ["xrdfs", host, "stat", path],
         check=False,
-        text=True,
+        universal_newlines=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -102,7 +102,7 @@ def read_url_text(url, workdir):
         proc = subprocess.run(
             ["xrdcp", "--nopbar", "-f", url, str(local_path)],
             check=False,
-            text=True,
+            universal_newlines=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
@@ -139,17 +139,36 @@ def expected_events_from_manifests(inputs, workdir, strict=False):
                 raise SystemExit(f"invalid processing manifest JSON: {item.get('manifest_url', '')}")
             return None, []
         if strict:
-            if payload.get("status") != "ok" or not payload.get("complete"):
-                raise SystemExit(f"processing manifest is not successful: {item.get('manifest_url', '')}")
+            status = payload.get("status")
+            accepted_complete = (
+                status == "ok"
+                and payload.get("complete") is True
+                and not payload.get("failure_reason")
+            )
+            accepted_partial = (
+                status == "partial"
+                and payload.get("merge_eligible") is True
+                and not payload.get("failure_reason")
+            )
+            if not (accepted_complete or accepted_partial):
+                raise SystemExit(
+                    f"processing manifest is not merge-eligible: {item.get('manifest_url', '')}"
+                )
             if payload.get("miniaod_url") != item.get("url"):
                 raise SystemExit(
                     f"processing manifest URL mismatch: {payload.get('miniaod_url')} != {item.get('url')}"
                 )
-            if payload.get("miniaod_count_source") != "edmFileUtil":
+            if not str(payload.get("miniaod_count_source") or "").startswith("edmFileUtil"):
                 raise SystemExit("strict merge requires an edmFileUtil MiniAOD count")
             actual_miniaod = int(payload.get("actual_miniaod_events", 0))
             actual_mixed = int(payload.get("actual_mixed_hepmc_events", 0))
-            if actual_miniaod <= 0 or actual_miniaod != actual_mixed:
+            invalid_counts = (
+                actual_miniaod <= 0
+                or actual_mixed <= 0
+                or actual_miniaod > actual_mixed
+                or (status == "ok" and actual_miniaod != actual_mixed)
+            )
+            if invalid_counts:
                 raise SystemExit(
                     f"invalid processing counts: mixed={actual_mixed} miniaod={actual_miniaod}"
                 )
@@ -164,6 +183,12 @@ def expected_events_from_manifests(inputs, workdir, strict=False):
             "actual_mixed_hepmc_events": int(payload.get("actual_mixed_hepmc_events", 0)),
             "actual_miniaod_events": actual_miniaod,
             "miniaod_count_source": payload.get("miniaod_count_source"),
+            "status": payload.get("status"),
+            "complete": payload.get("complete"),
+            "merge_eligible": payload.get("merge_eligible"),
+            "partial_reason": payload.get("partial_reason"),
+            "missing_miniaod_events": int(payload.get("missing_miniaod_events", 0)),
+            "miniaod_loss_fraction": float(payload.get("miniaod_loss_fraction", 0.0)),
         })
     if len(actuals) != len(inputs):
         return None, []
@@ -287,10 +312,18 @@ def main():
     if size is None or size <= 0:
         raise SystemExit(f"merged MiniAOD remote validation failed: {output_url}")
 
+    partial_components = [
+        item.get("job_id")
+        for item in processing_manifest_counts
+        if item.get("status") == "partial"
+    ]
     manifest = {
         "campaign": cfg["campaign"],
         "job_id": cfg["job_id"],
-        "status": "ok",
+        "status": "partial" if partial_components else "ok",
+        "complete": not partial_components,
+        "merge_eligible": True,
+        "partial_components": partial_components,
         "output_url": output_url,
         "size_bytes": size,
         "expected_events": expected_events,

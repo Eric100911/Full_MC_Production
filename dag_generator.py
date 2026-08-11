@@ -24,9 +24,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -39,6 +40,12 @@ from tools.lhe_inventory_condor import (  # noqa: E402
     prepare_workspace as prepare_lhe_inventory_workspace,
     submit_workspace as submit_lhe_inventory_workspace,
     summarize_workspace as summarize_lhe_inventory_workspace,
+)
+from tools.split_workflow import (  # noqa: E402
+    audit_stage as audit_split_stage,
+    export_mix_manifest,
+    finalize as finalize_split_workspace,
+    prepare_workspace as prepare_split_workspace,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -150,6 +157,11 @@ REQUIRED_FILES = (
     "processing/templates/ntuple.sub",
     "processing/templates/summary.sub",
     "processing/templates/summary.sh",
+    "tools/archive_workflow_logs.py",
+    "processing/templates/allocate_campaign_shards.sub",
+    "processing/condor_wrappers/run_allocate_campaign_shards.sh",
+    "processing/condor_wrappers/run_ihep_split_task.sh",
+    "tools/allocate_campaign_shards.py",
     "processing/templates/count_lhe_inventory.sub",
     "tools/lhe_inventory_condor.py",
     "common/cmssw_configs/hepmc_to_GENSIM.py",
@@ -321,6 +333,13 @@ COORDINATE_SUBMIT_TEMPLATE = "processing/templates/coordinate_lhe_blocks.sub"
 COORDINATE_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_coordinate_lhe_blocks.sh"
 )
+ALLOCATE_SUBMIT_TEMPLATE = "processing/templates/allocate_campaign_shards.sub"
+ALLOCATE_WRAPPER_PATH = os.path.join(
+    BASE_DIR,
+    "processing",
+    "condor_wrappers",
+    "run_allocate_campaign_shards.sh",
+)
 MINIAOD_MERGE_SUBMIT_TEMPLATE = "processing/templates/miniaod_merge.sub"
 MINIAOD_MERGE_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_miniaod_merge.sh"
@@ -331,7 +350,6 @@ SUBDAG_FINAL_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_subdag_final_inventory.sh"
 )
 SUBDAG_FINAL_WRAPPER_NAME = "run_subdag_final_inventory.sh"
-SUBDAG_LOG_ARCHIVE_SCRIPT = os.path.join(BASE_DIR, "tools", "archive_subdag_logs.sh")
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -582,6 +600,7 @@ class WorkflowOptions:
         normal_shortfall_policy: str = "fail",
         campaign_job_spec: str = "",
         archive_subdag_logs: bool = True,
+        output_mode: str = "full",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -632,6 +651,7 @@ class WorkflowOptions:
         self.unused_hepmc_warning_fraction = UNUSED_HEPMC_WARNING_FRACTION
         self.campaign_job_spec = campaign_job_spec
         self.archive_subdag_logs = archive_subdag_logs
+        self.output_mode = output_mode
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -727,6 +747,7 @@ class WorkflowOptions:
                 if self.campaign_job_spec else ""
             ),
             "archive_subdag_logs": self.archive_subdag_logs,
+            "output_mode": self.output_mode,
         }
 
 
@@ -1396,6 +1417,67 @@ def load_campaign_planning_spec(
             })
         selected_inventory[pool_name] = records
 
+    block_sizes_by_pool: Dict[str, List[int]] = OrderedDict()
+    for pool_name, records in selected_inventory.items():
+        block_sizes: List[int] = []
+        for record in records:
+            planned_events = int(record["planned_events"])
+            full_blocks, remainder = divmod(planned_events, block_events)
+            block_sizes.extend([block_events] * full_blocks)
+            if remainder:
+                block_sizes.append(remainder)
+        block_sizes_by_pool[pool_name] = block_sizes
+
+    def simulate_campaign_allocation(
+        campaign: Campaign,
+        budgets: Sequence[int],
+        start_cursors: Dict[str, int],
+        node_limit: int = 0,
+    ) -> Tuple[int, Dict[str, int], List[int], List[int]]:
+        """Mirror coordinator block consumption, including partial file tails."""
+
+        cursors = dict(start_cursors)
+        nodes = 0
+        attempted_by_slot = [0] * campaign.n_sources
+        blocks_by_slot = [0] * campaign.n_sources
+        while node_limit <= 0 or nodes < node_limit:
+            next_cursors = dict(cursors)
+            node_attempted = [0] * campaign.n_sources
+            node_blocks = [0] * campaign.n_sources
+            can_build = True
+            for slot, (pool_name, budget) in enumerate(
+                zip(campaign.inputs, budgets)
+            ):
+                blocks = block_sizes_by_pool[pool_name]
+                cursor = next_cursors.get(pool_name, 0)
+                accumulated = 0
+                chosen = 0
+                while cursor < len(blocks) and (
+                    chosen == 0 or accumulated < budget
+                ):
+                    accumulated += blocks[cursor]
+                    cursor += 1
+                    chosen += 1
+                if chosen == 0:
+                    can_build = False
+                    break
+                next_cursors[pool_name] = cursor
+                node_attempted[slot] = accumulated
+                node_blocks[slot] = chosen
+            if not can_build:
+                break
+            cursors = next_cursors
+            nodes += 1
+            attempted_by_slot = [
+                total + value
+                for total, value in zip(attempted_by_slot, node_attempted)
+            ]
+            blocks_by_slot = [
+                total + value
+                for total, value in zip(blocks_by_slot, node_blocks)
+            ]
+        return nodes, cursors, attempted_by_slot, blocks_by_slot
+
     campaign_specs: Dict[str, Dict[str, object]] = OrderedDict()
     for campaign_name in campaign_names:
         cfg = campaigns.get(campaign_name)
@@ -1460,6 +1542,123 @@ def load_campaign_planning_spec(
             "expected_final_events": expected_events_per_node * processing_nodes,
             "required_blocks_by_pool": dict(required_blocks),
         }
+
+    def apply_campaign_allocation(
+        campaign_name: str,
+        start_cursors: Dict[str, int],
+    ) -> Dict[str, int]:
+        campaign = CAMPAIGNS[campaign_name]
+        cfg = campaign_specs[campaign_name]
+        budgets = list(cfg["source_lhe_budgets"])
+        available_nodes, _, _, _ = simulate_campaign_allocation(
+            campaign,
+            budgets,
+            start_cursors,
+        )
+        configured_cap = int(cfg.get("max_processing_nodes", 0) or 0)
+        processing_nodes = (
+            min(available_nodes, configured_cap)
+            if configured_cap > 0 else available_nodes
+        )
+        if processing_nodes <= 0:
+            raise ValueError(
+                f"{campaign_name}: allocation produces no processing nodes"
+            )
+
+        campaign_pools = tuple(dict.fromkeys(campaign.inputs))
+        shard_cursor = dict(start_cursors)
+        estimated_processing_shards: List[Dict[str, object]] = []
+        attempted_by_slot = [0] * campaign.n_sources
+        blocks_by_slot = [0] * campaign.n_sources
+        for start_index in range(0, processing_nodes, shard_nodes):
+            shard_index = start_index // shard_nodes
+            node_count = min(shard_nodes, processing_nodes - start_index)
+            shard_start = dict(shard_cursor)
+            (
+                selected_nodes,
+                shard_cursor,
+                shard_attempted,
+                shard_blocks,
+            ) = simulate_campaign_allocation(
+                campaign,
+                budgets,
+                shard_start,
+                node_count,
+            )
+            if selected_nodes != node_count:
+                raise ValueError(
+                    f"{campaign_name}: shard {shard_index} selected "
+                    f"{selected_nodes} of {node_count} requested nodes"
+                )
+            attempted_by_slot = [
+                total + value
+                for total, value in zip(
+                    attempted_by_slot, shard_attempted
+                )
+            ]
+            blocks_by_slot = [
+                total + value
+                for total, value in zip(blocks_by_slot, shard_blocks)
+            ]
+            estimated_processing_shards.append({
+                "shard_index": shard_index,
+                "processing_start_index": start_index,
+                "node_count": node_count,
+                "pool_start_blocks": {
+                    pool: shard_start[pool]
+                    for pool in campaign_pools
+                },
+                "pool_end_blocks": {
+                    pool: shard_cursor[pool]
+                    for pool in campaign_pools
+                },
+            })
+
+        expected_events_per_node = float(cfg["expected_events_per_node"])
+        cfg.update({
+            "available_processing_nodes": available_nodes,
+            "processing_nodes": processing_nodes,
+            "expected_final_events": (
+                expected_events_per_node * processing_nodes
+            ),
+            "estimated_pool_start_blocks": {
+                pool: start_cursors[pool]
+                for pool in campaign_pools
+            },
+            "estimated_pool_end_blocks": {
+                pool: shard_cursor[pool]
+                for pool in campaign_pools
+            },
+            "estimated_lhe_events_by_slot": attempted_by_slot,
+            "estimated_blocks_by_slot": blocks_by_slot,
+            "estimated_processing_shards": estimated_processing_shards,
+        })
+        return shard_cursor
+
+    allocation_order_raw = planning.get("campaign_allocation_order", [])
+    if allocation_order_raw:
+        if (
+            not isinstance(allocation_order_raw, list)
+            or len(allocation_order_raw) != len(campaign_names)
+            or set(allocation_order_raw) != set(campaign_names)
+            or len(set(allocation_order_raw)) != len(allocation_order_raw)
+        ):
+            raise ValueError(
+                "planning.campaign_allocation_order must contain each requested "
+                "campaign exactly once"
+            )
+        pool_cursors = {pool: 0 for pool in selected_inventory}
+        for campaign_name in allocation_order_raw:
+            pool_cursors = apply_campaign_allocation(
+                campaign_name,
+                dict(pool_cursors),
+            )
+    else:
+        for campaign_name in campaign_names:
+            apply_campaign_allocation(
+                campaign_name,
+                {pool: 0 for pool in selected_inventory},
+            )
 
     storage = copy.deepcopy(raw.get("storage", {}))
     if not isinstance(storage, dict):
@@ -2836,10 +3035,22 @@ def prepare_runtime_assets(
                         os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
                         "runtime/processing/templates/summary.sh",
                     ),
+                    (
+                        os.path.join(BASE_DIR, "tools", "archive_workflow_logs.py"),
+                        "runtime/tools/archive_workflow_logs.py",
+                    ),
                 ),
             )
             return_assets["summary_bundle_path"] = summary_bundle_path
             return_assets["summary_bundle_name"] = summary_bundle_name
+            summary_script_name = "summary_final.sh"
+            summary_script_path = os.path.join(output_dir, summary_script_name)
+            shutil.copy2(
+                os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
+                summary_script_path,
+            )
+            return_assets["summary_script_path"] = summary_script_path
+            return_assets["summary_script_name"] = summary_script_name
             return return_assets
 
         ntuple_items: List[Tuple[str, str]] = [
@@ -2871,10 +3082,22 @@ def prepare_runtime_assets(
                 os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
                 "runtime/processing/templates/summary.sh",
             ),
+            (
+                os.path.join(BASE_DIR, "tools", "archive_workflow_logs.py"),
+                "runtime/tools/archive_workflow_logs.py",
+            ),
         ),
     )
     assets["summary_bundle_path"] = summary_bundle_path
     assets["summary_bundle_name"] = summary_bundle_name
+    summary_script_name = "summary_final.sh"
+    summary_script_path = os.path.join(output_dir, summary_script_name)
+    shutil.copy2(
+        os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
+        summary_script_path,
+    )
+    assets["summary_script_path"] = summary_script_path
+    assets["summary_script_name"] = summary_script_name
 
     # Planner bundle (per-pool block planner)
     plan_bundle_name = BUNDLE_NAMES["plan"]
@@ -2897,6 +3120,8 @@ def prepare_runtime_assets(
     coord_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "tools", "coordinate_lhe_blocks.py"),
          "runtime/tools/coordinate_lhe_blocks.py"),
+        (os.path.join(BASE_DIR, "tools", "allocate_campaign_shards.py"),
+         "runtime/tools/allocate_campaign_shards.py"),
         (os.path.join(BASE_DIR, "common", "compression_util.py"),
          "runtime/common/compression_util.py"),
     ]
@@ -3006,6 +3231,7 @@ class DAGBuilder:
         )
         self.campaign_jobs: Dict[str, List[Dict[str, object]]] = {}
         self.planning_spec: Optional[Dict[str, object]] = None
+        self.workflow_archive_id = ""
 
     def write_node_config(
         self,
@@ -3023,6 +3249,68 @@ class DAGBuilder:
         path = os.path.join(self.options.log_root, *(str(part) for part in parts))
         ensure_dir(path)
         return path
+
+    def initialize_workflow_archive_id(self, dag_filename: str) -> str:
+        if not self.workflow_archive_id:
+            stem = os.path.splitext(os.path.basename(dag_filename))[0]
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
+            if not safe_stem:
+                safe_stem = "workflow"
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.workflow_archive_id = (
+                f"{safe_stem}-{timestamp}-{uuid.uuid4().hex[:8]}"
+            )
+        return self.workflow_archive_id
+
+    def append_summary_final(self) -> None:
+        summary_log_root = self.log_directory("_shared", "summary")
+        archive_enabled = bool(
+            self.options.archive_subdag_logs
+            and self.options.enable_lhe_block_subdags
+        )
+        target_base_url = self.options.target_base_url or EOS_BASE
+        self.dag_lines.extend([
+            "# -------- 汇总与日志归档节点 --------",
+            (
+                "FINAL SUMMARY "
+                f"{os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}"
+            ),
+            (
+                "VARS SUMMARY "
+                f'summary_bundle_path="{dag_escape(self.runtime_assets["summary_bundle_path"])}" '
+                f'summary_bundle_name="{dag_escape(self.runtime_assets["summary_bundle_name"])}" '
+                f'summary_script_path="{dag_escape(self.runtime_assets["summary_script_path"])}" '
+                f'summary_script_name="{dag_escape(self.runtime_assets["summary_script_name"])}" '
+                f'proxy_bundle_path="{dag_escape(self.runtime_assets["proxy_bundle_path"])}" '
+                f'proxy_bundle_name="{dag_escape(self.runtime_assets["proxy_bundle_name"])}" '
+                f'log_dir="{dag_escape(self.options.local_log_dir)}" '
+                f'log_root="{dag_escape(summary_log_root)}" '
+                f'log_source_root="{dag_escape(self.options.log_root)}" '
+                f'target_base_url="{dag_escape(target_base_url)}" '
+                f'workflow_archive_id="{dag_escape(self.workflow_archive_id)}" '
+                f'archive_enabled="{dag_escape(bool_string(archive_enabled))}"'
+            ),
+        ])
+
+    def log_archive_metadata(self) -> Dict[str, object]:
+        enabled = bool(
+            self.options.archive_subdag_logs
+            and self.options.enable_lhe_block_subdags
+        )
+        return OrderedDict([
+            ("enabled", enabled),
+            ("mechanism", "top-level-final-worker"),
+            ("workflow_archive_id", self.workflow_archive_id),
+            ("source", "scan-log-root"),
+            ("source_log_root", self.options.log_root),
+            ("proxy_source", "frozen-runtime-bundle"),
+            ("stages", list(("processing", "miniaod_merge", "ntuple", "final"))),
+            (
+                "target_layout",
+                "output/<campaign>/<job_component>_logs/<workflow_archive_id>/",
+            ),
+            ("retry_attempts", 3),
+        ])
 
     def seed_for_pool_index(self, pool_name: str, index: int) -> int:
         pool = LHE_POOLS[pool_name]
@@ -3703,8 +3991,13 @@ class DAGBuilder:
         campaign_inputs: Tuple[str, ...],
         job_record: Optional[Dict[str, object]] = None,
         source_lhe_budgets: Optional[List[int]] = None,
+        pool_start_blocks: Optional[Dict[str, int]] = None,
         processing_start_index: int = 0,
         max_processing_nodes: int = 0,
+        shared_source_manifests: bool = False,
+        source_manifests_path_override: str = "",
+        allocation_manifest_path: str = "",
+        allocation_shard_index: int = -1,
     ) -> str:
         """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
         campaign = CAMPAIGNS[campaign_name]
@@ -3746,8 +4039,18 @@ class DAGBuilder:
         )
         subdag_output_path = os.path.join(subdag_dir, "blocks_processing.dag")
         os.makedirs(subdag_dir, exist_ok=True)
-        source_manifests_path = os.path.join(subdag_dir, "source_manifests.json")
-        write_json_file(source_manifests_path, source_manifest_entries)
+        source_manifests_path = source_manifests_path_override or (
+            os.path.join(
+                self.output_dir,
+                "plan_subdags",
+                campaign_name,
+                "source_manifests.json",
+            )
+            if shared_source_manifests
+            else os.path.join(subdag_dir, "source_manifests.json")
+        )
+        if not source_manifests_path_override:
+            write_json_file(source_manifests_path, source_manifest_entries)
 
         request_cpus, request_memory, request_disk = self.processing_resource_request()
 
@@ -3764,7 +4067,7 @@ class DAGBuilder:
             "campaign": campaign_name,
             "job_index": job_index,
             "source_manifests_path": source_manifests_path,
-            "source_manifests": source_manifest_entries,
+            "source_manifests_count": len(source_manifest_entries),
             "shower_modes": list(campaign.shower_modes),
             "campaign_inputs": list(campaign_inputs),
             "analysis_type": campaign.analysis_type,
@@ -3781,11 +4084,15 @@ class DAGBuilder:
                 self.options.unused_hepmc_warning_fraction
             ),
             "source_lhe_budgets": list(source_lhe_budgets or []),
+            "pool_start_blocks": dict(pool_start_blocks or {}),
             "processing_start_index": processing_start_index,
             "max_processing_nodes": max_processing_nodes,
+            "allocation_manifest_path": allocation_manifest_path,
+            "allocation_shard_index": allocation_shard_index,
             "physics_campaign": campaign.physics_campaign,
             "source_rng_seeds": list((job_record or {}).get("source_rng_seeds", [])),
             "mixing_rng_seed": int((job_record or {}).get("mixing_rng_seed", 0) or 0),
+            "output_mode": self.options.output_mode,
             "enable_ntuple": self.options.enable_ntuple and not self.options.machine_env.uses_local_storage,
             "efficiency_ntuple": self.options.efficiency_ntuple,
             "cleanup": self.options.cleanup,
@@ -3868,6 +4175,87 @@ class DAGBuilder:
         self.dag_lines.append(f"RETRY {job_name} 2")
         return job_name
 
+    def add_campaign_allocation_job(
+        self,
+        source_manifests_path: str,
+        allocation_manifest_path: str,
+        campaign_names: Sequence[str],
+        shard_processing_nodes: int,
+    ) -> str:
+        """Emit the post-planner node that assigns authoritative shard cursors."""
+
+        job_name = "ALLOCATE_CAMPAIGN_SHARDS"
+        assert self.planning_spec is not None
+        planning = self.planning_spec["planning"]
+        allocation_order = list(
+            planning.get("campaign_allocation_order") or campaign_names
+        )
+        allocation_config = {
+            "source_manifests_path": source_manifests_path,
+            "output_path": allocation_manifest_path,
+            "shard_processing_nodes": shard_processing_nodes,
+            "campaign_allocation_order": allocation_order,
+            "campaigns": {
+                campaign_name: {
+                    "campaign_inputs": list(CAMPAIGNS[campaign_name].inputs),
+                    "source_lhe_budgets": list(
+                        self.planning_spec["campaigns"][campaign_name][
+                            "source_lhe_budgets"
+                        ]
+                    ),
+                    "max_processing_nodes": int(
+                        self.planning_spec["campaigns"][campaign_name].get(
+                            "max_processing_nodes", 0
+                        ) or 0
+                    ),
+                    "expected_shards": (
+                        int(
+                            self.planning_spec["campaigns"][campaign_name][
+                                "processing_nodes"
+                            ]
+                        )
+                        + shard_processing_nodes
+                        - 1
+                    ) // shard_processing_nodes,
+                }
+                for campaign_name in allocation_order
+            },
+        }
+        config_path, config_name = self.write_node_config(
+            "coordination",
+            f"{job_name}.json",
+            allocation_config,
+        )
+        log_root = self.log_directory(
+            "_shared", "lhe_coordination", "campaign_allocation"
+        )
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, ALLOCATE_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_coordination")
+        self.dag_lines.append(
+            "VARS {job} "
+            "allocation_wrapper_path=\"{wrapper}\" "
+            "coord_bundle_path=\"{bundle_path}\" "
+            "coord_bundle_name=\"{bundle_name}\" "
+            "config_path=\"{config_path}\" config_name=\"{config_name}\" "
+            "log_root=\"{log_root}\"".format(
+                job=job_name,
+                wrapper=dag_escape(ALLOCATE_WRAPPER_PATH),
+                bundle_path=dag_escape(
+                    self.runtime_assets["coordinate_bundle_path"]
+                ),
+                bundle_name=dag_escape(
+                    self.runtime_assets["coordinate_bundle_name"]
+                ),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
+                log_root=dag_escape(log_root),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
     def add_block_subdag_node(
         self,
         campaign_name: str,
@@ -3892,30 +4280,6 @@ class DAGBuilder:
         self.dag_lines.append(
             f"SUBDAG EXTERNAL {subdag_name} {subdag_path}"
         )
-        if self.options.archive_subdag_logs:
-            archive_script = os.path.join(
-                self.output_dir,
-                "runtime_scripts",
-                os.path.basename(SUBDAG_LOG_ARCHIVE_SCRIPT),
-            )
-            ensure_dir(os.path.dirname(archive_script))
-            shutil.copy2(SUBDAG_LOG_ARCHIVE_SCRIPT, archive_script)
-            self.dag_lines.append(
-                "SCRIPT POST {node} {script} "
-                "--campaign {campaign} --job-index {job_index} "
-                "--log-root {log_root} --target-eos-base {target} "
-                "--proxy-bundle {proxy_bundle}".format(
-                    node=subdag_name,
-                    script=dag_escape(archive_script),
-                    campaign=dag_escape(campaign_name),
-                    job_index=dag_escape(job_index),
-                    log_root=dag_escape(self.options.log_root),
-                    target=dag_escape(self.options.target_base_url or EOS_BASE),
-                    proxy_bundle=dag_escape(
-                        self.runtime_assets["proxy_bundle_path"]
-                    ),
-                )
-            )
         return subdag_name
 
     def _build_planning_spec_v2(
@@ -3967,7 +4331,27 @@ class DAGBuilder:
                 })
 
         processing_jobs: List[str] = []
-        for campaign_name in campaign_names:
+        campaign_build_order = list(
+            planning.get("campaign_allocation_order") or campaign_names
+        )
+        shared_manifest_root = os.path.join(self.output_dir, "plan_subdags")
+        global_source_manifests_path = os.path.join(
+            shared_manifest_root, "source_manifests.json"
+        )
+        write_json_file(global_source_manifests_path, source_infos)
+        allocation_manifest_path = os.path.join(
+            shared_manifest_root, "campaign_shard_allocation.json"
+        )
+        allocation_job = self.add_campaign_allocation_job(
+            global_source_manifests_path,
+            allocation_manifest_path,
+            campaign_build_order,
+            shard_nodes,
+        )
+        for _, planner in planner_nodes:
+            self.dag_lines.append(f"PARENT {planner} CHILD {allocation_job}")
+
+        for campaign_name in campaign_build_order:
             campaign = CAMPAIGNS[campaign_name]
             campaign_spec = self.planning_spec["campaigns"][campaign_name]
             processing_nodes = int(campaign_spec["processing_nodes"])
@@ -3977,24 +4361,39 @@ class DAGBuilder:
                 source for source in source_infos
                 if str(source["pool"]) in campaign_pools
             ]
-            campaign_planners = [
-                planner for pool, planner in planner_nodes
-                if pool in campaign_pools
-            ]
-            for start_index in range(0, processing_nodes, shard_nodes):
-                shard_index = start_index // shard_nodes
-                node_count = min(shard_nodes, processing_nodes - start_index)
+            campaign_source_manifests_path = os.path.join(
+                shared_manifest_root,
+                campaign_name,
+                "source_manifests.json",
+            )
+            write_json_file(
+                campaign_source_manifests_path,
+                campaign_sources,
+            )
+            shard_count = (processing_nodes + shard_nodes - 1) // shard_nodes
+            for shard_index in range(shard_count):
+                node_count = min(
+                    shard_nodes,
+                    processing_nodes - shard_index * shard_nodes,
+                )
                 coord_job = self.add_coordinator_job(
                     campaign_name,
                     shard_index,
                     campaign_sources,
                     campaign.inputs,
                     source_lhe_budgets=budgets,
-                    processing_start_index=start_index,
+                    pool_start_blocks={},
+                    processing_start_index=0,
                     max_processing_nodes=node_count,
+                    source_manifests_path_override=(
+                        campaign_source_manifests_path
+                    ),
+                    allocation_manifest_path=allocation_manifest_path,
+                    allocation_shard_index=shard_index,
                 )
-                for planner in campaign_planners:
-                    self.dag_lines.append(f"PARENT {planner} CHILD {coord_job}")
+                self.dag_lines.append(
+                    f"PARENT {allocation_job} CHILD {coord_job}"
+                )
                 subdag_name = self.add_block_subdag_node(
                     campaign_name,
                     shard_index,
@@ -4004,22 +4403,8 @@ class DAGBuilder:
                 processing_jobs.append(subdag_name)
 
         if processing_jobs:
-            summary_log_root = self.log_directory("_shared", "summary")
-            self.dag_lines.extend([
-                "",
-                "# -------- 汇总节点 --------",
-                (
-                    "FINAL SUMMARY "
-                    f"{os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}"
-                ),
-                (
-                    "VARS SUMMARY "
-                    f'summary_bundle_path="{dag_escape(self.runtime_assets["summary_bundle_path"])}" '
-                    f'summary_bundle_name="{dag_escape(self.runtime_assets["summary_bundle_name"])}" '
-                    f'log_dir="{dag_escape(self.options.local_log_dir)}" '
-                    f'log_root="{dag_escape(summary_log_root)}"'
-                ),
-            ])
+            self.dag_lines.append("")
+            self.append_summary_final()
 
         self.metadata = OrderedDict([
             ("created_at", datetime.now().isoformat()),
@@ -4027,6 +4412,7 @@ class DAGBuilder:
             ("dagman_config_path", dagman_config_path),
             ("options", self.options.to_dict()),
             ("runtime_assets", self.runtime_assets),
+            ("log_archive", self.log_archive_metadata()),
             ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
             ("campaign_planning_spec", self.planning_spec),
             ("production_capacity_signals", {
@@ -4045,6 +4431,18 @@ class DAGBuilder:
                         "available_processing_nodes": cfg["available_processing_nodes"],
                         "selected_processing_nodes": cfg["processing_nodes"],
                         "required_blocks_by_pool": cfg["required_blocks_by_pool"],
+                        "estimated_pool_start_blocks": cfg.get(
+                            "estimated_pool_start_blocks", {}
+                        ),
+                        "estimated_pool_end_blocks": cfg.get(
+                            "estimated_pool_end_blocks", {}
+                        ),
+                        "estimated_lhe_events_by_slot": cfg.get(
+                            "estimated_lhe_events_by_slot", []
+                        ),
+                        "estimated_blocks_by_slot": cfg.get(
+                            "estimated_blocks_by_slot", []
+                        ),
                         "expected_events_per_node": cfg["expected_events_per_node"],
                         "expected_final_events": cfg["expected_final_events"],
                     }
@@ -4058,6 +4456,7 @@ class DAGBuilder:
     def build(self, campaign_names: Sequence[str], dag_filename: str) -> str:
         dagman_config_path = os.path.join(self.output_dir, "dagman.config")
         processing_jobs: List[str] = []
+        self.initialize_workflow_archive_id(dag_filename)
         self.planning_spec = load_campaign_planning_spec(
             self.options.campaign_job_spec,
             campaign_names,
@@ -4319,19 +4718,7 @@ class DAGBuilder:
             self.dag_lines.append("")
 
         if processing_jobs:
-            summary_log_root = self.log_directory("_shared", "summary")
-            self.dag_lines.append("# -------- 汇总节点 --------")
-            self.dag_lines.append(f"FINAL SUMMARY {os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}")
-            self.dag_lines.append(
-                "VARS SUMMARY summary_bundle_path=\"{summary_bundle_path}\" "
-                "summary_bundle_name=\"{summary_bundle_name}\" "
-                "log_dir=\"{log_dir}\" log_root=\"{log_root}\"".format(
-                    summary_bundle_path=dag_escape(self.runtime_assets["summary_bundle_path"]),
-                    summary_bundle_name=dag_escape(self.runtime_assets["summary_bundle_name"]),
-                    log_dir=dag_escape(self.options.local_log_dir),
-                    log_root=dag_escape(summary_log_root),
-                )
-            )
+            self.append_summary_final()
 
         self.metadata = OrderedDict(
             [
@@ -4340,6 +4727,7 @@ class DAGBuilder:
                 ("dagman_config_path", dagman_config_path),
                 ("options", self.options.to_dict()),
                 ("runtime_assets", self.runtime_assets),
+                ("log_archive", self.log_archive_metadata()),
                 ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
                 (
                     "campaign_job_ids",
@@ -5102,6 +5490,8 @@ def execute_generation(
             "processing_bundle_name": BUNDLE_NAMES["processing"],
             "summary_bundle_path": "<dry-run>/summary_runtime_bundle.tar.gz",
             "summary_bundle_name": BUNDLE_NAMES["summary"],
+            "summary_script_path": "<dry-run>/summary_final.sh",
+            "summary_script_name": "summary_final.sh",
             "proxy_bundle_path": "<dry-run>/proxy_bundle.tar.gz",
             "proxy_bundle_name": BUNDLE_NAMES["proxy"],
             "plan_bundle_path": "<dry-run>/plan_runtime_bundle.tar.gz",
@@ -5455,9 +5845,18 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--campaign",
         action="append",
-        required=True,
+        default=None,
         help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
     )
+    parser.add_argument("--output-mode", choices=("full", "mix-only", "merge-ntuple"),
+                        default="full", help="全链、CERN MIX-only 或 IHEP merge/ntuple 工作区。")
+    parser.add_argument("--split-manifest", default="")
+    parser.add_argument("--hepjob-merge-walltime", default="short",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-ntuple-walltime", default="mid",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-merge-memory-mb", type=int, default=0)
+    parser.add_argument("--hepjob-ntuple-memory-mb", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=1, help="每个 campaign 的 job 数。")
     parser.add_argument(
         "--campaign-job-spec",
@@ -5611,13 +6010,13 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         dest="archive_subdag_logs",
         action="store_true",
         default=True,
-        help="为 block SubDAG 添加 submit-side 日志归档 SCRIPT POST。",
+        help="由顶层 FINAL worker 归档 block workflow 的阶段日志。",
     )
     parser.add_argument(
         "--no-archive-subdag-logs",
         dest="archive_subdag_logs",
         action="store_false",
-        help="不为 block SubDAG 添加日志归档 SCRIPT POST。",
+        help="禁用顶层 FINAL worker 的 block workflow 日志归档。",
     )
     parser.add_argument(
         "--skip-lhe-generation",
@@ -5994,6 +6393,16 @@ def build_parser() -> argparse.ArgumentParser:
         force_generate_lhe=False,
         test_mode=True,
     )
+    audit_split_parser = subparsers.add_parser("audit-split")
+    audit_split_parser.add_argument("--stage", required=True, choices=("mix", "merge", "ntuple"))
+    audit_split_parser.add_argument("--workspace", required=True)
+    audit_split_parser.add_argument("--output", default="")
+    audit_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser = subparsers.add_parser("finalize-split")
+    finalize_split_parser.add_argument("--workspace", required=True)
+    finalize_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser.add_argument("--apply", action="store_true")
+
 
     matrix_parser = subparsers.add_parser(
         "generate-helac-matrix",
@@ -6186,6 +6595,8 @@ def normalize_args(argv: Sequence[str]) -> Sequence[str]:
         "generate",
         "generate-test",
         "generate-helac-matrix",
+        "audit-split",
+        "finalize-split",
         "generate-ntuple-only",
     }:
         return argv
@@ -6207,6 +6618,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "audit-split":
+        try:
+            if args.stage == "mix":
+                if not args.output:
+                    parser.error("--stage mix requires --output")
+                result = export_mix_manifest(args.workspace, args.output, args.campaign)
+            else:
+                result = audit_split_stage(args.workspace, args.stage, args.campaign)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("complete", True) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "finalize-split":
+        try:
+            result = finalize_split_workspace(args.workspace, args.campaign, args.apply)
+            print(json.dumps(result, indent=2))
+            return 0 if not any(x["action"] == "failed" for x in result["records"]) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "list":
         if args.kind in ("all", "campaigns"):
@@ -6303,7 +6736,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.output:
                 parser.error("fresh --run-on-condor preparation requires --output")
             try:
-                campaign_names = expand_campaign_selection(args.campaign)
+                campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
                 local_output_base = args.local_output_base or (
                     machine_env.local_output_base if machine_env.uses_local_storage else ""
                 )
@@ -6333,7 +6766,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.output:
             parser.error("direct scan-lhe-inventory requires --output")
         try:
-            campaign_names = expand_campaign_selection(args.campaign)
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
         except ValueError as exc:
             parser.error(str(exc))
         return execute_lhe_inventory_scan(
@@ -6373,7 +6806,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env = resolve_machine_env(requested_machine_env_name(args))
         except ValueError as exc:
             parser.error(str(exc))
-        campaign_names = expand_campaign_selection(args.campaign)
+        campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
+        if args.output_mode == "merge-ntuple":
+            if args.command != "generate" or not args.split_manifest:
+                parser.error("merge-ntuple requires generate and --split-manifest")
+            try:
+                bundle_dir = os.path.join(os.path.abspath(args.output_dir), "bundles")
+                assets = prepare_ntuple_only_assets(
+                    bundle_dir, cmssw15_runtime_tarball=args.cmssw15_runtime_tarball
+                )
+                names = expand_campaign_selection(args.campaign) if args.campaign else None
+                result = prepare_split_workspace(
+                    args.split_manifest, args.output_dir, BASE_DIR,
+                    assets["ntuple_bundle_path"], names, args.hepjob_group,
+                    args.hepjob_merge_walltime, args.hepjob_ntuple_walltime,
+                    args.hepjob_merge_memory_mb, args.hepjob_ntuple_memory_mb,
+                    args.proxy_path,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            except (OSError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        if not args.campaign:
+            parser.error("--campaign is required unless --output-mode merge-ntuple")
         if args.efficiency_ntuple:
             try:
                 validate_efficiency_campaigns(campaign_names)
@@ -6449,6 +6905,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             use_subprocess_naming=args.use_subprocess_naming,
             target_base_url=args.target_base_url,
             lhe_group_min_events=args.lhe_group_min_events,
+            output_mode=args.output_mode,
             lhe_group_max_events=args.lhe_group_max_events,
             lhe_group_max_files=args.lhe_group_max_files,
         )
@@ -6468,7 +6925,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Resolve campaign names
         if args.campaign:
-            campaign_names = expand_campaign_selection(args.campaign)
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
         elif args.miniaod_dir:
             # Auto-discover campaigns from directory
             if not os.path.isdir(args.miniaod_dir):

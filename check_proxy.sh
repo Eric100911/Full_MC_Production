@@ -70,7 +70,8 @@ check_proxy() {
     fi
 
     # Check time left
-    local timeleft=$(voms-proxy-info -file "${X509_USER_PROXY}" --timeleft 2>/dev/null || echo "0")
+    local timeleft
+    timeleft=$(voms-proxy-info -file "${X509_USER_PROXY}" --timeleft 2>/dev/null || echo "0")
     local hours_left=$((timeleft / 3600))
 
     if [[ $hours_left -lt $MIN_HOURS_LEFT ]]; then
@@ -79,7 +80,8 @@ check_proxy() {
     fi
 
     # Check CMS VO
-    local vo=$(voms-proxy-info -file "${X509_USER_PROXY}" --vo 2>/dev/null || echo "")
+    local vo
+    vo=$(voms-proxy-info -file "${X509_USER_PROXY}" --vo 2>/dev/null || echo "")
     if [[ "$vo" != "cms" ]]; then
         msg_error "Proxy is not for CMS VO (found: $vo)"
         return 1
@@ -160,7 +162,8 @@ test_xrootd() {
     fi
     
     # Test directory creation
-    local test_dir="$EOS_PATH_BASE/test_access_$(date +%s)"
+    local test_dir
+    test_dir="$EOS_PATH_BASE/test_access_$(date +%s)"
     msg_info "Testing xrdfs mkdir..."
     if xrdfs "$EOS_XRDFS_TARGET" mkdir -p "$test_dir" 2>/dev/null; then
         msg_ok "Can create directories"

@@ -254,10 +254,41 @@ After the pilot, recompute the normal:phi ratio from measured efficiencies and
 freeze the accepted values and inventory/layout hash in the production v2
 spec.
 
-Generated MiniAOD merge nodes request one CPU and 3 GB memory. Submit-side log
-archival uses a copy of `archive_subdag_logs.sh` snapshotted under the generated
-output directory. This prevents edits to the repository helper from changing
-the POST behavior of an in-flight DAG.
+Generated MiniAOD merge nodes request one CPU and 3 GB memory. With
+`--archive-subdag-logs`, the existing top-level `FINAL SUMMARY` becomes a
+one-CPU EL9 worker that scans the configured `log_root`, groups the
+`processing`, `miniaod_merge`, `ntuple`, and `final` logs by campaign/job, and
+uploads one structured archive plus manifest for each group. The helper is
+snapshotted in `summary_runtime_bundle.tar.gz`; no network or credential work
+runs as a DAGMan POST script on the schedd.
+
+The FINAL worker uses the proxy frozen into `proxy_bundle.tar.gz`. An expired
+proxy makes log archival fail-soft and writes
+`_shared/summary/workflow_log_archive_status_<workflow-id>.json`; it does not
+invalidate successful physics work. The FINAL wrapper propagates
+`DAG_STATUS`/`FAILED_COUNT`, so an upstream DAG failure is not hidden by a
+successful summary or archive.
+
+Remote archives use:
+
+```text
+<target>/output/<campaign>/<job_component>_logs/<workflow-id>/
+<target>/output/_log_archives/<workflow-id>/archive_index.json
+```
+
+`tools/archive_subdag_logs.sh` remains available only for manual recovery of
+older generated DAGs.
+
+For a processing job whose CMSSW chain completed but whose stageout manifest
+reports `transfer_failed`, set
+`PROCESSING_STAGEOUT_RECOVERY=validate-existing-or-rerun` in a recovery submit
+file. The worker first checks the remote ROOT and manifest sizes, opens the
+ROOT with `edmFileUtil`, and compares its event count with the manifest. A
+valid product keeps the original manifest under the job's `recovery/`
+directory and replaces the canonical manifest with recovery provenance. Any
+missing, empty, unreadable, or event-mismatched product automatically falls
+back to the full processing chain. Acceptance requires a final
+`size-verified` log line for both the ROOT product and canonical manifest.
 
 The generated metadata contains `production_capacity_signals`: bottleneck
 block counts, available and selected processing nodes, predicted event yields,
@@ -395,6 +426,16 @@ source occurrence reaches its configured LHE-event budget. It stops when any
 required source can no longer form another complete budgeted group; this
 determines the number of mixed output blocks.
 
+In inventory-driven v2 production, pre-generation block counts are capacity
+estimates only. Stratified splitting can create several partial tail blocks
+per source file, so exact cross-campaign and shard boundaries are calculated
+after every planner finishes. `ALLOCATE_CAMPAIGN_SHARDS` scans the shared
+planner-manifest index once and writes
+`plan_subdags/campaign_shard_allocation.json`. Every coordinator then loads its
+own shard cursor from that file. Check that coordinator configs do not contain
+an embedded `source_manifests` array; they should reference the shared
+campaign-level JSON file instead.
+
 Each output ID includes both the source-file index and block index:
 `JOBxxxxxx_BLOCKxxxxxx`. This prevents different planner groups from
 overwriting one another.
@@ -502,3 +543,147 @@ python3 tools/review_phase2_shower_efficiency.py \
 
 Run `--fetch-remote` only from a normal CERN/IHEP shell or with approved
 unsandboxed network access and a valid proxy.
+
+## CERN MIX / IHEP MERGE+NTUPLE split
+
+### Preconditions and invariants
+
+- Use block SubDAG generation with MiniAOD merge planning enabled. In
+  `mix-only`, coordinator manifests freeze merge groups even though the CERN
+  SubDAG emits no MERGE, NTUPLE, or per-SubDAG FINAL nodes.
+- Keep `target_eos_base` and storage settings centralized in
+  `common/node_config_defaults.json`. IHEP full URLs must retain
+  `root://cceos.ihep.ac.cn:1094///store/...`.
+- Run IHEP preparation from an IHEP-visible repository checkout and place the
+  generated workspace on persistent IHEP-visible storage.
+- A valid CMS proxy is rebuilt into `bundles/proxy_bundle.tar.gz` immediately
+  before each stage submission. Submission stops if less than ten minutes remain.
+- Split audits intentionally validate sidecar manifests only. They do not
+  checksum or download ROOT files. Existing worker-side EDM validation remains
+  authoritative.
+
+| Stage | Success evidence | Enables |
+|---|---|---|
+| MIX | Every processing sidecar is complete or explicitly merge-eligible | Frozen split manifest |
+| MERGE | Every merge sidecar is merge-eligible and names the planned output | Per-campaign merge gate |
+| NTUPLE | Every split ntuple sidecar names the planned output | Per-campaign ntuple gate and cleanup |
+
+### Generate and run the CERN stage
+
+Generate the CERN DAG with the normal campaign and block-planning options, plus
+`--output-mode mix-only`.  Coordinator SubDAGs then contain only MIX nodes;
+their manifests retain the frozen merge groups and ntuple destinations.
+
+```bash
+python3 dag_generator.py generate \
+  --campaign <campaign> \
+  --output-mode mix-only \
+  <normal production options> \
+  --output-dir generated/<cern-workspace> \
+  --output mix-only.dag
+```
+
+After the CERN DAG has completed, export the handoff manifest.  This gate reads
+processing sidecars only; it does not download or checksum ROOT files.  Worker
+scripts retain their normal EDM validation.
+
+```bash
+python3 dag_generator.py audit-split \
+  --stage mix \
+  --workspace generated/<cern-workspace> \
+  --output /path/on/ihep/split-manifest.json
+```
+
+### Prepare and run the IHEP stages
+
+On an IHEP login node, use a repository checkout and an IHEP-visible persistent
+output directory.  This creates two explicit HepJob submit scripts per campaign:
+MERGE first, then NTUPLE after the merge audit gate exists.
+
+```bash
+python3 dag_generator.py generate \
+  --output-mode merge-ntuple \
+  --split-manifest /path/on/ihep/split-manifest.json \
+  --output-dir /scratchfs/cms/<user>/split-workspace
+
+bash /scratchfs/cms/<user>/split-workspace/submit_merge_<campaign>.sh
+python3 dag_generator.py audit-split --stage merge \
+  --workspace /scratchfs/cms/<user>/split-workspace
+bash /scratchfs/cms/<user>/split-workspace/submit_ntuple_<campaign>.sh
+python3 dag_generator.py audit-split --stage ntuple \
+  --workspace /scratchfs/cms/<user>/split-workspace
+```
+
+An incomplete audit writes a compact `*_retry_tasks_<stamp>.json` and a matching
+snapshot wrapper `run_*_retry_<stamp>.sh`, then a stable `submit_*_retry.sh`
+that always submits the latest snapshot. Inspect the failed count and worker
+logs, submit only that retry script, and repeat the same audit. Retry artifacts
+are snapshot-isolated by timestamp: re-auditing while a retry cluster is in
+flight cannot rewrite the manifest a running job reads by `%{ProcId}`, so
+already-submitted jobs keep their original indices (do not hand-trim the shared
+retry task file). A successful audit purges stale snapshots and writes
+`gates/<stage>_<campaign>.json`.
+
+The generated HepJob scripts use one array-style cluster per campaign and pass
+`%{ProcId}` as the task index. Default resource classes are `short` for
+MERGE and `mid` for NTUPLE. Override them during workspace generation with
+`--hepjob-merge-walltime`, `--hepjob-ntuple-walltime`,
+`--hepjob-merge-memory-mb`, and `--hepjob-ntuple-memory-mb`.
+
+### DPS1 split architecture validation (2026-08-06)
+
+The split workflow was exercised end to end with HepJob on IHEP using an
+isolated CERN pilot and production groups 71--74. The production canary merged
+group 71 while accepting the existing successful group 74 merge sidecar, then
+produced both ntuples. Groups 72 and 73 were submitted only after the canary
+ntuple gate passed. The CERN pilot produced two five-event component MiniAODs,
+which IHEP merged into one approximately ten-event MiniAOD before running the
+ntuple stage.
+
+| Scope | MERGE cluster | NTUPLE cluster | Result |
+|---|---:|---:|---|
+| Production canary, groups 71/74 | `80201258`, retry `80201270` | `80201303` | Both gates complete |
+| Production batch, groups 72/73 | `80201381` | `80201413` | Both gates complete |
+| Isolated CERN pilot | `80201291` | `80201305`, retry `80201359` | Both gates complete |
+
+Each production merge contained 4,300 events, matching the five processing
+sidecars at 860 valid events each. The resulting ntuple sizes were 43,832,169,
+43,736,625, 43,832,653, and 43,790,526 bytes for groups 71--74 respectively;
+the pilot ntuple was 229,098 bytes. The files were checked with `xrdfs stat`,
+and every split ntuple sidecar named its planned triple-slash IHEP URL.
+
+The test exposed four operational compatibility requirements:
+
+- IHEP login-node Python 3.6 requires `universal_newlines=True` rather than the
+  newer `subprocess.run(..., text=True)` spelling in the merge wrapper.
+- The `test` HepJob walltime is only five minutes and is too short for this
+  ntuple workload; use `short` or longer even for the small pilot.
+- The outer split wrapper must extract and export the bundled proxy again after
+  the ntuple container exits so that post-container sidecar stage-out is
+  authenticated independently of host and container UID differences.
+- Create the configured HepJob log directory before submission. If a cluster
+  is held only for that missing directory, create the exact path and release
+  the affected processes with `hep_release`.
+
+All recorded clusters had left the queue at completion. Cleanup was previewed
+for the canary, batch, and pilot workspaces with `finalize-split` in dry-run
+mode only; no component MiniAOD was deleted.
+
+### Finalize component cleanup
+
+Cleanup is explicit and dry-run by default:
+
+```bash
+python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace
+python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace --apply
+```
+
+Finalize requires a successful ntuple audit gate and removes component MiniAODs
+only; merged MiniAODs, ntuples, and sidecars are retained. Each invocation
+writes a timestamped cleanup report under `logs/cleanup/`. Review the dry-run
+report before using `--apply`.
+
+The legacy polling workflow remains available for existing deployments, but new
+split production should use these explicit stage commands. Workspace generation
+does not submit jobs: record the IHEP campaign, task count, HepJob submission
+output, and stage gate before proceeding.

@@ -74,14 +74,15 @@ CMSSW_15_BASE="${CMSSW_15_BASE:-/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMS
 # Canonical IHEP full URL form: root://host:1094///store/... .
 # Keep the triple slash after the endpoint; do not normalize it away.
 # Override TARGET_EOS_BASE to redirect output to a different storage area.
-EOS_REDIRECTOR="cceos.ihep.ac.cn"
+EOS_REDIRECTOR="cceos.ihep.ac.cn:1094"
 EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="${EOS_HOST}"
 EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
 EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}//${EOS_LFN_BASE}}"
 EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
-EOS_OUTPUT="${EOS_BASE}/output"
+EOS_OUTPUT_SUBDIR="output"
+EOS_OUTPUT="${EOS_BASE}/${EOS_OUTPUT_SUBDIR}"
 NODE_CONFIG=""
 
 # LHE pools on T2_CN_Beijing storage
@@ -98,10 +99,14 @@ PHI_EXPOSURE_EVENTS=0
 MINIMUM_ACCEPTED_EVENTS=0
 MIXING_RNG_SEED=0
 PROCESSING_FAILURE_REASON=""
+PROCESSING_PARTIAL_REASON=""
 COMMON_MIX_TARGET=0
 ACTUAL_MIXED_HEPMC_EVENTS=0
+ACTUAL_RAW_EVENTS=0
+RAW_COMMAND_EXIT_CODE=0
 ACTUAL_MINIAOD_EVENTS=0
 MINIAOD_COUNT_SOURCE="unavailable"
+MINIAOD_LOSS_WARNING_FRACTION="${MINIAOD_LOSS_WARNING_FRACTION:-0.25}"
 PROCESSING_MANIFEST=""
 declare -a SOURCE_SLOTS=()
 declare -a SOURCE_MODES=()
@@ -206,9 +211,10 @@ run_logged() {
         stderr_size=$(wc -c < "${stderr_log}" 2>/dev/null || echo 0)
         msg_ok "${label} 完成 (stdout=${stdout_size} B, stderr=${stderr_size} B)"
         return 0
+    else
+        rc=$?
     fi
 
-    rc=$?
     msg_error "${label} 失败 (rc=${rc})"
     show_log_tail "${label} stderr" "${stderr_log}" 80 >&2
     show_log_tail "${label} stdout" "${stdout_log}" 40
@@ -244,9 +250,53 @@ print(value % 900000000 + 1)
 PYHELPER
 }
 
+sync_stageout_target() {
+    local parsed_target=""
+    parsed_target=$(python3 - "${TARGET_EOS_BASE:-${EOS_BASE}}" <<'PYHELPER'
+import posixpath
+import sys
+from urllib.parse import urlsplit
+
+raw = sys.argv[1].strip().rstrip("/")
+parsed = urlsplit(raw)
+if parsed.scheme != "root" or not parsed.netloc:
+    raise SystemExit(f"stageout base must be a root:// URL: {raw!r}")
+if parsed.query or parsed.fragment:
+    raise SystemExit("stageout base must not contain a query or fragment")
+
+lfn = "/" + parsed.path.lstrip("/")
+lfn = posixpath.normpath(lfn)
+if lfn == "/" or not lfn.startswith("/store/"):
+    raise SystemExit(f"stageout base must resolve below /store: {lfn!r}")
+if any(part == ".." for part in parsed.path.split("/")):
+    raise SystemExit("stageout base must not contain '..'")
+
+endpoint = f"root://{parsed.netloc}/"
+# lfn begins with '/', so endpoint + '/' + lfn preserves the required
+# root://host:port///store/... form.
+canonical_base = f"root://{parsed.netloc}//{lfn}"
+print(f"{endpoint}\t{lfn}\t{canonical_base}")
+PYHELPER
+    ) || {
+        msg_error "Invalid final stageout target: ${TARGET_EOS_BASE:-${EOS_BASE}}"
+        return 1
+    }
+
+    IFS=$'\t' read -r EOS_XRDFS_TARGET EOS_PATH_BASE EOS_BASE <<< "${parsed_target}"
+    EOS_HOST="${EOS_XRDFS_TARGET#root://}"
+    EOS_HOST="${EOS_HOST%/}"
+    EOS_REDIRECTOR="${EOS_HOST}"
+    EOS_OUTPUT="${EOS_BASE}/${EOS_OUTPUT_SUBDIR}"
+
+    msg_info "Stageout target synchronized: url=${EOS_BASE} lfn=${EOS_PATH_BASE} xrdfs=${EOS_XRDFS_TARGET}"
+}
+
 load_node_config() {
     local config_path="$1"
-    [[ -n "${config_path}" ]] || return 0
+    if [[ -z "${config_path}" ]]; then
+        sync_stageout_target
+        return $?
+    fi
     if [[ ! -s "${config_path}" ]]; then
         msg_error "Node config JSON not found or empty: ${config_path}"
         return 1
@@ -278,7 +328,8 @@ load_node_config() {
                         EOS_GENERATED_LHE_BASE="${value}"
                         ;;
                     output_subdir)
-                        EOS_OUTPUT="${EOS_BASE}/${value}"
+                        EOS_OUTPUT_SUBDIR="${value#/}"
+                        EOS_OUTPUT_SUBDIR="${EOS_OUTPUT_SUBDIR%/}"
                         ;;
                 esac
                 ;;
@@ -317,7 +368,7 @@ PYHELPER
     )
 
     EOS_BASE="${TARGET_EOS_BASE:-${EOS_BASE}}"
-    EOS_OUTPUT="${EOS_OUTPUT:-${EOS_BASE}/output}"
+    sync_stageout_target || return 1
     if [[ -z "${EOS_GENERATED_LHE_BASE}" ]]; then
         msg_error "Configured generated_lhe_base is empty"
         return 1
@@ -490,20 +541,58 @@ make_remote_dir() {
 stage_out() {
     local local_file="$1"
     local remote_subpath="$2"
+    local max_attempts="${STAGEOUT_MAX_ATTEMPTS:-3}"
+    local attempt=0
+    local local_size=0
+    local remote_size=""
+    local remote_stat=""
+    local remote_path="${EOS_PATH_BASE}/${remote_subpath}"
 
     if [[ ! -f "${local_file}" ]]; then
         msg_error "Local file not found: ${local_file}"
         return 1
     fi
+
+    local_size=$(stat -c '%s' "${local_file}") || {
+        msg_error "Failed to determine local file size: ${local_file}"
+        return 1
+    }
+    if [[ "${local_size}" -le 0 ]]; then
+        msg_error "Refusing to stage out an empty file: ${local_file}"
+        return 1
+    fi
+    if ! [[ "${max_attempts}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "STAGEOUT_MAX_ATTEMPTS must be a positive integer: ${max_attempts}"
+        return 1
+    fi
     
     local remote_url="${EOS_BASE}/${remote_subpath}"
     msg_info "Staging out: ${local_file} -> ${remote_url}"
-    
-    run_logged "xrdcp_stageout_$(basename "${local_file}")" run_xrdcp --nopbar --force "${local_file}" "${remote_url}" || {
-        msg_error "Failed to stage out ${local_file} to ${remote_url}"
-        return 1
-    }
-    msg_ok "Staged out: ${remote_url}"
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if ! run_logged \
+            "xrdcp_stageout_$(basename "${local_file}")_attempt${attempt}" \
+            run_xrdcp --nopbar --force "${local_file}" "${remote_url}"; then
+            msg_warn "Stageout attempt ${attempt}/${max_attempts} failed: ${remote_url}"
+        else
+            remote_stat=$(run_xrdfs "${EOS_XRDFS_TARGET}" stat "${remote_path}" 2>/dev/null || true)
+            remote_size=$(awk '$1 == "Size:" {print $2; exit}' <<< "${remote_stat}")
+            if [[ "${remote_size}" == "${local_size}" ]]; then
+                msg_ok "Staged out and size-verified (${local_size} B): ${remote_url}"
+                return 0
+            fi
+            msg_warn "Stageout size mismatch on attempt ${attempt}/${max_attempts}: local=${local_size} remote=${remote_size:-unavailable} url=${remote_url} stat_path=${remote_path}"
+        fi
+
+        # A failed transfer can leave a zero-byte or truncated object.  Remove
+        # only this exact destination before retrying so --force does not build
+        # on top of a bad remote file.
+        run_xrdfs "${EOS_XRDFS_TARGET}" rm "${remote_path}" >/dev/null 2>&1 || true
+    done
+
+    msg_error \
+        "Failed to stage out and verify ${local_file} after ${max_attempts} attempts: ${remote_url}"
+    return 1
 }
 
 get_lhe_file() {
@@ -784,7 +873,6 @@ setup_cmssw12() {
     source /cvmfs/cms.cern.ch/cmsset_default.sh
     # Force el8 architecture for CMSSW_12
     export SCRAM_ARCH=el8_amd64_gcc10
-    export SITECONFIG_PATH=/cvmfs/cms.cern.ch/SITECONF/T2_CN_Beijing
     
     # Create project on demand if needed
     local base_path
@@ -899,14 +987,8 @@ run_in_cmssw12_container() {
     local script_path="$1"
     shift
     local scratch_root=""
-    local siteconf_overlay=""
     local command_text=""
     scratch_root=$(dirname "${WORKDIR}")
-    siteconf_overlay="${scratch_root}/cms_siteconf_overlay"
-    rm -rf "${siteconf_overlay}"
-    mkdir -p "${siteconf_overlay}"
-    cp -a /cvmfs/cms.cern.ch/SITECONF/T2_CN_Beijing "${siteconf_overlay}/"
-    ln -s T2_CN_Beijing "${siteconf_overlay}/local"
     command_text=$(quote_shell_words /bin/bash "${script_path}" "$@")
 
     UNPACKED_IMAGE="${CMSSW12_CONTAINER}" \
@@ -915,7 +997,6 @@ run_in_cmssw12_container() {
     /cvmfs/cms.cern.ch/common/cmssw-el8 \
         -B "${scratch_root}" \
         -B /tmp \
-        -B "${siteconf_overlay}:/cvmfs/cms.cern.ch/SITECONF" \
         --command-to-run "${command_text}"
 
     return $?
@@ -1607,7 +1688,11 @@ run_raw() {
     
     setup_cmssw12
     
-    local cfg_file=$(mktemp --suffix=_raw_cfg.py)
+    local cfg_file
+    cfg_file=$(mktemp --suffix=_raw_cfg.py) || {
+        msg_error "Failed to create temporary RAW configuration"
+        return 1
+    }
     local raw_threads="${RAW_THREADS:-2}"
     local raw_streams="${RAW_STREAMS:-2}"
     local raw_watchdog_timeout="${RAW_WATCHDOG_TIMEOUT:-7200s}"
@@ -1659,15 +1744,35 @@ run_raw() {
         --fileout "file:${RAW_OUTPUT}"
     
     msg_info "Running RAW step with nThreads=${raw_threads}, nStreams=${raw_streams}, watchdog=${raw_watchdog_timeout}..."
-    run_cmssw12_command "cmsRun_step2_raw" timeout --preserve-status --kill-after="${raw_watchdog_kill_after}" "${raw_watchdog_timeout}" cmsRun "${cfg_file}"
+    local raw_rc=0
+    run_cmssw12_command "cmsRun_step2_raw" timeout --preserve-status --kill-after="${raw_watchdog_kill_after}" "${raw_watchdog_timeout}" cmsRun "${cfg_file}" || raw_rc=$?
     rm -f "${cfg_file}"
     
     if [[ ! -f "${RAW_OUTPUT}" ]]; then
         msg_error "RAW step failed: ${RAW_OUTPUT} not created"
         return 1
     fi
+
+    if [[ "${raw_rc}" -ne 0 ]]; then
+        validate_root_file "partial_raw" "${RAW_OUTPUT}" || {
+            msg_error "RAW cmsRun exited ${raw_rc} and its output is not a valid closed ROOT file"
+            return "${raw_rc}"
+        }
+        ACTUAL_RAW_EVENTS=$(count_root_events "${RAW_OUTPUT}")
+        if ! [[ "${ACTUAL_RAW_EVENTS}" =~ ^[1-9][0-9]*$ ]]; then
+            msg_error "RAW cmsRun exited ${raw_rc} and its output has no verifiable events"
+            return "${raw_rc}"
+        fi
+        RAW_COMMAND_EXIT_CODE="${raw_rc}"
+        PROCESSING_PARTIAL_REASON="raw_cmsrun_nonzero_with_valid_output"
+        msg_warn "RAW cmsRun exited ${raw_rc}; retaining valid partial RAW with ${ACTUAL_RAW_EVENTS} events"
+    fi
     
-    msg_ok "RAW complete: ${RAW_OUTPUT}"
+    if [[ "${RAW_COMMAND_EXIT_CODE}" -ne 0 ]]; then
+        msg_ok "RAW partial output accepted: ${RAW_OUTPUT} (${ACTUAL_RAW_EVENTS} verified events)"
+    else
+        msg_ok "RAW complete: ${RAW_OUTPUT}"
+    fi
 }
 
 # Step 5: RECO
@@ -1678,7 +1783,11 @@ run_reco() {
     
     setup_cmssw12
     
-    local cfg_file=$(mktemp --suffix=_reco_cfg.py)
+    local cfg_file
+    cfg_file=$(mktemp --suffix=_reco_cfg.py) || {
+        msg_error "Failed to create temporary RECO configuration"
+        return 1
+    }
     
     msg_info "Generating RECO config..."
     run_logged "cmsDriver_step3_reco" cmsDriver.py step3 \
@@ -1740,7 +1849,9 @@ PYHELPER
 
 count_root_events() {
     local root_file="$1"
-    local json_path="${WORKDIR}/$(basename "${root_file}").edmFileUtil.json"
+    local root_basename
+    root_basename=$(basename "${root_file}") || return 1
+    local json_path="${WORKDIR}/${root_basename}.edmFileUtil.json"
     rm -f "${json_path}"
     run_cmssw12_command "edmFileUtil_miniaod" \
         bash -c 'edmFileUtil -j -f "$1" > "$2"' \
@@ -1759,7 +1870,9 @@ write_processing_manifest() {
         "${FIRST_EVENT}" "${EVENT_ID_SPAN}" "${miniaod_url_value}" \
         "${PHI_CONSUMPTION_MODE}" "${PHI_EXPOSURE_EVENTS}" "${MINIMUM_ACCEPTED_EVENTS}" \
         "${NORMAL_SHORTFALL_POLICY}" "${UNUSED_HEPMC_WARNING_FRACTION}" \
-        "${PROCESSING_FAILURE_REASON}" \
+        "${PROCESSING_FAILURE_REASON}" "${PROCESSING_PARTIAL_REASON}" \
+        "${RAW_COMMAND_EXIT_CODE}" "${ACTUAL_RAW_EVENTS}" \
+        "${MINIAOD_LOSS_WARNING_FRACTION}" \
         "${MINIAOD_COUNT_SOURCE}" "${SOURCE_MANIFESTS[@]}" <<'PYHELPER'
 import json
 import os
@@ -1784,6 +1897,10 @@ from datetime import datetime, timezone
     normal_shortfall_policy,
     unused_warning_fraction,
     failure_reason,
+    partial_reason,
+    raw_command_exit_code,
+    actual_raw_events,
+    miniaod_loss_warning_fraction,
     miniaod_count_source,
     *source_manifest_paths,
 ) = sys.argv[1:]
@@ -1795,6 +1912,9 @@ event_id_span = int(event_id_span)
 exposure_target = int(exposure_target or 0)
 minimum_accepted = int(minimum_accepted or 0)
 unused_warning_fraction = float(unused_warning_fraction)
+raw_command_exit_code = int(raw_command_exit_code or 0)
+actual_raw_events = int(actual_raw_events or 0)
+miniaod_loss_warning_fraction = float(miniaod_loss_warning_fraction)
 source_statistics = []
 for path in source_manifest_paths:
     if not path or not os.path.isfile(path):
@@ -1839,10 +1959,24 @@ for index, item in enumerate(source_statistics):
         "unused_fraction": unused_fraction,
         "assessment": assessment,
     })
+missing_miniaod_events = max(0, actual_mixed - actual_miniaod)
+miniaod_loss_fraction = (
+    missing_miniaod_events / actual_mixed if actual_mixed else 0.0
+)
+is_partial = bool(
+    actual_miniaod > 0
+    and not failure_reason
+    and (partial_reason or actual_miniaod < actual_mixed)
+)
+status = (
+    "failed" if actual_miniaod <= 0 or failure_reason
+    else "partial" if is_partial
+    else "ok"
+)
 manifest = {
     "campaign": campaign,
     "job_id": job_id,
-    "status": "ok" if actual_miniaod > 0 and not failure_reason else "failed",
+    "status": status,
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "phi_consumption_mode": consumption_mode,
     "phi_exposure_events": exposure_target if consumption_mode == "exhaustive" else None,
@@ -1863,10 +1997,28 @@ manifest = {
     "target_mixed_events": None if consumption_mode == "exhaustive" else target_mixed,
     "event_id_span": event_id_span,
     "actual_mixed_hepmc_events": actual_mixed,
+    "actual_raw_events": actual_raw_events or None,
+    "raw_cmsrun_exit_code": raw_command_exit_code,
     "actual_miniaod_events": actual_miniaod,
-    "completion_fraction": None if consumption_mode == "exhaustive" else (actual_mixed / target_mixed if target_mixed else 0.0),
-    "complete": actual_miniaod > 0 and not failure_reason,
+    "completion_fraction": (
+        actual_miniaod / actual_mixed if consumption_mode == "exhaustive" and actual_mixed
+        else actual_mixed / target_mixed if target_mixed
+        else 0.0
+    ),
+    "missing_miniaod_events": missing_miniaod_events,
+    "miniaod_loss_fraction": miniaod_loss_fraction,
+    "miniaod_loss_warning_fraction": miniaod_loss_warning_fraction,
+    "miniaod_loss_assessment": (
+        "warning"
+        if miniaod_loss_fraction > miniaod_loss_warning_fraction
+        else "within_threshold"
+    ),
+    "complete": status == "ok",
+    "merge_eligible": status in {"ok", "partial"} and actual_miniaod > 0,
     "failure_reason": failure_reason or None,
+    "partial_reason": partial_reason or (
+        "miniaod_event_count_shortfall" if is_partial else None
+    ),
     "miniaod_count_source": miniaod_count_source,
     "edm_event_id": {
         "run": int(first_run),
@@ -1907,6 +2059,165 @@ stage_failed_processing_manifest() {
     fi
 }
 
+recover_existing_stageout() {
+    local output_subpath="${CUSTOM_OUTPUT_SUBPATH:-output/${CAMPAIGN_NAME}/${JOB_ID}}"
+    local miniaod_name="output_MINIAOD.root"
+    local manifest_name="processing_manifest_${CAMPAIGN_NAME}_${JOB_ID}.json"
+    local miniaod_url="${EOS_BASE}/${output_subpath}/${miniaod_name}"
+    local miniaod_path="${EOS_PATH_BASE}/${output_subpath}/${miniaod_name}"
+    local manifest_url="${EOS_BASE}/${output_subpath}/${manifest_name}"
+    local manifest_path="${EOS_PATH_BASE}/${output_subpath}/${manifest_name}"
+    local local_manifest="${WORKDIR}/${manifest_name}.original"
+    local repaired_manifest="${WORKDIR}/${manifest_name}"
+    local remote_size=""
+    local manifest_size=""
+    local manifest_status=""
+    local expected_events=""
+    local manifest_merge_eligible=""
+    local actual_events=""
+    local original_sha=""
+    local archive_subpath=""
+
+    msg_step "Stageout recovery: validate existing MiniAOD"
+
+    remote_size=$(run_xrdfs "${EOS_XRDFS_TARGET}" stat "${miniaod_path}" 2>/dev/null |
+        awk '$1 == "Size:" {print $2; exit}') || true
+    if ! [[ "${remote_size}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "Existing MiniAOD is missing or empty: ${miniaod_url}"
+        return 20
+    fi
+
+    manifest_size=$(run_xrdfs "${EOS_XRDFS_TARGET}" stat "${manifest_path}" 2>/dev/null |
+        awk '$1 == "Size:" {print $2; exit}') || true
+    if ! [[ "${manifest_size}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "Existing processing manifest is missing or empty: ${manifest_url}"
+        return 21
+    fi
+
+    run_logged "download_existing_manifest_${JOB_ID}" \
+        run_xrdcp --nopbar --force "${manifest_url}" "${local_manifest}" || return 22
+
+    IFS=$'\t' read -r manifest_status expected_events manifest_merge_eligible < <(
+        python3 - "${local_manifest}" "${CAMPAIGN_NAME}" "${JOB_ID}" "${miniaod_url}" <<'PYHELPER'
+import json
+import sys
+
+path, campaign, job_id, expected_url = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("campaign") != campaign:
+    raise SystemExit("manifest campaign does not match recovery config")
+if manifest.get("job_id") != job_id:
+    raise SystemExit("manifest job_id does not match recovery config")
+if manifest.get("miniaod_url") != expected_url:
+    raise SystemExit("manifest miniaod_url does not match the final stageout target")
+events = int(manifest.get("actual_miniaod_events") or 0)
+if events <= 0:
+    raise SystemExit("manifest does not contain a positive MiniAOD event count")
+print(
+    f"{manifest.get('status') or ''}\t{events}\t"
+    f"{str(manifest.get('merge_eligible') is True).lower()}"
+)
+PYHELPER
+    ) || {
+        msg_error "Existing processing manifest failed structural validation: ${manifest_url}"
+        return 23
+    }
+
+    actual_events=$(count_root_events "${miniaod_url}")
+    if ! [[ "${actual_events}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "edmFileUtil could not open/count existing MiniAOD: ${miniaod_url}"
+        return 24
+    fi
+    if [[ "${actual_events}" != "${expected_events}" ]]; then
+        msg_error "Existing MiniAOD event mismatch: manifest=${expected_events} edmFileUtil=${actual_events} url=${miniaod_url}"
+        return 25
+    fi
+
+    if [[ "${manifest_status}" == "ok" ]] && python3 - "${local_manifest}" <<'PYHELPER'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+raise SystemExit(0 if manifest.get("complete") is True and not manifest.get("failure_reason") else 1)
+PYHELPER
+    then
+        msg_ok "Existing stageout already valid and size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
+        return 0
+    fi
+    if [[ "${manifest_status}" == "partial" && "${manifest_merge_eligible}" == "true" ]] && python3 - "${local_manifest}" <<'PYHELPER'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+raise SystemExit(0 if not manifest.get("failure_reason") else 1)
+PYHELPER
+    then
+        msg_warn "Existing partial stageout is merge-eligible and size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
+        return 0
+    fi
+
+    original_sha=$(sha256sum "${local_manifest}" | awk '{print $1}') || return 26
+    archive_subpath="${output_subpath}/recovery/original_processing_manifest_${original_sha}.json"
+    make_remote_dir "${output_subpath}/recovery" || return 27
+    stage_out "${local_manifest}" "${archive_subpath}" || return 28
+
+    python3 - "${local_manifest}" "${repaired_manifest}" "${actual_events}" \
+        "${remote_size}" "${original_sha}" "${EOS_BASE}/${archive_subpath}" \
+        "${PROCESSING_RUNTIME_BUNDLE_SHA256:-unknown}" <<'PYHELPER'
+import json
+import sys
+from datetime import datetime, timezone
+
+(
+    source_path,
+    output_path,
+    actual_events,
+    remote_size,
+    original_sha,
+    archived_url,
+    runtime_bundle_sha,
+) = sys.argv[1:]
+with open(source_path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+actual_events = int(actual_events)
+actual_mixed = int(manifest.get("actual_mixed_hepmc_events") or 0)
+is_partial = actual_mixed > 0 and actual_events < actual_mixed
+missing_events = max(0, actual_mixed - actual_events)
+loss_fraction = missing_events / actual_mixed if actual_mixed else 0.0
+warning_fraction = float(manifest.get("miniaod_loss_warning_fraction") or 0.25)
+manifest.update({
+    "status": "partial" if is_partial else "ok",
+    "complete": not is_partial,
+    "merge_eligible": True,
+    "failure_reason": None,
+    "partial_reason": "miniaod_event_count_shortfall" if is_partial else None,
+    "actual_miniaod_events": actual_events,
+    "completion_fraction": actual_events / actual_mixed if actual_mixed else 0.0,
+    "missing_miniaod_events": missing_events,
+    "miniaod_loss_fraction": loss_fraction,
+    "miniaod_loss_warning_fraction": warning_fraction,
+    "miniaod_loss_assessment": "warning" if loss_fraction > warning_fraction else "within_threshold",
+    "miniaod_count_source": "edmFileUtil-remote-recovery",
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "recovery": {
+        "mode": "validate-existing",
+        "validated_at": datetime.now(timezone.utc).isoformat(),
+        "miniaod_remote_size": int(remote_size),
+        "original_manifest_sha256": original_sha,
+        "original_manifest_url": archived_url,
+        "runtime_bundle_sha256": runtime_bundle_sha,
+    },
+})
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+    handle.write("\n")
+PYHELPER
+
+    stage_out "${repaired_manifest}" "${output_subpath}/${manifest_name}" || return 29
+    msg_ok "Existing MiniAOD and repaired manifest size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
+}
+
 # Step 6: MiniAOD
 run_miniaod() {
     msg_step "Step 6: MiniAOD"
@@ -1915,7 +2226,11 @@ run_miniaod() {
     
     setup_cmssw12
     
-    local cfg_file=$(mktemp --suffix=_miniaod_cfg.py)
+    local cfg_file
+    cfg_file=$(mktemp --suffix=_miniaod_cfg.py) || {
+        msg_error "Failed to create temporary MiniAOD configuration"
+        return 1
+    }
     
     msg_info "Generating MiniAOD config..."
     run_logged "cmsDriver_step4_miniaod" cmsDriver.py step4 \
@@ -1956,10 +2271,22 @@ run_miniaod() {
     if [[ "${MINIAOD_COUNT_SOURCE}" == "unavailable" ]]; then
         MINIAOD_COUNT_SOURCE="edmFileUtil"
     fi
-    if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${ACTUAL_MINIAOD_EVENTS}" -ne "${ACTUAL_MIXED_HEPMC_EVENTS}" ]]; then
-        PROCESSING_FAILURE_REASON="miniaod_mixed_event_count_mismatch"
-        msg_error "MiniAOD count ${ACTUAL_MINIAOD_EVENTS} != mixed count ${ACTUAL_MIXED_HEPMC_EVENTS}"
+    if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${ACTUAL_MINIAOD_EVENTS}" -gt "${ACTUAL_MIXED_HEPMC_EVENTS}" ]]; then
+        PROCESSING_FAILURE_REASON="miniaod_event_count_exceeds_mixed"
+        msg_error "MiniAOD count ${ACTUAL_MINIAOD_EVENTS} exceeds mixed count ${ACTUAL_MIXED_HEPMC_EVENTS}"
         return 1
+    fi
+    if [[ "${PHI_CONSUMPTION_MODE}" == "exhaustive" && "${ACTUAL_MINIAOD_EVENTS}" -lt "${ACTUAL_MIXED_HEPMC_EVENTS}" ]]; then
+        local missing_events=$((ACTUAL_MIXED_HEPMC_EVENTS - ACTUAL_MINIAOD_EVENTS))
+        local loss_fraction
+        loss_fraction=$(awk -v missing="${missing_events}" -v mixed="${ACTUAL_MIXED_HEPMC_EVENTS}" \
+            'BEGIN { if (mixed > 0) printf "%.6f", missing / mixed; else print "0" }')
+        PROCESSING_PARTIAL_REASON="${PROCESSING_PARTIAL_REASON:+${PROCESSING_PARTIAL_REASON},}miniaod_event_count_shortfall"
+        msg_warn "Accepting partial MiniAOD: ${ACTUAL_MINIAOD_EVENTS}/${ACTUAL_MIXED_HEPMC_EVENTS} events (loss=${loss_fraction})"
+        if awk -v loss="${loss_fraction}" -v threshold="${MINIAOD_LOSS_WARNING_FRACTION}" \
+            'BEGIN { exit !(loss > threshold) }'; then
+            msg_warn "MiniAOD event loss ${loss_fraction} exceeds warning threshold ${MINIAOD_LOSS_WARNING_FRACTION}; output remains merge-eligible"
+        fi
     fi
     
     msg_ok "MiniAOD complete: ${MINIAOD_OUTPUT} (${ACTUAL_MINIAOD_EVENTS} events)"
@@ -2082,14 +2409,20 @@ MANIFESTEOF
     
     # Copy final outputs via XRootD
     if [[ "${TRANSFER_MINIAOD}" == "true" && -f "${MINIAOD_OUTPUT}" ]]; then
-        local miniaod_basename=$(basename "${MINIAOD_OUTPUT}")
+        local miniaod_basename
+        miniaod_basename=$(basename "${MINIAOD_OUTPUT}") || return 1
         stage_out "${MINIAOD_OUTPUT}" "${output_subpath}/${miniaod_basename}" || return 1
         write_processing_manifest "${EOS_BASE}/${output_subpath}/${miniaod_basename}" || return 1
         stage_out "${PROCESSING_MANIFEST}" "${output_subpath}/$(basename "${PROCESSING_MANIFEST}")" || return 1
     fi
     
     if [[ -f "${NTUPLE_OUTPUT:-}" ]]; then
-        local ntuple_basename="${CUSTOM_NTUPLE_BASENAME:-$(basename "${NTUPLE_OUTPUT}")}"
+        local ntuple_basename
+        if [[ -n "${CUSTOM_NTUPLE_BASENAME:-}" ]]; then
+            ntuple_basename="${CUSTOM_NTUPLE_BASENAME}"
+        else
+            ntuple_basename=$(basename "${NTUPLE_OUTPUT}") || return 1
+        fi
         stage_out "${NTUPLE_OUTPUT}" "${output_subpath}/${ntuple_basename}" || return 1
 
         if [[ "${EFFICIENCY_NTUPLE}" == "true" ]]; then
@@ -2144,6 +2477,7 @@ Optional:
   --stop-at STEP          Stop after specified step
   --miniaod-input PATH    Existing MiniAOD input for standalone ntuple nodes
   --transfer-miniaod BOOL Whether transfer step should upload MiniAOD (true|false)
+  --stageout-recovery MODE Validate an existing stageout (none|validate-existing)
   --max-events N          Limit events for fast local test (default: -1 = all)
   --first-run N           First run number for GEN-SIM EventID assignment
   --first-luminosity-block N First luminosity block for GEN-SIM EventID assignment
@@ -2185,6 +2519,7 @@ FIRST_RUN=1
 FIRST_LUMINOSITY_BLOCK=1
 FIRST_EVENT=1
 N_EVENTS_IN_LUMI=0
+STAGEOUT_RECOVERY_MODE="${PROCESSING_STAGEOUT_RECOVERY:-none}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -2250,6 +2585,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --transfer-miniaod)
             TRANSFER_MINIAOD="$2"
+            shift 2
+            ;;
+        --stageout-recovery)
+            STAGEOUT_RECOVERY_MODE="$2"
             shift 2
             ;;
         --first-run)
@@ -2320,6 +2659,12 @@ if [[ "${TRANSFER_MINIAOD}" != "true" ]] && [[ "${TRANSFER_MINIAOD}" != "false" 
     exit 1
 fi
 
+if [[ "${STAGEOUT_RECOVERY_MODE}" != "none" ]] && \
+   [[ "${STAGEOUT_RECOVERY_MODE}" != "validate-existing" ]]; then
+    msg_error "--stageout-recovery must be none or validate-existing"
+    exit 1
+fi
+
 if ! [[ "${MAX_EVENTS}" =~ ^-?[0-9]+$ ]]; then
     msg_error "--max-events must be an integer"
     exit 1
@@ -2377,6 +2722,11 @@ fi
 
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
 ensure_voms_proxy
+
+if [[ "${STAGEOUT_RECOVERY_MODE}" == "validate-existing" ]]; then
+    recover_existing_stageout
+    exit $?
+fi
 
 LHE_FILES=()
 if [[ "${SKIP_TO}" == "ntuple" ]]; then

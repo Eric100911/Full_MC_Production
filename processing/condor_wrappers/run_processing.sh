@@ -38,6 +38,9 @@ if command -v voms-proxy-info >/dev/null 2>&1; then
 fi
 
 echo "Extracting processing bundle..."
+PROCESSING_RUNTIME_BUNDLE_SHA256=$(sha256sum "${PROCESSING_BUNDLE}" | awk '{print $1}')
+export PROCESSING_RUNTIME_BUNDLE_SHA256
+echo "Processing runtime bundle SHA256: ${PROCESSING_RUNTIME_BUNDLE_SHA256}"
 tar -xzf "${PROCESSING_BUNDLE}"
 
 export LD_LIBRARY_PATH="/usr/lib64:${LD_LIBRARY_PATH:-}"
@@ -156,6 +159,27 @@ if cfg.get("skip_to"):
     cmd.extend(["--skip-to", str(cfg["skip_to"])])
 if cfg.get("stop_at"):
     cmd.extend(["--stop-at", str(cfg["stop_at"])])
+stageout_recovery = str(
+    cfg.get("stageout_recovery")
+    or env.get("PROCESSING_STAGEOUT_RECOVERY")
+    or "none"
+)
+if stageout_recovery == "validate-existing-or-rerun":
+    recovery_cmd = cmd + ["--stageout-recovery", "validate-existing"]
+    recovery_result = subprocess.run(recovery_cmd, env=env, check=False)
+    if recovery_result.returncode == 0:
+        raise SystemExit(0)
+    print(
+        "WARN: existing stageout validation failed "
+        f"(rc={recovery_result.returncode}); falling back to the full chain",
+        file=sys.stderr,
+        flush=True,
+    )
+    # The recovery submit exports validate-existing-or-rerun.  Clear it for
+    # the second run so run_chain executes the normal full processing path.
+    env["PROCESSING_STAGEOUT_RECOVERY"] = "none"
+elif stageout_recovery != "none":
+    cmd.extend(["--stageout-recovery", stageout_recovery])
 
 raise SystemExit(subprocess.run(cmd, env=env, check=False).returncode)
 PY

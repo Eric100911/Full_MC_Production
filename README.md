@@ -97,6 +97,50 @@ All commands share `--machine-env` to select the submit/storage profile.
 
 `lxplus_t2_ihep` splits MiniAOD and ntuple into separate DAG nodes; `hepthu` keeps ntuple inline to avoid cross-node local file access.
 
+### CERN MIX / IHEP MERGE+NTUPLE split
+
+Large block productions can keep CPU-heavy MIX processing at CERN while moving
+MiniAOD merging and ntuple production to IHEP, where the staged MiniAODs are
+site-local:
+
+```text
+CERN HTCondor: MIX -> MiniAOD -> IHEP EOS
+IHEP HepJob:   local MiniAOD reads -> MERGE -> NTUPLE
+```
+
+The handoff is explicit and manifest-driven. It does not poll the other batch
+system and does not add file checksums: processing and merge worker sidecars are
+the stage gates, while the existing workers retain their EDM event validation.
+
+```bash
+# CERN: generate and run the block workflow with MIX nodes only
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep \
+  --campaign <campaign> \
+  --output-mode mix-only \
+  <block production options> \
+  --output-dir generated/<cern-workspace> \
+  --output mix-only.dag
+
+# CERN after completion: freeze the IHEP handoff
+python3 dag_generator.py audit-split --stage mix \
+  --workspace generated/<cern-workspace> \
+  --output /path/on/ihep/split-manifest.json
+
+# IHEP: prepare one MERGE cluster and one NTUPLE cluster per campaign
+python3 dag_generator.py generate \
+  --output-mode merge-ntuple \
+  --split-manifest /path/on/ihep/split-manifest.json \
+  --output-dir /scratchfs/cms/<user>/split-workspace
+```
+
+Submit the generated `submit_merge_<campaign>.sh`, run
+`audit-split --stage merge`, then submit `submit_ntuple_<campaign>.sh`.
+Incomplete audits generate compact retry clusters. `finalize-split` previews
+component-MiniAOD cleanup and requires `--apply` to delete anything. See
+[docs/testing.md](docs/testing.md#cern-mix--ihep-mergentuple-split) for the
+complete operational procedure.
+
 ### Listing available configurations
 
 ```bash

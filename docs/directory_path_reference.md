@@ -58,6 +58,12 @@ EOS_OUTPUT="${EOS_BASE}/output"
 
 **How `TARGET_EOS_BASE` is set**: `dag_generator.py --target-base-url <url>` → generated node JSON `target_eos_base` / `storage.target_eos_base` → JSON wrapper sets `TARGET_EOS_BASE` in the worker environment → `run_chain.sh` derives processing output and generated-block roots.
 
+`run_chain.sh` parses the final effective `EOS_BASE` after all overrides and
+derives both the `xrdfs` endpoint and `EOS_PATH_BASE` from that same URL.
+Consequently `xrdcp`, `xrdfs stat`, retry cleanup with `xrdfs rm`, and remote
+directory creation always address the same LFN. The parser also restores the
+required `root://host:1094///store/...` canonical URL form.
+
 LHE generation is separate: `run_lhe_gen.sh` reads
 `node_configs/lhe_generation/LHE_*.json`, passes `output_dir` directly to
 `run_helac.sh --output-dir`, and also passes the node config with `--config`.
@@ -84,14 +90,21 @@ their exact `lhe_pool_directories.<pool>.path`.
 │       └── sample_{storage_name}_{seed}.lhe[.gz]
 │
 ├── output/
-│   └── {campaign_name}/
-│       └── {job_id}/                  ← JOBxxxxxx_BLOCKxxxxxx for block SubDAGs
-│           ├── output_GENSIM.root
-│           ├── output_RAW.root
-│           ├── output_RECO.root
-│           ├── output_MINIAOD.root
-│           ├── output_ntuple.root     ← (or {subprocess_id}-Ntuple-{version}-{job_id}.root)
-│           └── processing_manifest_{campaign}_{job_id}.json
+│   ├── {campaign_name}/
+│   │   ├── {job_id}/                  ← JOBxxxxxx_BLOCKxxxxxx for block SubDAGs
+│   │   │   ├── output_GENSIM.root
+│   │   │   ├── output_RAW.root
+│   │   │   ├── output_RECO.root
+│   │   │   ├── output_MINIAOD.root
+│   │   │   ├── output_ntuple.root     ← (or {subprocess_id}-Ntuple-{version}-{job_id}.root)
+│   │   │   └── processing_manifest_{campaign}_{job_id}.json
+│   │   └── {job_component}_logs/
+│   │       └── {workflow_archive_id}/
+│   │           ├── logs_{campaign}_{job_component}.tar.gz
+│   │           └── logs_{campaign}_{job_component}.json
+│   └── _log_archives/
+│       └── {workflow_archive_id}/
+│           └── archive_index.json
 │
 └── JpsiJpsiPhi/                       ← only with --use-subprocess-naming
     └── Ntuple/ or Ntuple-{version}/
@@ -326,6 +339,22 @@ $(proxy_bundle_name) $(runtime_bundle_name) $(config_name)
 {output_dir}/plan_subdags/{campaign_name}/job_{job_index}/blocks_processing.dag
 ```
 
+For inventory-driven v2 workflows, source lists and the authoritative
+post-planner allocation are shared:
+
+```text
+{output_dir}/plan_subdags/source_manifests.json
+{output_dir}/plan_subdags/campaign_shard_allocation.json
+{output_dir}/plan_subdags/{campaign_name}/source_manifests.json
+```
+
+The global source list is consumed once by `ALLOCATE_CAMPAIGN_SHARDS`, after
+all planner nodes finish. The resulting allocation records each campaign and
+shard's pool start/end cursors and exact node count from the actual planner
+blocks. A coordinator config contains only the campaign source-list path,
+source count, allocation path, and shard index; it does not embed the source
+list.
+
 ### Coordinator manifest
 
 ```
@@ -356,6 +385,26 @@ Block processing uses event-ID scheme `run1-cantor-job-block-lumi-v1`:
 This makes block outputs disjoint within one campaign coordinator/output
 dataset. Different campaigns may reuse the same EventIDs and remain separate
 datasets. The coordinator manifest and final inventory record the scheme name.
+
+### FINAL worker log archives
+
+`--archive-subdag-logs` remains the public switch, but archival runs in the
+top-level `FINAL SUMMARY` vanilla job. It scans:
+
+```text
+{log_root}/{campaign}/processing/job_*/
+{log_root}/{campaign}/miniaod_merge/job_*/
+{log_root}/{campaign}/ntuple/job_*/
+{log_root}/{campaign}/final/job_*/
+```
+
+Each tar member is relative to `log_root`, preserving the campaign/stage/job
+tree. Planner, coordination, `_shared`, DAGMan, and the top-level FINAL job's
+own logs are outside this archive scope. The local audit status is:
+
+```text
+{log_root}/_shared/summary/workflow_log_archive_status_{workflow_archive_id}.json
+```
 
 ### Ntuple configs (inside SubDAG)
 
