@@ -1,0 +1,4 @@
+interface:
+  display_name: "CMS Continuous Production"
+  short_description: "Operate continuous CERN/IHEP split production workflows"
+  default_prompt: "Use $cms-continuous-production to inventory EOS state, classify merge groups, build IHEP batch handoffs, recover sidecars, and advance the production cycle."
