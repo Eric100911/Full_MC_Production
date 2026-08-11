@@ -7,10 +7,11 @@ though the ntuple ROOT was uploaded. This script verifies every ntuple ROOT is
 positive-size on EOS, then writes the exact planned sidecar from an
 authenticated login node (run with X509_USER_PROXY set).
 
-Usage: python3 recover_ntuple_sidecars.py <workspace> [--force]
+Usage: python3 recover_ntuple_sidecars.py <workspace> [--force] [--eos HOST]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -19,7 +20,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-EOS = "root://cceos.ihep.ac.cn:1094"
+DEFAULT_EOS = "root://cceos.ihep.ac.cn:1094"
+EOS = DEFAULT_EOS  # module default; overridden in main() from args
 
 
 def run(cmd):
@@ -29,7 +31,7 @@ def run(cmd):
 
 def lfn_of(url):
     m = re.match(r"^root://[^/]+/(.*)$", url)
-    return "/" + m.group(1) if m else None
+    return "/" + m.group(1).lstrip("/") if m else None
 
 
 def stat_ok(url):
@@ -44,8 +46,19 @@ def stat_ok(url):
 
 
 def main():
-    workspace = Path(sys.argv[1]).resolve()
-    force = "--force" in sys.argv[2:]
+    parser = argparse.ArgumentParser(
+        description="Recover split_ntuple_manifest sidecars for a split workspace.")
+    parser.add_argument("workspace", help="split workspace directory (with split_workspace.json)")
+    parser.add_argument("--force", action="store_true",
+                        help="rewrite sidecars even when one already exists")
+    parser.add_argument("--eos", default=os.environ.get("RECOVER_EOS", DEFAULT_EOS),
+                        help="XRootD redirector root:// URL")
+    args = parser.parse_args()
+
+    global EOS
+    EOS = args.eos.rstrip("/")
+    workspace = Path(args.workspace).resolve()
+    force = args.force
     root_meta = json.loads((workspace / "split_workspace.json").read_text(encoding="utf-8"))
     recovered, missing_root = [], []
     for campaign, info in root_meta["campaigns"].items():

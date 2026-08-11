@@ -70,7 +70,10 @@ hep_q <cluster_id>        # specific cluster
 ## Inventory classification (tps_cutover_inventory.py)
 
 The inventory compares each component block and merge group against its
-planned EOS URL. Classification:
+planned EOS URL. Campaign, job index, and the EOS output layout are derived
+from the coordinator manifest (no TPS-specific constants). Env overrides:
+`INV_EOS`, `INV_COORD`, `INV_WORK`, `INV_WORKERS`, `INV_TIMEOUT`, `INV_TMP`.
+Classification:
 
 | Category | Condition |
 |----------|-----------|
@@ -79,7 +82,32 @@ planned EOS URL. Classification:
 | cat3 | All 5 `processing_manifest` sidecars present, `complete: true`, `merge_eligible` |
 | cat4 | One or more component blocks missing valid processing manifest |
 
-Output: `<work>/inventory/tps_job6_inventory.json` with `summary` (cat counts, blocks valid/missing) and `groups` (per-group detail including per-component `actual_miniaod_events`).
+Output: `<work>/inventory/<campaign>_job<job_index>_inventory.json` with `summary`
+(cat counts, blocks valid/missing) and `groups` (per-group detail including
+per-component `actual_miniaod_events`).
+
+## IHEP batch build (ihep_build_batch.py)
+
+Filters a frozen coordinator manifest to the chosen merge groups, then runs the
+MIX audit → merge-ntuple workspace generation → pre-submit merge audit, all on
+IHEP. The coordinator manifest supplies campaign, job index, and the EOS output
+layout; site paths come from flags or `IH_PFX` / `IH_TS` / `IH_EOS` /
+`IH_LHE_POOL_LFN` env vars.
+
+```bash
+python3 skills/cms-continuous-production/scripts/ihep_build_batch.py \
+  --coord <frozen coord_manifest.json> \
+  [--ts <workspace-ts>] [--proxy <x509 path>] \
+  <batch_name> <comma-separated-groups>
+```
+
+Default proxy is `<ih-pfx>/credentials/<ts>/credentials/x509_user_proxy`;
+pass `--proxy` when the credentials live elsewhere.
+
+Sidecar recovery (`recover_ntuple_sidecars.py`) verifies each ntuple ROOT is
+positive-size on EOS (`--eos` / `RECOVER_EOS`, default
+`root://cceos.ihep.ac.cn:1094`), then writes the planned
+`split_ntuple_manifest_<campaign>_<job_id>.json` from the login node.
 
 ## Sidecar schemas
 

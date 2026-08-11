@@ -54,7 +54,10 @@ All live under `skills/cms-continuous-production/scripts/`.
 ### `tps_cutover_inventory.py`
 
 Audits live EOS state against the frozen coordinator manifest and classifies
-every merge group as cat1–4. Re-runnable with a local manifest cache.
+every merge group as cat1–4. Campaign, job index, and the EOS output layout are
+derived from the coordinator manifest. Re-runnable with a local manifest cache.
+Env overrides: `INV_EOS`, `INV_COORD`, `INV_WORK`, `INV_WORKERS`, `INV_TIMEOUT`,
+`INV_TMP`.
 
 ```
 # from CERN (reads AFS coord manifest by default):
@@ -70,28 +73,36 @@ INV_WORK=/scratchfs2/.../workspace \
 python3 skills/cms-continuous-production/scripts/tps_cutover_inventory.py
 ```
 
-Output: `<work>/inventory/tps_job6_inventory.json` with summary counts and
-per-group detail.
+Output: `<work>/inventory/<campaign>_job<job_index>_inventory.json` with summary
+counts and per-group detail.
 
 ### `ihep_build_batch.py`
 
 Fast, site-local IHEP batch builder. Filters the coordinator manifest to a
 chosen set of merge groups, runs `audit-split --stage mix`, generates the
 merge-ntuple workspace, and runs the pre-submit merge audit — all on IHEP.
+The coordinator manifest is the authority: campaign, job index, and the EOS
+storage layout are derived from it. Site paths default from `IH_PFX`, `IH_TS`,
+`IH_EOS`, `IH_LHE_POOL_LFN` and are overridable per flag.
 
 ```
-python3 skills/cms-continuous-production/scripts/ihep_build_batch.py <batch_name> <comma-separated-groups>
+python3 skills/cms-continuous-production/scripts/ihep_build_batch.py \
+  --coord /path/to/coord_manifest.json \
+  [--ts <workspace-ts>] [--proxy <x509>] \
+  <batch_name> <comma-separated-groups>
 ```
 
 ### `recover_ntuple_sidecars.py`
 
 Recovers post-container `split_ntuple_manifest` sidecars that failed to upload
 (`Operation not permitted` in the sandbox). Verifies the ntuple ROOT is
-positive-size, then writes the correct sidecar from the login node.
+positive-size, then writes the correct sidecar from the login node. EOS
+endpoint defaults to `root://cceos.ihep.ac.cn:1094`, overridable with
+`--eos` / `RECOVER_EOS`.
 
 ```
 X509_USER_PROXY=/path/to/proxy \
-python3 skills/cms-continuous-production/scripts/recover_ntuple_sidecars.py <workspace>
+python3 skills/cms-continuous-production/scripts/recover_ntuple_sidecars.py <workspace> [--force]
 ```
 
 ## Batch workflow (production cycle)

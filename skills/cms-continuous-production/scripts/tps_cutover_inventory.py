@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Inventory TPS job_6 merge groups against EOS sidecars.
+"""Inventory merge groups of a coordinator manifest against EOS sidecars.
 
 Reads the frozen coordinator manifest (task authority) and audits the live EOS
-state of every component block, merge group, and ntuple. Classifies each group
-per the cutover plan:
+state of every component block, merge group, and ntuple. Classifies each group:
   1 complete through NTUPLE
   2 valid MERGE, missing NTUPLE
   3 five valid components, missing MERGE
   4 waiting for one or more MIX components
 
-Re-runnable: manifests are cached locally under the workspace inventory cache.
+Campaign, job index, and the EOS output layout are derived from the coordinator
+manifest. Re-runnable: manifests are cached locally under the workspace cache.
+
+Env overrides: INV_EOS, INV_COORD, INV_WORK, INV_WORKERS, INV_TIMEOUT, INV_TMP.
 """
 from __future__ import annotations
 
@@ -37,6 +39,10 @@ TIMEOUT = int(os.environ.get("INV_TIMEOUT", "60"))
 TMPDIR = Path(os.environ.get("INV_TMP", "/tmp/chiw"))
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
+# Derived from the coordinator manifest in main(); read by worker functions.
+CAMPAIGN = ""
+JOB_PFX = ""
+
 
 def run_checked(cmd, **kwargs):
     """Run a subprocess with retries on transient fork/resource errors."""
@@ -52,9 +58,13 @@ def run_checked(cmd, **kwargs):
 
 
 def lfn_of(url):
-    """Return /store/... path for xrdfs, or None for non-root URLs."""
+    """Return /store/... path for xrdfs, or None for non-root URLs.
+
+    Tolerates the triple-slash form (root://host///store/...) by collapsing
+    leading slashes down to one.
+    """
     m = re.match(r"^root://[^/]+/(.*)$", url)
-    return "/" + m.group(1) if m else None
+    return "/" + m.group(1).lstrip("/") if m else None
 
 
 def dir_lfn_of(url):
@@ -132,29 +142,35 @@ def ntuple_ok(p, planned_url):
 
 
 def main():
+    global CAMPAIGN, JOB_PFX
     coord = json.loads(COORD.read_text(encoding="utf-8"))
     campaign = coord["campaign"]
+    job_index = int(coord["job_index"])
+    CAMPAIGN = campaign
+    JOB_PFX = f"JOB{job_index:06d}"
     blocks = {str(b["index"]): b for b in coord["mixed_blocks"]}
     groups = coord["merge_groups"]
     ntuples = {str(t["job_id"]): t for t in coord["ntuples"]}
     n_blocks = len(blocks)
-    print(f"campaign={campaign} blocks={n_blocks} groups={len(groups)} "
+    print(f"campaign={campaign} job={job_index} blocks={n_blocks} groups={len(groups)} "
           f"ntuples={len(ntuples)}", file=sys.stderr)
 
     # ---- 0. pre-pass: which block dirs exist (one xrdfs ls) ----
     existing = set()
-    root_lfn = "/store/user/chiw/JpsiJpsiPhi_MC_Production_v4_2_full/output/JJP_TPS_MC_v4_1"
+    # miniaod_url layout: <base>/output/<campaign>/<job_id>/output_MINIAOD.root
+    miniaod_lfn = lfn_of(coord["mixed_blocks"][0]["miniaod_url"])
+    root_lfn = miniaod_lfn.rsplit("/", 2)[0]   # <base>/output/<campaign>
     rl = run_checked(["xrdfs", EOS + "/", "ls", root_lfn], check=False,
                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                      universal_newlines=True, timeout=120)
     if rl.returncode == 0:
         for line in rl.stdout.splitlines():
-            m = re.search(r"JOB000006_BLOCK(\d+)$", line.strip())
+            m = re.search(rf"{JOB_PFX}_BLOCK(\d+)$", line.strip())
             if m:
                 existing.add(int(m.group(1)))
-    print(f"existing job_6 block dirs: {len(existing)}", file=sys.stderr)
-    if len(existing) < 600:
-        # suspiciously low listing; audit everything to be safe
+    print(f"existing {JOB_PFX} block dirs: {len(existing)}", file=sys.stderr)
+    if len(existing) < n_blocks:
+        # listing is short of the planned block count; audit everything to be safe
         print("WARNING: existing-dirs listing looks truncated; auditing all blocks", file=sys.stderr)
         existing = set()
 
@@ -164,7 +180,7 @@ def main():
     for idx, blk in blocks.items():
         if int(idx) not in existing:
             block_results[idx] = {"block_index": int(idx),
-                                  "job_id": f"JOB000006_BLOCK{int(idx):06d}",
+                                  "job_id": f"{JOB_PFX}_BLOCK{int(idx):06d}",
                                   "valid": False, "manifest_present": False,
                                   "actual_miniaod_events": None,
                                   "miniaod_exists": False, "miniaod_size": None,
@@ -238,7 +254,7 @@ def main():
         else:
             report["summary"]["blocks_missing"] += 1
 
-    out = WORK / "inventory" / "tps_job6_inventory.json"
+    out = WORK / "inventory" / f"{campaign}_job{job_index}_inventory.json"
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"wrote {out}", file=sys.stderr)
     print("SUMMARY:", json.dumps(report["summary"], indent=2))
@@ -249,7 +265,7 @@ def audit_block(blk):
     valid = processing_ok(manifest)
     miniaod_exists, miniaod_size = stat_size(blk["miniaod_url"])
     return {"block_index": blk["index"],
-            "job_id": blk.get("job_id") or f"JOB000006_BLOCK{blk['index']:06d}",
+            "job_id": blk.get("job_id") or f"{JOB_PFX}_BLOCK{blk['index']:06d}",
             "miniaod_url": blk["miniaod_url"],
             "manifest_url": blk["processing_manifest_url"],
             "manifest_present": manifest is not None,
@@ -276,7 +292,7 @@ def _audit_group(g, ntuples, block_results):
     job_id = g["job_id"]
     merge_url = g["merged_miniaod_url"]
     merge_dir = merge_url.rsplit("/", 1)[0]
-    merge_manifest_url = merge_dir + f"/merge_manifest_{'JJP_TPS_MC_v4_1'}_{job_id}.json"
+    merge_manifest_url = merge_dir + f"/merge_manifest_{CAMPAIGN}_{job_id}.json"
     n_valid = 0
     comp_records = []
     for comp in g["components"]:
@@ -294,7 +310,7 @@ def _audit_group(g, ntuples, block_results):
     ntuple_url = nt["ntuple_url"] if nt else None
     ntuple_exists, ntuple_size = stat_size(ntuple_url) if ntuple_url else (False, None)
     split_manifest_url = (ntuple_url.rsplit("/", 1)[0]
-                          + f"/split_ntuple_manifest_{'JJP_TPS_MC_v4_1'}_{job_id}.json"
+                          + f"/split_ntuple_manifest_{CAMPAIGN}_{job_id}.json"
                           if ntuple_url else None)
     sm = fetch_manifest(split_manifest_url) if split_manifest_url else None
     ntuple_ok_v = ntuple_ok(sm, ntuple_url) if sm else False
