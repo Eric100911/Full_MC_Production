@@ -299,6 +299,27 @@ def valid_manifest(stage, task, payload):
     return payload.get("status") == "ok" and payload.get("ntuple_url") == task["ntuple_url"]
 
 
+def _retry_stamp():
+    """UTC timestamp used to snapshot retry artifacts immutably.
+
+    Each audit run writes a unique, timestamped retry manifest and wrapper so a
+    re-audit while a retry cluster is in flight never rewrites the files a
+    running job reads by ProcId (previously a shared path was truncated, shifting
+    every later job's index and silently skipping groups).
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _purge_retry_artifacts(root, campaign, stage):
+    """Remove stale snapshot retry files once the stage gate completes."""
+    task_dir = root / "tasks" / campaign
+    for snapshot in task_dir.glob(f"{stage}_retry_tasks_*.json"):
+        snapshot.unlink(missing_ok=True)
+    for snapshot in (root / "scripts").glob(f"run_{stage}_{campaign}_retry_*.sh"):
+        snapshot.unlink(missing_ok=True)
+    (root / f"submit_{stage}_{campaign}_retry.sh").unlink(missing_ok=True)
+
+
 def audit_stage(workspace, stage, campaigns=None):
     if stage not in {"merge", "ntuple"}:
         raise ValueError("workspace stage must be merge or ntuple")
@@ -311,12 +332,18 @@ def audit_stage(workspace, stage, campaigns=None):
                   if not valid_manifest(stage, task, read_json_url(task["manifest_url"]))]
         gate = root / "gates" / f"{stage}_{campaign}.json"
         gate.unlink(missing_ok=True)
-        retry = root / "tasks" / campaign / f"{stage}_retry_tasks.json"
+        # Snapshot-isolated artifacts: the manifest and wrapper get immutable,
+        # timestamped names sharing one stamp; only the stable submit entry
+        # point is rewritten so it always submits the latest snapshot.
+        # Re-auditing in flight therefore cannot shift indices for
+        # already-submitted retry jobs.
+        stamp = _retry_stamp()
+        retry = root / "tasks" / campaign / f"{stage}_retry_tasks_{stamp}.json"
         retry_submit = root / f"submit_{stage}_{campaign}_retry.sh"
         if failed:
             complete = False
             atomic_json(retry, failed)
-            retry_wrapper = root / "scripts" / f"run_{stage}_{campaign}_retry.sh"
+            retry_wrapper = root / "scripts" / f"run_{stage}_{campaign}_retry_{stamp}.sh"
             executable(
                 retry_wrapper,
                 "#!/bin/bash\nset -euo pipefail\n"
@@ -334,8 +361,7 @@ def audit_stage(workspace, stage, campaigns=None):
                 ),
             )
         else:
-            retry.unlink(missing_ok=True)
-            retry_submit.unlink(missing_ok=True)
+            _purge_retry_artifacts(root, campaign, stage)
             atomic_json(gate, {"stage": stage, "campaign": campaign, "status": "complete",
                                "tasks": len(tasks), "checked_at": datetime.now(timezone.utc).isoformat()})
         results[campaign] = {"total": len(tasks), "passed": len(tasks) - len(failed),

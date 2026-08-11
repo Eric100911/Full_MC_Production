@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import tempfile
 import sys
 from pathlib import Path
@@ -74,6 +75,17 @@ def main():
         assert not first["complete"]
         retry_submit = Path(first["campaigns"][campaign]["retry_submit"])
         assert retry_submit.is_file()
+        # Snapshot isolation: re-auditing while a retry cluster is in flight must
+        # not rewrite the manifest/wrapper a previously-generated retry job reads.
+        submit_text = retry_submit.read_text()
+        first_wrapper = Path(re.search(r"hep_sub (\S+_retry_\S+\.sh)", submit_text).group(1))
+        first_manifest = Path(re.search(r"\s(\S+_retry_tasks_\S+\.json) ", first_wrapper.read_text()).group(1))
+        assert first_manifest.is_file()
+        second = audit_stage(str(ihep), "merge")
+        assert not second["complete"]
+        assert first_manifest.is_file(), "re-audit must not delete an in-flight snapshot"
+        assert "retry_tasks_" + first_manifest.name.split("_retry_tasks_")[1] in first_wrapper.read_text()
+        assert first_manifest != Path(second["campaigns"][campaign]["retry_manifest"])
         merge_task = split["campaigns"][campaign]["merge_tasks"][0]
         write_json(Path(merge_task["manifest_url"]), {
             "status": "ok",

@@ -614,10 +614,15 @@ python3 dag_generator.py audit-split --stage ntuple \
   --workspace /scratchfs/cms/<user>/split-workspace
 ```
 
-An incomplete audit writes a compact `*_retry_tasks.json` and matching
-`submit_*_retry.sh`. Inspect the failed count and worker logs, submit only
-that retry script, and repeat the same audit. A successful audit removes stale
-retry metadata and writes `gates/<stage>_<campaign>.json`.
+An incomplete audit writes a compact `*_retry_tasks_<stamp>.json` and a matching
+snapshot wrapper `run_*_retry_<stamp>.sh`, then a stable `submit_*_retry.sh`
+that always submits the latest snapshot. Inspect the failed count and worker
+logs, submit only that retry script, and repeat the same audit. Retry artifacts
+are snapshot-isolated by timestamp: re-auditing while a retry cluster is in
+flight cannot rewrite the manifest a running job reads by `%{ProcId}`, so
+already-submitted jobs keep their original indices (do not hand-trim the shared
+retry task file). A successful audit purges stale snapshots and writes
+`gates/<stage>_<campaign>.json`.
 
 The generated HepJob scripts use one array-style cluster per campaign and pass
 `%{ProcId}` as the task index. Default resource classes are `short` for
