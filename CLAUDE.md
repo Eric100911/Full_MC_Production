@@ -49,6 +49,7 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/paths.sh`** — Centralized workspace-relative path definitions (proxy resolution, temp dir, log dir). Source from shell scripts that need user-local paths; no hardcoded usernames.
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred for ntuple).
 - **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus legacy component-level test scripts.
+- **`tools/apply_slim_logs_to_recovery.py`** — Apply slim-log mode (`log_level: slim`) to already-generated recovery `blocks_processing.dag` SubDAGs in place: rebuilds each recovery `processing_runtime_bundle.tar.gz` with the gated `run_chain.sh` and patches every MIX node config's `processing_environment`. No DAG/manifest regeneration.
 - **`tools/`** — Utilities: `check_gensim_vtxsmeared_config.py`, `summarize_helac_finished.py`, `compress_existing_lhe.py` (backfill LHE compression), `run_compress_lhe.sh` (batch compression worker wrapper).
 
 ### Repository skills
@@ -81,6 +82,7 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - Worker nodes never read from AFS business directories at runtime — everything arrives via tarball bundles.
 - Shower mode names are normalized through `canonical_mode()` (dag_generator.py:247): aliases like `phi`, `sps`, `phi_mode1` all map to `phi_mpi_off`.
 - The `--efficiency-ntuple` flag only works for JJP campaigns and writes an `ntuple_manifest.json` consumable by the external `run-multileppat-efficiency` tool.
+- `--log-level info|slim` gates processing-node stdout verbosity: `slim` suppresses per-command `msg_info`/`msg_ok` chatter and step banners (bulk lives in worker-local `command_logs/`), keeps warnings/errors and a compact step marker. Defaults to `slim` when `--campaign-job-spec` is set (inventory-driven production), else `info` for validation. Driven by `PROCESSING_LOG_LEVEL` in `run_chain.sh` via config `processing_environment.log_level`.
 - Pool scan results are cached via the `DAG_GENERATOR_POOL_SCAN_CACHE` environment variable.
 - Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS. Proxy resolution (`detect_proxy_path`) uses `$X509_USER_PROXY` → `voms-proxy-info --path`; /tmp proxies trigger a warning (Condor workers cannot access them).
 - Ntuple output directory structure for `--use-subprocess-naming`: `JpsiJpsiPhi/Ntuple/{subprocess_id}/{subprocess_id}-Ntuple-{version}-{job_id}.root` under the target EOS base.
@@ -302,6 +304,16 @@ python3 dag_generator.py generate-ntuple-only \
   --miniaod-base-url root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/output \
   --jobs 50 --use-subprocess-naming \
   --output-dir generated/ntuple_from_v3_miniaod
+
+# Slim processing-node logs for large production (saves AFS; warn/error kept)
+python3 dag_generator.py generate \
+  --machine-env lxplus_t2_ihep --campaign JJP_SPS_CS \
+  --campaign-job-spec common/campaign_job_specs/jjp_sps_cs_full_v2.json \
+  --log-level slim --output-dir generated/jjp_sps_cs --output mc_sps.dag
+
+# Apply slim logs to an already-generated recovery DAG in place (no regen)
+python3 tools/apply_slim_logs_to_recovery.py --dry-run   # inspect
+python3 tools/apply_slim_logs_to_recovery.py             # rebuild bundles + patch configs
 ```
 
 ### Running tests

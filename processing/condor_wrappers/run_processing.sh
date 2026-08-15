@@ -107,6 +107,7 @@ processing_env = cfg.get("processing_environment", {})
 if not isinstance(processing_env, dict):
     raise SystemExit("Processing config key processing_environment must be an object when provided")
 env_mapping = {
+    "log_level": "PROCESSING_LOG_LEVEL",
     "premix_input_mode": "PREMIX_INPUT_MODE",
     "premix_redirector": "PREMIX_REDIRECTOR",
     "premix_cache_files": "PREMIX_CACHE_FILES",

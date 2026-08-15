@@ -139,11 +139,23 @@ fi
 # Utility Functions
 # ==============================================================================
 
-msg_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-msg_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+# Log-level gate: PROCESSING_LOG_LEVEL=slim suppresses per-command INFO/OK
+# chatter and step banners (bulk lives in worker-local command_logs/). Warnings
+# and errors always print so failures remain diagnosable. Full logs remain the
+# default (validation).
+PROCESSING_LOG_LEVEL="${PROCESSING_LOG_LEVEL:-info}"
+_slim() { [[ "${PROCESSING_LOG_LEVEL}" == "slim" ]]; }
+msg_info() { _slim || echo -e "${BLUE}[INFO]${NC} $1"; }
+msg_ok() { _slim || echo -e "${GREEN}[OK]${NC} $1"; }
 msg_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 msg_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-msg_step() { echo -e "\n${YELLOW}========================================${NC}"; echo -e "${YELLOW}  $1${NC}"; echo -e "${YELLOW}========================================${NC}\n"; }
+msg_step() {
+    if _slim; then
+        echo -e "${YELLOW}-- ${1} --${NC}"
+    else
+        echo -e "\n${YELLOW}========================================${NC}"; echo -e "${YELLOW}  $1${NC}"; echo -e "${YELLOW}========================================${NC}\n"
+    fi
+}
 
 # 高噪声命令统一写入 worker 本地日志，避免 Condor stdout/stderr 过大被 hold。
 JOB_LOG_DIR=""
@@ -2816,27 +2828,31 @@ fi
 
 # Print configuration
 echo ""
-echo "=============================================="
-echo "MC Production Chain"
-echo "=============================================="
-echo "Campaign:     ${CAMPAIGN_NAME}"
-echo "Job ID:       ${JOB_ID}"
-echo "Analysis:     ${ANALYSIS_TYPE}"
-echo "Work dir:     ${WORKDIR}"
-echo "Do ntuple:    ${ENABLE_NTUPLE}"
-echo "Eff ntuple:   ${EFFICIENCY_NTUPLE}"
-echo "N sources:    ${#SOURCE_SLOTS[@]}"
-for ((i=0; i<${#SOURCE_SLOTS[@]}; i++)); do
-    mode_str="${SOURCE_MODES[$i]:-N/A}"
-    echo "  Source slot ${SOURCE_SLOTS[$i]}: ${SOURCE_INPUT_GROUPS[$i]} (mode: ${mode_str}, target=${SOURCE_TARGET_HEPMC_EVENTS[$i]}, max_lhe=${SOURCE_MAX_LHE_EVENTS[$i]})"
-done
-echo "Max events:   ${MAX_EVENTS}"
-echo "Target mixed: ${TARGET_MIXED_EVENTS}"
-echo "Normal shortfall policy: ${NORMAL_SHORTFALL_POLICY}"
-echo "Unused-event warning threshold: >${UNUSED_HEPMC_WARNING_FRACTION}"
-echo "EDM EventID:  run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} eventsPerLumi=${N_EVENTS_IN_LUMI}"
-echo "=============================================="
-echo ""
+if _slim; then
+    echo "MC Production Chain: campaign=${CAMPAIGN_NAME} job=${JOB_ID} analysis=${ANALYSIS_TYPE} sources=${#SOURCE_SLOTS[@]} max_events=${MAX_EVENTS} target_mixed=${TARGET_MIXED_EVENTS}"
+else
+    echo "=============================================="
+    echo "MC Production Chain"
+    echo "=============================================="
+    echo "Campaign:     ${CAMPAIGN_NAME}"
+    echo "Job ID:       ${JOB_ID}"
+    echo "Analysis:     ${ANALYSIS_TYPE}"
+    echo "Work dir:     ${WORKDIR}"
+    echo "Do ntuple:    ${ENABLE_NTUPLE}"
+    echo "Eff ntuple:   ${EFFICIENCY_NTUPLE}"
+    echo "N sources:    ${#SOURCE_SLOTS[@]}"
+    for ((i=0; i<${#SOURCE_SLOTS[@]}; i++)); do
+        mode_str="${SOURCE_MODES[$i]:-N/A}"
+        echo "  Source slot ${SOURCE_SLOTS[$i]}: ${SOURCE_INPUT_GROUPS[$i]} (mode: ${mode_str}, target=${SOURCE_TARGET_HEPMC_EVENTS[$i]}, max_lhe=${SOURCE_MAX_LHE_EVENTS[$i]})"
+    done
+    echo "Max events:   ${MAX_EVENTS}"
+    echo "Target mixed: ${TARGET_MIXED_EVENTS}"
+    echo "Normal shortfall policy: ${NORMAL_SHORTFALL_POLICY}"
+    echo "Unused-event warning threshold: >${UNUSED_HEPMC_WARNING_FRACTION}"
+    echo "EDM EventID:  run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} eventsPerLumi=${N_EVENTS_IN_LUMI}"
+    echo "=============================================="
+    echo ""
+fi
 
 # Create work directory
 mkdir -p "${WORKDIR}"

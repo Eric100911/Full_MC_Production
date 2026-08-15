@@ -601,6 +601,7 @@ class WorkflowOptions:
         campaign_job_spec: str = "",
         archive_subdag_logs: bool = True,
         output_mode: str = "full",
+        log_level: str = "info",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -652,6 +653,7 @@ class WorkflowOptions:
         self.campaign_job_spec = campaign_job_spec
         self.archive_subdag_logs = archive_subdag_logs
         self.output_mode = output_mode
+        self.log_level = log_level
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -1030,6 +1032,15 @@ def detect_machine_env_name() -> str:
     if os.environ.get("LOCAL_OUTPUT_BASE"):
         return "local_condor"
     return "lxplus_t2_ihep"
+
+
+def effective_log_level(args: argparse.Namespace) -> str:
+    """Resolve --log-level, defaulting to slim for inventory-driven production."""
+    if getattr(args, "log_level", None):
+        return args.log_level
+    if getattr(args, "campaign_job_spec", ""):
+        return "slim"
+    return "info"
 
 
 def requested_machine_env_name(args: argparse.Namespace) -> str:
@@ -2570,13 +2581,15 @@ def node_storage_config(target_eos_base: str = "") -> Dict[str, object]:
     return storage
 
 
-def processing_environment_config() -> Dict[str, str]:
+def processing_environment_config(log_level: str = "info") -> Dict[str, str]:
     defaults = {
         "premix_input_mode": "eoscms",
         "premix_redirector": "root://eoscms.cern.ch",
         "premix_cache_files": "1",
         "premix_cache_redirector": "root://eoscms.cern.ch",
     }
+    if log_level and log_level != "info":
+        defaults["log_level"] = str(log_level)
     defaults.update({str(k): str(v) for k, v in PROCESSING_ENV_DEFAULTS.items()})
     overrides = {
         "premix_input_mode": os.environ.get("PREMIX_INPUT_MODE"),
@@ -3470,7 +3483,9 @@ class DAGBuilder:
             "local_output_base": self.options.local_output_base,
             "target_eos_base": self.options.target_base_url,
             "storage": node_storage_config(self.options.target_base_url),
-            "processing_environment": processing_environment_config(),
+            "processing_environment": processing_environment_config(
+                getattr(self.options, "log_level", "info")
+            ),
         }
         config_path, config_name = self.write_node_config(
             "processing",
@@ -4129,7 +4144,9 @@ class DAGBuilder:
             "max_block_subdag_jobs": self.options.max_block_subdag_jobs,
             "local_output_base": self.options.local_output_base,
             "storage": node_storage_config(self.options.target_base_url),
-            "processing_environment": processing_environment_config(),
+            "processing_environment": processing_environment_config(
+                getattr(self.options, "log_level", "info")
+            ),
         }
         config_path, config_name = self.write_node_config(
             "coordination",
@@ -5891,6 +5908,18 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
             "phi-derived target or report the shortfall and mix the common positive yield."
         ),
     )
+    parser.add_argument(
+        "--log-level",
+        choices=("info", "slim"),
+        default=None,
+        help=(
+            "Processing node stdout verbosity. slim suppresses per-command "
+            "INFO/OK chatter and step banners (kept in worker-local command_logs); "
+            "warnings/errors and the completion banner always print. info (default) "
+            "keeps the full log for validation. Defaults to 'slim' when "
+            "--campaign-job-spec is set (inventory-driven production), else 'info'."
+        ),
+    )
     parser.add_argument("--minimum-output-fraction", type=float, default=0.8, help="block 接受的最小完成比例；0 表示任何正输出均可。")
     parser.add_argument(
         "--compress-lhe",
@@ -6906,6 +6935,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target_base_url=args.target_base_url,
             lhe_group_min_events=args.lhe_group_min_events,
             output_mode=args.output_mode,
+            log_level=effective_log_level(args),
             lhe_group_max_events=args.lhe_group_max_events,
             lhe_group_max_files=args.lhe_group_max_files,
         )
@@ -6991,6 +7021,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             keep_legacy_single_processing_path=False,
             lhe_shuffle_seed_base=None,
             max_block_subdag_jobs=0,
+            log_level=effective_log_level(args),
         )
         return execute_ntuple_only_generation(
             campaign_names=campaign_names,
