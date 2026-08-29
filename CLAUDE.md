@@ -60,6 +60,7 @@ available, so read the matching `SKILL.md` directly when the task matches:
 - **`skills/cms-ihep-condor-pilot/SKILL.md`** — Generate, submit, rerun, and validate small Full_MC_Production pilot DAGs; pilot-specific output and event-accounting acceptance. Delegates schedd/Condor operations to the job-operator skill.
 - **`skills/cms-condor-job-operator/SKILL.md`** — Inspect, triage, audit, and safely operate HTCondor/DAGMan jobs: `myschedd bump`, DAG progress by cluster ID, idle/held/eviction triage, transfer audits, rescue/recovery, and removal. One-shot snapshots use `skills/cms-condor-job-operator/scripts/dag_snapshot.py <dag-cluster> --schedd <schedd>`.
 - **`skills/cms-lhe-capacity-planner/SKILL.md`** — Plan source ratios, per-source LHE budgets, block sizes, processing-node counts, and retained-storage estimates from counted inventory event counts and pilot efficiency measurements. The current unused-HepMC threshold of 0.15 is a diagnostic, not a hard target.
+- **`skills/cms-continuous-production/SKILL.md`** — Operate the CERN MIX → IHEP MERGE/NTUPLE split workflow across campaigns (audit gates, batch builds, handoff wrappers). IHEP HepJob submission lessons (hep_sub usage, AVX2-safe-node pinning, proxy race fix, batch-build serialization): `skills/cms-continuous-production/references/hepjob-submission.md`.
 
 Pilot operations must reuse the Condor skill for live queue inspection and
 mutations.
@@ -84,7 +85,7 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
 - The `--efficiency-ntuple` flag only works for JJP campaigns and writes an `ntuple_manifest.json` consumable by the external `run-multileppat-efficiency` tool.
 - `--log-level info|slim` gates processing-node stdout verbosity: `slim` suppresses per-command `msg_info`/`msg_ok` chatter and step banners (bulk lives in worker-local `command_logs/`), keeps warnings/errors and a compact step marker. Defaults to `slim` when `--campaign-job-spec` is set (inventory-driven production), else `info` for validation. Driven by `PROCESSING_LOG_LEVEL` in `run_chain.sh` via config `processing_environment.log_level`.
 - Pool scan results are cached via the `DAG_GENERATOR_POOL_SCAN_CACHE` environment variable.
-- Proxy handling: worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; DAGMan on lxplus uses a persistent proxy copy on AFS. Proxy resolution (`detect_proxy_path`) uses `$X509_USER_PROXY` → `voms-proxy-info --path`; /tmp proxies trigger a warning (Condor workers cannot access them).
+- Proxy handling: worker wrappers install the bundled proxy at a WORKDIR-unique path (`${PWD}/credentials/x509_user_proxy` in `run_miniaod_merge.sh` and `run_ntuple_only.sh`) rather than the node-shared `/tmp/x509up_u$UID` — the shared path raced when concurrent same-UID jobs landed on one worker node (`install ... File exists` / `No such file or directory`). DAGMan on lxplus uses a persistent proxy copy on AFS. Proxy resolution (`detect_proxy_path`) uses `$X509_USER_PROXY` → `voms-proxy-info --path`; /tmp proxies trigger a warning (Condor workers cannot access them).
 - Ntuple output directory structure for `--use-subprocess-naming`: `JpsiJpsiPhi/Ntuple/{subprocess_id}/{subprocess_id}-Ntuple-{version}-{job_id}.root` under the target EOS base.
 - CMSSW15 runtime tarball: built with `scram b clean && scram b -j 8` (full project rebuild) to ensure `.edmplugincache` is regenerated. Validation checks for `pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so` and `.edmplugincache`.
 - LHE files may be stored compressed (`.lhe.gz`) or uncompressed (`.lhe`). Pool scanning, listing, and resolution try `.lhe.gz` first then fall back to `.lhe`. New LHE output defaults to `.lhe.gz` when `--compress-lhe` is set. HepMC outputs may be compressed (`.hepmc.gz`). HepMC intermediates passed to CMSSW always remain plain text.
@@ -196,7 +197,18 @@ When the submodule is updated to a new tag:
 | `MC_GenPart_*` arrays all empty | `X_config` → `inputGEN` must be `prunedGenParticles`, not `genParticles`. MiniAOD drops the `genParticles` collection. |
 | Zero HLT-matched muons in efficiency | `X_config` → `FiltersForJpsi` must be `["hltJpsiMuonL3Filtered3p5", "hltDoubleMu43LowMassL3Filtered"]`. The old labels (`hltVertexmumuFilterJpsiMuon3p5`, `hltDisplacedmumuFilterDoubleMu43LowMass`) match no trigger objects. |
 
-## Runtime Environments
+### Counting reconstructed candidate events
+
+"Events with ≥1 reconstructed JpsiJpsiPhi candidate" == entries of the ntuple
+`X_data` tree whose `Pri_passAny` vector is non-empty. The analyzer stores a
+primary candidate only when `passAny = fitPass || assocPVPass` is true
+(`external/TPS-Onia2MuMu/src/MultiLepPAT.cc`,
+`evaluatePriCandidateDiagnostics`; `PriVtxProbCut_=-1.0` disables the vertex-prob
+term, `PriRequireCommonAssocPV=True`). Use
+`tools/count_ntuple_candidates.py <ntuple_tasks.json> [--proxy …] [--jobs N]` to
+count it across a batch (parallel ROOT over xrootd; run from IHEP with a valid
+`X509_USER_PROXY`). See `docs/v44_dps1_good_rerun_summary.md` for the definition
+and a worked batch.
 - **HELAC image**: `cmssw/el7:x86_64` (CentOS 7, glibc 2.17), with LCG_88b for the HELAC/HepMC2 runtime.
 - **Processing and bundle-preparation host**: EL9. The production `lhe_shuffle_split` binary is compiled natively with `g++ -std=c++14` while runtime bundles are prepared.
 - **Python tools**: host EL9 / Python 3.
@@ -314,6 +326,13 @@ python3 dag_generator.py generate \
 # Apply slim logs to an already-generated recovery DAG in place (no regen)
 python3 tools/apply_slim_logs_to_recovery.py --dry-run   # inspect
 python3 tools/apply_slim_logs_to_recovery.py             # rebuild bundles + patch configs
+
+# Finalize a split workspace: dry-run lists would-delete; --apply deletes the
+# per-block intermediate output_MINIAOD.root URLs. Enforces the ntuple gate
+# file first (missing gate => hard error). Runs on IHEP where the workspace
+# paths are IHEP-absolute (cd repo && X509_USER_PROXY=... before running).
+python3 dag_generator.py finalize-split --workspace /scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/runs/sps_cs_full              # dry-run (no-op)
+python3 dag_generator.py finalize-split --workspace /scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/runs/sps_cs_full --apply     # delete
 ```
 
 ### Running tests

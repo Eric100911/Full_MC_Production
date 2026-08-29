@@ -24,9 +24,12 @@ echo "Config: ${CONFIG_NAME}"
 echo "--- Extracting proxy bundle ---"
 tar -xzf "${PROXY_BUNDLE}"
 
-PROXY_TARGET="/tmp/x509up_u$(id -u)"
-install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"
-rm -rf credentials
+# Keep the proxy at a WORKDIR-unique path instead of the shared /tmp/x509up_u$UID:
+# many same-uid ntuple jobs on one worker node race on the shared /tmp path
+# (install "File exists" / "No such file or directory"). Same hardening as
+# run_miniaod_merge.sh. WORKDIR is cleaned by the outer wrapper's EXIT trap.
+PROXY_TARGET="${PWD}/credentials/x509_user_proxy"
+chmod 600 "${PROXY_TARGET}"
 export X509_USER_PROXY="${PROXY_TARGET}"
 
 echo "--- Extracting ntuple runtime bundle ---"
