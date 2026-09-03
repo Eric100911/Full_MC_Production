@@ -24,10 +24,8 @@ echo "Config: ${CONFIG_NAME}"
 echo "--- Extracting proxy bundle ---"
 tar -xzf "${PROXY_BUNDLE}"
 
-# Keep the proxy at a WORKDIR-unique path instead of the shared /tmp/x509up_u$UID:
-# many same-uid ntuple jobs on one worker node race on the shared /tmp path
-# (install "File exists" / "No such file or directory"). Same hardening as
-# run_miniaod_merge.sh. WORKDIR is cleaned by the outer wrapper's EXIT trap.
+# Keep the proxy at a WORKDIR-unique path. Multiple same-uid jobs on one worker
+# node must not race while installing their credentials.
 PROXY_TARGET="${PWD}/credentials/x509_user_proxy"
 chmod 600 "${PROXY_TARGET}"
 export X509_USER_PROXY="${PROXY_TARGET}"

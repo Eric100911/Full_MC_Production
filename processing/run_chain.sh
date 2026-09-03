@@ -1230,16 +1230,10 @@ run_cmsrun_cmssw15() {
 ensure_voms_proxy() {
     msg_info "Checking VOMS proxy for pileup access..."
 
-    # Prefer user-provided proxy if already set
-    if [[ -z "${X509_USER_PROXY:-}" ]] && [[ -f "/tmp/x509up_u$(id -u)" ]]; then
-        export X509_USER_PROXY="/tmp/x509up_u$(id -u)"
-        msg_info "Using default proxy path: ${X509_USER_PROXY}"
-    fi
-
-    if command -v voms-proxy-info >/dev/null 2>&1; then
-        if voms-proxy-info --exists >/dev/null 2>&1; then
+    if [[ -n "${X509_USER_PROXY:-}" ]] && command -v voms-proxy-info >/dev/null 2>&1; then
+        if voms-proxy-info --file "${X509_USER_PROXY}" --exists >/dev/null 2>&1; then
             local tl
-            tl=$(voms-proxy-info --timeleft 2>/dev/null || true)
+            tl=$(voms-proxy-info --file "${X509_USER_PROXY}" --timeleft 2>/dev/null || true)
             msg_ok "VOMS proxy valid (timeleft: ${tl}s)"
             return 0
         fi
@@ -1248,7 +1242,7 @@ ensure_voms_proxy() {
         return 0
     fi
 
-    msg_warn "No valid VOMS proxy detected. If DIGI premix download fails, run: voms-proxy-init -voms cms -valid 192:00"
+    msg_warn "No valid VOMS proxy detected. Set X509_USER_PROXY to a job-private or persistent proxy path."
 }
 
 prepare_cmssw15_from_package() {

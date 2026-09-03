@@ -192,7 +192,7 @@ def executable(path, text):
 
 
 def proxy_refresh(root, proxy):
-    source = quote(proxy) if proxy else "${X509_USER_PROXY:-/tmp/x509up_u$(id -u)}"
+    source = quote(proxy) if proxy else "${X509_USER_PROXY:?set X509_USER_PROXY to a persistent proxy path}"
     bundle = quote(root / "bundles/proxy_bundle.tar.gz")
     return f"""PROXY_SOURCE={source}
 [[ -s "${{PROXY_SOURCE}}" ]] || {{ echo "ERROR: missing proxy" >&2; exit 2; }}

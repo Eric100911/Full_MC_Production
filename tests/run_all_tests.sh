@@ -128,6 +128,8 @@ echo "[INFO] 检查 worker 命令日志封装的退出码传播"
 
 echo "[INFO] 检查 existing-LHE generate-test 的 planner 事件上限"
 python3 "${SCRIPT_DIR}/test_lhe_planner_cap_generation.py"
+echo "[INFO] 检查 planner 的 LHE 纵向对称性 fail-closed QA"
+python3 "${SCRIPT_DIR}/test_plan_lhe_blocks_symmetry.py"
 
 echo "[INFO] 检查 counted existing-LHE inventory 分组"
 python3 "${SCRIPT_DIR}/test_existing_lhe_inventory.py"

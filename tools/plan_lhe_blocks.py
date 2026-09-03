@@ -53,6 +53,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest-output-path", default="", help="Full path for the output manifest JSON")
     p.add_argument("--lhe-shuffle-split-bin", default="lhe_shuffle_split",
                    help="Path to lhe_shuffle_split binary")
+    p.add_argument("--longitudinal-symmetry-pdg-ids", default="",
+                   help="Comma-separated outgoing PDG IDs audited by pz sign")
+    p.add_argument("--longitudinal-symmetry-policy", choices=("off", "warn", "fail"),
+                   default="off", help="Action when an input file fails the pz-sign audit")
+    p.add_argument("--longitudinal-symmetry-max-asymmetry", type=float, default=0.20,
+                   help="Maximum allowed abs(N(+pz)-N(-pz))/(N(+pz)+N(-pz))")
+    p.add_argument("--longitudinal-symmetry-min-particles", type=int, default=500,
+                   help="Minimum selected particles required to evaluate each input file")
     return p.parse_args()
 
 
@@ -150,6 +158,140 @@ def _normalize_inputs(args: argparse.Namespace) -> tuple:
     return primary_seed, group_id, seeds, expected_counts
 
 
+def _parse_pdg_ids(raw: str) -> list:
+    pdg_ids = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            pdg_ids.append(abs(int(item)))
+    return sorted(set(pdg_ids))
+
+
+def _scan_lhe_longitudinal_symmetry(path: str, pdg_ids: list) -> dict:
+    """Count selected outgoing particles by longitudinal-momentum sign."""
+    selected = set(pdg_ids)
+    counts = {"positive_pz": 0, "negative_pz": 0, "zero_pz": 0}
+    events = 0
+    particles_remaining = 0
+
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line.startswith("<event") and not line.startswith("</event"):
+                events += 1
+                particles_remaining = -1
+                continue
+            if particles_remaining == -1:
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split()
+                try:
+                    particles_remaining = int(fields[0])
+                except (IndexError, ValueError) as exc:
+                    raise ValueError(
+                        f"Malformed LHE event header in {path}: {line}"
+                    ) from exc
+                continue
+            if particles_remaining <= 0 or not line or line.startswith("#"):
+                continue
+
+            particles_remaining -= 1
+            fields = line.split()
+            if len(fields) < 10:
+                raise ValueError(f"Malformed LHE particle line in {path}: {line}")
+            try:
+                pdg_id = abs(int(fields[0]))
+                status = int(fields[1])
+                pz = float(fields[8])
+            except ValueError as exc:
+                raise ValueError(f"Malformed LHE particle line in {path}: {line}") from exc
+            if pdg_id not in selected or status <= 0:
+                continue
+            if pz > 0.0:
+                counts["positive_pz"] += 1
+            elif pz < 0.0:
+                counts["negative_pz"] += 1
+            else:
+                counts["zero_pz"] += 1
+
+    signed = counts["positive_pz"] + counts["negative_pz"]
+    asymmetry = None
+    if signed:
+        asymmetry = abs(counts["positive_pz"] - counts["negative_pz"]) / signed
+    return {
+        "events": events,
+        **counts,
+        "signed_particles": signed,
+        "absolute_asymmetry": asymmetry,
+    }
+
+
+def audit_input_longitudinal_symmetry(
+    local_paths: list,
+    source_paths: list,
+    pdg_ids: list,
+    policy: str,
+    max_asymmetry: float,
+    min_particles: int,
+) -> dict:
+    """Audit each input independently so balanced files cannot hide a bad file."""
+    if policy == "off" or not pdg_ids:
+        return {
+            "policy": policy,
+            "pdg_ids": pdg_ids,
+            "result": "not_checked",
+            "files": [],
+        }
+    if not 0.0 <= max_asymmetry <= 1.0:
+        raise ValueError("--longitudinal-symmetry-max-asymmetry must be in [0, 1]")
+    if min_particles <= 0:
+        raise ValueError("--longitudinal-symmetry-min-particles must be positive")
+    if len(local_paths) != len(source_paths):
+        raise ValueError("Local and source LHE path counts differ")
+
+    files = []
+    for local_path, source_path in zip(local_paths, source_paths):
+        record = _scan_lhe_longitudinal_symmetry(local_path, pdg_ids)
+        signed = record["signed_particles"]
+        asymmetry = record["absolute_asymmetry"]
+        if signed == 0 and record["events"] >= min_particles:
+            result = "fail"
+            reason = "expected_particles_missing"
+        elif signed < min_particles:
+            result = "insufficient_statistics"
+            reason = "below_minimum_particles"
+        elif asymmetry is not None and asymmetry > max_asymmetry:
+            result = "fail"
+            reason = "asymmetry_exceeds_limit"
+        else:
+            result = "pass"
+            reason = "within_limit"
+        files.append({"path": source_path, "result": result, "reason": reason, **record})
+
+    if any(item["result"] == "fail" for item in files):
+        result = "fail"
+    elif any(item["result"] == "pass" for item in files):
+        result = "pass"
+    else:
+        result = "insufficient_statistics"
+    return {
+        "policy": policy,
+        "pdg_ids": pdg_ids,
+        "max_absolute_asymmetry": max_asymmetry,
+        "min_particles_per_file": min_particles,
+        "result": result,
+        "files": files,
+    }
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(temporary, path)
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -189,10 +331,35 @@ def main() -> int:
 
         print(f"[INFO] Input LHE group {group_id} has {len(local_inputs)} file(s)")
 
-        # --- 2. Check for existing blocks (reuse) ---
+        # --- 2. Reject or flag longitudinally asymmetric source files ---
+        try:
+            pdg_ids = _parse_pdg_ids(args.longitudinal_symmetry_pdg_ids)
+            input_symmetry = audit_input_longitudinal_symmetry(
+                local_inputs,
+                args.lhe_path,
+                pdg_ids,
+                args.longitudinal_symmetry_policy,
+                args.longitudinal_symmetry_max_asymmetry,
+                args.longitudinal_symmetry_min_particles,
+            )
+        except ValueError as exc:
+            print(f"[ERROR] Input longitudinal-symmetry audit failed: {exc}", file=sys.stderr)
+            return 1
+
         manifest_path = args.manifest_output_path or os.path.join(
             args.output_dir, f"plan_manifest_{args.pool_name}_{group_id}.json"
         )
+        symmetry_path = manifest_path + ".input_symmetry.json"
+        _write_json_atomic(symmetry_path, input_symmetry)
+        print(f"[INFO] Input longitudinal-symmetry audit: {symmetry_path}")
+        if input_symmetry["result"] == "fail":
+            message = "One or more LHE inputs failed the longitudinal-symmetry audit"
+            if args.longitudinal_symmetry_policy == "fail":
+                print(f"[ERROR] {message}", file=sys.stderr)
+                return 1
+            print(f"[WARNING] {message}", file=sys.stderr)
+
+        # --- 3. Check for existing blocks (reuse) ---
         prefix = f"block_{group_id}_"
         block_stage_dir = args.block_output_dir.rstrip("/")
         if grouped_output:
@@ -205,7 +372,7 @@ def main() -> int:
                 return 0
             print("[INFO] Existing blocks incomplete or mismatched, regenerating...")
 
-        # --- 3. Run lhe_shuffle_split ---
+        # --- 4. Run lhe_shuffle_split ---
         split_out = os.path.join(workdir, "split_out")
         os.makedirs(split_out, exist_ok=True)
         shuffle_cmd = [
@@ -253,7 +420,7 @@ def main() -> int:
             print("[ERROR] lhe_shuffle_split produced zero blocks", file=sys.stderr)
             return 1
 
-        # --- 4. Compress each block and stage out ---
+        # --- 5. Compress each block and stage out ---
         os.makedirs(args.output_dir, exist_ok=True)
         if is_remote_output:
             _ensure_remote_dir(block_stage_dir)
@@ -291,10 +458,10 @@ def main() -> int:
                                     "n_events": shuffle_manifest["blocks"][bi]["n_events"],
                                     "path": dst_path})
 
-        # --- 5. Write plan manifest ---
+        # --- 6. Write plan manifest ---
         manifest = {
             "tool": "plan_lhe_blocks",
-            "version": "2.0",
+            "version": "2.1",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "pool": args.pool_name,
             "group_id": group_id,
@@ -306,6 +473,7 @@ def main() -> int:
             "input_event_count_source": (
                 "discovery_inventory" if expected_input_event_counts else "not_provided"
             ),
+            "input_longitudinal_symmetry": input_symmetry,
             "shuffle_seed": args.shuffle_seed,
             "shuffle_mode": args.shuffle_mode,
             "n_strata_arg": args.n_strata,
@@ -321,10 +489,7 @@ def main() -> int:
             "unused_blocks": [],
         }
 
-        manifest_tmp = manifest_path + ".tmp"
-        with open(manifest_tmp, "w") as f:
-            json.dump(manifest, f, indent=2)
-        os.rename(manifest_tmp, manifest_path)
+        _write_json_atomic(manifest_path, manifest)
         print(f"[INFO] Manifest written: {manifest_path}")
 
         # Cleanup uncompressed block files

@@ -42,6 +42,12 @@ TMPDIR.mkdir(parents=True, exist_ok=True)
 # Derived from the coordinator manifest in main(); read by worker functions.
 CAMPAIGN = ""
 JOB_PFX = ""
+FAILURES = []
+
+
+def record_failure(kind, target, detail):
+    """Record an operational audit failure without changing classification."""
+    FAILURES.append({"kind": kind, "target": str(target), "detail": str(detail)})
 
 
 def run_checked(cmd, **kwargs):
@@ -143,6 +149,7 @@ def ntuple_ok(p, planned_url):
 
 def main():
     global CAMPAIGN, JOB_PFX
+    FAILURES.clear()
     coord = json.loads(COORD.read_text(encoding="utf-8"))
     campaign = coord["campaign"]
     job_index = int(coord["job_index"])
@@ -168,6 +175,9 @@ def main():
             m = re.search(rf"{JOB_PFX}_BLOCK(\d+)$", line.strip())
             if m:
                 existing.add(int(m.group(1)))
+    else:
+        record_failure("xrdfs_ls", root_lfn,
+                       rl.stderr.strip() or f"exit status {rl.returncode}")
     print(f"existing {JOB_PFX} block dirs: {len(existing)}", file=sys.stderr)
     if len(existing) < n_blocks:
         # listing is short of the planned block count; audit everything to be safe
@@ -196,6 +206,7 @@ def main():
             try:
                 block_results[idx] = fut.result()
             except Exception as exc:  # noqa: BLE001
+                record_failure("block_audit", idx, exc)
                 block_results[idx] = {"error": str(exc)}
 
     # ---- 2. audit merge groups ----
@@ -209,6 +220,7 @@ def main():
             try:
                 group_results[gi] = fut.result()
             except Exception as exc:  # noqa: BLE001
+                record_failure("group_audit", gi, exc)
                 group_results[gi] = {"error": str(exc)}
 
     errs = [gr for gr in group_results.values() if "error" in gr]
@@ -224,6 +236,9 @@ def main():
                           "cat3_components_missing_merge": 0,
                           "cat4_waiting_mix": 0, "groups_with_valid_merge": 0,
                           "blocks_valid": 0, "blocks_missing": 0},
+              "failure_report": str(WORK / "inventory" /
+                                     f"{campaign}_job{job_index}_failures.json"),
+              "failures": FAILURES,
               "groups": {}}
     for gi, gr in group_results.items():
         if "error" in gr:
@@ -255,20 +270,29 @@ def main():
             report["summary"]["blocks_missing"] += 1
 
     out = WORK / "inventory" / f"{campaign}_job{job_index}_inventory.json"
+    failure_out = WORK / "inventory" / f"{campaign}_job{job_index}_failures.json"
+    failure_report = {"schema": "tps-merge-inventory-failures-v1",
+                      "created_at": report["created_at"], "campaign": campaign,
+                      "coordinator": str(COORD), "count": len(FAILURES),
+                      "failures": FAILURES}
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    failure_out.write_text(json.dumps(failure_report, indent=2), encoding="utf-8")
     print(f"wrote {out}", file=sys.stderr)
+    print(f"wrote {failure_out}", file=sys.stderr)
     print("SUMMARY:", json.dumps(report["summary"], indent=2))
 
 
 def audit_block(blk):
     manifest = fetch_manifest(blk["processing_manifest_url"])
-    valid = processing_ok(manifest)
+    manifest_valid = processing_ok(manifest)
     miniaod_exists, miniaod_size = stat_size(blk["miniaod_url"])
+    valid = manifest_valid and miniaod_exists and (miniaod_size or 0) > 0
     return {"block_index": blk["index"],
             "job_id": blk.get("job_id") or f"{JOB_PFX}_BLOCK{blk['index']:06d}",
             "miniaod_url": blk["miniaod_url"],
             "manifest_url": blk["processing_manifest_url"],
             "manifest_present": manifest is not None,
+            "manifest_valid": manifest_valid,
             "valid": valid,
             "status": manifest.get("status") if manifest else None,
             "complete": manifest.get("complete") if manifest else None,
@@ -284,6 +308,7 @@ def audit_group(g, ntuples, block_results):
     try:
         return _audit_group(g, ntuples, block_results)
     except Exception as exc:  # noqa: BLE001
+        record_failure("group_audit", g.get("merge_index"), exc)
         return {"merge_index": g.get("merge_index"), "job_id": g.get("job_id"),
                 "error": str(exc), "traceback": _tb.format_exc()}
 
@@ -299,13 +324,15 @@ def _audit_group(g, ntuples, block_results):
         bm = block_results.get(str(comp["block_index"]), {})
         comp_records.append({"block_index": comp["block_index"], "job_id": comp["job_id"],
                              "valid": bm.get("valid", False),
+                             "miniaod_exists": bm.get("miniaod_exists", False),
+                             "miniaod_size": bm.get("miniaod_size"),
                              "actual_miniaod_events": bm.get("actual_miniaod_events"),
                              "manifest_present": bm.get("manifest_present", False)})
         if bm.get("valid"):
             n_valid += 1
     mm = fetch_manifest(merge_manifest_url)
-    merge_ok_v = merge_ok(mm, merge_url) if mm else False
     merged_exists, merged_size = stat_size(merge_url)
+    merge_ok_v = (merge_ok(mm, merge_url) if mm else False) and merged_exists and (merged_size or 0) > 0
     nt = ntuples.get(job_id)
     ntuple_url = nt["ntuple_url"] if nt else None
     ntuple_exists, ntuple_size = stat_size(ntuple_url) if ntuple_url else (False, None)
@@ -331,7 +358,7 @@ def _audit_group(g, ntuples, block_results):
             "ntuple_size": ntuple_size,
             "split_ntuple_manifest_present": sm is not None,
             "ntuple_ok": ntuple_ok_v,
-            "ntuple_complete": ntuple_ok_v or (ntuple_exists and (ntuple_size or 0) > 0)}
+            "ntuple_complete": ntuple_ok_v and ntuple_exists and (ntuple_size or 0) > 0}
 
 
 if __name__ == "__main__":

@@ -38,6 +38,17 @@ CERN HTCondor handles MIX (processing); IHEP HepJob handles MERGE and NTUPLE.
   rewritten on every audit. Re-auditing while jobs are running can still shift
   the submit target. Wait for the cluster to exit the queue first.
 
+## HepJob submission (IHEP)
+
+`hep_sub` needs `export PATH=/cvmfs/common.ihep.ac.cn/software/hepjob/bin:$PATH`.
+ntuple must be pinned round-robin to the **11 AVX2-safe nodes**
+(ams017/018/019/020 + cws047/048/049/051/052/053/054) via `-wn`; merge runs
+unpinned (cmssw-el8, unaffected). Rebuild the proxy bundle into the workspace
+before submitting — never the shared `/tmp/x509up_u$UID` path. Batch builds must
+be serialized (IHEP login-node fork exhaustion). Full lessons:
+`references/hepjob-submission.md`; ready-to-run:
+`scripts/submit_ntuple_pinned.sh <campaign> <workspace>`.
+
 ## Classification categories
 
 | Category | Status | Next action |
@@ -114,8 +125,13 @@ python3 skills/cms-continuous-production/scripts/recover_ntuple_sidecars.py <wor
 3. **Submit ntuple** only after the merge gate exists.
 4. **Recover sidecars** (`recover_ntuple_sidecars.py`) after ntuple ROOTs land.
 5. **Audit ntuple gate** → `gates/ntuple_<campaign>.json`.
-6. Optional **finalize** (cleanup): `dag_generator.py finalize-split` (dry-run
-   default; `--apply` only with explicit authorization).
+6. Optional **count candidate yield**: `tools/count_ntuple_candidates.py
+   <run>/tasks/<campaign>/ntuple_tasks.json` (with `X509_USER_PROXY`), then
+   cross-check `events_total` against the merge gate's summed `actual_events`.
+7. Optional **finalize** (cleanup): `dag_generator.py finalize-split` (dry-run
+   default; `--apply` only with explicit authorization). Note: `--apply` must be
+   run with `X509_USER_PROXY` set, or `xrdfs rm` fails `Operation not permitted`
+   on `cmsuser`-owned block outputs.
 7. **Reconcile** the old CERN DAG: take final snapshot, verify external
    completion evidence, record a reconciliation artifact, and remove/retire
    the held controller only after evidence is recorded.
@@ -124,7 +140,7 @@ python3 skills/cms-continuous-production/scripts/recover_ntuple_sidecars.py <wor
 
 | Symptom | Cause | Response |
 |---------|-------|----------|
-| `Illegal instruction (rc=132)` in ntuple | Ivy Bridge node (cws050/052/055, no AVX2) | Retry on another worker; conservative CMSSW build if persistent |
+| `Illegal instruction (rc=132)` in ntuple | Ivy Bridge node **cws050/cws055 only** (no AVX2; cws052 is safe) | Resubmit pinned to an AVX2-safe node via `submit_ntuple_pinned.sh` — see `references/hepjob-submission.md` |
 | `Operation not permitted` sidecar upload | Post-container sandbox EOS mkdir | Run `recover_ntuple_sidecars.py` from login node |
 | ProcId outside task count | Retry manifest rewritten while cluster in flight | Wait for cluster to finish, re-audit, submit clean retry |
 | `[FATAL] Invalid address` | Restricted sandbox XRootD | Reproduce on normal IHEP shell with same proxy |

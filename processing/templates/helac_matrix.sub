@@ -13,7 +13,7 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); install -m 600 credentials/x509_user_proxy /tmp/x509up_u$UID; rm -rf credentials; unset X509_USER_PROXY; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool helac_matrix --charm-state $(charm_state) --bottom-state $(bottom_state) --extra-gluon $(extra_gluon) --job-slug $(job_slug) --stageout-mode helac-output --seed $(seed) --output-dir $(stageout_dir) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt $(unwevt) --test-mode $(test_mode)'"
+Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); chmod 600 credentials/x509_user_proxy; export X509_USER_PROXY=\"$PWD/credentials/x509_user_proxy\"; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool helac_matrix --charm-state $(charm_state) --bottom-state $(bottom_state) --extra-gluon $(extra_gluon) --job-slug $(job_slug) --stageout-mode helac-output --seed $(seed) --output-dir $(stageout_dir) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt $(unwevt) --test-mode $(test_mode)'"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

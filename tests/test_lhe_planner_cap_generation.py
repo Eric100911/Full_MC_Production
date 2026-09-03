@@ -51,6 +51,11 @@ def main() -> int:
         payload = json.loads(planning_configs[0].read_text(encoding="utf-8"))
         assert payload["events_per_block"] == 5
         assert payload["max_events_per_plan"] == 20
+        assert payload["longitudinal_symmetry_policy"] == "fail"
+        assert payload["longitudinal_symmetry_max_asymmetry"] == 0.20
+        assert payload["longitudinal_symmetry_min_particles"] == 500
+        assert 443 in payload["longitudinal_symmetry_pdg_ids"]
+        assert 9941003 in payload["longitudinal_symmetry_pdg_ids"]
 
         dag_text = (output_dir / "planner_cap_test.dag").read_text(encoding="utf-8")
         assert "JOB PLAN_" in dag_text

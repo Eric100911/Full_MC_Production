@@ -432,6 +432,7 @@ class LHEPool:
         storage_name: Optional[str] = None,
         variants: Sequence[str] = (),
         public: bool = True,
+        longitudinal_symmetry_pdg_ids: Sequence[int] = (),
     ):
         self.name = name
         self.description = description
@@ -444,6 +445,7 @@ class LHEPool:
         self.storage_name = storage_name or name
         self.variants = list(variants)
         self.public = public
+        self.longitudinal_symmetry_pdg_ids = list(longitudinal_symmetry_pdg_ids)
 
     @property
     def process_text(self) -> str:
@@ -467,6 +469,7 @@ class LHEPool:
             "storage_name": self.storage_name,
             "variants": self.variants,
             "public": self.public,
+            "longitudinal_symmetry_pdg_ids": self.longitudinal_symmetry_pdg_ids,
         }
 
 
@@ -753,6 +756,13 @@ class WorkflowOptions:
         }
 
 
+CHARMONIUM_LONGITUDINAL_QA_PDG_IDS = (
+    443, 9900441, 9900443, 9910441, 9940003, 9941003, 9942003,
+)
+BOTTOMONIUM_LONGITUDINAL_QA_PDG_IDS = (
+    553, 9900551, 9900553, 9910551, 9950003, 9951003, 9952003,
+)
+
 LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
     [
         (
@@ -766,6 +776,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 ),
                 notes="J/psi 基础池使用 HELAC-Onia addon/pp_psiX_CrystalBall，CrystalBall 参数取 addon input 默认。",
                 seed_offset=0,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -779,6 +790,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 ),
                 notes="Upsilon(1S) 基础池使用 HELAC-Onia addon/pp_psiX_CrystalBall，CrystalBall 参数取 addon input 默认。",
                 seed_offset=20000,
+                longitudinal_symmetry_pdg_ids=BOTTOMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -803,6 +815,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 notes="double-J/psi born/color-singlet SPS 基础池。",
                 seed_offset=60000,
                 public=True,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -813,6 +826,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > cc~(3S11) cc~(3S11) g",),
                 notes="double-J/psi + g SPS 基础池。",
                 seed_offset=70000,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -823,6 +837,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > jpsi y(1s)",),
                 notes="J/psi + Upsilon SPS 基础池。",
                 seed_offset=80000,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
     ]
@@ -1191,32 +1206,7 @@ def detect_proxy_path(machine_env_name: str = "auto") -> str:
 
 
 def ensure_local_xrootd_proxy(proxy_path: str) -> str:
-    """给本地 xrdfs/xrdcp 准备一个可直接使用的代理副本。"""
-
-    tmp_proxy = f"/tmp/x509up_u{os.getuid()}"
-    candidates: List[str] = []
-    if tmp_proxy:
-        candidates.append(tmp_proxy)
-    if proxy_path and proxy_path not in candidates:
-        candidates.append(proxy_path)
-
-    for candidate in candidates:
-        if not candidate or not os.path.exists(candidate):
-            continue
-        ok, _, _ = check_proxy_valid(candidate)
-        if ok and candidate == tmp_proxy:
-            return candidate
-
-    if proxy_path and os.path.exists(proxy_path):
-        try:
-            shutil.copyfile(proxy_path, tmp_proxy)
-            os.chmod(tmp_proxy, 0o600)
-            ok, _, _ = check_proxy_valid(tmp_proxy)
-            if ok:
-                return tmp_proxy
-        except OSError:
-            pass
-
+    """Return the caller-selected proxy without copying it to shared /tmp."""
     return proxy_path
 
 
@@ -3915,6 +3905,7 @@ class DAGBuilder:
         max_events_per_plan_override: Optional[int] = None,
     ) -> str:
         """Emit a per-pool LHE block planner DAG node."""
+        pool = LHE_POOLS[pool_name]
         pool_label = pool_dag_label(pool_name)
         job_name = f"PLAN_{pool_label}_{index}"
         lhe_path = lhe_path_override or self._resolve_lhe_path(pool_name, seed)
@@ -3955,6 +3946,12 @@ class DAGBuilder:
             "shuffle_mode": self.options.lhe_shuffle_mode,
             "n_strata": self.options.lhe_n_strata,
             "drop_incomplete_last_block": self.options.lhe_drop_incomplete_last_block,
+            "longitudinal_symmetry_pdg_ids": pool.longitudinal_symmetry_pdg_ids,
+            "longitudinal_symmetry_policy": (
+                "fail" if pool.longitudinal_symmetry_pdg_ids else "off"
+            ),
+            "longitudinal_symmetry_max_asymmetry": 0.20,
+            "longitudinal_symmetry_min_particles": 500,
             "block_output_dir": block_output_dir,
             "local_output_base": self.options.local_output_base,
             "reuse_existing_blocks": False,

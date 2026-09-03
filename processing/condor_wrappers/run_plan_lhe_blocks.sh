@@ -19,9 +19,8 @@ echo "Config: ${CONFIG_NAME}"
 
 echo "Extracting proxy bundle..."
 tar -xzf "${PROXY_BUNDLE}"
-PROXY_TARGET="/tmp/x509up_u$(id -u)"
-install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"
-rm -rf credentials
+PROXY_TARGET="${PWD}/credentials/x509_user_proxy"
+chmod 600 "${PROXY_TARGET}"
 export X509_USER_PROXY="${PROXY_TARGET}"
 
 echo "Extracting planner bundle..."
@@ -81,6 +80,20 @@ cmd = [
     "--manifest-output-path", str(cfg["manifest_output_path"]),
     "--lhe-shuffle-split-bin", "./lhe_shuffle_split",
 ]
+symmetry_pdg_ids = cfg.get("longitudinal_symmetry_pdg_ids", [])
+if not isinstance(symmetry_pdg_ids, list):
+    raise SystemExit("Planner config key longitudinal_symmetry_pdg_ids must be a list")
+if symmetry_pdg_ids:
+    cmd.extend([
+        "--longitudinal-symmetry-pdg-ids",
+        ",".join(str(pdg_id) for pdg_id in symmetry_pdg_ids),
+        "--longitudinal-symmetry-policy",
+        str(cfg.get("longitudinal_symmetry_policy", "fail")),
+        "--longitudinal-symmetry-max-asymmetry",
+        str(cfg.get("longitudinal_symmetry_max_asymmetry", 0.20)),
+        "--longitudinal-symmetry-min-particles",
+        str(cfg.get("longitudinal_symmetry_min_particles", 500)),
+    ])
 max_events_per_plan = int(cfg.get("max_events_per_plan", 0) or 0)
 if max_events_per_plan > 0:
     cmd.extend(["--max-events-per-plan", str(max_events_per_plan)])

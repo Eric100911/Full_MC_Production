@@ -7,10 +7,10 @@
 
 set -e
 
-# Configuration
-PROXY_ROOT="/workfs2/cms/chengxing/Full_MC_Production"
-PROXY_SRC="/tmp/x509up_u$(id -u)"
-PROXY_DST="${PROXY_ROOT}/x509up_u$(id -u)"
+# Configuration.  Keep the proxy on the persistent workflow filesystem; do
+# not rely on the shared temporary default created by voms-proxy-init.
+PROXY_ROOT="${PROXY_ROOT:-${PWD}}"
+PROXY_DST="${X509_USER_PROXY:-${PROXY_ROOT}/x509up_u$(id -u)}"
 EOS_HOST="cceos.ihep.ac.cn"
 EOS_XRDFS_TARGET="root://${EOS_HOST}"
 EOS_PATH_BASE="/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
@@ -37,10 +37,6 @@ resolve_proxy_path() {
         echo "${PROXY_DST}"
         return 0
     fi
-    if [[ -f "${PROXY_SRC}" ]]; then
-        echo "${PROXY_SRC}"
-        return 0
-    fi
     return 1
 }
 
@@ -60,7 +56,7 @@ check_proxy() {
     fi
 
     if ! activate_proxy_env; then
-        msg_error "No proxy file found in X509_USER_PROXY, ${PROXY_DST} or ${PROXY_SRC}."
+        msg_error "No proxy file found in X509_USER_PROXY or ${PROXY_DST}."
         return 1
     fi
 
@@ -94,8 +90,9 @@ check_proxy() {
 init_proxy() {
     msg_info "Initializing new CMS VOMS proxy..."
     
-    # Request 7-day proxy
-    voms-proxy-init -voms cms -valid 192:00
+    # Request a 7-day proxy directly at the persistent target.
+    mkdir -p "$(dirname "${PROXY_DST}")"
+    voms-proxy-init -voms cms -valid 192:00 -out "${PROXY_DST}"
     
     if [[ $? -eq 0 ]]; then
         msg_ok "New proxy initialized successfully"
@@ -111,15 +108,12 @@ copy_proxy() {
 
     local source_proxy=""
 
-    # 优先从 /tmp 获取最新创建的 proxy（voms-proxy-init 的默认位置）
-    if [[ -f "${PROXY_SRC}" ]]; then
-        source_proxy="${PROXY_SRC}"
-    elif [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
+    if [[ -n "${X509_USER_PROXY:-}" && -f "${X509_USER_PROXY}" ]]; then
         source_proxy="${X509_USER_PROXY}"
     elif [[ -f "${PROXY_DST}" ]]; then
         source_proxy="${PROXY_DST}"
     else
-        msg_error "Source proxy not found in ${PROXY_SRC}, X509_USER_PROXY or ${PROXY_DST}"
+        msg_error "Source proxy not found in X509_USER_PROXY or ${PROXY_DST}"
         return 1
     fi
 
@@ -136,9 +130,10 @@ copy_proxy() {
         return 1
     fi
 
-    # 复制到 workfs2 持久位置
-    mkdir -p "${PROXY_ROOT}"
-    cp "${source_proxy}" "$PROXY_DST"
+    mkdir -p "$(dirname "${PROXY_DST}")"
+    if [[ "${source_proxy}" != "${PROXY_DST}" ]]; then
+        cp "${source_proxy}" "$PROXY_DST"
+    fi
     chmod 600 "$PROXY_DST"
 
     local hours_left=$((timeleft / 3600))

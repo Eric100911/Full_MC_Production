@@ -36,7 +36,7 @@ trap cleanup EXIT
 msg() { printf '[INFO] %s\n' "$*"; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-proxy_path="${X509_USER_PROXY:-/tmp/x509up_u$(id -u)}"
+proxy_path="${X509_USER_PROXY:-}"
 [[ -s "${proxy_path}" ]] || die "No X509 proxy found at ${proxy_path}; run voms-proxy-init first"
 if command -v voms-proxy-info >/dev/null 2>&1; then
     voms-proxy-info --file "${proxy_path}" --timeleft >/dev/null || \

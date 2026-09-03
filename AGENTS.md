@@ -151,6 +151,19 @@ the changed workflow. If touching:
 - Verify operational changes in live DAGMan and worker logs; generated configs
   alone are not proof that a running process loaded the new values.
 
+## IHEP HepJob Submission
+
+- `hep_sub` needs `export PATH=/cvmfs/common.ihep.ac.cn/software/hepjob/bin:$PATH`.
+- ntuple runs CMSSW_15 (cmssw-el9): pin round-robin to the 11 AVX2-safe nodes
+  (ams017/018/019/020 + cws047/048/049/051/052/053/054) with `-wn`; cws050/cws055
+  are the only bad nodes (rc=132). merge (cmssw-el8) runs unpinned.
+- Install the proxy to the job-private `${PWD}/credentials/x509_user_proxy`, never
+  the shared `/tmp/x509up_u$UID` (concurrent same-UID jobs collide).
+- Serialize IHEP batch builds; `hep_q`/`xrdfs` empty results under fork exhaustion
+  need a retry before reading as zero.
+- Full lessons:
+  `skills/cms-continuous-production/references/hepjob-submission.md`.
+
 ## Config and Security
 
 - Keep storage paths centralized in `common/node_config_defaults.json`.

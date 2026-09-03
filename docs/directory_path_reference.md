@@ -40,6 +40,41 @@ validation belongs before submission, not in worker-side layout inference.
 
 ---
 
+## Accessing IHEP EOS (`xrdfs`) for manual inspection
+
+The storage is served by `cceos.ihep.ac.cn:1094`. Manual `xrdfs` inspection
+(`ls`, `ls -R`, `stat`) requires a valid CMS proxy.
+
+**Resolve the proxy from the environment, never by searching the filesystem.**
+On lxplus the current proxy is whatever `$X509_USER_PROXY` points at (e.g.
+`/afs/cern.ch/user/c/chiw/condor/x509up`); fall back to `voms-proxy-info --path`.
+`common/paths.sh::resolve_proxy_path()` implements exactly this order.
+
+**Run the inspection from ihep (lxlogin), not lxplus.** lxlogin sits on the IHEP
+network and reaches `T2_Beijing_CN` (cceos) far faster than lxplus. After a proxy
+refresh, copy the proxy over and point `X509_USER_PROXY` at the copy:
+
+```bash
+# from lxplus, once per proxy refresh
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+ssh ihep "mkdir -p /scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/credentials/$TS/credentials"
+scp -q "$X509_USER_PROXY" \
+  "ihep:/scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/credentials/$TS/credentials/x509_user_proxy"
+ssh ihep "chmod 600 /scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/credentials/$TS/credentials/x509_user_proxy"
+
+# then on ihep
+export X509_USER_PROXY=/scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/credentials/$TS/credentials/x509_user_proxy
+xrdfs root://cceos.ihep.ac.cn:1094/ ls -R /store/user/chiw/<path>/
+```
+
+The ihep credential convention is one timestamped directory per refresh:
+`credentials/<UTC timestamp>/credentials/x509_user_proxy` (mirroring the
+HepJob credentials layout). The ihep `xrdfs` client does **not** support
+`find`; for recursive enumeration/counting use `xrdfs ls -R <dir>` and filter
+the output (e.g. `xrdfs ... ls -R <dir> | grep -c "output_ntuple.root"`).
+
+---
+
 ## The master override: `TARGET_EOS_BASE`
 
 Every worker script that writes to remote storage follows the same pattern:

@@ -66,9 +66,6 @@ fi
 msg_pass "CVMFS accessible"
 
 PROXY_PATH="${X509_USER_PROXY:-}"
-if [[ -z "${PROXY_PATH}" ]]; then
-    PROXY_PATH="/tmp/x509up_u$(id -u)"
-fi
 if [[ -f "${PROXY_PATH}" ]]; then
     PROXY_TIMELEFT=$(voms-proxy-info -timeleft -file "${PROXY_PATH}" 2>/dev/null || echo "0")
     msg_pass "Proxy: ${PROXY_PATH} (${PROXY_TIMELEFT}s remaining)"

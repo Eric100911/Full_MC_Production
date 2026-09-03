@@ -32,9 +32,8 @@ echo "Extracting proxy bundle..."
 tar -xzf "${PROXY_BUNDLE}"
 
 echo "Installing proxy..."
-PROXY_TARGET="/tmp/x509up_u$(id -u)"
-install -m 600 credentials/x509_user_proxy "${PROXY_TARGET}"
-rm -rf credentials
+PROXY_TARGET="${PWD}/credentials/x509_user_proxy"
+chmod 600 "${PROXY_TARGET}"
 export X509_USER_PROXY="${PROXY_TARGET}"
 echo "X509_USER_PROXY=${X509_USER_PROXY}"
 if command -v voms-proxy-info >/dev/null 2>&1; then

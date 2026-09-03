@@ -9,6 +9,7 @@ bash 作业脚本，并提供自动化编排器（提交 LHE → 等待 → 提�
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import subprocess
@@ -46,9 +47,12 @@ from dag_generator import (
     write_ntuple_manifest,
 )
 
-WORKFS2_BASE = "/workfs2/cms/chengxing/Full_MC_Production"
-SCRATCHFS_BASE = "/scratchfs/cms/chengxing"
-WORKFLOW_BASE = os.path.join(SCRATCHFS_BASE, "hepjob")
+IHEP_USER = os.environ.get("IHEP_USER") or os.environ.get("USER") or getpass.getuser()
+WORKFS2_BASE = os.environ.get(
+    "WORKFS2_BASE", f"/workfs2/cms/{IHEP_USER}/Full_MC_Production"
+)
+SCRATCHFS_BASE = os.environ.get("SCRATCHFS_BASE", f"/scratchfs2/cms/{IHEP_USER}")
+WORKFLOW_BASE = os.environ.get("WORKFLOW_BASE", os.path.join(SCRATCHFS_BASE, "hepjob"))
 LOG_BASE = os.path.join(WORKFLOW_BASE, "logs")
 
 CONTAINER_IMAGES = {
@@ -544,6 +548,7 @@ set -euo pipefail
 source ~/.bashrc 2>/dev/null || true
 
 LOG_DIR="{logs_dir}"
+HEPJOB_USER="${{HEPJOB_USER:-$(id -un)}}"
 mkdir -p "${{LOG_DIR}}"
 
 echo "============================================"
@@ -565,7 +570,9 @@ WAITED=0
 
 while [ $WAITED -lt $MAX_WAIT ]; do
     source ~/.bashrc 2>/dev/null || true
-    ACTIVE=$(hep_q -u chengxing 2>/dev/null | tail -1 | grep -oP '\d+ idle' | grep -oP '\d+' || echo "0")
+    ACTIVE=$(hep_q -u "${{HEPJOB_USER}}" 2>/dev/null | tail -1 \\
+        | grep -oP '\\d+ (?:idle|running|run|held)' \\
+        | awk '{{sum += $1}} END {{print sum+0}}' || echo "0")
 
     if [ "${{ACTIVE:-0}}" -eq 0 ]; then
         echo "All LHE jobs completed (no active jobs)"
@@ -578,12 +585,13 @@ while [ $WAITED -lt $MAX_WAIT ]; do
 done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
-    echo "WARNING: LHE job wait timeout reached"
+    echo "ERROR: LHE job wait timeout reached; active jobs remain" >&2
+    exit 4
 fi
 
 echo "Current job status:"
 source ~/.bashrc 2>/dev/null || true
-hep_q -u chengxing 2>/dev/null || echo "  (no active jobs)"
+hep_q -u "${{HEPJOB_USER}}" 2>/dev/null || echo "  (no active jobs)"
 
 # Phase 3: Submit processing jobs
 echo ""
@@ -595,7 +603,7 @@ echo "============================================"
 echo "Workflow submitted successfully"
 echo "============================================"
 echo ""
-echo "Monitor with: source ~/.bashrc && hep_q -u chengxing"
+echo "Monitor with: source ~/.bashrc && hep_q -u ${{HEPJOB_USER}}"
 echo "Check logs: ${{LOG_DIR}}"
 echo "End: $(date)"
 '''

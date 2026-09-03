@@ -37,11 +37,19 @@ cp "${WRAPPER_DIR}/run_ntuple_only.sh" "${WORKDIR}/"
 cp "${NTUPLE_BUNDLE}" "${WORKDIR}/ntuple_runtime_bundle.tar.gz"
 COMMAND=$(printf 'cd %q && bash run_ntuple_only.sh proxy_bundle.tar.gz ntuple_runtime_bundle.tar.gz task_config.json' "${WORKDIR}")
 /cvmfs/cms.cern.ch/common/cmssw-el9 -B /tmp -B /scratchfs2 --command-to-run "${COMMAND}"
+RC=$?
+if [ "$RC" -ne 0 ]; then
+    echo "ERROR: ntuple container failed (rc=${RC}); not writing manifest" >&2
+    exit "$RC"
+fi
 tar -xzf "${WORKDIR}/proxy_bundle.tar.gz" -C "${WORKDIR}"
 PROXY_TARGET="${WORKDIR}/credentials/x509_user_proxy"
 [[ -s "${PROXY_TARGET}" ]] || { echo "ERROR: missing extracted proxy after ntuple container" >&2; exit 2; }
-export X509_USER_PROXY="${PROXY_TARGET}"
-python3 - "${META}" "${WORKDIR}" <<'PY'
+# Manifest write MUST run inside the container: bare worker-node XRootD clients
+# (xrdfs/xrdcp) cannot authenticate to the IHEP EOS (ztn/TLS -> 3010) on EL9
+# worker nodes, while the cmssw-el9 container's XRootD works (same path as the
+# ROOT stage-out and the merge stage's cmssw-el8 manifest write).
+cat > "${WORKDIR}/write_split_manifest.py" <<'PY'
 import json
 from pathlib import Path
 import re
@@ -49,9 +57,10 @@ import shutil
 import subprocess
 import sys
 task = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+workdir = Path(sys.argv[2])
 payload = {"status": "ok", "campaign": task["campaign"], "job_id": task["job_id"],
            "ntuple_url": task["ntuple_url"]}
-local = Path(sys.argv[2]) / f"split_ntuple_manifest_{task['campaign']}_{task['job_id']}.json"
+local = workdir / f"split_ntuple_manifest_{task['campaign']}_{task['job_id']}.json"
 local.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 destination = task["manifest_url"]
 if destination.startswith("root://"):
@@ -64,4 +73,7 @@ else:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(local, target)
 PY
+COMMAND=$(printf 'cd %q && X509_USER_PROXY=%q python3 write_split_manifest.py %q %q' \
+  "${WORKDIR}" "${PROXY_TARGET}" "${META}" "${WORKDIR}")
+/cvmfs/cms.cern.ch/common/cmssw-el9 -B /tmp -B /scratchfs2 --command-to-run "${COMMAND}"
 echo "IHEP split task complete: stage=${STAGE} ProcId=${PROC_ID}"
