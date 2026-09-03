@@ -15,7 +15,8 @@
 - Ntuple 步骤保留在接口中；如需执行，请确保 `external/TPS-Onia2MuMu` submodule 已初始化且指向所需的分析代码版本。
 - Ntuple 的输入文件、输出文件和 `maxEvents` 通过 `cmsRun` CLI 切换；分析行为（`analysisMode`、MC truth tree、acceptance gating）固定在 `common/cmssw_configs/ntuple_*.py` 中。
 - 所有程序、文件、证书统一打包上传后在 worker 解压运行——worker 运行时不再回读 AFS 业务目录。
-- Worker 启动时将打包证书复制到 `/tmp/x509up_u$UID`；后续程序不引用解压目录中的本地文件。
+- 每个 worker 将打包证书解压到作业私有的 `${PWD}/credentials/x509_user_proxy` 并导出 `X509_USER_PROXY`。提交端的代理源必须位于持久存储上，并在整个提交窗口内保持有效。
+- 遗留的 `hepjob_workflow.py` 轮询 orchestrator 仅保留给既有部署；split production 使用明确的 CERN MIX / IHEP MERGE+NTUPLE 交接。
 - 使用 `dag_generator.py --machine-env ...` 选择 submit/storage profile，不再有 `VtxSmeared`、`ihep`、`hepthu` 等分支。
 - `pool_jpsi_CSCO_g` 和 `pool_upsilon_CSCO_g` 使用 HELAC-Onia 的 CrystalBall pT model。
 

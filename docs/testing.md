@@ -558,9 +558,14 @@ unsandboxed network access and a valid proxy.
   generated workspace on persistent IHEP-visible storage.
 - A valid CMS proxy is rebuilt into `bundles/proxy_bundle.tar.gz` immediately
   before each stage submission. Submission stops if less than ten minutes remain.
-- Split audits intentionally validate sidecar manifests only. They do not
-  checksum or download ROOT files. Existing worker-side EDM validation remains
-  authoritative.
+- Split audits intentionally validate sidecar manifests only. They do not stat,
+  checksum, or download ROOT files. Existing worker-side EDM validation remains
+  authoritative. For a TPS cutover, pair every stage gate with the read-only
+  inventory in
+  `skills/cms-continuous-production/scripts/tps_cutover_inventory.py`: it
+  verifies the expected sidecars and positive-size component, merged, and ntuple
+  ROOT products, and writes a separate failure report. An inventory failure is
+  for human follow-up; it never submits, retries, or removes work.
 
 | Stage | Success evidence | Enables |
 |---|---|---|
@@ -597,22 +602,43 @@ python3 dag_generator.py audit-split \
 ### Prepare and run the IHEP stages
 
 On an IHEP login node, use a repository checkout and an IHEP-visible persistent
-output directory.  This creates two explicit HepJob submit scripts per campaign:
-MERGE first, then NTUPLE after the merge audit gate exists.
+output directory. Set a persistent workspace root and proxy source first; do
+not use a shared `/tmp/x509up_u$UID` worker credential path.
 
 ```bash
+export IHEP_WORK_ROOT=/scratchfs2/cms/$USER/hepjobs/Full_MC_Production
+export X509_USER_PROXY=/persistent/path/to/x509_user_proxy
+WORKSPACE=$IHEP_WORK_ROOT/runs/<cutover-id>
+mkdir -p "$WORKSPACE"
+
 python3 dag_generator.py generate \
   --output-mode merge-ntuple \
   --split-manifest /path/on/ihep/split-manifest.json \
-  --output-dir /scratchfs/cms/<user>/split-workspace
+  --output-dir "$WORKSPACE"
 
-bash /scratchfs/cms/<user>/split-workspace/submit_merge_<campaign>.sh
+INV_COORD=/path/to/frozen/coord_manifest.json \
+  INV_WORK="$WORKSPACE" \
+  X509_USER_PROXY="$X509_USER_PROXY" \
+  python3 skills/cms-continuous-production/scripts/tps_cutover_inventory.py
+bash "$WORKSPACE"/submit_merge_<campaign>.sh
 python3 dag_generator.py audit-split --stage merge \
-  --workspace /scratchfs/cms/<user>/split-workspace
-bash /scratchfs/cms/<user>/split-workspace/submit_ntuple_<campaign>.sh
+  --workspace "$WORKSPACE"
+bash "$WORKSPACE"/submit_ntuple_<campaign>.sh
 python3 dag_generator.py audit-split --stage ntuple \
-  --workspace /scratchfs/cms/<user>/split-workspace
+  --workspace "$WORKSPACE"
 ```
+
+Record each HepJob cluster ID and UTC submission interval, inspect `hep_q`
+and the corresponding worker logs before running the next command, and repeat
+the inventory after each completed batch. A component, merge, or ntuple is
+complete only when its planned sidecar passes its stage gate **and** its ROOT
+output exists with positive size in the inventory report.
+
+MERGE uses one array-style HepJob cluster per campaign. NTUPLE uses one
+submission per task, pinned round-robin to the eleven AVX2-safe nodes because
+the CMSSW_15 EL9 container can fail with `rc=132` on cws050/cws055. The
+generated `submit_ntuple_<campaign>.sh` is the canonical pinned path; do not
+replace it with an unpinned array submission.
 
 An incomplete audit writes a compact `*_retry_tasks_<stamp>.json` and a matching
 snapshot wrapper `run_*_retry_<stamp>.sh`, then a stable `submit_*_retry.sh`
@@ -624,9 +650,8 @@ already-submitted jobs keep their original indices (do not hand-trim the shared
 retry task file). A successful audit purges stale snapshots and writes
 `gates/<stage>_<campaign>.json`.
 
-The generated HepJob scripts use one array-style cluster per campaign and pass
-`%{ProcId}` as the task index. Default resource classes are `short` for
-MERGE and `mid` for NTUPLE. Override them during workspace generation with
+Default resource classes are `short` for MERGE and `mid` for NTUPLE.
+Override them during workspace generation with
 `--hepjob-merge-walltime`, `--hepjob-ntuple-walltime`,
 `--hepjob-merge-memory-mb`, and `--hepjob-ntuple-memory-mb`.
 
@@ -674,14 +699,14 @@ mode only; no component MiniAOD was deleted.
 Cleanup is explicit and dry-run by default:
 
 ```bash
-python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace
-python3 dag_generator.py finalize-split --workspace /scratchfs/cms/<user>/split-workspace --apply
+python3 dag_generator.py finalize-split --workspace "$WORKSPACE"
 ```
 
 Finalize requires a successful ntuple audit gate and removes component MiniAODs
 only; merged MiniAODs, ntuples, and sidecars are retained. Each invocation
-writes a timestamped cleanup report under `logs/cleanup/`. Review the dry-run
-report before using `--apply`.
+writes a timestamped cleanup report under `logs/cleanup/`. Cleanup remains
+preview-only in this procedure; a separately authorized operation must review
+the dry-run report before using `--apply`.
 
 The legacy polling workflow remains available for existing deployments, but new
 split production should use these explicit stage commands. Workspace generation

@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA = "full-mc-production-split-v1"
+SAFE_NTUPLE_NODES = (
+    "ams017", "ams018", "ams019", "ams020",
+    "cws047", "cws048", "cws049", "cws051", "cws052", "cws053", "cws054",
+)
 
 
 def atomic_json(path, payload):
@@ -214,12 +218,29 @@ def submit_text(stage, campaign, count, wrapper, root, group, walltime, memory, 
     check = "" if not gate else f'[[ -s {quote(gate)} ]] || {{ echo "ERROR: missing gate {gate}" >&2; exit 3; }}\n'
     mem = f" -mem {memory}" if memory > 0 else ""
     logs = root / "logs" / stage / campaign
-    return f"""#!/bin/bash
+    header = f"""#!/bin/bash
 set -euo pipefail
 source ~/.bashrc 2>/dev/null || true
 {check}{proxy_refresh(root, proxy)}
 mkdir -p {quote(logs)}
-hep_sub {quote(wrapper)} -g {quote(group)} -gwn CMS -wt {quote(walltime)}{mem} \\
+"""
+    if stage == "ntuple":
+        safe_nodes = " ".join(SAFE_NTUPLE_NODES)
+        return header + f"""SAFE_NTUPLE_NODES=({safe_nodes})
+failed=0
+for ((idx = 0; idx < {count}; ++idx)); do
+  node="${{SAFE_NTUPLE_NODES[$((idx % ${{#SAFE_NTUPLE_NODES[@]}}))]}}.ihep.ac.cn"
+  if ! hep_sub {quote(wrapper)} -g {quote(group)} -gwn CMS -wt {quote(walltime)}{mem} \\
+    -wn "${{node}}" -argu "${{idx}}" -n 1 \\
+    -o {quote(logs)}/ntuple_${{idx}}.out \\
+    -e {quote(logs)}/ntuple_${{idx}}.err; then
+    echo "ERROR: ntuple submission failed for task ${{idx}} on ${{node}}" >&2
+    failed=$((failed + 1))
+  fi
+done
+(( failed == 0 ))
+"""
+    return header + f"""hep_sub {quote(wrapper)} -g {quote(group)} -gwn CMS -wt {quote(walltime)}{mem} \\
   -argu "%{{ProcId}}" -n {count} \\
   -o {quote(logs)}/{stage}_%{{ProcId}}.out \\
   -e {quote(logs)}/{stage}_%{{ProcId}}.err

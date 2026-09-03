@@ -15,7 +15,8 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - The Ntuple step is retained in the interface; to run it, ensure the `external/TPS-Onia2MuMu` submodule is initialized and its gitlink points to the desired analysis code state.
 - Ntuple input files, output files, and `maxEvents` are switched through `cmsRun` CLI. Analysis behavior (`analysisMode`, MC truth tree, acceptance gating) is fixed in `common/cmssw_configs/ntuple_*.py`.
 - All programs, files, and certificates are bundled and uploaded to workers — worker nodes never read from AFS business directories at runtime.
-- Worker startup copies the bundled proxy to `/tmp/x509up_u$UID`; subsequent programs do not reference local files in the unpack directory.
+- Each worker extracts the bundled proxy to its job-private `${PWD}/credentials/x509_user_proxy` path and exports `X509_USER_PROXY`. Submit-side proxy sources must remain on persistent storage for the intended submission window.
+- The legacy `hepjob_workflow.py` polling orchestrator is retained for existing deployments; split production uses the explicit CERN MIX / IHEP MERGE+NTUPLE handoff below.
 - Use `dag_generator.py --machine-env ...` to select the submit/storage profile. There are no longer separate branches for `VtxSmeared`, `ihep`, or `hepthu`.
 - `pool_jpsi_CSCO_g` and `pool_upsilon_CSCO_g` use HELAC-Onia's CrystalBall pT model.
 
@@ -127,15 +128,18 @@ python3 dag_generator.py audit-split --stage mix \
   --workspace generated/<cern-workspace> \
   --output /path/on/ihep/split-manifest.json
 
-# IHEP: prepare one MERGE cluster and one NTUPLE cluster per campaign
+# IHEP: prepare a persistent split workspace
+export IHEP_WORK_ROOT=/scratchfs2/cms/$USER/hepjobs/Full_MC_Production
 python3 dag_generator.py generate \
   --output-mode merge-ntuple \
   --split-manifest /path/on/ihep/split-manifest.json \
-  --output-dir /scratchfs/cms/<user>/split-workspace
+  --output-dir "$IHEP_WORK_ROOT"/runs/<cutover-id>
 ```
 
 Submit the generated `submit_merge_<campaign>.sh`, run
-`audit-split --stage merge`, then submit `submit_ntuple_<campaign>.sh`.
+`audit-split --stage merge`, then submit `submit_ntuple_<campaign>.sh`;
+the generated ntuple submitter pins each CMSSW15 task to the AVX2-safe IHEP
+nodes.
 Incomplete audits generate compact retry clusters. `finalize-split` previews
 component-MiniAOD cleanup and requires `--apply` to delete anything. See
 [docs/testing.md](docs/testing.md#cern-mix--ihep-mergentuple-split) for the

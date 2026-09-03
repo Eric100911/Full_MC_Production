@@ -46,8 +46,9 @@ ntuple must be pinned round-robin to the **11 AVX2-safe nodes**
 unpinned (cmssw-el8, unaffected). Rebuild the proxy bundle into the workspace
 before submitting — never the shared `/tmp/x509up_u$UID` path. Batch builds must
 be serialized (IHEP login-node fork exhaustion). Full lessons:
-`references/hepjob-submission.md`; ready-to-run:
-`scripts/submit_ntuple_pinned.sh <campaign> <workspace>`.
+`references/hepjob-submission.md`; generated split workspaces provide the
+canonical `submit_ntuple_<campaign>.sh`. For older workspaces, use
+`scripts/submit_ntuple_pinned.sh <campaign> <workspace> <proxy>`.
 
 ## Classification categories
 
@@ -85,7 +86,8 @@ python3 skills/cms-continuous-production/scripts/tps_cutover_inventory.py
 ```
 
 Output: `<work>/inventory/<campaign>_job<job_index>_inventory.json` with summary
-counts and per-group detail.
+counts and per-group detail, plus a separate `*_failures.json` report. The
+inventory is read-only: it does not submit, retry, or remove jobs.
 
 ### `ihep_build_batch.py`
 

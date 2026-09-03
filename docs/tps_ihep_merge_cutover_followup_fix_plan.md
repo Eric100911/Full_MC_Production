@@ -1,7 +1,8 @@
 # TPS CERN/IHEP Cutover Follow-up Fix Plan
 
-Status: outline only. This document records the next documentation pass; it
-does not authorize or implement those edits.
+Status: implemented on 2026-09-03. This record captures the completed
+documentation and split-submitter follow-up; it does not authorize production
+submission, cleanup, or recovery actions.
 
 ## Goal
 
@@ -14,41 +15,42 @@ Document the intended operating boundary clearly:
 - The CERN/IHEP boundary remains an explicit handoff rather than an
   agent-dependent end-to-end controller.
 
-## Planned documentation updates
+## Implemented follow-up
 
 1. **README workflow description**
-   - Replace stale worker proxy wording that refers to shared temporary paths.
-   - Describe the private worker credential path and the persistent submit-side
-     proxy requirement.
-   - Separate the current split workflow from the legacy monolithic HepJob
-     backend.
+   - Replaced stale shared-temporary-path proxy wording in both English and
+     Chinese READMEs with the job-private
+     `${PWD}/credentials/x509_user_proxy` path.
+   - Kept the separate persistent submit-side proxy requirement.
+   - Distinguished the current split workflow from the legacy monolithic
+     HepJob backend.
 
 2. **Testing and operations procedures**
-   - Update command examples for the explicit proxy argument and
-     `X509_USER_PROXY` alternative.
-   - Document the manual IHEP sequence: inventory, merge submission, audit,
-     ntuple submission, audit, and reconciliation.
-   - State that cleanup remains preview-only unless separately authorized.
+   - Documented the explicit persistent `X509_USER_PROXY` and workspace-root
+     setup, plus the human-watched sequence: inventory, merge, audit, ntuple,
+     audit, and reconciliation.
+   - Clarified that `audit-split` validates sidecars only; the TPS inventory
+     also checks positive-size ROOT products and writes a separate failure
+     report.
+   - Kept cleanup preview-only in the canonical procedure.
 
-3. **HepJob reference material**
-   - Document the configurable IHEP user/path variables and the legacy
-     orchestrator’s no-active-jobs wait.
-   - Explain when to use the pinned ntuple submitter and how safe-node pinning
-     relates to the CMSSW15 runtime.
-   - Keep recovery and submission as login-node operations rather than worker
-     responsibilities.
+3. **HepJob reference material and submitter**
+   - Replaced username-, timestamp-, and deployment-specific workspace examples
+     with `IHEP_WORK_ROOT` and `$USER`.
+   - Marked the legacy orchestrator’s global no-active-jobs wait as unsuitable
+     for cutover control.
+   - Changed generated split NTUPLE submitters to pin each CMSSW15 task
+     round-robin to the eleven AVX2-safe nodes; MERGE remains unpinned.
 
 4. **Inventory and completion criteria**
-   - Document the separate inventory failure report.
-   - Define complete component, merge, and ntuple products as requiring both
+   - Defined complete component, merge, and ntuple products as requiring both
      the expected sidecar and a positive-size ROOT output.
-   - Clarify that missing products are classified for human follow-up; the
-     inventory command does not submit or remove jobs.
+   - Clarified that missing products are classified for human follow-up; the
+     inventory command does not submit, retry, or remove jobs.
 
-5. **Legacy path cleanup**
-   - Mark obsolete username-, timestamp-, and deployment-specific examples.
-   - Replace remaining stale proxy examples with persistent, user-selected
-     paths while retaining exact storage URLs.
+5. **Regression coverage**
+   - Extended the split-workflow test to require pinned, per-index NTUPLE
+     submission while preserving array-style MERGE and retry snapshot behavior.
 
 ## Out of scope
 

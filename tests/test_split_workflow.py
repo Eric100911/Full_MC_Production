@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import re
+import subprocess
 import tempfile
 import sys
 from pathlib import Path
@@ -71,6 +72,15 @@ def main():
         submit_ntuple = Path(metadata["campaigns"][campaign]["submit_ntuple"]).read_text()
         assert '-argu "%{ProcId}" -n 1' in submit_merge
         assert f"merge_{campaign}.json" in submit_ntuple
+        assert '-argu "${idx}" -n 1' in submit_ntuple
+        assert '-wn "${node}"' in submit_ntuple
+        assert '%{ProcId}' not in submit_ntuple
+        for node in ("ams017", "ams018", "ams019", "ams020", "cws047", "cws048",
+                     "cws049", "cws051", "cws052", "cws053", "cws054"):
+            assert node in submit_ntuple
+        syntax = subprocess.run(["bash", "-n"], input=submit_ntuple, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert syntax.returncode == 0, syntax.stderr
         first = audit_stage(str(ihep), "merge")
         assert not first["complete"]
         retry_submit = Path(first["campaigns"][campaign]["retry_submit"])

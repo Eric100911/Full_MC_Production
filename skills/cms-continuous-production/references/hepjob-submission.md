@@ -39,10 +39,13 @@
 - **正确做法**：提交 ntuple 时**从一开始就用 `-wn` 在 11 台安全节点上
   round-robin**（`nodes[idx % 11]`），从源头避开 ~50% 的 rc=132 浪费，不要等
   失败再补跑。G 交接裸跑失败率 14–32%，CS job_0 裸跑 50%（cws050/055 空闲被占满）。
-- **现成脚本**：`skills/cms-continuous-production/scripts/submit_ntuple_pinned.sh
-  <campaign> <workspace>`（IHEP 侧执行）——重建 proxy bundle、校验 merge gate、
-  round-robin 钉安全节点提交全部 ntuple。Python 版
-  `submit_ntuple_safe.py --campaign <C> --job-index <N>`（CERN 侧缓存驱动）。
+- **标准路径**：split workspace 生成的 `submit_ntuple_<campaign>.sh` 已重建
+  proxy bundle、校验 merge gate，并 round-robin 钉安全节点提交每个 ntuple task；
+  不要用未钉节点的 array submitter 替换它。为旧 workspace 保留的
+  `skills/cms-continuous-production/scripts/submit_ntuple_pinned.sh
+  <campaign> <workspace> <proxy>` 也执行相同策略。Python 版
+  `submit_ntuple_safe.py --campaign <C> --job-index <N>` 是 CERN 侧历史缓存驱动
+  辅助工具。
 
 ## 3. Proxy 处理
 
@@ -63,10 +66,9 @@
   mv -f "$WS/bundles/proxy_bundle.tar.gz.tmp" "$WS/bundles/proxy_bundle.tar.gz"
   ```
 
-  `submit_ntuple_pinned.sh` 里已内建这一步，还带 `voms-proxy-info` 剩余时间检查
+  生成的 `submit_ntuple_<campaign>.sh` 和旧 workspace 的
+  `submit_ntuple_pinned.sh` 都内建这一步，并带 `voms-proxy-info` 剩余时间检查
   （<10 分钟拒绝提交）。
-- ⚠️ CERN 侧还有 ~8 个 wrapper/submit template 用 `/tmp/x509up_u$UID` 旧模式，
-  同一隐患未修——将来 CERN 侧跑同样会踩。
 
 ## 4. 登录节点 / 并发
 
@@ -86,8 +88,9 @@
 
 ## 6. 构建 / workspace
 
-- **workspace 布局**（IHEP）：
-  `/scratchfs2/cms/wangchi/hepjobs/Full_MC_Production/runs/<ts>/<batch>/`
+- **workspace 布局**（IHEP）：先设置
+  `IHEP_WORK_ROOT=/scratchfs2/cms/$USER/hepjobs/Full_MC_Production`，再使用
+  `$IHEP_WORK_ROOT/runs/<cutover-id>/`。
   - `scripts/run_ntuple_<campaign>.sh`、`scripts/run_merge_<campaign>.sh`
   - `bundles/proxy_bundle.tar.gz`、`tasks/<campaign>/ntuple_tasks.json`、`gates/`
   - `logs/ntuple/<campaign>/`
@@ -97,6 +100,10 @@
 - **尽量合并成 campaign 级大 workspace**：`audit-split --stage mix` 的
   `export_mix_manifest` 原生支持多 job 合并（`coordinator_manifests` 是 list），
   不要 26 个 job 各建一个小 workspace。
+- **遗留 orchestrator**：`hepjob_workflow.py` 生成的 `workflow.sh` 会以
+  `hep_q -u "$HEPJOB_USER"` 的全用户队列是否为空作为 LHE→processing 等待条件；
+  它不按本次提交的 cluster ID 过滤，也没有 split stage gate。它只用于历史部署，
+  不得作为 CERN/IHEP cutover controller。
 
 ## 7. 监控 / 重跑
 
@@ -115,7 +122,8 @@
 1. ssh 到 IHEP，`export PATH=.../hepjob/bin:$PATH`
 2. `klist && aklog`（token 有效）；proxy 剩余时间 > 10 分钟
 3. merge 正常提交（`cmssw-el8`，不钉节点）
-4. ntuple 用 `submit_ntuple_pinned.sh`（merge gate 已存在 + `-wn` round-robin）
+4. ntuple 用生成的 `submit_ntuple_<campaign>.sh`（merge gate 已存在 + `-wn`
+   round-robin；旧 workspace 才使用 `submit_ntuple_pinned.sh`）
 5. 批量构建串行化；nohup log 放 `/scratchfs2`
-6. 监控用 `hep_q -u wangchi`；空结果重试；"卡住"先确认是否排队
+6. 监控用 `hep_q -u "$USER"`；空结果重试；"卡住"先确认是否排队
 7. 补跑只补缺失 idx；`xrdcp -f` 幂等
