@@ -217,6 +217,23 @@ python3 dag_generator.py generate-helac-matrix \
 
 This runs only HELAC-Onia (no downstream shower/CMSSW). It generates 162 jobs covering 9 `cc~` Fock states, 9 `bb~` Fock states, and both born / `+ g` processes. Output tarballs are staged under the target EOS base.
 
+Use `--helac-diagnostics` to control post-job HELAC information. `legacy` is
+the default compact worker-log bundle; `none` suppresses that bundle, `slim`
+writes a JSON summary of `PROC_HO_*` progress/results, and `full` archives all
+`PROC_HO_*` trees under the configured stageout directory. The same option is
+available on `generate` and `generate-test`, and is passed through the HepJob
+backend.
+
+For a live job, inspect a specific schedd and Condor process with:
+
+```bash
+python3 tools/helac_inspector.py live \
+  --schedd bigbirdNN.cern.ch --job <cluster>.<proc> --watch 3600 --pretty
+```
+
+Use `parse --count-lhe-events` only for an explicit event-count audit; the
+default live path avoids rescanning large LHE payloads.
+
 ### Preparing worker runtime bundles
 
 ```bash
@@ -400,6 +417,7 @@ python3 dag_generator.py generate \
 | `--force-generate-lhe` | `generate`, `generate-test` | Skip remote LHE reuse |
 | `--no-scan-existing` | `generate`, `generate-test` | Skip remote pool scan |
 | `--test-mode` | `generate`, `generate-test` | Fast-test mode for HELAC |
+| `--helac-diagnostics {legacy,none,slim,full}` | `generate`, `generate-test`, `generate-helac-matrix` | Select HELAC post-job diagnostic stageout |
 | `--compress-lhe` | `generate`, `generate-test` | Write compressed `.lhe.gz` output |
 | `--lhe-compression-level` | `generate`, `generate-test` | Gzip compression level (default: 1) |
 | `--lhe-shuffle-split` | `generate`, `generate-test` | Stratified shuffle-split LHE into blocks |

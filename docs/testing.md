@@ -342,6 +342,47 @@ through a compatible pager or `--color=never` for plain logs. If the root
 DAGMan job has already left the queue, also pass the persistent root DAG path
 with `--dag-file`.
 
+### HELAC diagnostics and live progress
+
+LHE generation accepts `--helac-diagnostics {legacy,none,slim,full}`. The
+default `legacy` mode retains the existing compact worker-log bundle; `none`
+suppresses it; `slim` stages `diagnostics/<job-slug>/helac_summary.json`; and
+`full` stages an archive containing every `PROC_HO_*` tree, including its
+`input/` and `output/` directories. The destination is the same configured
+stageout area as the LHE output. A forbidden-channel marker remains a required
+status output when HELAC reports no nonvanishing subprocess.
+
+For a new test or production launch, select the mode on the generator command
+line; it is copied into each LHE node JSON and Condor `VARS` record:
+
+```bash
+python3 dag_generator.py generate-test \
+  --campaign JJP_DPS2_G --no-scan-existing \
+  --helac-diagnostics slim
+
+python3 dag_generator.py generate-helac-matrix \
+  --helac-diagnostics full
+```
+
+The bundled inspector is read-only and can parse a local worker directory or
+an extracted full archive:
+
+```bash
+python3 tools/helac_inspector.py parse --root /path/to/HELAC-Onia-2.7.6 --pretty
+python3 tools/helac_inspector.py live \
+  --schedd bigbirdNN.cern.ch --job <cluster>.<proc> --watch 3600 --pretty
+python3 tools/helac_inspector.py parse \
+  --root /path/to/HELAC-Onia-2.7.6 --count-lhe-events --pretty
+```
+
+The `live` command first checks the explicit `schedd` and `cluster.proc` with
+`condor_q`; only a running job is inspected with `condor_ssh_to_job`. It
+reports the current stage, recent integration iterations, final
+cross-section/error when available, and the Poisson-equivalent number of
+events (`ceil(1/r^2)`) corresponding to the relative cross-section
+uncertainty. `--count-lhe-events` is opt-in because recursively scanning large
+LHE files is expensive.
+
 A pilot is accepted only when:
 
 - DAGMan exits with status 0.

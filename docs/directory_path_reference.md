@@ -198,6 +198,38 @@ Remote stage-out:
 {OUTPUT_DIR}/lhe_blocks/block_{seed}_{idx}.lhe.gz
 ```
 
+### HELAC diagnostic stage-out
+
+The LHE node configuration records the selected mode in
+`helac_diagnostics`. It is passed to `run_helac.sh` at launch time, so changing
+the default does not alter already-submitted jobs. The destination is derived
+from the same configured `output_dir` as the LHE product:
+
+| Mode | Diagnostic product | Behavior |
+|---|---|---|
+| `legacy` | `{OUTPUT_DIR}/logs/logs_{pool}_{seed}.tar.gz` | Preserve the existing compact worker-log bundle. Matrix jobs retain their existing HELAC output archive behavior. |
+| `none` | none | Suppress the diagnostic bundle/archive. A forbidden-channel marker may still be written because it is a required status output. |
+| `slim` | `{OUTPUT_DIR}/diagnostics/{safe_job_slug}/helac_summary.json` | Write structured progress, integration iterations, cross-section/error, input parameters, and equivalent-event estimates. |
+| `full` | `{OUTPUT_DIR}/diagnostics/{safe_job_slug}/helac_proc_{safe_job_slug}_{seed}.tar.gz` | Archive every `PROC_HO_*` tree, including each calculation/addon `input/` and `output/` directory. |
+
+With local stage-out, prepend `LOCAL_OUTPUT_BASE` to the same relative path:
+
+```text
+{LOCAL_OUTPUT_BASE}/{OUTPUT_DIR}/diagnostics/{safe_job_slug}/...
+```
+
+The safe job slug is derived from `JOB_SLUG` (or `{pool}_{seed}` when no slug
+is supplied), with characters outside `[A-Za-z0-9._-]` replaced by `_`.
+
+The slim JSON is produced by `tools/helac_inspector.py`. Its `stage` field is
+one of `pre-helac`, `helac-directory-created`, `calculation-preparing`,
+`calculation-running`, `calculation-complete`, or `postprocessing`. Each
+`RESULT_*.out` record includes the latest `sigma=` iteration, up to eight
+recent iterations, final cross section/error when present, and
+`poisson_equivalent_events = ceil(1/r^2)`. Recursive LHE event counting is
+disabled by default and must be requested explicitly with
+`--count-lhe-events`.
+
 ---
 
 ## LHE block planning (`plan_lhe_blocks.py`)
