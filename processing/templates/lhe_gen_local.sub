@@ -16,11 +16,12 @@ transfer_executable = True
 arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
-WhenToTransferOutput = ON_EXIT
+WhenToTransferOutput = ON_EXIT_OR_EVICT
 
 Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path), $(config_path)
 
-transfer_output_files =
+transfer_output_files = wrapper_logs
+transfer_output_remaps = "wrapper_logs/wrapper.stdout=$(LOCAL_LOG_DIR)/lhe_$(pool)_$(seed)_$(Cluster)_$(Process).wrapper.stdout;wrapper_logs/wrapper.stderr=$(LOCAL_LOG_DIR)/lhe_$(pool)_$(seed)_$(Cluster)_$(Process).wrapper.stderr"
 
 Output = $(LOCAL_LOG_DIR)/lhe_$(pool)_$(seed)_$(Cluster)_$(Process).stdout
 Error  = $(LOCAL_LOG_DIR)/lhe_$(pool)_$(seed)_$(Cluster)_$(Process).stderr

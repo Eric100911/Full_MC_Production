@@ -224,6 +224,16 @@ writes a JSON summary of `PROC_HO_*` progress/results, and `full` archives all
 available on `generate` and `generate-test`, and is passed through the HepJob
 backend.
 
+Standard generated pipeline worker nodes accept the same `log_level` setting through
+`--log-level {info,slim}`. `info` retains status chatter for validation;
+`slim` suppresses routine INFO/OK summaries while preserving warnings, errors,
+and full command output in worker-local logs. LHE, processing, planner,
+coordinator, merge, ntuple, and final wrappers also retain
+`wrapper_logs/wrapper.stdout` and `wrapper_logs/wrapper.stderr`. These files are
+explicitly transferred with `ON_EXIT_OR_EVICT`, so a held or evicted job leaves
+diagnostic wrapper output in its submit-side log directory. `--helac-diagnostics`
+continues to control HELAC artifact retention independently of verbosity.
+
 For a live job, inspect a specific schedd and Condor process with:
 
 ```bash
@@ -418,6 +428,7 @@ python3 dag_generator.py generate \
 | `--no-scan-existing` | `generate`, `generate-test` | Skip remote pool scan |
 | `--test-mode` | `generate`, `generate-test` | Fast-test mode for HELAC |
 | `--helac-diagnostics {legacy,none,slim,full}` | `generate`, `generate-test`, `generate-helac-matrix` | Select HELAC post-job diagnostic stageout |
+| `--log-level {info,slim}` | `generate`, `generate-test` | Shared worker status verbosity; full command logs remain retained |
 | `--compress-lhe` | `generate`, `generate-test` | Write compressed `.lhe.gz` output |
 | `--lhe-compression-level` | `generate`, `generate-test` | Gzip compression level (default: 1) |
 | `--lhe-shuffle-split` | `generate`, `generate-test` | Stratified shuffle-split LHE into blocks |

@@ -16,6 +16,15 @@ if [[ ! -f "${CONFIG_NAME}" ]]; then
     exit 66
 fi
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=== LHE Generation Wrapper ==="
 echo "Working directory: $(pwd)"
 echo "Config: ${CONFIG_NAME}"
@@ -103,6 +112,12 @@ cmd = [
     "--output-dir", str(cfg["output_dir"]),
     "--config", config_path,
 ]
+
+if cfg.get("log_level"):
+    os.environ["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
+    cmd[cmd.index("--config"):cmd.index("--config")] = [
+        "--log-level", str(cfg["log_level"])
+    ]
 
 if cfg.get("compress_lhe", False):
     cmd.extend([

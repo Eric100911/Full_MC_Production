@@ -58,6 +58,7 @@ LHE_EVENTS_PER_BLOCK=1000
 LHE_SHUFFLE_MODE="stratified"
 LHE_N_STRATA="auto"
 LHE_DROP_INCOMPLETE_LAST_BLOCK="false"
+WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-info}"
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
 HELAC_SRC_TAR=""
@@ -85,9 +86,10 @@ NODE_CONFIG=""
 # Helper functions
 # ----------------------------------------------------------------------------
 
-msg_info() { echo "[INFO] $1"; }
-msg_ok() { echo "[OK] $1"; }
-msg_warn() { echo "[WARN] $1"; }
+_slim() { [[ "${WORKFLOW_LOG_LEVEL}" == "slim" ]]; }
+msg_info() { _slim || echo "[INFO] $1"; }
+msg_ok() { _slim || echo "[OK] $1"; }
+msg_warn() { echo "[WARN] $1" >&2; }
 msg_error() { echo "[ERROR] $1" >&2; }
 
 sanitize_log_label() {
@@ -428,12 +430,12 @@ stage_out_helac_output_archive() {
     local remote_url=""
 
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
-        echo "[INFO] SKIP_STAGEOUT=1, skip HELAC output archive stageout"
+        msg_info "SKIP_STAGEOUT=1, skip HELAC output archive stageout"
         return 0
     fi
 
     if ! calc_output_dir=$(find_helac_calc_output_dir "${run_dir}"); then
-        echo "[ERROR] Could not find HELAC calc output directory under ${run_dir:-PROC_HO_*}"
+    msg_error "Could not find HELAC calc output directory under ${run_dir:-PROC_HO_*}"
         return 1
     fi
 
@@ -441,19 +443,19 @@ stage_out_helac_output_archive() {
     archive_name="helac_output_${safe_slug}_${MY_SEED}.tar.gz"
     archive_path="${WORKDIR}/${archive_name}"
 
-    echo "[INFO] Archiving HELAC output directory: ${calc_output_dir}"
+    msg_info "Archiving HELAC output directory: ${calc_output_dir}"
     run_logged "tar_helac_output" tar -C "$(dirname "${calc_output_dir}")" -czf "${archive_path}" "$(basename "${calc_output_dir}")"
 
     remote_dir=$(join_remote_spec "${OUTPUT_DIR}" "${safe_slug}")
     make_remote_dir "${remote_dir}" || true
     remote_url=$(remote_url_for_spec "$(join_remote_spec "${remote_dir}" "${archive_name}")")
-    echo "[INFO] Staging out HELAC output archive to: ${remote_url}"
+    msg_info "Staging out HELAC output archive to: ${remote_url}"
     run_logged "xrdcp_helac_output_stageout" xrdcp --nopbar --force "${archive_path}" "${remote_url}" || {
         echo "Error: Failed to stage out HELAC output archive"
         return 1
     }
 
-    echo "[INFO] HELAC output archive complete: ${remote_url}"
+    msg_info "HELAC output archive complete: ${remote_url}"
 }
 
 stage_out_forbidden_marker() {
@@ -480,18 +482,18 @@ seed: ${MY_SEED}
 EOF
 
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
-        echo "[INFO] SKIP_STAGEOUT=1, skip forbidden-channel marker upload"
+        msg_info "SKIP_STAGEOUT=1, skip forbidden-channel marker upload"
         return 0
     fi
 
     remote_dir=$(join_remote_spec "${OUTPUT_DIR}" "forbidden")
     make_remote_dir "${remote_dir}" || true
     remote_url=$(remote_url_for_spec "$(join_remote_spec "${remote_dir}" "${marker_name}")")
-    echo "[INFO] Staging out forbidden-channel marker to: ${remote_url}"
+    msg_info "Staging out forbidden-channel marker to: ${remote_url}"
     if xrdcp --nopbar --force "${marker_path}" "${remote_url}" >/dev/null 2>&1; then
-        echo "[INFO] Forbidden-channel marker uploaded: ${remote_url}"
+        msg_info "Forbidden-channel marker uploaded: ${remote_url}"
     else
-        echo "[WARN] Failed to upload forbidden-channel marker: ${remote_url}"
+        msg_warn "Failed to upload forbidden-channel marker: ${remote_url}"
     fi
 }
 
@@ -533,7 +535,7 @@ PYWRAP
 
 ensure_hepmc() {
     if [ -d "${HEPMC_PREFIX}/install" ]; then
-        echo "[INFO] Reusing existing HepMC build at ${HEPMC_PREFIX}"
+        msg_info "Reusing existing HepMC build at ${HEPMC_PREFIX}"
         return 0
     fi
 
@@ -557,7 +559,7 @@ ensure_hepmc() {
 
 ensure_helac() {
     if [ -d "${WORKDIR}/HELAC-Onia-2.7.6" ] && [ -x "${WORKDIR}/HELAC-Onia-2.7.6/ho_cluster" ]; then
-        echo "[INFO] Reusing existing HELAC-Onia build"
+        msg_info "Reusing existing HELAC-Onia build"
         return 0
     fi
 
@@ -684,7 +686,7 @@ build_lhe_converter_if_needed() {
     if compiler_supports_flag "-fallow-argument-mismatch"; then
         build_flags+=("-fallow-argument-mismatch")
     else
-        echo "[WARN] 当前 gfortran 不支持 -fallow-argument-mismatch，改用兼容编译参数"
+        msg_warn "当前 gfortran 不支持 -fallow-argument-mismatch，改用兼容编译参数"
     fi
 
     msg_info "Building lhe_pythia6_pythia8 converter..."
@@ -694,11 +696,11 @@ build_lhe_converter_if_needed() {
 verify_lhe_octet_codes() {
     local lhe_file="$1"
     if [[ ! -f "${lhe_file}" ]]; then
-        echo "[ERROR] LHE file not found for octet verification: ${lhe_file}"
+        msg_error "LHE file not found for octet verification: ${lhe_file}"
         return 1
     fi
     if [[ ! -f "${OCTET_PDG_TOOL}" ]]; then
-        echo "[ERROR] Octet PDG tool not found: ${OCTET_PDG_TOOL}"
+        msg_error "Octet PDG tool not found: ${OCTET_PDG_TOOL}"
         return 1
     fi
 
@@ -739,7 +741,7 @@ prepare_runtime_user_inp() {
     if [[ -f "${template_user_inp}" ]]; then
         cp "${template_user_inp}" "${runtime_user_inp}"
     elif [[ ! -f "${runtime_user_inp}" ]]; then
-        echo "[ERROR] 找不到可用的 user.inp 模板"
+        msg_error "找不到可用的 user.inp 模板"
         return 1
     fi
 
@@ -791,8 +793,8 @@ prepare_runtime_user_inp() {
     set_user_inp_value "${runtime_user_inp}" "root_output" "F"
     set_user_inp_value "${runtime_user_inp}" "hwu_output" "F"
 
-    echo "[INFO] 运行时 user.inp 中的关键积分参数:"
-    grep -E '^(cmass|bmass|minptq|minptconia|minptbonia|preunw|unwevt|nmc|nopt|nopt_step|noptlim|gener|ranhel)[[:space:]]' "${runtime_user_inp}"
+    msg_info "运行时 user.inp 中的关键积分参数:"
+    grep -E '^(cmass|bmass|minptq|minptconia|minptbonia|miny1c|maxy1c|absoluterap|preunw|unwevt|nmc|nopt|nopt_step|noptlim|gener|ranhel)[[:space:]]' "${runtime_user_inp}"
 }
 
 pool_uses_crystalball_addon() {
@@ -858,7 +860,7 @@ prepare_crystalball_addon_input() {
     set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "-2.4d0"
     set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "2.4d0"
 
-    echo "[INFO] CrystalBall addon input:"
+    msg_info "CrystalBall addon input:"
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
     grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
@@ -911,6 +913,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --stageout-mode)
             STAGEOUT_MODE="$2"
+            shift 2
+            ;;
+        --log-level)
+            WORKFLOW_LOG_LEVEL="$2"
             shift 2
             ;;
         --min-pt-conia)
@@ -1022,6 +1028,15 @@ fi
 if ! load_node_config "${NODE_CONFIG}"; then
     exit 1
 fi
+
+case "${WORKFLOW_LOG_LEVEL}" in
+    info|slim)
+        ;;
+    *)
+        echo "Error: --log-level must be one of info, slim" >&2
+        exit 1
+        ;;
+esac
 
 # Set default process string based on pool name if not specified
 if [ -z "$PROCESS_STRING" ]; then
@@ -1168,7 +1183,7 @@ if [ -d "${HEPMC_PREFIX}/install" ]; then
 fi
 
 if has_prebuilt_helac; then
-    echo "[INFO] Reusing prebuilt HELAC-Onia runtime"
+    msg_info "Reusing prebuilt HELAC-Onia runtime"
     normalize_prebuilt_helac_links
 else
     # Build dependencies from packaged sources.
@@ -1252,10 +1267,10 @@ EOF
     PY8_ONIA_CONFIG="${WORKDIR}/py8_onia_user.inp"
     if write_py8_onia_config "${PY8_ONIA_KIND}" "input/py8_onia_user.inp"; then
         cp "input/py8_onia_user.inp" "${PY8_ONIA_CONFIG}"
-        echo "[INFO] HELAC input/py8_onia_user.inp:"
+        msg_info "HELAC input/py8_onia_user.inp:"
         cat "input/py8_onia_user.inp"
     else
-        echo "[WARN] No py8_onia_user.inp rule for ${PY8_ONIA_KIND}; converter fallback may use raw LHE"
+        msg_warn "No py8_onia_user.inp rule for ${PY8_ONIA_KIND}; converter fallback may use raw LHE"
     fi
 
     msg_info "Running HELAC-Onia..."
@@ -1264,7 +1279,7 @@ EOF
     cp "${HELAC_RUN_LOG}" ../helac_run.log
 
     if grep -q "No nonvanishing subprocesses are found" "${HELAC_RUN_LOG}"; then
-        echo "[INFO] HELAC-Onia found no nonvanishing subprocesses; treating this channel as QCD-forbidden."
+        msg_info "HELAC-Onia found no nonvanishing subprocesses; treating this channel as QCD-forbidden."
         stage_out_forbidden_marker
         exit 0
     fi
@@ -1274,7 +1289,7 @@ EOF
         echo "Error: Could not find HELAC run directory"
         exit 1
     fi
-    echo "[INFO] HELAC run directory: ${RUN_DIR}"
+    msg_info "HELAC run directory: ${RUN_DIR}"
 
     # Find the LHE file from the latest run directory
     if [[ -n "${RUN_DIR}" ]] && [[ -d "${RUN_DIR}/results" ]]; then
@@ -1292,7 +1307,7 @@ elif [[ -n "${PY8_LHE_FILE}" && -f "${PY8_LHE_FILE}" ]]; then
     LHE_FILE="${PY8_LHE_FILE}"
 else
     if pool_uses_crystalball_addon "${POOL_NAME}"; then
-        echo "[ERROR] CrystalBall addon output files:"
+        msg_error "CrystalBall addon output files:"
         find addon/pp_psiX_CrystalBall/output output -maxdepth 1 -type f -printf '  %p\n' 2>/dev/null || true
     fi
     echo "Error: LHE file not found"
@@ -1302,9 +1317,9 @@ fi
 echo "Found LHE file: $LHE_FILE"
 
 RAW_EVENT_COUNT=$(count_lhe_events "${LHE_FILE}")
-echo "[INFO] 原始 LHE 事件数: ${RAW_EVENT_COUNT}"
+msg_info "原始 LHE 事件数: ${RAW_EVENT_COUNT}"
 if (( RAW_EVENT_COUNT <= 0 )); then
-    echo "[ERROR] HELAC 生成的原始 LHE 不包含任何 <event>，终止上传空文件"
+    msg_error "HELAC 生成的原始 LHE 不包含任何 <event>，终止上传空文件"
     exit 1
 fi
 
@@ -1313,37 +1328,37 @@ FINAL_LHE_FILE="${LHE_FILE}"
 CONVERTED_LHE_FILE="${WORKDIR}/sample_${POOL_NAME}_${MY_SEED}_converted.lhe"
 
 if [[ -f "${PY8_ONIA_CONFIG}" ]] && build_lhe_converter_if_needed; then
-    echo "[INFO] Running lhe_pythia6_pythia8 converter..."
+    msg_info "Running lhe_pythia6_pythia8 converter..."
     if run_logged "lhe_pythia6_pythia8" "${WORKDIR}/lhe_pythia6_pythia8" "${LHE_FILE}" "${PY8_ONIA_CONFIG}" "${CONVERTED_LHE_FILE}"; then
         if [[ -f "${CONVERTED_LHE_FILE}" ]]; then
             CONVERTED_EVENT_COUNT=$(count_lhe_events "${CONVERTED_LHE_FILE}")
-            echo "[INFO] 转换后 LHE 事件数: ${CONVERTED_EVENT_COUNT}"
+            msg_info "转换后 LHE 事件数: ${CONVERTED_EVENT_COUNT}"
             if (( CONVERTED_EVENT_COUNT > 0 )); then
                 FINAL_LHE_FILE="${CONVERTED_LHE_FILE}"
-                echo "[INFO] Converted LHE ready: ${FINAL_LHE_FILE}"
+                msg_info "Converted LHE ready: ${FINAL_LHE_FILE}"
             else
-                echo "[WARN] 转换后 LHE 不包含任何 <event>，回退到原始 LHE"
+                msg_warn "转换后 LHE 不包含任何 <event>，回退到原始 LHE"
             fi
         fi
     else
-        echo "[WARN] LHE converter failed, fallback to original LHE"
+        msg_warn "LHE converter failed, fallback to original LHE"
     fi
 elif [[ -n "${PY8_LHE_FILE}" && -f "${PY8_LHE_FILE}" ]]; then
     FINAL_LHE_FILE="${PY8_LHE_FILE}"
-    echo "[INFO] Reusing HELAC generated *_py8.lhe: ${FINAL_LHE_FILE}"
+    msg_info "Reusing HELAC generated *_py8.lhe: ${FINAL_LHE_FILE}"
 else
-    echo "[WARN] No standalone converter available, fallback to original LHE"
+    msg_warn "No standalone converter available, fallback to original LHE"
 fi
 
 FINAL_EVENT_COUNT=$(count_lhe_events "${FINAL_LHE_FILE}")
-echo "[INFO] 最终待上传 LHE 事件数: ${FINAL_EVENT_COUNT}"
+msg_info "最终待上传 LHE 事件数: ${FINAL_EVENT_COUNT}"
 if (( FINAL_EVENT_COUNT <= 0 )); then
-    echo "[ERROR] 最终 LHE 不包含任何 <event>，拒绝上传空文件"
+    msg_error "最终 LHE 不包含任何 <event>，拒绝上传空文件"
     exit 1
 fi
 
 if [[ -f "${OCTET_PDG_TOOL}" ]] && grep -q "\<9900" "${FINAL_LHE_FILE}"; then
-    echo "[INFO] Standalone converter 后仍检测到旧编码，使用统一工具补做转换..."
+    msg_info "Standalone converter 后仍检测到旧编码，使用统一工具补做转换..."
     PYTHONIOENCODING=UTF-8 python3 "${OCTET_PDG_TOOL}" convert-file "${FINAL_LHE_FILE}" --in-place >/dev/null
 fi
 
@@ -1372,12 +1387,12 @@ if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         SHUFFLE_SPLIT_ARGS+=(--drop-incomplete-last-block)
     fi
     if ! run_logged "lhe_shuffle_split" "${SHUFFLE_SPLIT_BINARY}" "${SHUFFLE_SPLIT_ARGS[@]}"; then
-        echo "[ERROR] LHE shuffle-split failed"
+        msg_error "LHE shuffle-split failed"
         exit 1
     fi
     BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}"/block_*.lhe 2>/dev/null | wc -l)
     if (( BLOCK_COUNT == 0 )); then
-        echo "[ERROR] Shuffle-split produced no block files"
+        msg_error "Shuffle-split produced no block files"
         exit 1
     fi
     msg_ok "Shuffle-split: ${BLOCK_COUNT} blocks in ${SHUFFLE_SPLIT_DIR}"
@@ -1389,29 +1404,29 @@ LHE_EXT="lhe"
 if bool_is_true "${COMPRESS_LHE}" && command -v gzip >/dev/null 2>&1; then
     LHE_EXT="lhe.gz"
     STAGEOUT_FILE="${WORKDIR}/sample_${POOL_NAME}_${MY_SEED}.lhe.gz"
-    echo "[INFO] Compressing LHE output (gzip level=${LHE_COMPRESSION_LEVEL})..."
+    msg_info "Compressing LHE output (gzip level=${LHE_COMPRESSION_LEVEL})..."
     gzip -${LHE_COMPRESSION_LEVEL} -c "${FINAL_LHE_FILE}" > "${STAGEOUT_FILE}.tmp" \
         && mv "${STAGEOUT_FILE}.tmp" "${STAGEOUT_FILE}" \
-        || { echo "[ERROR] Failed to compress LHE file"; exit 1; }
-    echo "[INFO] Compressed: ${STAGEOUT_FILE}"
+        || { msg_error "Failed to compress LHE file"; exit 1; }
+    msg_info "Compressed: ${STAGEOUT_FILE}"
 fi
 
 # Create output directory and stage out LHE.
 if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
-    echo "[INFO] Using local stageout to ${LOCAL_OUTPUT_BASE}"
+    msg_info "Using local stageout to ${LOCAL_OUTPUT_BASE}"
     LOCAL_DIR="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}"
     mkdir -p "${LOCAL_DIR}" || {
-        echo "[ERROR] Failed to create local directory: ${LOCAL_DIR}"
+        msg_error "Failed to create local directory: ${LOCAL_DIR}"
         exit 1
     }
 
     LOCAL_OUTPUT="${LOCAL_DIR}/sample_${POOL_NAME}_${MY_SEED}.${LHE_EXT}"
-    echo "[INFO] Staging out LHE file to: ${LOCAL_OUTPUT}"
+    msg_info "Staging out LHE file to: ${LOCAL_OUTPUT}"
     if cp "${STAGEOUT_FILE}" "${LOCAL_OUTPUT}"; then
-        echo "[INFO] Local stageout successful"
+        msg_info "Local stageout successful"
         echo "Output: ${LOCAL_OUTPUT}"
     else
-        echo "[ERROR] Failed to stage out LHE file locally"
+        msg_error "Failed to stage out LHE file locally"
         exit 1
     fi
     # Stage out shuffle-split blocks if enabled
@@ -1425,7 +1440,7 @@ elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
     stage_out_helac_output_archive "${RUN_DIR}"
     echo "HELAC output generation complete!"
 elif [ "${SKIP_STAGEOUT:-0}" -eq 1 ]; then
-    echo "[INFO] SKIP_STAGEOUT=1, skip XRootD stageout"
+    msg_info "SKIP_STAGEOUT=1, skip XRootD stageout"
 else
     # Create remote directory and copy to T2_CN_Beijing storage via XRootD
     echo "Creating remote directory on T2_CN_Beijing..."
@@ -1449,7 +1464,7 @@ else
             bname=$(basename "$bf")
             BLOCK_OUTPUT=$(remote_url_for_spec "$(join_remote_spec "${BLOCK_REMOTE_DIR}" "${bname}")")
             xrdcp --nopbar --force "$bf" "${BLOCK_OUTPUT}" || \
-                echo "[WARN] Failed to stage block: ${bname}" >&2
+                msg_warn "Failed to stage block: ${bname}"
         done
         msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_REMOTE_DIR}"
     fi

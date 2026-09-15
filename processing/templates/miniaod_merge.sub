@@ -17,11 +17,12 @@ transfer_executable = False
 Arguments = "./$(miniaod_merge_wrapper_name) $(proxy_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
-WhenToTransferOutput = ON_EXIT
+WhenToTransferOutput = ON_EXIT_OR_EVICT
 
 Transfer_Input_Files = $(proxy_bundle_path), $(miniaod_merge_wrapper_path), $(config_path)
 
-transfer_output_files =
+transfer_output_files = wrapper_logs
+transfer_output_remaps = "wrapper_logs/wrapper.stdout=$(log_root)/merge_$(campaign)_$(job_id)_$(Cluster)_$(Process).wrapper.stdout;wrapper_logs/wrapper.stderr=$(log_root)/merge_$(campaign)_$(job_id)_$(Cluster)_$(Process).wrapper.stderr"
 
 Output = $(log_root)/merge_$(campaign)_$(job_id)_$(Cluster)_$(Process).stdout
 Error  = $(log_root)/merge_$(campaign)_$(job_id)_$(Cluster)_$(Process).stderr

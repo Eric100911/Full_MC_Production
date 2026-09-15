@@ -12,6 +12,15 @@ if [[ ! -s "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=== Processing Chain Wrapper ==="
 echo "Working directory: $(pwd)"
 echo "Config: ${CONFIG_NAME}"
@@ -123,6 +132,9 @@ for cfg_key, env_key in env_mapping.items():
     value = processing_env.get(cfg_key, cfg.get(cfg_key))
     if value:
         env[env_key] = str(value)
+if cfg.get("log_level"):
+    env["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
+    env["PROCESSING_LOG_LEVEL"] = str(cfg["log_level"])
 
 cmd = [
     "bash",

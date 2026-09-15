@@ -15,6 +15,15 @@ if [[ ! -s "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=== LHE Block Coordinator Wrapper ==="
 echo "Config: ${CONFIG_NAME}"
 
@@ -31,6 +40,7 @@ echo "Running coordinate_lhe_blocks.py..."
 cd runtime/tools
 if ! python3 - "${CONFIG_PATH}" <<'PY'
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +48,8 @@ import sys
 config_path = sys.argv[1]
 with open(config_path, "r", encoding="utf-8") as handle:
     cfg = json.load(handle)
+if cfg.get("log_level"):
+    os.environ["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
 
 required = [
     "campaign",
@@ -127,6 +139,7 @@ cmd = [
     "--miniaod-merge-wrapper-path", str(cfg["miniaod_merge_wrapper_path"]),
     "--final-sub-template-path", str(cfg["final_sub_template_path"]),
     "--final-wrapper-path", str(cfg["final_wrapper_path"]),
+    "--log-level", str(cfg.get("log_level", "info")),
 ]
 for key, flag in [
     ("target_mixed_events", "--target-mixed-events"),

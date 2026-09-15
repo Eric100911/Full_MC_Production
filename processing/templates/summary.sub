@@ -9,10 +9,11 @@ transfer_executable = False
 Arguments = "$(summary_script_name) $(summary_bundle_name) $(proxy_bundle_name) $(log_source_root) $(target_base_url) $(workflow_archive_id) $(archive_enabled) $(DAG_STATUS) $(FAILED_COUNT)"
 
 Should_Transfer_Files = YES
-WhenToTransferOutput = ON_EXIT
+WhenToTransferOutput = ON_EXIT_OR_EVICT
 Transfer_Input_Files = $(summary_script_path), $(summary_bundle_path), $(proxy_bundle_path)
 
-transfer_output_files =
+transfer_output_files = wrapper_logs
+transfer_output_remaps = "wrapper_logs/wrapper.stdout=$(log_root)/summary_$(Cluster)_$(Process).wrapper.stdout;wrapper_logs/wrapper.stderr=$(log_root)/summary_$(Cluster)_$(Process).wrapper.stderr"
 
 Output = $(log_root)/summary_$(Cluster)_$(Process).stdout
 Error  = $(log_root)/summary_$(Cluster)_$(Process).stderr

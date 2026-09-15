@@ -27,6 +27,13 @@ import tempfile
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+LOG_LEVEL = "info"
+
+
+def log_info(message: str) -> None:
+    if LOG_LEVEL != "slim":
+        print(f"[INFO] {message}")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Per-pool LHE block planner")
@@ -53,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest-output-path", default="", help="Full path for the output manifest JSON")
     p.add_argument("--lhe-shuffle-split-bin", default="lhe_shuffle_split",
                    help="Path to lhe_shuffle_split binary")
+    p.add_argument("--log-level", choices=("info", "slim"), default="info")
     p.add_argument("--longitudinal-symmetry-pdg-ids", default="",
                    help="Comma-separated outgoing PDG IDs audited by pz sign")
     p.add_argument("--longitudinal-symmetry-policy", choices=("off", "warn", "fail"),
@@ -293,7 +301,9 @@ def _write_json_atomic(path: str, payload: dict) -> None:
 
 
 def main() -> int:
+    global LOG_LEVEL
     args = parse_args()
+    LOG_LEVEL = args.log_level
     try:
         primary_seed, group_id, seeds, expected_input_event_counts = _normalize_inputs(args)
     except ValueError as exc:
@@ -312,7 +322,7 @@ def main() -> int:
             if lhe_path.startswith("root://"):
                 basename = os.path.basename(_extract_eos_path(lhe_path))
                 local_lhe = os.path.join(workdir, f"input_{i}_{basename}")
-                print(f"[INFO] Downloading {lhe_path} -> {local_lhe}")
+                log_info(f"Downloading {lhe_path} -> {local_lhe}")
                 subprocess.run(["xrdcp", "--nopbar", "--force", lhe_path, local_lhe], check=True)
 
             if not os.path.exists(local_lhe):
@@ -321,7 +331,7 @@ def main() -> int:
 
             if local_lhe.endswith(".gz"):
                 decompressed = os.path.join(workdir, f"input_{i}.lhe")
-                print(f"[INFO] Decompressing {local_lhe} -> {decompressed}")
+                log_info(f"Decompressing {local_lhe} -> {decompressed}")
                 with gzip.open(local_lhe, "rb") as f_in:
                     with open(decompressed, "wb") as f_out:
                         shutil.copyfileobj(f_in, f_out)
@@ -329,7 +339,7 @@ def main() -> int:
 
             local_inputs.append(local_lhe)
 
-        print(f"[INFO] Input LHE group {group_id} has {len(local_inputs)} file(s)")
+        log_info(f"Input LHE group {group_id} has {len(local_inputs)} file(s)")
 
         # --- 2. Reject or flag longitudinally asymmetric source files ---
         try:
@@ -351,7 +361,7 @@ def main() -> int:
         )
         symmetry_path = manifest_path + ".input_symmetry.json"
         _write_json_atomic(symmetry_path, input_symmetry)
-        print(f"[INFO] Input longitudinal-symmetry audit: {symmetry_path}")
+        log_info(f"Input longitudinal-symmetry audit: {symmetry_path}")
         if input_symmetry["result"] == "fail":
             message = "One or more LHE inputs failed the longitudinal-symmetry audit"
             if args.longitudinal_symmetry_policy == "fail":
@@ -368,9 +378,9 @@ def main() -> int:
         if args.reuse_existing_blocks:
             existing = _list_existing_blocks(block_stage_dir, prefix, is_remote_output)
             if existing and _blocks_match_manifest(existing, manifest_path):
-                print(f"[INFO] Reusing {len(existing)} existing blocks (--reuse-existing-blocks)")
+                log_info(f"Reusing {len(existing)} existing blocks (--reuse-existing-blocks)")
                 return 0
-            print("[INFO] Existing blocks incomplete or mismatched, regenerating...")
+            log_info("Existing blocks incomplete or mismatched, regenerating...")
 
         # --- 4. Run lhe_shuffle_split ---
         split_out = os.path.join(workdir, "split_out")
@@ -392,7 +402,7 @@ def main() -> int:
         if args.drop_incomplete_last_block:
             shuffle_cmd.append("--drop-incomplete-last-block")
 
-        print(f"[INFO] Running: {' '.join(shuffle_cmd)}")
+        log_info(f"Running: {' '.join(shuffle_cmd)}")
         result = subprocess.run(shuffle_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 universal_newlines=True)
         if result.returncode != 0:
@@ -435,7 +445,7 @@ def main() -> int:
             gz_tmp = os.path.join(workdir, dst_name)
 
             # Compress
-            print(f"[INFO] Compressing {src_name} -> {dst_name}")
+            log_info(f"Compressing {src_name} -> {dst_name}")
             with open(src_path, "rb") as f_in:
                 with gzip.open(gz_tmp, "wb", compresslevel=1) as f_out:
                     shutil.copyfileobj(f_in, f_out)
@@ -490,7 +500,7 @@ def main() -> int:
         }
 
         _write_json_atomic(manifest_path, manifest)
-        print(f"[INFO] Manifest written: {manifest_path}")
+        log_info(f"Manifest written: {manifest_path}")
 
         # Cleanup uncompressed block files
         for bi in range(n_blocks):

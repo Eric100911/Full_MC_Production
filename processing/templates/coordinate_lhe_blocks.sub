@@ -13,10 +13,11 @@ transfer_executable = True
 Arguments = "$(proxy_bundle_name) $(coord_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
-WhenToTransferOutput = ON_EXIT
+WhenToTransferOutput = ON_EXIT_OR_EVICT
 Transfer_Input_Files = $(coord_bundle_path), $(proxy_bundle_path), $(config_path)
 
-transfer_output_files =
+transfer_output_files = wrapper_logs
+transfer_output_remaps = "wrapper_logs/wrapper.stdout=$(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).wrapper.stdout;wrapper_logs/wrapper.stderr=$(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).wrapper.stderr"
 
 Output = $(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).stdout
 Error  = $(log_root)/coord_$(campaign)_$(job_index)_$(Cluster)_$(Process).stderr

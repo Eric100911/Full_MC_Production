@@ -17,6 +17,15 @@ archive_enabled=$6
 dag_status=$7
 failed_count=$8
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=========================================="
 echo "Top-level FINAL summary"
 echo "workflow_archive_id=${workflow_archive_id}"

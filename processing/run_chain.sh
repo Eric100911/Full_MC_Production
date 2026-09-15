@@ -21,7 +21,7 @@ set -e
 cleanup_on_exit() {
     local exit_code=$?
     if [[ "${CLEANUP}" == "true" ]] && [[ -n "${WORKDIR}" ]]; then
-        echo "[INFO] Cleaning up intermediate files on exit (code=${exit_code})..."
+        msg_info "Cleaning up intermediate files on exit (code=${exit_code})..."
         rm -f "${WORKDIR}"/*.hepmc "${WORKDIR}"/*.hepmc.gz 2>/dev/null || true
         rm -f "${WORKDIR}"/*.lhe "${WORKDIR}"/*.lhe.gz 2>/dev/null || true
         rm -f "${WORKDIR}"/output_GENSIM.root 2>/dev/null || true
@@ -34,7 +34,7 @@ cleanup_on_exit() {
         rm -f "${WORKDIR}"/.viminfo 2>/dev/null || true
         rm -rf "${WORKDIR}"/CMSSW_14_0_18 2>/dev/null || true
         rm -rf "${WORKDIR}"/CMSSW_15_0_15 2>/dev/null || true
-        echo "[INFO] Cleanup done"
+        msg_info "Cleanup done"
     fi
     exit ${exit_code}
 }
@@ -131,7 +131,7 @@ export HISTSIZE=0
 export HISTFILESIZE=0
 
 if [[ ! -d "${COMMON_DIR}" ]]; then
-    echo "[ERROR] Common directory not found at ${COMMON_DIR}. Ensure common/ is transferred alongside run_chain.sh."
+    echo "[ERROR] Common directory not found at ${COMMON_DIR}. Ensure common/ is transferred alongside run_chain.sh." >&2
     exit 1
 fi
 
@@ -143,12 +143,12 @@ fi
 # chatter and step banners (bulk lives in worker-local command_logs/). Warnings
 # and errors always print so failures remain diagnosable. Full logs remain the
 # default (validation).
-PROCESSING_LOG_LEVEL="${PROCESSING_LOG_LEVEL:-info}"
+PROCESSING_LOG_LEVEL="${PROCESSING_LOG_LEVEL:-${WORKFLOW_LOG_LEVEL:-info}}"
 _slim() { [[ "${PROCESSING_LOG_LEVEL}" == "slim" ]]; }
 msg_info() { _slim || echo -e "${BLUE}[INFO]${NC} $1"; }
 msg_ok() { _slim || echo -e "${GREEN}[OK]${NC} $1"; }
-msg_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-msg_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+msg_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+msg_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 msg_step() {
     if _slim; then
         echo -e "${YELLOW}-- ${1} --${NC}"

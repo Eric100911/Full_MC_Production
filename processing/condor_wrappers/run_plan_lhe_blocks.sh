@@ -14,6 +14,15 @@ if [[ ! -s "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=== LHE Block Planner Wrapper ==="
 echo "Config: ${CONFIG_NAME}"
 
@@ -30,12 +39,15 @@ echo "Running plan_lhe_blocks.py..."
 cd runtime/tools
 if ! python3 - "${CONFIG_PATH}" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
 config_path = sys.argv[1]
 with open(config_path, "r", encoding="utf-8") as handle:
     cfg = json.load(handle)
+if cfg.get("log_level"):
+    os.environ["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
 
 required = [
     "pool_name",
@@ -79,6 +91,7 @@ cmd = [
     "--block-output-dir", str(cfg["block_output_dir"]),
     "--manifest-output-path", str(cfg["manifest_output_path"]),
     "--lhe-shuffle-split-bin", "./lhe_shuffle_split",
+    "--log-level", str(cfg.get("log_level", "info")),
 ]
 symmetry_pdg_ids = cfg.get("longitudinal_symmetry_pdg_ids", [])
 if not isinstance(symmetry_pdg_ids, list):

@@ -310,6 +310,13 @@ python3 dag_generator.py generate \
   --jobs 20 --output-dir generated/custom_eos --output custom.dag
 ```
 
+标准 pipeline 生成的 worker 共用 `--log-level {info,slim}`。`info` 保留常规状态
+输出，`slim` 减少 INFO/OK 摘要，但始终保留 warning/error 和命令详细日志。
+wrapper 会在 worker 沙盒中写出 `wrapper_logs/wrapper.stdout` 与
+`wrapper_logs/wrapper.stderr`；submit 模板使用 `ON_EXIT_OR_EVICT` 并显式传回
+这些文件，因此作业进入 held 或被驱逐后仍可在 `log_root` 中查看 wrapper 上下文。
+`--helac-diagnostics` 仍独立控制 HELAC 诊断产物的保留方式。
+
 ---
 
 ### 常用选项参考
@@ -322,6 +329,7 @@ python3 dag_generator.py generate \
 | `--force-generate-lhe` | `generate`、`generate-test` | 不复用远端已有 LHE |
 | `--no-scan-existing` | `generate`、`generate-test` | 不扫描远端已有 LHE |
 | `--test-mode` | `generate`、`generate-test` | HELAC 快速测试模式 |
+| `--log-level {info,slim}` | `generate`、`generate-test` | 所有 worker 的统一状态输出级别 |
 | `--compress-lhe` | `generate`、`generate-test` | 输出压缩 `.lhe.gz` |
 | `--lhe-compression-level` | `generate`、`generate-test` | Gzip 压缩级别（默认：1） |
 | `--lhe-shuffle-split` | `generate`、`generate-test` | 分层洗牌切分 LHE 为分块 |

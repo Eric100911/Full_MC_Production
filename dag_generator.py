@@ -3370,6 +3370,7 @@ class DAGBuilder:
                 "min_pt_conia": pool.min_pt_conia,
                 "min_pt_bonia": pool.min_pt_bonia,
                 "min_pt_q": pool.min_pt_q,
+                "log_level": self.options.log_level,
                 "unwevt": self.options.resolved_lhe_unwevt(),
                 "test_mode": self.options.test_mode,
                 "local_output_base": self.options.local_output_base,
@@ -3476,6 +3477,7 @@ class DAGBuilder:
             "processing_environment": processing_environment_config(
                 getattr(self.options, "log_level", "info")
             ),
+            "log_level": getattr(self.options, "log_level", "info"),
         }
         config_path, config_name = self.write_node_config(
             "processing",
@@ -3554,6 +3556,7 @@ class DAGBuilder:
             "custom_output_subpath": custom_output_subpath,
             "custom_ntuple_basename": custom_ntuple_basename,
             "storage": node_storage_config(target_eos_base or self.options.target_base_url),
+            "log_level": getattr(self.options, "log_level", "info"),
         }
         config_path, config_name = self.write_node_config(
             "ntuple",
@@ -3957,6 +3960,7 @@ class DAGBuilder:
             "reuse_existing_blocks": False,
             "manifest_output_path": plan_manifest_path,
             "storage": node_storage_config(self.options.target_base_url),
+            "log_level": getattr(self.options, "log_level", "info"),
         }
         config_path, config_name = self.write_node_config(
             "planning",
@@ -4144,6 +4148,7 @@ class DAGBuilder:
             "processing_environment": processing_environment_config(
                 getattr(self.options, "log_level", "info")
             ),
+            "log_level": getattr(self.options, "log_level", "info"),
         }
         config_path, config_name = self.write_node_config(
             "coordination",
@@ -4209,6 +4214,7 @@ class DAGBuilder:
             "output_path": allocation_manifest_path,
             "shard_processing_nodes": shard_processing_nodes,
             "campaign_allocation_order": allocation_order,
+            "log_level": getattr(self.options, "log_level", "info"),
             "campaigns": {
                 campaign_name: {
                     "campaign_inputs": list(CAMPAIGNS[campaign_name].inputs),

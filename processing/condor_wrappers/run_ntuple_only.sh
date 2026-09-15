@@ -15,6 +15,15 @@ if [[ ! -s "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
+WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
+mkdir -p "${WRAPPER_LOG_DIR}"
+if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stdout") \
+        2> >(tee -a "${WRAPPER_LOG_DIR}/wrapper.stderr" >&2)
+else
+    exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
+fi
+
 echo "=== Ntuple-only Wrapper ==="
 echo "Host: $(hostname)"
 echo "Date: $(date -Iseconds)"
@@ -76,6 +85,9 @@ for cfg_key, env_key in [
     value = cfg.get(cfg_key)
     if value:
         env[env_key] = str(value)
+if cfg.get("log_level"):
+    env["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
+    env["PROCESSING_LOG_LEVEL"] = str(cfg["log_level"])
 target_eos_base = cfg.get("target_eos_base") or storage.get("target_eos_base")
 if target_eos_base:
     env["TARGET_EOS_BASE"] = str(target_eos_base)

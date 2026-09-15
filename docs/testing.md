@@ -344,6 +344,26 @@ with `--dag-file`.
 
 ### HELAC diagnostics and live progress
 
+### Unified worker logging and held-job diagnostics
+
+Use the generator-level `--log-level {info,slim}` option for standard pipeline
+workers. The setting is copied into each node configuration. `info` keeps
+routine status messages; `slim` reduces routine INFO/OK output while retaining
+warnings, errors, and detailed command logs. `--helac-diagnostics` is separate:
+it selects which HELAC artifacts are staged and does not change verbosity.
+Warnings and errors are emitted on stderr consistently; routine informational
+messages use stdout when the selected level permits them.
+
+Every standard pipeline wrapper writes `wrapper_logs/wrapper.stdout` and
+`wrapper_logs/wrapper.stderr` in its worker sandbox. The submit templates list
+`wrapper_logs` in `transfer_output_files` and use
+`WhenToTransferOutput = ON_EXIT_OR_EVICT`. Consequently, wrapper output is
+available under the node's configured `log_root` after a non-zero exit, hold, or
+eviction, subject to the submit host having space for the transferred files.
+The LHE command-level files under `command_logs/` remain the detailed HELAC
+diagnostic source; wrapper logs contain the outer extraction, configuration,
+and failure context.
+
 LHE generation accepts `--helac-diagnostics {legacy,none,slim,full}`. The
 default `legacy` mode retains the existing compact worker-log bundle; `none`
 suppresses it; `slim` stages `diagnostics/<job-slug>/helac_summary.json`; and

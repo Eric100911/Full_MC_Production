@@ -34,6 +34,12 @@ DEFAULT_UNUSED_HEPMC_WARNING_FRACTION = 0.15
 EDM_EVENT_ID_SCHEME = "run1-cantor-job-block-lumi-v1"
 UINT32_MAX = 2**32 - 1
 UINT64_MAX = 2**64 - 1
+LOG_LEVEL = "info"
+
+
+def log_info(message: str) -> None:
+    if LOG_LEVEL != "slim":
+        print(f"[INFO] {message}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cleanup", action="store_true")
     p.add_argument("--shuffle-mixing", action="store_true")
     p.add_argument("--log-root", default=".")
+    p.add_argument("--log-level", choices=("info", "slim"), default="info")
     p.add_argument("--request-cpus", default="8")
     p.add_argument("--request-memory", default="20GB")
     p.add_argument("--request-disk", default="50GB")
@@ -311,7 +318,9 @@ def validate_edm_event_ids(block_records: list) -> None:
 
 
 def main() -> int:
+    global LOG_LEVEL
     args = parse_args()
+    LOG_LEVEL = args.log_level
 
     # --- 1. Parse source manifests ---
     try:
@@ -387,8 +396,8 @@ def main() -> int:
         if args.max_processing_nodes <= 0:
             print("[ERROR] Allocated shard contains no processing nodes", file=sys.stderr)
             return 1
-        print(
-            f"[INFO] Loaded authoritative allocation for {args.campaign} "
+        log_info(
+            f"Loaded authoritative allocation for {args.campaign} "
             f"shard {args.allocation_shard_index}: "
             f"{args.max_processing_nodes} nodes, starts={pool_start_blocks}"
         )
@@ -419,8 +428,8 @@ def main() -> int:
         group_id = info.get("group_id", m.get("group_id", str(primary_seed)))
         seeds = info.get("seeds", m.get("seeds", [primary_seed]))
         source_blocks.append((info["pool"], group_id, primary_seed, seeds, m.get("blocks", [])))
-        print(f"[INFO] Source {info['pool']} (group={group_id}, primary_seed={primary_seed}): "
-              f"{len(m.get('blocks', []))} blocks")
+        log_info(f"Source {info['pool']} (group={group_id}, primary_seed={primary_seed}): "
+                 f"{len(m.get('blocks', []))} blocks")
 
     # --- 3. Resolve campaign inputs and budget-derived source groups ---
     campaign_inputs = [p.strip() for p in args.campaign_inputs.split(",") if p.strip()]
@@ -613,8 +622,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(
-        f"[INFO] Budget-derived global stream: {total_mixed} nodes; "
+    log_info(
+        f"Budget-derived global stream: {total_mixed} nodes; "
         f"emitting [{args.processing_start_index}, {shard_stop})"
     )
 
@@ -627,7 +636,7 @@ def main() -> int:
             unused.append({"pool": pool,
                            "unused_global_indices": leftover,
                            "unused_count": len(leftover)})
-            print(f"[INFO] {pool}: {len(leftover)} unused blocks (indices {leftover[0]}-{leftover[-1]})")
+            log_info(f"{pool}: {len(leftover)} unused blocks (indices {leftover[0]}-{leftover[-1]})")
 
     def mixed_block_sources(block_index: int) -> list:
         return mixed_source_slots[block_index]
@@ -903,6 +912,7 @@ def main() -> int:
                     "custom_output_subpath": "",
                     "custom_ntuple_basename": "",
                     "storage": storage_config,
+                    "log_level": processing_environment_config.get("log_level", "info"),
                 }
                 ntuple_config_name = f"{ntuple_name}.json"
                 ntuple_config_path = os.path.join(ntuple_config_dir, ntuple_config_name)
@@ -971,6 +981,7 @@ def main() -> int:
                     "max_size": 5000000,
                     "validation": args.miniaod_merge_validation,
                     "storage": storage_config,
+                    "log_level": processing_environment_config.get("log_level", "info"),
                 }
                 merge_config_name = f"{merge_name}.json"
                 merge_config_path = os.path.join(merge_config_dir, merge_config_name)
@@ -1018,6 +1029,7 @@ def main() -> int:
                     "custom_output_subpath": "",
                     "custom_ntuple_basename": "",
                     "storage": storage_config,
+                    "log_level": processing_environment_config.get("log_level", "info"),
                 }
                 ntuple_config_name = f"{ntuple_name}.json"
                 ntuple_config_path = os.path.join(ntuple_config_dir, ntuple_config_name)
@@ -1059,6 +1071,7 @@ def main() -> int:
             "cleanup_components": bool(
                 args.cleanup and merge_records and ntuple_records
             ),
+            "log_level": processing_environment_config.get("log_level", "info"),
         }
         final_config_name = f"{final_name}.json"
         final_config_path = os.path.join(final_config_dir, final_config_name)
@@ -1088,7 +1101,7 @@ def main() -> int:
 
     # Atomic rename
     os.rename(dag_tmp, args.subdag_output_path)
-    print(f"[INFO] SubDAG written: {args.subdag_output_path}")
+    log_info(f"SubDAG written: {args.subdag_output_path}")
 
     # --- 5. Write coordinator manifest ---
     coord_manifest = {
@@ -1164,7 +1177,7 @@ def main() -> int:
     with open(coord_tmp, "w") as f:
         json.dump(coord_manifest, f, indent=2)
     os.rename(coord_tmp, coord_manifest_path)
-    print(f"[INFO] Coordinator manifest written: {coord_manifest_path}")
+    log_info(f"Coordinator manifest written: {coord_manifest_path}")
 
     print(f"[OK] Coordination complete: {n_mixed} mixed blocks")
     return 0
