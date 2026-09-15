@@ -86,6 +86,7 @@ NODE_CONFIG=""
 # ----------------------------------------------------------------------------
 
 msg_info() { echo "[INFO] $1"; }
+msg_ok() { echo "[OK] $1"; }
 msg_warn() { echo "[WARN] $1"; }
 msg_error() { echo "[ERROR] $1" >&2; }
 
