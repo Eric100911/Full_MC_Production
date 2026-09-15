@@ -107,11 +107,17 @@ cmd = [
     "--min-pt-conia", str(cfg["min_pt_conia"]),
     "--min-pt-bonia", str(cfg["min_pt_bonia"]),
     "--min-pt-q", str(cfg["min_pt_q"]),
+    "--min-m-qqp", str(cfg.get("min_m_qqp", 0.0)),
+    "--min-m-q-beam", str(cfg.get("min_m_q_beam", 0.0)),
     "--unwevt", str(cfg["unwevt"]),
     "--test-mode", bool_text(cfg["test_mode"]),
     "--output-dir", str(cfg["output_dir"]),
+    "--helac-diagnostics", str(cfg.get("helac_diagnostics", "legacy")),
     "--config", config_path,
 ]
+
+if cfg.get("nmc") is not None:
+    cmd[cmd.index("--config"):cmd.index("--config")] = ["--nmc", str(cfg["nmc"])]
 
 if cfg.get("log_level"):
     os.environ["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])

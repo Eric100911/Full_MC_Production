@@ -85,6 +85,7 @@ EOS_XRDFS_TARGET = EOS_HOST
 EOS_PATH_BASE = EOS_LFN_BASE
 EOS_OUTPUT = f"{EOS_BASE}/output"
 STORAGE_SITE = "T2_CN_Beijing"
+HELAC_DIAGNOSTICS_MODES = ("legacy", "none", "slim", "full")
 
 NTUPLE_VERSION = "v01_06"  # Should track the TPS-Onia2MuMu submodule tag (currently v2.0_patch2).
 
@@ -150,6 +151,7 @@ REQUIRED_FILES = (
     "common/octet_pdg.py",
     "common/node_config_defaults.json",
     "lhe_generation/run_helac.sh",
+    "tools/helac_inspector.py",
     "processing/run_chain.sh",
     "processing/templates/lhe_gen.sub",
     "processing/templates/helac_matrix.sub",
@@ -427,6 +429,8 @@ class LHEPool:
         min_pt_conia: float = 6.0,
         min_pt_bonia: float = 4.0,
         min_pt_q: float = 0.0,
+        min_m_qqp: float = 0.0,
+        min_m_q_beam: float = 0.0,
         notes: str = "",
         seed_offset: int = 0,
         storage_name: Optional[str] = None,
@@ -440,6 +444,8 @@ class LHEPool:
         self.min_pt_conia = min_pt_conia
         self.min_pt_bonia = min_pt_bonia
         self.min_pt_q = min_pt_q
+        self.min_m_qqp = min_m_qqp
+        self.min_m_q_beam = min_m_q_beam
         self.notes = notes
         self.seed_offset = seed_offset
         self.storage_name = storage_name or name
@@ -465,6 +471,8 @@ class LHEPool:
             "min_pt_conia": self.min_pt_conia,
             "min_pt_bonia": self.min_pt_bonia,
             "min_pt_q": self.min_pt_q,
+            "min_m_qqp": self.min_m_qqp,
+            "min_m_q_beam": self.min_m_q_beam,
             "notes": self.notes,
             "storage_name": self.storage_name,
             "variants": self.variants,
@@ -605,6 +613,12 @@ class WorkflowOptions:
         archive_subdag_logs: bool = True,
         output_mode: str = "full",
         log_level: str = "info",
+        helac_diagnostics: str = "legacy",
+        lhe_nmc: Optional[int] = None,
+        lhe_request_cpus: str = "8",
+        lhe_request_memory: str = "15GB",
+        lhe_request_disk: str = "10GB",
+        lhe_job_flavour: str = "nextweek",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -657,8 +671,19 @@ class WorkflowOptions:
         self.archive_subdag_logs = archive_subdag_logs
         self.output_mode = output_mode
         self.log_level = log_level
+        if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+            raise ValueError(
+                "helac_diagnostics must be one of "
+                + ", ".join(HELAC_DIAGNOSTICS_MODES)
+            )
+        self.helac_diagnostics = helac_diagnostics
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
+        self.lhe_nmc = lhe_nmc
+        self.lhe_request_cpus = lhe_request_cpus
+        self.lhe_request_memory = lhe_request_memory
+        self.lhe_request_disk = lhe_request_disk
+        self.lhe_job_flavour = lhe_job_flavour
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
         self.dagman_max_jobs_idle = dagman_max_jobs_idle
         self.local_log_dir = local_log_dir or self.machine_env.log_dir
@@ -698,6 +723,13 @@ class WorkflowOptions:
             "force_generate_lhe": self.force_generate_lhe,
             "proxy_path": self.proxy_path,
             "lhe_unwevt": self.resolved_lhe_unwevt(),
+            "lhe_nmc": self.lhe_nmc,
+            "lhe_resource_request": {
+                "cpus": self.lhe_request_cpus,
+                "memory": self.lhe_request_memory,
+                "disk": self.lhe_request_disk,
+                "job_flavour": self.lhe_job_flavour,
+            },
             "dagman_max_jobs_submitted": self.dagman_max_jobs_submitted,
             "dagman_max_jobs_idle": self.dagman_max_jobs_idle,
             "local_log_dir": self.local_log_dir,
@@ -753,6 +785,7 @@ class WorkflowOptions:
             ),
             "archive_subdag_logs": self.archive_subdag_logs,
             "output_mode": self.output_mode,
+            "helac_diagnostics": self.helac_diagnostics,
         }
 
 
@@ -826,6 +859,8 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > cc~(3S11) cc~(3S11) g",),
                 notes="double-J/psi + g SPS 基础池。",
                 seed_offset=70000,
+                min_m_qqp=3.0969,
+                min_m_q_beam=3.0969,
                 longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
@@ -1083,6 +1118,7 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
         "common/octet_pdg.py",
         "common/node_config_defaults.json",
         "lhe_generation/run_helac.sh",
+        "tools/helac_inspector.py",
         "processing/run_chain.sh",
         "processing/cmssw_helpers/cmssw12_exec.sh",
         "processing/cmssw_helpers/cmssw15_exec.sh",
@@ -2921,16 +2957,56 @@ def prepare_runtime_assets(
     ensure_dir(output_dir)
     assets: Dict[str, str] = OrderedDict()
 
-    # Compile lhe_shuffle_split natively on el9 for planner/coordinator runtime.
+    # Build separate shuffle-split binaries for the two execution environments.
+    # HELAC generation runs inside cmssw/el7 with LCG_88b, while the planner
+    # bundle keeps the native EL9 build used by its existing runtime path.
     shuffle_split_src = os.path.join(BASE_DIR, "lhe_generation", "lhe_shuffle_split.cc")
-    shuffle_split_bin = os.path.join(output_dir, "lhe_shuffle_split")
-    print("  [lhe-bundle] Compiling lhe_shuffle_split natively (el9)...")
+    shuffle_split_el9_bin = os.path.join(output_dir, "lhe_shuffle_split_el9")
+    print("  [planner-bundle] Compiling lhe_shuffle_split_el9 natively...")
     subprocess.run(
-        ["g++", "-std=c++14", "-O2", "-Wall", "-o", shuffle_split_bin, shuffle_split_src],
+        [
+            "g++", "-std=c++14", "-O2", "-Wall",
+            "-o", shuffle_split_el9_bin, shuffle_split_src,
+        ],
         check=True,
         timeout=120,
     )
-    print(f"  [lhe-bundle] Compiled: {shuffle_split_bin}")
+    print(f"  [planner-bundle] Compiled: {shuffle_split_el9_bin}")
+
+    shuffle_split_el7_bin = os.path.join(output_dir, "lhe_shuffle_split_el7")
+    el7_image = (
+        "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/"
+        "cmssw/el7:x86_64"
+    )
+    el7_lcg_setup = (
+        "/cvmfs/sft.cern.ch/lcg/views/LCG_88b/"
+        "x86_64-centos7-gcc62-opt/setup.sh"
+    )
+    print(
+        "  [lhe-bundle] Compiling lhe_shuffle_split_el7 "
+        "in cmssw/el7 + LCG_88b..."
+    )
+    with tempfile.TemporaryDirectory(prefix="lhe_shuffle_split_el7_") as build_dir:
+        container_bin = os.path.join(build_dir, "lhe_shuffle_split_el7")
+        compile_command = (
+            f"source {shlex.quote(el7_lcg_setup)} && "
+            "g++ -std=c++14 -O2 -Wall "
+            f"-o {shlex.quote(container_bin)} {shlex.quote(shuffle_split_src)}"
+        )
+        subprocess.run(
+            [
+                "singularity", "exec",
+                "--bind", f"{BASE_DIR}:{BASE_DIR}:ro",
+                "--bind", f"{build_dir}:{build_dir}",
+                "--bind", "/cvmfs:/cvmfs",
+                el7_image,
+                "bash", "-c", compile_command,
+            ],
+            check=True,
+            timeout=120,
+        )
+        shutil.copy2(container_bin, shuffle_split_el7_bin)
+    print(f"  [lhe-bundle] Compiled: {shuffle_split_el7_bin}")
 
     lhe_bundle_name = BUNDLE_NAMES["lhe"]
     lhe_bundle_path = os.path.join(output_dir, lhe_bundle_name)
@@ -2938,7 +3014,10 @@ def prepare_runtime_assets(
         lhe_bundle_path,
         (
             (os.path.join(BASE_DIR, "lhe_generation", "run_helac.sh"), "runtime/lhe_generation/run_helac.sh"),
-            (shuffle_split_bin, "runtime/lhe_generation/lhe_shuffle_split"),
+            (
+                shuffle_split_el7_bin,
+                "runtime/lhe_generation/lhe_shuffle_split_el7",
+            ),
             (
                 os.path.join(BASE_DIR, "lhe_generation", "input_templates", "user.inp"),
                 "runtime/lhe_generation/input_templates/user.inp",
@@ -2952,6 +3031,7 @@ def prepare_runtime_assets(
                 "runtime/lhe_generation/helac_package.tar.gz",
             ),
             (os.path.join(BASE_DIR, "common", "octet_pdg.py"), "runtime/common/octet_pdg.py"),
+            (os.path.join(BASE_DIR, "tools", "helac_inspector.py"), "runtime/tools/helac_inspector.py"),
             (
                 os.path.join(BASE_DIR, "common", "compression_helpers.sh"),
                 "runtime/common/compression_helpers.sh",
@@ -3108,7 +3188,7 @@ def prepare_runtime_assets(
     plan_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "tools", "plan_lhe_blocks.py"),
          "runtime/tools/plan_lhe_blocks.py"),
-        (shuffle_split_bin, "runtime/tools/lhe_shuffle_split"),
+        (shuffle_split_el9_bin, "runtime/tools/lhe_shuffle_split_el9"),
         (os.path.join(BASE_DIR, "common", "compression_util.py"),
          "runtime/common/compression_util.py"),
     ]
@@ -3272,6 +3352,7 @@ class DAGBuilder:
             and self.options.enable_lhe_block_subdags
         )
         target_base_url = self.options.target_base_url or EOS_BASE
+        subdag_root = os.path.join(self.output_dir, "plan_subdags")
         self.dag_lines.extend([
             "# -------- 汇总与日志归档节点 --------",
             (
@@ -3289,6 +3370,7 @@ class DAGBuilder:
                 f'log_dir="{dag_escape(self.options.local_log_dir)}" '
                 f'log_root="{dag_escape(summary_log_root)}" '
                 f'log_source_root="{dag_escape(self.options.log_root)}" '
+                f'subdag_root="{dag_escape(subdag_root)}" '
                 f'target_base_url="{dag_escape(target_base_url)}" '
                 f'workflow_archive_id="{dag_escape(self.workflow_archive_id)}" '
                 f'archive_enabled="{dag_escape(bool_string(archive_enabled))}"'
@@ -3306,12 +3388,18 @@ class DAGBuilder:
             ("workflow_archive_id", self.workflow_archive_id),
             ("source", "scan-log-root"),
             ("source_log_root", self.options.log_root),
+            ("subdag_source", os.path.join(self.output_dir, "plan_subdags")),
             ("proxy_source", "frozen-runtime-bundle"),
             ("stages", list(("processing", "miniaod_merge", "ntuple", "final"))),
             (
                 "target_layout",
                 "output/<campaign>/<job_component>_logs/<workflow_archive_id>/",
             ),
+            (
+                "subdag_target_layout",
+                "output/_workflow_archives/<workflow_archive_id>/plan_subdags.tar.gz",
+            ),
+            ("subdag_source_cleanup", "after-archive-and-manifest-upload"),
             ("retry_attempts", 3),
         ])
 
@@ -3327,9 +3415,17 @@ class DAGBuilder:
         return bool(info.get("use_existing"))
 
     def lhe_resource_request(self) -> Tuple[str, str, str]:
-        if self.options.test_mode:
+        if self.options.test_mode and (
+            self.options.lhe_request_cpus == "8"
+            and self.options.lhe_request_memory == "15GB"
+            and self.options.lhe_request_disk == "10GB"
+        ):
             return "4", "8GB", "8GB"
-        return "8", "15GB", "10GB"
+        return (
+            self.options.lhe_request_cpus,
+            self.options.lhe_request_memory,
+            self.options.lhe_request_disk,
+        )
 
     def processing_resource_request(self) -> Tuple[str, str, str]:
         if os.environ.get("PREMIX_INPUT_MODE") == "localcache":
@@ -3370,8 +3466,12 @@ class DAGBuilder:
                 "min_pt_conia": pool.min_pt_conia,
                 "min_pt_bonia": pool.min_pt_bonia,
                 "min_pt_q": pool.min_pt_q,
-                "log_level": self.options.log_level,
+                "min_m_qqp": pool.min_m_qqp,
+                "min_m_q_beam": pool.min_m_q_beam,
                 "unwevt": self.options.resolved_lhe_unwevt(),
+                "nmc": self.options.lhe_nmc,
+                "log_level": self.options.log_level,
+                "helac_diagnostics": self.options.helac_diagnostics,
                 "test_mode": self.options.test_mode,
                 "local_output_base": self.options.local_output_base,
                 "compress_lhe": self.options.compress_lhe,
@@ -3405,6 +3505,8 @@ class DAGBuilder:
                 "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
                 "log_root=\"{log_root}\" config_path=\"{config_path}\" config_name=\"{config_name}\" "
+                "helac_diagnostics=\"{helac_diagnostics}\" "
+                "lhe_job_flavour=\"{lhe_job_flavour}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
@@ -3425,6 +3527,8 @@ class DAGBuilder:
                     ),
                     target_machine=dag_escape(self.options.machine_env.target_machine),
                     log_root=dag_escape(log_root),
+                    helac_diagnostics=dag_escape(self.options.helac_diagnostics),
+                    lhe_job_flavour=dag_escape(self.options.lhe_job_flavour),
                 )
             )
             self.dag_lines.append(f"RETRY {job_name} 2")
@@ -3658,6 +3762,20 @@ class DAGBuilder:
         plan_job = self.add_planning_job(
             pool_name, job_index, seed, lhe_path_override=lhe_path,
         )
+        planners[job_index] = plan_job
+        return plan_job
+
+    def _ensure_generated_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
+        """Create one fresh-LHE planner per pool/index and share it across campaigns."""
+        planners = self.generated_planners_by_pool.setdefault(pool_name, [])
+        while len(planners) <= job_index:
+            planners.append("")
+        if planners[job_index]:
+            return planners[job_index]
+        seed = self.seed_for_pool_index(pool_name, job_index)
+        plan_job = self.add_planning_job(pool_name, job_index, seed)
+        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
+        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
         planners[job_index] = plan_job
         return plan_job
 
@@ -4685,9 +4803,7 @@ class DAGBuilder:
                 pool_name = campaign.inputs[0]
                 for job_index in range(self.options.jobs_per_campaign):
                     seed = self.seed_for_pool_index(pool_name, job_index)
-                    plan_job = self.add_planning_job(pool_name, job_index, seed)
-                    lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
-                    self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                    plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
                     coord_job = self.add_coordinator_job(
                         campaign_name,
                         job_index,
@@ -4713,9 +4829,7 @@ class DAGBuilder:
                             continue
                         seen_pools.add(pool_name)
                         seed = self.seed_for_pool_index(pool_name, job_index)
-                        plan_job = self.add_planning_job(pool_name, job_index, seed)
-                        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
-                        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                        plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
                         plan_jobs.append(plan_job)
                         source_infos.append((pool_name, seed))
                     coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
@@ -5583,6 +5697,7 @@ def execute_helac_matrix_generation(
     dagman_max_jobs_idle: int,
     log_root: str,
     maxjobs_lhe: int,
+    helac_diagnostics: str,
     dry_run: bool,
 ) -> int:
     output_dir = os.path.abspath(output_dir)
@@ -5591,6 +5706,11 @@ def execute_helac_matrix_generation(
         raise ValueError("seed-base must leave all 162 HELAC matrix seeds between 11 and 99999")
     if lhe_unwevt <= 0:
         raise ValueError("--lhe-unwevt must be positive")
+    if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "--helac-diagnostics must be one of "
+            + ", ".join(HELAC_DIAGNOSTICS_MODES)
+        )
     if not dry_run:
         ensure_submit_visible_output_dir(output_dir)
         helac_package_path = os.path.join(BASE_DIR, "common", "packages", "helac_package.tar.gz")
@@ -5677,6 +5797,7 @@ def execute_helac_matrix_generation(
             "extra_gluon=\"{extra_gluon}\" job_slug=\"{job_slug}\" seed=\"{seed}\" "
             "stageout_dir=\"{stageout_dir}\" min_pt_conia=\"6.0\" min_pt_bonia=\"4.0\" "
             "min_pt_q=\"0.0\" unwevt=\"{unwevt}\" test_mode=\"{test_mode}\" "
+            "helac_diagnostics=\"{helac_diagnostics}\" "
             "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" request_disk=\"{request_disk}\" "
             "lhe_bundle_path=\"{lhe_bundle_path}\" lhe_bundle_name=\"{lhe_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
@@ -5690,6 +5811,7 @@ def execute_helac_matrix_generation(
                 stageout_dir=dag_escape(stageout_dir.rstrip("/")),
                 unwevt=dag_escape(lhe_unwevt),
                 test_mode=dag_escape(bool_string(test_mode)),
+                helac_diagnostics=dag_escape(helac_diagnostics),
                 request_cpus=dag_escape(request_cpus),
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
@@ -5715,6 +5837,7 @@ def execute_helac_matrix_generation(
                         ("seed_base", seed_base),
                         ("stageout_dir", stageout_dir.rstrip("/")),
                         ("lhe_unwevt", lhe_unwevt),
+                        ("helac_diagnostics", helac_diagnostics),
                         ("test_mode", test_mode),
                         ("dagman_max_jobs_submitted", dagman_max_jobs_submitted),
                         ("dagman_max_jobs_idle", dagman_max_jobs_idle),
@@ -5817,6 +5940,7 @@ def execute_hepjob_delegate(args: argparse.Namespace) -> int:
             command.append("--force-generate-lhe")
         if args.lhe_unwevt is not None:
             command.extend(["--lhe-unwevt", str(args.lhe_unwevt)])
+        command.extend(["--helac-diagnostics", args.helac_diagnostics])
         command.extend(["--walltime", args.hepjob_walltime])
 
     if args.command == "generate-ntuple-only":
@@ -5890,6 +6014,25 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="LHE 节点的 unwevt；默认正式模式 100000、测试模式 100。",
+    )
+    parser.add_argument(
+        "--lhe-nmc",
+        type=int,
+        default=None,
+        help="Optional HELAC nmc override for every generated LHE node.",
+    )
+    parser.add_argument("--lhe-request-cpus", default="8")
+    parser.add_argument("--lhe-request-memory", default="15GB")
+    parser.add_argument("--lhe-request-disk", default="10GB")
+    parser.add_argument("--lhe-job-flavour", default="nextweek")
+    parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the current compact "
+            "bundle; none, slim, and full select the new modes."
+        ),
     )
     parser.add_argument("--max-events", type=int, default=-1, help="兼容旧配置的 processing 事件目标/上限。")
     parser.add_argument("--target-mixed-events", type=int, default=0, help="每个 block 的目标混合 HepMC 事件数；0 表示正数 --max-events，否则 100。")
@@ -6475,6 +6618,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="把 HELAC matrix job 切到 fast-test 积分设置。",
     )
     matrix_parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the compact output "
+            "archive; none, slim, and full select the new modes."
+        ),
+    )
+    matrix_parser.add_argument(
         "--dagman-max-jobs-submitted",
         type=int,
         default=0,
@@ -6827,6 +6979,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dagman_max_jobs_idle=args.dagman_max_jobs_idle,
                 log_root=args.log_root,
                 maxjobs_lhe=args.maxjobs_lhe,
+                helac_diagnostics=args.helac_diagnostics,
                 dry_run=args.dry_run,
             )
         except (OSError, ValueError) as exc:
@@ -6894,6 +7047,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_generate_lhe=args.force_generate_lhe,
             proxy_path=args.proxy_path,
             lhe_unwevt=args.lhe_unwevt,
+            lhe_nmc=args.lhe_nmc,
+            lhe_request_cpus=args.lhe_request_cpus,
+            lhe_request_memory=args.lhe_request_memory,
+            lhe_request_disk=args.lhe_request_disk,
+            lhe_job_flavour=args.lhe_job_flavour,
             dagman_max_jobs_submitted=args.dagman_max_jobs_submitted,
             dagman_max_jobs_idle=args.dagman_max_jobs_idle,
             machine_env=machine_env,
@@ -6939,6 +7097,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lhe_group_min_events=args.lhe_group_min_events,
             output_mode=args.output_mode,
             log_level=effective_log_level(args),
+            helac_diagnostics=args.helac_diagnostics,
             lhe_group_max_events=args.lhe_group_max_events,
             lhe_group_max_files=args.lhe_group_max_files,
         )

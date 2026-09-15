@@ -6,7 +6,9 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "$(summary_script_name) $(summary_bundle_name) $(proxy_bundle_name) $(log_source_root) $(target_base_url) $(workflow_archive_id) $(archive_enabled) $(DAG_STATUS) $(FAILED_COUNT)"
+# ``subdag_root`` was added after existing production DAGs were submitted.
+# Its empty default preserves their eight-argument summary_final.sh interface.
+Arguments = "$(summary_script_name) $(summary_bundle_name) $(proxy_bundle_name) $(log_source_root) $(subdag_root:) $(target_base_url) $(workflow_archive_id) $(archive_enabled) $(DAG_STATUS) $(FAILED_COUNT)"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT_OR_EVICT

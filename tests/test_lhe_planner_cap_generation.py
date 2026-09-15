@@ -65,6 +65,7 @@ def main() -> int:
         assert 'archive_enabled="true"' in dag_text
         assert f'proxy_bundle_path="{output_dir / "proxy_bundle.tar.gz"}"' in dag_text
         assert f'log_source_root="{log_root}"' in dag_text
+        assert f'subdag_root="{output_dir / "plan_subdags"}"' in dag_text
         assert "workflow_archive_id=" in dag_text
 
         metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -72,6 +73,8 @@ def main() -> int:
         assert archive_metadata["enabled"] is True
         assert archive_metadata["mechanism"] == "top-level-final-worker"
         assert archive_metadata["source"] == "scan-log-root"
+        assert archive_metadata["subdag_source"] == str(output_dir / "plan_subdags")
+        assert archive_metadata["subdag_source_cleanup"] == "after-archive-and-manifest-upload"
         assert archive_metadata["workflow_archive_id"]
 
         with tarfile.open(output_dir / "summary_runtime_bundle.tar.gz", "r:gz") as archive:
@@ -79,6 +82,25 @@ def main() -> int:
         assert "runtime/processing/templates/summary.sh" in members
         assert "runtime/tools/archive_workflow_logs.py" in members
         assert (output_dir / "summary_final.sh").is_file()
+
+        with tarfile.open(output_dir / "lhe_runtime_bundle.tar.gz", "r:gz") as archive:
+            lhe_members = set(archive.getnames())
+        assert "runtime/lhe_generation/lhe_shuffle_split_el7" in lhe_members
+        assert "runtime/lhe_generation/lhe_shuffle_split_el9" not in lhe_members
+
+        with tarfile.open(output_dir / "plan_runtime_bundle.tar.gz", "r:gz") as archive:
+            plan_members = set(archive.getnames())
+        assert "runtime/tools/lhe_shuffle_split_el9" in plan_members
+        assert "runtime/tools/lhe_shuffle_split_el7" not in plan_members
+
+        helac_worker = (BASE_DIR / "lhe_generation" / "run_helac.sh").read_text(
+            encoding="utf-8"
+        )
+        planner_worker = (
+            BASE_DIR / "processing" / "condor_wrappers" / "run_plan_lhe_blocks.sh"
+        ).read_text(encoding="utf-8")
+        assert '${SCRIPT_DIR}/lhe_shuffle_split_el7' in helac_worker
+        assert '"--lhe-shuffle-split-bin", "./lhe_shuffle_split_el9"' in planner_worker
 
     print("[OK] generate-test existing-LHE planner cap auto-follows --max-events")
     return 0

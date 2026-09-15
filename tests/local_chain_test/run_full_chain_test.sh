@@ -89,7 +89,7 @@ msg_pass "Test LHE files present (500 events each)"
 # --------------------------------------------------------------------
 msg_step "Step 1: Compile lhe_shuffle_split (native el9)"
 
-SHUFFLE_BIN="${WORKDIR}/lhe_shuffle_split"
+SHUFFLE_BIN="${WORKDIR}/lhe_shuffle_split_el9"
 g++ -std=c++14 -O2 -Wall -o "${SHUFFLE_BIN}" \
     "${BASE_DIR}/lhe_generation/lhe_shuffle_split.cc" 2>&1
 BIN_SIZE=$(stat -c%s "${SHUFFLE_BIN}")

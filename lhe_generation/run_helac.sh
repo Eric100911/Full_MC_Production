@@ -32,6 +32,10 @@ PARTON_SHOWER_LINE=""
 MIN_PT_CONIA=6.0
 MIN_PT_BONIA=4.0
 MIN_PT_Q=0.0
+# Infrared-safety cuts for a real-emission final-state light parton.
+# The HELAC-Onia NLO* prescription is sqrt(s_ij^min) = 2 m_c.
+MIN_M_QQP=0.0
+MIN_M_Q_BEAM=0.0
 WORKDIR=$(pwd)
 OUTPUT_DIR=""
 CMASS="1.54845"
@@ -51,6 +55,7 @@ NOPT_LIM=100000
 FAST_TEST=0
 TEST_MODE="false"
 UNWEVT_OVERRIDE=0
+NMC_OVERRIDE=0
 COMPRESS_LHE="false"
 LHE_COMPRESSION_LEVEL=1
 LHE_SHUFFLE_SPLIT="false"
@@ -58,6 +63,7 @@ LHE_EVENTS_PER_BLOCK=1000
 LHE_SHUFFLE_MODE="stratified"
 LHE_N_STRATA="auto"
 LHE_DROP_INCOMPLETE_LAST_BLOCK="false"
+HELAC_DIAGNOSTICS_MODE="legacy"
 WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-info}"
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
@@ -68,6 +74,7 @@ COMMAND_LOG_INDEX=0
 LAST_STDOUT_LOG=""
 LAST_STDERR_LOG=""
 LOG_STAGEOUT_ATTEMPTED=0
+DIAGNOSTICS_STAGEOUT_ATTEMPTED=0
 
 # T2_CN_Beijing XRootD storage paths
 # Canonical form: redirector + LFN (see common/node_config_defaults.json).
@@ -324,6 +331,11 @@ stage_out_worker_logs() {
     fi
     LOG_STAGEOUT_ATTEMPTED=1
 
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" != "legacy" ]]; then
+        msg_info "HELAC diagnostics mode=${HELAC_DIAGNOSTICS_MODE}; skip legacy worker-log bundle"
+        return 0
+    fi
+
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
         msg_info "SKIP_STAGEOUT=1, skip log stageout"
         return 0
@@ -343,6 +355,8 @@ stage_out_worker_logs() {
         echo "min_pt_conia=${MIN_PT_CONIA}"
         echo "min_pt_bonia=${MIN_PT_BONIA}"
         echo "min_pt_q=${MIN_PT_Q}"
+        echo "min_m_qqp=${MIN_M_QQP}"
+        echo "min_m_q_beam=${MIN_M_Q_BEAM}"
         echo "unwevt=${UNWEVT}"
         echo "nmc=${NMC}"
         echo "preunw=${PREUNW}"
@@ -378,6 +392,107 @@ stage_out_worker_logs() {
     else
         msg_warn "完整日志上传失败: ${remote_url}"
     fi
+}
+
+diagnostics_safe_slug() {
+    sanitize_log_label "${JOB_SLUG:-${POOL_NAME}_${MY_SEED}}"
+}
+
+stage_diagnostic_file() {
+    local local_path="$1"
+    local relative_path="$2"
+    local remote_url=""
+    local local_path_target=""
+
+    [[ -f "${local_path}" ]] || return 1
+    if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
+        local_path_target="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}/${relative_path}"
+        mkdir -p "$(dirname "${local_path_target}")"
+        cp "${local_path}" "${local_path_target}"
+        msg_info "HELAC diagnostic staged locally: ${local_path_target}"
+        return 0
+    fi
+
+    make_remote_dir "$(dirname "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")" || true
+    remote_url=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")
+    msg_info "Staging HELAC diagnostic to: ${remote_url}"
+    if xrdcp --nopbar --force "${local_path}" "${remote_url}" >/dev/null 2>&1; then
+        msg_info "HELAC diagnostic uploaded: ${remote_url}"
+        return 0
+    fi
+    msg_warn "HELAC diagnostic upload failed: ${remote_url}"
+    return 1
+}
+
+stage_out_helac_diagnostics() {
+    local safe_slug=""
+    local diagnostic_dir=""
+    local summary_path=""
+    local archive_path=""
+    local archive_name=""
+    local proc_dir=""
+    local -a proc_dirs=()
+    local inspector_path="${SCRIPT_DIR}/../tools/helac_inspector.py"
+    local helac_dir="${WORKDIR}/HELAC-Onia-2.7.6"
+
+    if [[ "${DIAGNOSTICS_STAGEOUT_ATTEMPTED}" -eq 1 ]]; then
+        return 0
+    fi
+    DIAGNOSTICS_STAGEOUT_ATTEMPTED=1
+
+    case "${HELAC_DIAGNOSTICS_MODE}" in
+        none|legacy)
+            return 0
+            ;;
+        slim|full)
+            ;;
+        *)
+            msg_warn "Unknown HELAC diagnostics mode: ${HELAC_DIAGNOSTICS_MODE}"
+            return 0
+            ;;
+    esac
+
+    if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
+        msg_info "SKIP_STAGEOUT=1, skip HELAC diagnostics stageout"
+        return 0
+    fi
+    if [[ ! -d "${helac_dir}" ]]; then
+        msg_warn "HELAC worktree not found; no diagnostics to stage"
+        return 0
+    fi
+
+    safe_slug=$(diagnostics_safe_slug)
+    diagnostic_dir="diagnostics/${safe_slug}"
+
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "slim" ]]; then
+        summary_path="${WORKDIR}/helac_summary_${safe_slug}_${MY_SEED}.json"
+        if [[ ! -f "${inspector_path}" ]]; then
+            msg_warn "HELAC inspector not found: ${inspector_path}"
+            return 0
+        fi
+        if ! python3 "${inspector_path}" parse --root "${helac_dir}" > "${summary_path}"; then
+            msg_warn "Failed to generate HELAC slim summary"
+            return 0
+        fi
+        stage_diagnostic_file "${summary_path}" "${diagnostic_dir}/helac_summary.json" || true
+        return 0
+    fi
+
+    while IFS= read -r -d '' proc_dir; do
+        proc_dirs+=("${proc_dir#${helac_dir}/}")
+    done < <(find "${helac_dir}" -mindepth 1 -maxdepth 1 -type d \
+        -name 'PROC_HO_*' -print0)
+    if (( ${#proc_dirs[@]} == 0 )); then
+        msg_warn "No PROC_HO_* directory found; no full HELAC diagnostic archive"
+        return 0
+    fi
+    archive_name="helac_proc_${safe_slug}_${MY_SEED}.tar.gz"
+    archive_path="${WORKDIR}/${archive_name}"
+    if ! tar -C "${helac_dir}" -czf "${archive_path}" -- "${proc_dirs[@]}"; then
+        msg_warn "Failed to create full HELAC diagnostic archive"
+        return 0
+    fi
+    stage_diagnostic_file "${archive_path}" "${diagnostic_dir}/${archive_name}" || true
 }
 
 find_helac_calc_output_dir() {
@@ -501,6 +616,7 @@ upload_logs_on_exit() {
     local exit_code=$?
     set +e
     stage_out_worker_logs
+    stage_out_helac_diagnostics
     exit "${exit_code}"
 }
 
@@ -753,6 +869,8 @@ prepare_runtime_user_inp() {
         -e "s|^(minptq)[[:space:]].*$|\\1 ${MIN_PT_Q}d0|" \
         -e "s|^(minptconia)[[:space:]].*$|\\1 ${MIN_PT_CONIA}d0|" \
         -e "s|^(minptbonia)[[:space:]].*$|\\1 ${MIN_PT_BONIA}d0|" \
+        -e "s|^(minmqqp)[[:space:]].*$|\\1 ${MIN_M_QQP}d0|" \
+        -e "s|^(minmqbeam)[[:space:]].*$|\\1 ${MIN_M_Q_BEAM}d0|" \
         -e "s|^(preunw)[[:space:]].*$|\\1 ${PREUNW}|" \
         -e "s|^(unwevt)[[:space:]].*$|\\1 ${UNWEVT}|" \
         -e "s|^(nmc)[[:space:]].*$|\\1 ${NMC}|" \
@@ -857,13 +975,14 @@ prepare_crystalball_addon_input() {
     ln -sfn ../../pdf "${addon_dir}/pdf"
     set_user_inp_value "${addon_dir}/input/user.inp" "minpt1c" "${minpt_onia}d0"
     set_user_inp_value "${addon_dir}/input/user.inp" "maxpt1c" "-1d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "-2.4d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "2.4d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "0d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "30d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "absoluterap" "T"
 
     msg_info "CrystalBall addon input:"
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
-    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|absoluterap|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
 }
 
 build_crystalball_addon_if_needed() {
@@ -915,6 +1034,10 @@ while [[ $# -gt 0 ]]; do
             STAGEOUT_MODE="$2"
             shift 2
             ;;
+        --helac-diagnostics)
+            HELAC_DIAGNOSTICS_MODE="$2"
+            shift 2
+            ;;
         --log-level)
             WORKFLOW_LOG_LEVEL="$2"
             shift 2
@@ -931,6 +1054,14 @@ while [[ $# -gt 0 ]]; do
             MIN_PT_Q="$2"
             shift 2
             ;;
+        --min-m-qqp)
+            MIN_M_QQP="$2"
+            shift 2
+            ;;
+        --min-m-q-beam)
+            MIN_M_Q_BEAM="$2"
+            shift 2
+            ;;
         --output-dir)
             OUTPUT_DIR="$2"
             shift 2
@@ -942,6 +1073,11 @@ while [[ $# -gt 0 ]]; do
         --unwevt)
             UNWEVT="$2"
             UNWEVT_OVERRIDE=1
+            shift 2
+            ;;
+        --nmc)
+            NMC="$2"
+            NMC_OVERRIDE=1
             shift 2
             ;;
         --fast-test)
@@ -1038,6 +1174,15 @@ case "${WORKFLOW_LOG_LEVEL}" in
         ;;
 esac
 
+case "${HELAC_DIAGNOSTICS_MODE}" in
+    legacy|none|slim|full)
+        ;;
+    *)
+        echo "Error: --helac-diagnostics must be one of legacy, none, slim, full"
+        exit 1
+        ;;
+esac
+
 # Set default process string based on pool name if not specified
 if [ -z "$PROCESS_STRING" ]; then
     case "$POOL_NAME" in
@@ -1111,10 +1256,15 @@ if [ "$FAST_TEST" -eq 1 ]; then
         echo "Error: --unwevt must be a positive integer"
         exit 1
     fi
-    if [ "$UNWEVT" -ge 100000 ]; then
-        NMC="$UNWEVT"
-    else
-        NMC=100000
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        if [ "$UNWEVT" -ge 100000 ]; then
+            NMC="$UNWEVT"
+        else
+            NMC=100000
+        fi
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
     fi
     PREUNW=$(( NMC / 10 ))
     NOPT=$(( NMC / 10 ))
@@ -1122,12 +1272,23 @@ if [ "$FAST_TEST" -eq 1 ]; then
     NOPT_LIM=$(( NMC ))
 else
     GENER=0
-    UNWEVT=100000
-    PREUNW=500000
-    NMC=5000000
-    NOPT=500000
-    NOPT_STEP=500000
-    NOPT_LIM=5000000
+    if [ "$UNWEVT_OVERRIDE" -eq 0 ]; then
+        UNWEVT=100000
+    fi
+    if ! [[ "$UNWEVT" =~ ^[0-9]+$ ]] || [ "$UNWEVT" -le 0 ]; then
+        echo "Error: --unwevt must be a positive integer"
+        exit 1
+    fi
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        NMC=5000000
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
+    fi
+    PREUNW=$(( NMC / 10 ))
+    NOPT=$(( NMC / 10 ))
+    NOPT_STEP=$(( NMC / 10 ))
+    NOPT_LIM=$(( NMC ))
 fi
 
 echo "=============================================="
@@ -1147,6 +1308,8 @@ echo "Bottom mass:    ${BMASS} GeV"
 echo "Min pT (conia): $MIN_PT_CONIA GeV"
 echo "Min pT (bonia): $MIN_PT_BONIA GeV"
 echo "Min pT (q):     $MIN_PT_Q GeV"
+echo "Min m (q,q'):   $MIN_M_QQP GeV"
+echo "Min m (q,beam): $MIN_M_Q_BEAM GeV"
 echo "Unw. events:    $UNWEVT"
 echo "Generator:      PHEGAS (gener=${GENER})"
 echo "preunw:         $PREUNW"
@@ -1158,6 +1321,7 @@ if [ "$FAST_TEST" -eq 1 ]; then
     echo "Mode:           FAST TEST"
 fi
 echo "Output dir:     $OUTPUT_DIR"
+echo "HELAC diagnostics: ${HELAC_DIAGNOSTICS_MODE}"
 echo "=============================================="
 
 ensure_job_log_dir
@@ -1250,6 +1414,8 @@ set minptconia = ${MIN_PT_CONIA}d0
 set minptbonia = ${MIN_PT_BONIA}d0
 set maxrapconia = 2.4
 set minptq = ${MIN_PT_Q}
+set minmqqp = ${MIN_M_QQP}d0
+set minmqbeam = ${MIN_M_Q_BEAM}d0
 set ranhel = 4
 ${PARTON_SHOWER_LINE}
 ${PROCESS_STRING}
@@ -1367,7 +1533,7 @@ verify_lhe_octet_codes "${FINAL_LHE_FILE}"
 # ---- LHE Stratified Shuffle-Split ----
 SHUFFLE_SPLIT_DIR="${WORKDIR}/lhe_blocks"
 if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
-    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split"
+    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split_el7"
     mkdir -p "${SHUFFLE_SPLIT_DIR}"
     # Derive a deterministic shuffle seed from the generation seed with an offset
     # so shuffles are reproducible but distinct from HELAC's internal RNG.
@@ -1437,7 +1603,11 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
         msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
     fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
-    stage_out_helac_output_archive "${RUN_DIR}"
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "legacy" ]]; then
+        stage_out_helac_output_archive "${RUN_DIR}"
+    else
+        stage_out_helac_diagnostics
+    fi
     echo "HELAC output generation complete!"
 elif [ "${SKIP_STAGEOUT:-0}" -eq 1 ]; then
     msg_info "SKIP_STAGEOUT=1, skip XRootD stageout"

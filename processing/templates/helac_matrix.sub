@@ -3,7 +3,7 @@
 # ==============================================================================
 # Variables:
 #   charm_state / bottom_state / extra_gluon / job_slug / seed / stageout_dir
-#   min_pt_* / unwevt / test_mode
+#   min_pt_* / unwevt / test_mode / helac_diagnostics
 #   request_cpus / request_memory / request_disk
 #   lhe_bundle_path / lhe_bundle_name / proxy_bundle_path / proxy_bundle_name
 #   log_root
@@ -13,7 +13,7 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); chmod 600 credentials/x509_user_proxy; export X509_USER_PROXY=\"$PWD/credentials/x509_user_proxy\"; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool helac_matrix --charm-state $(charm_state) --bottom-state $(bottom_state) --extra-gluon $(extra_gluon) --job-slug $(job_slug) --stageout-mode helac-output --seed $(seed) --output-dir $(stageout_dir) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt $(unwevt) --test-mode $(test_mode)'"
+Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); chmod 600 credentials/x509_user_proxy; export X509_USER_PROXY=\"$PWD/credentials/x509_user_proxy\"; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool helac_matrix --charm-state $(charm_state) --bottom-state $(bottom_state) --extra-gluon $(extra_gluon) --job-slug $(job_slug) --stageout-mode helac-output --seed $(seed) --output-dir $(stageout_dir) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt $(unwevt) --test-mode $(test_mode) --helac-diagnostics $(helac_diagnostics)'"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

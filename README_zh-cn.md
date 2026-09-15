@@ -32,7 +32,7 @@
 - **`common/packages/`** — 预构建 tarball：`helac_package.tar.gz`（必需）、`cmssw15_tpsonia2mumu_runtime.tar.gz`（可选）。
 - **`external/TPS-Onia2MuMu`** — Git submodule，ntuple 分析器源码（v2.0_patch2）。无预编译 CMSSW15 runtime tarball 时作为回退。
 - **`lhe_generation/run_helac.sh`** — Worker 端 HELAC-Onia 执行脚本。支持压缩输出、shuffle-split、block staging 和 `TARGET_EOS_BASE` 覆盖。
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 分层 LHE 洗牌与定长分块工具。准备 runtime bundle 时在 EL9 上原生编译。
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 分层 LHE 洗牌与定长分块工具。准备 runtime bundle 时分别编译用于 HELAC 作业的 `lhe_shuffle_split_el7` 和用于 planner 作业的 `lhe_shuffle_split_el9`。
 - **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE 作业 wrapper，使用 JSON 配置（3 个位置参数）代替旧版多参数方式。
 - **`tools/plan_lhe_blocks.py`** — 单 pool LHE 分块规划器：压缩、shuffle-split、stage 分块、写出 `plan_manifest_<pool>_<seed>.json`。作为 Condor 作业在 HELAC 生成后运行。
 - **`tools/coordinate_lhe_blocks.py`** — 多源 campaign 协调器：读取各 pool 的 plan manifest，按每个 source 的 LHE 预算组合互不重叠的分块，分配确定性 EDM EventID，并生成 `blocks_processing.dag` SubDAG。

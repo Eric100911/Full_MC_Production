@@ -3,19 +3,20 @@
 
 set -u
 
-if [[ $# -ne 8 ]]; then
-    echo "ERROR: expected 8 arguments, got $#" >&2
+if [[ $# -ne 9 ]]; then
+    echo "ERROR: expected 9 arguments, got $#" >&2
     exit 2
 fi
 
 summary_bundle=$1
 proxy_bundle=$2
 log_root=$3
-target_base_url=$4
-workflow_archive_id=$5
-archive_enabled=$6
-dag_status=$7
-failed_count=$8
+subdag_root=$4
+target_base_url=$5
+workflow_archive_id=$6
+archive_enabled=$7
+dag_status=$8
+failed_count=$9
 
 WRAPPER_LOG_DIR="${PWD}/wrapper_logs"
 mkdir -p "${WRAPPER_LOG_DIR}"
@@ -33,6 +34,7 @@ echo "dag_status=${dag_status}"
 echo "failed_count=${failed_count}"
 echo "archive_enabled=${archive_enabled}"
 echo "log_root=${log_root}"
+echo "subdag_root=${subdag_root}"
 echo "target_base_url=${target_base_url}"
 
 archive_rc=0
@@ -43,6 +45,7 @@ if [[ "${archive_enabled}" == "true" ]]; then
     else
         python3 runtime/tools/archive_workflow_logs.py \
         --log-root "${log_root}" \
+        --subdag-root "${subdag_root}" \
         --target-base-url "${target_base_url}" \
         --workflow-id "${workflow_archive_id}" \
         --proxy-bundle "${proxy_bundle}" \
