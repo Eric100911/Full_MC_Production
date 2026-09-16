@@ -986,6 +986,11 @@ container_runtime() {
 }
 
 host_needs_cmssw12_container() {
+    # The new stage launcher already selected the exact image. Do not infer a
+    # different runtime or start a nested container from host libraries.
+    case "${FULL_MC_STAGE_RUNTIME:-}" in
+        pythia-el8|cmssw12-el8) return 1 ;;
+    esac
     if [[ -r /etc/os-release ]] && grep -Eq '^VERSION_ID="9(\.[0-9]+)?"$' /etc/os-release; then
         return 0
     fi
@@ -2727,7 +2732,9 @@ then
 fi
 
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
-ensure_voms_proxy
+if [[ "${FULL_MC_STAGE_RUNTIME:-}" != "pythia-el8" ]]; then
+    ensure_voms_proxy
+fi
 
 if [[ "${STAGEOUT_RECOVERY_MODE}" == "validate-existing" ]]; then
     recover_existing_stageout
@@ -2735,8 +2742,9 @@ if [[ "${STAGEOUT_RECOVERY_MODE}" == "validate-existing" ]]; then
 fi
 
 LHE_FILES=()
-if [[ "${SKIP_TO}" == "ntuple" ]]; then
-    msg_info "Skipping LHE input resolution for standalone ntuple node"
+if [[ "${SKIP_TO}" == "ntuple" ]] || \
+   [[ "${FULL_MC_STAGE_RUNTIME:-}" == "cmssw12-el8" && "${SKIP_TO}" == "gensim" ]]; then
+    msg_info "Skipping LHE resolution for a staged downstream node"
 elif [[ "${USE_SOURCE_CONFIG}" == "true" ]]; then
     msg_info "Using source-slot config; LHE inputs will be resolved per source during shower"
 else

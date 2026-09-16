@@ -6,17 +6,16 @@ durable; detailed procedures belong in `docs/testing.md` and path details in
 
 ## Project Map
 
-- `dag_generator.py` is the main entry point for listing campaigns, validating
-  environment, preparing runtime bundles, and generating DAGs.
-- `processing/run_chain.sh` is the worker-side chain from showering through
-  MiniAOD; ntuple is usually a separate DAG node.
-- `tools/plan_lhe_blocks.py` and `tools/coordinate_lhe_blocks.py` implement the
-  LHE block planner/coordinator and generated block SubDAGs.
+- `mcprod` is the primary entry point for campaign cataloguing, runtime
+  preparation, run planning, handoff, IHEP batches, aggregation, and workers.
+- `src/full_mc/` contains the refactored domain, planning, lifecycle,
+  scheduler, runtime, storage, and worker adapters.
+- `dag_generator.py`, `processing/run_chain.sh`, and `tools/` retain the
+  established production workflow and compatibility utilities; change them
+  only when maintaining the legacy path or its adapters.
 - Exact counted LHE inventories, together with versioned specs under
   `common/campaign_job_specs/`, are authoritative for inventory-driven
   campaigns; preserve their checksums and selected source IDs.
-- `tools/dag_progress.py` reports live and completed progress for nested DAGMan
-  and block SubDAG workflows.
 - Shared storage paths and processing defaults live in
   `common/node_config_defaults.json`.
 - Campaign CMSSW configs live under `common/cmssw_configs/`.
@@ -41,10 +40,12 @@ the task matches:
 
 ## Development Commands
 
-- List workflows: `python3 dag_generator.py list --kind all`
-- Static validation: `python3 dag_generator.py validate --campaign JJP_DPS1 --scan-existing`
-- Smoke DAG: `python3 dag_generator.py generate-test --campaign JJP_DPS1 --output-dir tests/generated/smoke --output smoke.dag`
-- Runtime bundle: `python3 dag_generator.py prepare-runtime --output-dir <dir> --include-ntuple --cmssw15-runtime-tarball <tarball>`
+- List campaigns: `./mcprod catalog`
+- Plan a run: `./mcprod run plan --spec <campaign.json> --output-dir <work-dir>`
+- Prepare a runtime: `./mcprod runtime prepare --site cern --release <release>`
+- Prepare an IHEP batch: `./mcprod batch prepare --handoff <handoff.json> --output-dir <batch-dir>`
+- Prepare aggregation: `./mcprod analysis aggregate --run <run-dir> --prepare`
+- Legacy smoke DAG: `python3 dag_generator.py generate-test --campaign JJP_DPS1 --output-dir tests/generated/smoke --output smoke.dag`
 - Default checks: `./tests/run_all_tests.sh`
 - Local worker mock: `./tests/mock_test_worker.sh`
 - LHE splitter test: `./tests/test_lhe_shuffle_split.sh`

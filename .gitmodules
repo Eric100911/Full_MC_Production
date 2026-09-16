@@ -1,3 +1,6 @@
 [submodule "external/TPS-Onia2MuMu"]
 	path = external/TPS-Onia2MuMu
 	url = git@github.com:Eric100911/TPS-Onia2MuMu.git
+[submodule "external/NtupleAnalyzer"]
+	path = external/NtupleAnalyzer
+	url = https://github.com/Eric100911/NtupleAnalyzer.git
