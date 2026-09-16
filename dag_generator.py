@@ -3765,6 +3765,20 @@ class DAGBuilder:
         planners[job_index] = plan_job
         return plan_job
 
+    def _ensure_generated_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
+        """Create one fresh-LHE planner per pool/index and share it across campaigns."""
+        planners = self.generated_planners_by_pool.setdefault(pool_name, [])
+        while len(planners) <= job_index:
+            planners.append("")
+        if planners[job_index]:
+            return planners[job_index]
+        seed = self.seed_for_pool_index(pool_name, job_index)
+        plan_job = self.add_planning_job(pool_name, job_index, seed)
+        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
+        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+        planners[job_index] = plan_job
+        return plan_job
+
     def _ensure_spec_planning_job(
         self,
         pool_name: str,
@@ -4789,9 +4803,7 @@ class DAGBuilder:
                 pool_name = campaign.inputs[0]
                 for job_index in range(self.options.jobs_per_campaign):
                     seed = self.seed_for_pool_index(pool_name, job_index)
-                    plan_job = self.add_planning_job(pool_name, job_index, seed)
-                    lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
-                    self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                    plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
                     coord_job = self.add_coordinator_job(
                         campaign_name,
                         job_index,
@@ -4817,9 +4829,7 @@ class DAGBuilder:
                             continue
                         seen_pools.add(pool_name)
                         seed = self.seed_for_pool_index(pool_name, job_index)
-                        plan_job = self.add_planning_job(pool_name, job_index, seed)
-                        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
-                        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+                        plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
                         plan_jobs.append(plan_job)
                         source_infos.append((pool_name, seed))
                     coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
