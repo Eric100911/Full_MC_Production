@@ -26,7 +26,7 @@ request_cpus = $(request_cpus)
 request_memory = $(request_memory)
 request_disk = $(request_disk)
 
-+MaxRuntime = 604800
++JobFlavour = "$(lhe_job_flavour)"
 
 Environment = "HOME=/srv"
 

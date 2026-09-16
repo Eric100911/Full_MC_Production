@@ -55,6 +55,7 @@ NOPT_LIM=100000
 FAST_TEST=0
 TEST_MODE="false"
 UNWEVT_OVERRIDE=0
+NMC_OVERRIDE=0
 COMPRESS_LHE="false"
 LHE_COMPRESSION_LEVEL=1
 LHE_SHUFFLE_SPLIT="false"
@@ -1074,6 +1075,11 @@ while [[ $# -gt 0 ]]; do
             UNWEVT_OVERRIDE=1
             shift 2
             ;;
+        --nmc)
+            NMC="$2"
+            NMC_OVERRIDE=1
+            shift 2
+            ;;
         --fast-test)
             FAST_TEST=1
             shift 1
@@ -1250,10 +1256,15 @@ if [ "$FAST_TEST" -eq 1 ]; then
         echo "Error: --unwevt must be a positive integer"
         exit 1
     fi
-    if [ "$UNWEVT" -ge 100000 ]; then
-        NMC="$UNWEVT"
-    else
-        NMC=100000
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        if [ "$UNWEVT" -ge 100000 ]; then
+            NMC="$UNWEVT"
+        else
+            NMC=100000
+        fi
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
     fi
     PREUNW=$(( NMC / 10 ))
     NOPT=$(( NMC / 10 ))
@@ -1261,12 +1272,23 @@ if [ "$FAST_TEST" -eq 1 ]; then
     NOPT_LIM=$(( NMC ))
 else
     GENER=0
-    UNWEVT=100000
-    PREUNW=500000
-    NMC=5000000
-    NOPT=500000
-    NOPT_STEP=500000
-    NOPT_LIM=5000000
+    if [ "$UNWEVT_OVERRIDE" -eq 0 ]; then
+        UNWEVT=100000
+    fi
+    if ! [[ "$UNWEVT" =~ ^[0-9]+$ ]] || [ "$UNWEVT" -le 0 ]; then
+        echo "Error: --unwevt must be a positive integer"
+        exit 1
+    fi
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        NMC=5000000
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
+    fi
+    PREUNW=$(( NMC / 10 ))
+    NOPT=$(( NMC / 10 ))
+    NOPT_STEP=$(( NMC / 10 ))
+    NOPT_LIM=$(( NMC ))
 fi
 
 echo "=============================================="

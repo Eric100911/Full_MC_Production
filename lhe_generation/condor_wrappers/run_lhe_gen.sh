@@ -116,6 +116,9 @@ cmd = [
     "--config", config_path,
 ]
 
+if cfg.get("nmc") is not None:
+    cmd[cmd.index("--config"):cmd.index("--config")] = ["--nmc", str(cfg["nmc"])]
+
 if cfg.get("log_level"):
     os.environ["WORKFLOW_LOG_LEVEL"] = str(cfg["log_level"])
     cmd[cmd.index("--config"):cmd.index("--config")] = [

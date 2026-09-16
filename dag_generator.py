@@ -614,6 +614,11 @@ class WorkflowOptions:
         output_mode: str = "full",
         log_level: str = "info",
         helac_diagnostics: str = "legacy",
+        lhe_nmc: Optional[int] = None,
+        lhe_request_cpus: str = "8",
+        lhe_request_memory: str = "15GB",
+        lhe_request_disk: str = "10GB",
+        lhe_job_flavour: str = "nextweek",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -674,6 +679,11 @@ class WorkflowOptions:
         self.helac_diagnostics = helac_diagnostics
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
+        self.lhe_nmc = lhe_nmc
+        self.lhe_request_cpus = lhe_request_cpus
+        self.lhe_request_memory = lhe_request_memory
+        self.lhe_request_disk = lhe_request_disk
+        self.lhe_job_flavour = lhe_job_flavour
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
         self.dagman_max_jobs_idle = dagman_max_jobs_idle
         self.local_log_dir = local_log_dir or self.machine_env.log_dir
@@ -713,6 +723,13 @@ class WorkflowOptions:
             "force_generate_lhe": self.force_generate_lhe,
             "proxy_path": self.proxy_path,
             "lhe_unwevt": self.resolved_lhe_unwevt(),
+            "lhe_nmc": self.lhe_nmc,
+            "lhe_resource_request": {
+                "cpus": self.lhe_request_cpus,
+                "memory": self.lhe_request_memory,
+                "disk": self.lhe_request_disk,
+                "job_flavour": self.lhe_job_flavour,
+            },
             "dagman_max_jobs_submitted": self.dagman_max_jobs_submitted,
             "dagman_max_jobs_idle": self.dagman_max_jobs_idle,
             "local_log_dir": self.local_log_dir,
@@ -3390,9 +3407,17 @@ class DAGBuilder:
         return bool(info.get("use_existing"))
 
     def lhe_resource_request(self) -> Tuple[str, str, str]:
-        if self.options.test_mode:
+        if self.options.test_mode and (
+            self.options.lhe_request_cpus == "8"
+            and self.options.lhe_request_memory == "15GB"
+            and self.options.lhe_request_disk == "10GB"
+        ):
             return "4", "8GB", "8GB"
-        return "8", "15GB", "10GB"
+        return (
+            self.options.lhe_request_cpus,
+            self.options.lhe_request_memory,
+            self.options.lhe_request_disk,
+        )
 
     def processing_resource_request(self) -> Tuple[str, str, str]:
         if os.environ.get("PREMIX_INPUT_MODE") == "localcache":
@@ -3435,8 +3460,9 @@ class DAGBuilder:
                 "min_pt_q": pool.min_pt_q,
                 "min_m_qqp": pool.min_m_qqp,
                 "min_m_q_beam": pool.min_m_q_beam,
-                "log_level": self.options.log_level,
                 "unwevt": self.options.resolved_lhe_unwevt(),
+                "nmc": self.options.lhe_nmc,
+                "log_level": self.options.log_level,
                 "helac_diagnostics": self.options.helac_diagnostics,
                 "test_mode": self.options.test_mode,
                 "local_output_base": self.options.local_output_base,
@@ -3472,6 +3498,7 @@ class DAGBuilder:
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
                 "log_root=\"{log_root}\" config_path=\"{config_path}\" config_name=\"{config_name}\" "
                 "helac_diagnostics=\"{helac_diagnostics}\" "
+                "lhe_job_flavour=\"{lhe_job_flavour}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
@@ -3493,6 +3520,7 @@ class DAGBuilder:
                     target_machine=dag_escape(self.options.machine_env.target_machine),
                     log_root=dag_escape(log_root),
                     helac_diagnostics=dag_escape(self.options.helac_diagnostics),
+                    lhe_job_flavour=dag_escape(self.options.lhe_job_flavour),
                 )
             )
             self.dag_lines.append(f"RETRY {job_name} 2")
@@ -5970,6 +5998,16 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="LHE 节点的 unwevt；默认正式模式 100000、测试模式 100。",
     )
     parser.add_argument(
+        "--lhe-nmc",
+        type=int,
+        default=None,
+        help="Optional HELAC nmc override for every generated LHE node.",
+    )
+    parser.add_argument("--lhe-request-cpus", default="8")
+    parser.add_argument("--lhe-request-memory", default="15GB")
+    parser.add_argument("--lhe-request-disk", default="10GB")
+    parser.add_argument("--lhe-job-flavour", default="nextweek")
+    parser.add_argument(
         "--helac-diagnostics",
         choices=HELAC_DIAGNOSTICS_MODES,
         default="legacy",
@@ -6991,6 +7029,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_generate_lhe=args.force_generate_lhe,
             proxy_path=args.proxy_path,
             lhe_unwevt=args.lhe_unwevt,
+            lhe_nmc=args.lhe_nmc,
+            lhe_request_cpus=args.lhe_request_cpus,
+            lhe_request_memory=args.lhe_request_memory,
+            lhe_request_disk=args.lhe_request_disk,
+            lhe_job_flavour=args.lhe_job_flavour,
             dagman_max_jobs_submitted=args.dagman_max_jobs_submitted,
             dagman_max_jobs_idle=args.dagman_max_jobs_idle,
             machine_env=machine_env,
