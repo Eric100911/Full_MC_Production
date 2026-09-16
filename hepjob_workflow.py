@@ -45,6 +45,7 @@ from dag_generator import (
     scan_existing_pools,
     validate_efficiency_campaigns,
     write_ntuple_manifest,
+    HELAC_DIAGNOSTICS_MODES,
 )
 
 IHEP_USER = os.environ.get("IHEP_USER") or os.environ.get("USER") or getpass.getuser()
@@ -95,6 +96,7 @@ def generate_lhe_job_script(
     lhe_shuffle_mode: str = "stratified",
     lhe_n_strata: str = "auto",
     lhe_drop_incomplete_last_block: bool = False,
+    helac_diagnostics: str = "legacy",
 ) -> str:
     """生成单个 LHE 生成作业的 bash 脚本内容。
     使用 cmssw-el7 容器运行 HELAC-Onia（提供 gfortran + LCG 环境）。
@@ -107,6 +109,12 @@ def generate_lhe_job_script(
     compress_args = ""
     if compress_lhe:
         compress_args = f" --compress-lhe --lhe-compression-level {lhe_compression_level}"
+    if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "helac_diagnostics must be one of "
+            + ", ".join(HELAC_DIAGNOSTICS_MODES)
+        )
+    diagnostics_args = f" --helac-diagnostics {helac_diagnostics}"
     shuffle_args = ""
     if lhe_shuffle_split:
         shuffle_args = (
@@ -134,6 +142,7 @@ def generate_lhe_job_script(
         proxy_path=proxy_path,
         compress_args=compress_args,
         shuffle_args=shuffle_args,
+        diagnostics_args=diagnostics_args,
     )
 
 
@@ -174,7 +183,7 @@ bash run_helac.sh \\
     --min-pt-bonia {min_pt_bonia} \\
     --min-pt-q {min_pt_q} \\
     --unwevt {unwevt} \\
-    --test-mode {test_str}{compress_args}{shuffle_args}
+    --test-mode {test_str}{diagnostics_args}{compress_args}{shuffle_args}
 INNER_EOF
 chmod +x "${{WORK_DIR}}/run_inside.sh"
 
@@ -627,6 +636,7 @@ class HepJobBuilder:
         force_generate_lhe: bool,
         proxy_path: str,
         lhe_unwevt: Optional[int],
+        helac_diagnostics: str = "legacy",
         hep_group: str = "cms",
         walltime: str = "test",
     ):
@@ -642,6 +652,12 @@ class HepJobBuilder:
         self.force_generate_lhe = force_generate_lhe
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
+        if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+            raise ValueError(
+                "helac_diagnostics must be one of "
+                + ", ".join(HELAC_DIAGNOSTICS_MODES)
+            )
+        self.helac_diagnostics = helac_diagnostics
         self.hep_group = hep_group
         self.walltime = walltime
 
@@ -713,6 +729,7 @@ class HepJobBuilder:
                     pool_name, index, seed,
                     self.resolved_lhe_unwevt(), self.test_mode,
                     self.bundle_dir, lhe_bundle_name, proxy_bundle_name,
+                    helac_diagnostics=self.helac_diagnostics,
                 )
                 write_job_script(script_path, content)
                 lhe_scripts.append(script_path)
@@ -798,6 +815,7 @@ class HepJobBuilder:
             ("efficiency_ntuple", self.efficiency_ntuple),
             ("shuffle_mixing", self.shuffle_mixing),
             ("test_mode", self.test_mode),
+            ("helac_diagnostics", self.helac_diagnostics),
             (
                 "ntuple_manifest",
                 build_ntuple_manifest(campaign_names, self.jobs_per_campaign)
@@ -847,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.add_argument("--max-events", type=int, default=-1, help="每个 job 的事件数，-1 表示全部。")
     generate_parser.add_argument("--lhe-unwevt", type=int, default=None, help="LHE 节点的 unwevt。")
+    generate_parser.add_argument(
+        "--helac-diagnostics", choices=HELAC_DIAGNOSTICS_MODES, default="legacy",
+        help="HELAC post-job diagnostics mode.",
+    )
     generate_parser.add_argument(
         "--enable-ntuple", dest="enable_ntuple", action="store_true", default=False,
         help="启用 Ntuple 步骤。",
@@ -908,6 +930,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出目录（默认: 自动生成时间戳目录）。",
     )
     test_parser.add_argument("--max-events", type=int, default=5, help="每个 job 的事件数。")
+    test_parser.add_argument(
+        "--helac-diagnostics", choices=HELAC_DIAGNOSTICS_MODES, default="legacy",
+        help="HELAC post-job diagnostics mode.",
+    )
     test_parser.add_argument(
         "--enable-ntuple", dest="enable_ntuple", action="store_true", default=False,
         help="测试 workflow 中启用 Ntuple 步骤。",
@@ -1012,6 +1038,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scan_existing = args.scan_existing if hasattr(args, "scan_existing") else True
         force_generate_lhe = args.force_generate_lhe if hasattr(args, "force_generate_lhe") else False
         lhe_unwevt = args.lhe_unwevt if hasattr(args, "lhe_unwevt") else None
+        helac_diagnostics = args.helac_diagnostics
         hep_group = args.group
         walltime = args.walltime if hasattr(args, "walltime") else "test"
 
@@ -1023,6 +1050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Efficiency ntuple: {efficiency_ntuple}")
         print(f"Shuffle mixing: {shuffle_mixing}")
         print(f"测试模式: {test_mode}")
+        print(f"HELAC diagnostics: {helac_diagnostics}")
         print(f"输出目录: {output_dir}")
         print()
 
@@ -1039,6 +1067,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_generate_lhe=force_generate_lhe,
             proxy_path=args.proxy_path,
             lhe_unwevt=lhe_unwevt,
+            helac_diagnostics=helac_diagnostics,
             hep_group=hep_group,
             walltime=walltime,
         )

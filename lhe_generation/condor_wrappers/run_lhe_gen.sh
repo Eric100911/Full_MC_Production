@@ -110,6 +110,7 @@ cmd = [
     "--unwevt", str(cfg["unwevt"]),
     "--test-mode", bool_text(cfg["test_mode"]),
     "--output-dir", str(cfg["output_dir"]),
+    "--helac-diagnostics", str(cfg.get("helac_diagnostics", "legacy")),
     "--config", config_path,
 ]
 

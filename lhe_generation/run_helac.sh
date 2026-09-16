@@ -58,6 +58,7 @@ LHE_EVENTS_PER_BLOCK=1000
 LHE_SHUFFLE_MODE="stratified"
 LHE_N_STRATA="auto"
 LHE_DROP_INCOMPLETE_LAST_BLOCK="false"
+HELAC_DIAGNOSTICS_MODE="legacy"
 WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-info}"
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
@@ -68,6 +69,7 @@ COMMAND_LOG_INDEX=0
 LAST_STDOUT_LOG=""
 LAST_STDERR_LOG=""
 LOG_STAGEOUT_ATTEMPTED=0
+DIAGNOSTICS_STAGEOUT_ATTEMPTED=0
 
 # T2_CN_Beijing XRootD storage paths
 # Canonical form: redirector + LFN (see common/node_config_defaults.json).
@@ -324,6 +326,11 @@ stage_out_worker_logs() {
     fi
     LOG_STAGEOUT_ATTEMPTED=1
 
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" != "legacy" ]]; then
+        msg_info "HELAC diagnostics mode=${HELAC_DIAGNOSTICS_MODE}; skip legacy worker-log bundle"
+        return 0
+    fi
+
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
         msg_info "SKIP_STAGEOUT=1, skip log stageout"
         return 0
@@ -378,6 +385,107 @@ stage_out_worker_logs() {
     else
         msg_warn "完整日志上传失败: ${remote_url}"
     fi
+}
+
+diagnostics_safe_slug() {
+    sanitize_log_label "${JOB_SLUG:-${POOL_NAME}_${MY_SEED}}"
+}
+
+stage_diagnostic_file() {
+    local local_path="$1"
+    local relative_path="$2"
+    local remote_url=""
+    local local_path_target=""
+
+    [[ -f "${local_path}" ]] || return 1
+    if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
+        local_path_target="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}/${relative_path}"
+        mkdir -p "$(dirname "${local_path_target}")"
+        cp "${local_path}" "${local_path_target}"
+        msg_info "HELAC diagnostic staged locally: ${local_path_target}"
+        return 0
+    fi
+
+    make_remote_dir "$(dirname "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")" || true
+    remote_url=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")
+    msg_info "Staging HELAC diagnostic to: ${remote_url}"
+    if xrdcp --nopbar --force "${local_path}" "${remote_url}" >/dev/null 2>&1; then
+        msg_info "HELAC diagnostic uploaded: ${remote_url}"
+        return 0
+    fi
+    msg_warn "HELAC diagnostic upload failed: ${remote_url}"
+    return 1
+}
+
+stage_out_helac_diagnostics() {
+    local safe_slug=""
+    local diagnostic_dir=""
+    local summary_path=""
+    local archive_path=""
+    local archive_name=""
+    local proc_dir=""
+    local -a proc_dirs=()
+    local inspector_path="${SCRIPT_DIR}/../tools/helac_inspector.py"
+    local helac_dir="${WORKDIR}/HELAC-Onia-2.7.6"
+
+    if [[ "${DIAGNOSTICS_STAGEOUT_ATTEMPTED}" -eq 1 ]]; then
+        return 0
+    fi
+    DIAGNOSTICS_STAGEOUT_ATTEMPTED=1
+
+    case "${HELAC_DIAGNOSTICS_MODE}" in
+        none|legacy)
+            return 0
+            ;;
+        slim|full)
+            ;;
+        *)
+            msg_warn "Unknown HELAC diagnostics mode: ${HELAC_DIAGNOSTICS_MODE}"
+            return 0
+            ;;
+    esac
+
+    if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
+        msg_info "SKIP_STAGEOUT=1, skip HELAC diagnostics stageout"
+        return 0
+    fi
+    if [[ ! -d "${helac_dir}" ]]; then
+        msg_warn "HELAC worktree not found; no diagnostics to stage"
+        return 0
+    fi
+
+    safe_slug=$(diagnostics_safe_slug)
+    diagnostic_dir="diagnostics/${safe_slug}"
+
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "slim" ]]; then
+        summary_path="${WORKDIR}/helac_summary_${safe_slug}_${MY_SEED}.json"
+        if [[ ! -f "${inspector_path}" ]]; then
+            msg_warn "HELAC inspector not found: ${inspector_path}"
+            return 0
+        fi
+        if ! python3 "${inspector_path}" parse --root "${helac_dir}" > "${summary_path}"; then
+            msg_warn "Failed to generate HELAC slim summary"
+            return 0
+        fi
+        stage_diagnostic_file "${summary_path}" "${diagnostic_dir}/helac_summary.json" || true
+        return 0
+    fi
+
+    while IFS= read -r -d '' proc_dir; do
+        proc_dirs+=("${proc_dir#${helac_dir}/}")
+    done < <(find "${helac_dir}" -mindepth 1 -maxdepth 1 -type d \
+        -name 'PROC_HO_*' -print0)
+    if (( ${#proc_dirs[@]} == 0 )); then
+        msg_warn "No PROC_HO_* directory found; no full HELAC diagnostic archive"
+        return 0
+    fi
+    archive_name="helac_proc_${safe_slug}_${MY_SEED}.tar.gz"
+    archive_path="${WORKDIR}/${archive_name}"
+    if ! tar -C "${helac_dir}" -czf "${archive_path}" -- "${proc_dirs[@]}"; then
+        msg_warn "Failed to create full HELAC diagnostic archive"
+        return 0
+    fi
+    stage_diagnostic_file "${archive_path}" "${diagnostic_dir}/${archive_name}" || true
 }
 
 find_helac_calc_output_dir() {
@@ -501,6 +609,7 @@ upload_logs_on_exit() {
     local exit_code=$?
     set +e
     stage_out_worker_logs
+    stage_out_helac_diagnostics
     exit "${exit_code}"
 }
 
@@ -915,6 +1024,10 @@ while [[ $# -gt 0 ]]; do
             STAGEOUT_MODE="$2"
             shift 2
             ;;
+        --helac-diagnostics)
+            HELAC_DIAGNOSTICS_MODE="$2"
+            shift 2
+            ;;
         --log-level)
             WORKFLOW_LOG_LEVEL="$2"
             shift 2
@@ -1034,6 +1147,15 @@ case "${WORKFLOW_LOG_LEVEL}" in
         ;;
     *)
         echo "Error: --log-level must be one of info, slim" >&2
+        exit 1
+        ;;
+esac
+
+case "${HELAC_DIAGNOSTICS_MODE}" in
+    legacy|none|slim|full)
+        ;;
+    *)
+        echo "Error: --helac-diagnostics must be one of legacy, none, slim, full"
         exit 1
         ;;
 esac
@@ -1158,6 +1280,7 @@ if [ "$FAST_TEST" -eq 1 ]; then
     echo "Mode:           FAST TEST"
 fi
 echo "Output dir:     $OUTPUT_DIR"
+echo "HELAC diagnostics: ${HELAC_DIAGNOSTICS_MODE}"
 echo "=============================================="
 
 ensure_job_log_dir
@@ -1437,7 +1560,11 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
         msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
     fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
-    stage_out_helac_output_archive "${RUN_DIR}"
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "legacy" ]]; then
+        stage_out_helac_output_archive "${RUN_DIR}"
+    else
+        stage_out_helac_diagnostics
+    fi
     echo "HELAC output generation complete!"
 elif [ "${SKIP_STAGEOUT:-0}" -eq 1 ]; then
     msg_info "SKIP_STAGEOUT=1, skip XRootD stageout"

@@ -85,6 +85,7 @@ EOS_XRDFS_TARGET = EOS_HOST
 EOS_PATH_BASE = EOS_LFN_BASE
 EOS_OUTPUT = f"{EOS_BASE}/output"
 STORAGE_SITE = "T2_CN_Beijing"
+HELAC_DIAGNOSTICS_MODES = ("legacy", "none", "slim", "full")
 
 NTUPLE_VERSION = "v01_06"  # Should track the TPS-Onia2MuMu submodule tag (currently v2.0_patch2).
 
@@ -150,6 +151,7 @@ REQUIRED_FILES = (
     "common/octet_pdg.py",
     "common/node_config_defaults.json",
     "lhe_generation/run_helac.sh",
+    "tools/helac_inspector.py",
     "processing/run_chain.sh",
     "processing/templates/lhe_gen.sub",
     "processing/templates/helac_matrix.sub",
@@ -605,6 +607,7 @@ class WorkflowOptions:
         archive_subdag_logs: bool = True,
         output_mode: str = "full",
         log_level: str = "info",
+        helac_diagnostics: str = "legacy",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -657,6 +660,12 @@ class WorkflowOptions:
         self.archive_subdag_logs = archive_subdag_logs
         self.output_mode = output_mode
         self.log_level = log_level
+        if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+            raise ValueError(
+                "helac_diagnostics must be one of "
+                + ", ".join(HELAC_DIAGNOSTICS_MODES)
+            )
+        self.helac_diagnostics = helac_diagnostics
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
@@ -753,6 +762,7 @@ class WorkflowOptions:
             ),
             "archive_subdag_logs": self.archive_subdag_logs,
             "output_mode": self.output_mode,
+            "helac_diagnostics": self.helac_diagnostics,
         }
 
 
@@ -1083,6 +1093,7 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
         "common/octet_pdg.py",
         "common/node_config_defaults.json",
         "lhe_generation/run_helac.sh",
+        "tools/helac_inspector.py",
         "processing/run_chain.sh",
         "processing/cmssw_helpers/cmssw12_exec.sh",
         "processing/cmssw_helpers/cmssw15_exec.sh",
@@ -2995,6 +3006,7 @@ def prepare_runtime_assets(
                 "runtime/lhe_generation/helac_package.tar.gz",
             ),
             (os.path.join(BASE_DIR, "common", "octet_pdg.py"), "runtime/common/octet_pdg.py"),
+            (os.path.join(BASE_DIR, "tools", "helac_inspector.py"), "runtime/tools/helac_inspector.py"),
             (
                 os.path.join(BASE_DIR, "common", "compression_helpers.sh"),
                 "runtime/common/compression_helpers.sh",
@@ -3415,6 +3427,7 @@ class DAGBuilder:
                 "min_pt_q": pool.min_pt_q,
                 "log_level": self.options.log_level,
                 "unwevt": self.options.resolved_lhe_unwevt(),
+                "helac_diagnostics": self.options.helac_diagnostics,
                 "test_mode": self.options.test_mode,
                 "local_output_base": self.options.local_output_base,
                 "compress_lhe": self.options.compress_lhe,
@@ -3448,6 +3461,7 @@ class DAGBuilder:
                 "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
                 "log_root=\"{log_root}\" config_path=\"{config_path}\" config_name=\"{config_name}\" "
+                "helac_diagnostics=\"{helac_diagnostics}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
@@ -3468,6 +3482,7 @@ class DAGBuilder:
                     ),
                     target_machine=dag_escape(self.options.machine_env.target_machine),
                     log_root=dag_escape(log_root),
+                    helac_diagnostics=dag_escape(self.options.helac_diagnostics),
                 )
             )
             self.dag_lines.append(f"RETRY {job_name} 2")
@@ -5626,6 +5641,7 @@ def execute_helac_matrix_generation(
     dagman_max_jobs_idle: int,
     log_root: str,
     maxjobs_lhe: int,
+    helac_diagnostics: str,
     dry_run: bool,
 ) -> int:
     output_dir = os.path.abspath(output_dir)
@@ -5634,6 +5650,11 @@ def execute_helac_matrix_generation(
         raise ValueError("seed-base must leave all 162 HELAC matrix seeds between 11 and 99999")
     if lhe_unwevt <= 0:
         raise ValueError("--lhe-unwevt must be positive")
+    if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "--helac-diagnostics must be one of "
+            + ", ".join(HELAC_DIAGNOSTICS_MODES)
+        )
     if not dry_run:
         ensure_submit_visible_output_dir(output_dir)
         helac_package_path = os.path.join(BASE_DIR, "common", "packages", "helac_package.tar.gz")
@@ -5720,6 +5741,7 @@ def execute_helac_matrix_generation(
             "extra_gluon=\"{extra_gluon}\" job_slug=\"{job_slug}\" seed=\"{seed}\" "
             "stageout_dir=\"{stageout_dir}\" min_pt_conia=\"6.0\" min_pt_bonia=\"4.0\" "
             "min_pt_q=\"0.0\" unwevt=\"{unwevt}\" test_mode=\"{test_mode}\" "
+            "helac_diagnostics=\"{helac_diagnostics}\" "
             "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" request_disk=\"{request_disk}\" "
             "lhe_bundle_path=\"{lhe_bundle_path}\" lhe_bundle_name=\"{lhe_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
@@ -5733,6 +5755,7 @@ def execute_helac_matrix_generation(
                 stageout_dir=dag_escape(stageout_dir.rstrip("/")),
                 unwevt=dag_escape(lhe_unwevt),
                 test_mode=dag_escape(bool_string(test_mode)),
+                helac_diagnostics=dag_escape(helac_diagnostics),
                 request_cpus=dag_escape(request_cpus),
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
@@ -5758,6 +5781,7 @@ def execute_helac_matrix_generation(
                         ("seed_base", seed_base),
                         ("stageout_dir", stageout_dir.rstrip("/")),
                         ("lhe_unwevt", lhe_unwevt),
+                        ("helac_diagnostics", helac_diagnostics),
                         ("test_mode", test_mode),
                         ("dagman_max_jobs_submitted", dagman_max_jobs_submitted),
                         ("dagman_max_jobs_idle", dagman_max_jobs_idle),
@@ -5860,6 +5884,7 @@ def execute_hepjob_delegate(args: argparse.Namespace) -> int:
             command.append("--force-generate-lhe")
         if args.lhe_unwevt is not None:
             command.extend(["--lhe-unwevt", str(args.lhe_unwevt)])
+        command.extend(["--helac-diagnostics", args.helac_diagnostics])
         command.extend(["--walltime", args.hepjob_walltime])
 
     if args.command == "generate-ntuple-only":
@@ -5933,6 +5958,15 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="LHE 节点的 unwevt；默认正式模式 100000、测试模式 100。",
+    )
+    parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the current compact "
+            "bundle; none, slim, and full select the new modes."
+        ),
     )
     parser.add_argument("--max-events", type=int, default=-1, help="兼容旧配置的 processing 事件目标/上限。")
     parser.add_argument("--target-mixed-events", type=int, default=0, help="每个 block 的目标混合 HepMC 事件数；0 表示正数 --max-events，否则 100。")
@@ -6518,6 +6552,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="把 HELAC matrix job 切到 fast-test 积分设置。",
     )
     matrix_parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the compact output "
+            "archive; none, slim, and full select the new modes."
+        ),
+    )
+    matrix_parser.add_argument(
         "--dagman-max-jobs-submitted",
         type=int,
         default=0,
@@ -6870,6 +6913,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dagman_max_jobs_idle=args.dagman_max_jobs_idle,
                 log_root=args.log_root,
                 maxjobs_lhe=args.maxjobs_lhe,
+                helac_diagnostics=args.helac_diagnostics,
                 dry_run=args.dry_run,
             )
         except (OSError, ValueError) as exc:
@@ -6982,6 +7026,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lhe_group_min_events=args.lhe_group_min_events,
             output_mode=args.output_mode,
             log_level=effective_log_level(args),
+            helac_diagnostics=args.helac_diagnostics,
             lhe_group_max_events=args.lhe_group_max_events,
             lhe_group_max_files=args.lhe_group_max_files,
         )
