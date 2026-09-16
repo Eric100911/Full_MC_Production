@@ -2921,16 +2921,56 @@ def prepare_runtime_assets(
     ensure_dir(output_dir)
     assets: Dict[str, str] = OrderedDict()
 
-    # Compile lhe_shuffle_split natively on el9 for planner/coordinator runtime.
+    # Build separate shuffle-split binaries for the two execution environments.
+    # HELAC generation runs inside cmssw/el7 with LCG_88b, while the planner
+    # bundle keeps the native EL9 build used by its existing runtime path.
     shuffle_split_src = os.path.join(BASE_DIR, "lhe_generation", "lhe_shuffle_split.cc")
-    shuffle_split_bin = os.path.join(output_dir, "lhe_shuffle_split")
-    print("  [lhe-bundle] Compiling lhe_shuffle_split natively (el9)...")
+    shuffle_split_el9_bin = os.path.join(output_dir, "lhe_shuffle_split_el9")
+    print("  [planner-bundle] Compiling lhe_shuffle_split_el9 natively...")
     subprocess.run(
-        ["g++", "-std=c++14", "-O2", "-Wall", "-o", shuffle_split_bin, shuffle_split_src],
+        [
+            "g++", "-std=c++14", "-O2", "-Wall",
+            "-o", shuffle_split_el9_bin, shuffle_split_src,
+        ],
         check=True,
         timeout=120,
     )
-    print(f"  [lhe-bundle] Compiled: {shuffle_split_bin}")
+    print(f"  [planner-bundle] Compiled: {shuffle_split_el9_bin}")
+
+    shuffle_split_el7_bin = os.path.join(output_dir, "lhe_shuffle_split_el7")
+    el7_image = (
+        "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/"
+        "cmssw/el7:x86_64"
+    )
+    el7_lcg_setup = (
+        "/cvmfs/sft.cern.ch/lcg/views/LCG_88b/"
+        "x86_64-centos7-gcc62-opt/setup.sh"
+    )
+    print(
+        "  [lhe-bundle] Compiling lhe_shuffle_split_el7 "
+        "in cmssw/el7 + LCG_88b..."
+    )
+    with tempfile.TemporaryDirectory(prefix="lhe_shuffle_split_el7_") as build_dir:
+        container_bin = os.path.join(build_dir, "lhe_shuffle_split_el7")
+        compile_command = (
+            f"source {shlex.quote(el7_lcg_setup)} && "
+            "g++ -std=c++14 -O2 -Wall "
+            f"-o {shlex.quote(container_bin)} {shlex.quote(shuffle_split_src)}"
+        )
+        subprocess.run(
+            [
+                "singularity", "exec",
+                "--bind", f"{BASE_DIR}:{BASE_DIR}:ro",
+                "--bind", f"{build_dir}:{build_dir}",
+                "--bind", "/cvmfs:/cvmfs",
+                el7_image,
+                "bash", "-c", compile_command,
+            ],
+            check=True,
+            timeout=120,
+        )
+        shutil.copy2(container_bin, shuffle_split_el7_bin)
+    print(f"  [lhe-bundle] Compiled: {shuffle_split_el7_bin}")
 
     lhe_bundle_name = BUNDLE_NAMES["lhe"]
     lhe_bundle_path = os.path.join(output_dir, lhe_bundle_name)
@@ -2938,7 +2978,10 @@ def prepare_runtime_assets(
         lhe_bundle_path,
         (
             (os.path.join(BASE_DIR, "lhe_generation", "run_helac.sh"), "runtime/lhe_generation/run_helac.sh"),
-            (shuffle_split_bin, "runtime/lhe_generation/lhe_shuffle_split"),
+            (
+                shuffle_split_el7_bin,
+                "runtime/lhe_generation/lhe_shuffle_split_el7",
+            ),
             (
                 os.path.join(BASE_DIR, "lhe_generation", "input_templates", "user.inp"),
                 "runtime/lhe_generation/input_templates/user.inp",
@@ -3108,7 +3151,7 @@ def prepare_runtime_assets(
     plan_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "tools", "plan_lhe_blocks.py"),
          "runtime/tools/plan_lhe_blocks.py"),
-        (shuffle_split_bin, "runtime/tools/lhe_shuffle_split"),
+        (shuffle_split_el9_bin, "runtime/tools/lhe_shuffle_split_el9"),
         (os.path.join(BASE_DIR, "common", "compression_util.py"),
          "runtime/common/compression_util.py"),
     ]

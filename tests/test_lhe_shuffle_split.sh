@@ -11,7 +11,7 @@ GEN_PY="${SCRIPT_DIR}/generate_synthetic_lhe.py"
 TMP_ROOT="/tmp/chiw"
 mkdir -p "${TMP_ROOT}"
 TMP_DIR="$(mktemp -d "${TMP_ROOT}/lhe_shuffle_split_XXXXX")"
-TOOL="${TMP_DIR}/lhe_shuffle_split"
+TOOL="${TMP_DIR}/lhe_shuffle_split_el7"
 PASS=0
 FAIL=0
 

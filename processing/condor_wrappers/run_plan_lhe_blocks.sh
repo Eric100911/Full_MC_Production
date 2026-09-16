@@ -90,7 +90,7 @@ cmd = [
     "--n-strata", str(cfg["n_strata"]),
     "--block-output-dir", str(cfg["block_output_dir"]),
     "--manifest-output-path", str(cfg["manifest_output_path"]),
-    "--lhe-shuffle-split-bin", "./lhe_shuffle_split",
+    "--lhe-shuffle-split-bin", "./lhe_shuffle_split_el9",
     "--log-level", str(cfg.get("log_level", "info")),
 ]
 symmetry_pdg_ids = cfg.get("longitudinal_symmetry_pdg_ids", [])

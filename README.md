@@ -33,7 +33,7 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`common/packages/`** — Pre-built tarballs: `helac_package.tar.gz` (required), `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional).
 - **`external/TPS-Onia2MuMu`** — Git submodule for the ntuple analyzer (v2.0_patch2). Used as fallback when the prebuilt CMSSW15 runtime tarball is unavailable.
 - **`lhe_generation/run_helac.sh`** — Worker-side HELAC-Onia execution script. Supports compressed output, shuffle-split, block staging, and `TARGET_EOS_BASE` override.
-- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 stratified LHE shuffle and fixed-size block splitter. Compiled natively on EL9 while preparing the runtime bundles.
+- **`lhe_generation/lhe_shuffle_split.cc`** — C++14 stratified LHE shuffle and fixed-size block splitter. Runtime preparation builds separate `lhe_shuffle_split_el7` (HELAC jobs) and `lhe_shuffle_split_el9` (planner jobs) executables.
 - **`lhe_generation/condor_wrappers/run_lhe_gen.sh`** — LHE job wrapper using JSON config (3 positional args) instead of legacy positional args.
 - **`tools/plan_lhe_blocks.py`** — Per-pool LHE block planner: compresses, shuffle-splits, stages blocks, writes `plan_manifest_<pool>_<seed>.json`. Runs as a Condor job after HELAC generation.
 - **`tools/coordinate_lhe_blocks.py`** — Multi-source campaign coordinator: reads per-pool plan manifests, groups non-overlapping blocks to satisfy per-source LHE budgets, assigns deterministic EDM EventIDs, and generates `blocks_processing.dag` SubDAGs.

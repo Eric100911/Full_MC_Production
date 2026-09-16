@@ -1367,7 +1367,7 @@ verify_lhe_octet_codes "${FINAL_LHE_FILE}"
 # ---- LHE Stratified Shuffle-Split ----
 SHUFFLE_SPLIT_DIR="${WORKDIR}/lhe_blocks"
 if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
-    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split"
+    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split_el7"
     mkdir -p "${SHUFFLE_SPLIT_DIR}"
     # Derive a deterministic shuffle seed from the generation seed with an offset
     # so shuffles are reproducible but distinct from HELAC's internal RNG.
