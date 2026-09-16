@@ -65,6 +65,7 @@ def main() -> int:
         assert 'archive_enabled="true"' in dag_text
         assert f'proxy_bundle_path="{output_dir / "proxy_bundle.tar.gz"}"' in dag_text
         assert f'log_source_root="{log_root}"' in dag_text
+        assert f'subdag_root="{output_dir / "plan_subdags"}"' in dag_text
         assert "workflow_archive_id=" in dag_text
 
         metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -72,6 +73,8 @@ def main() -> int:
         assert archive_metadata["enabled"] is True
         assert archive_metadata["mechanism"] == "top-level-final-worker"
         assert archive_metadata["source"] == "scan-log-root"
+        assert archive_metadata["subdag_source"] == str(output_dir / "plan_subdags")
+        assert archive_metadata["subdag_source_cleanup"] == "after-archive-and-manifest-upload"
         assert archive_metadata["workflow_archive_id"]
 
         with tarfile.open(output_dir / "summary_runtime_bundle.tar.gz", "r:gz") as archive:

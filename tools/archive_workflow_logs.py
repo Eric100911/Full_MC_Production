@@ -145,6 +145,23 @@ def collect_group_files(
     return files, stages, warnings
 
 
+def collect_workspace_files(source_root: Path) -> List[Tuple[Path, str]]:
+    """Collect regular files from a completed SubDAG workspace deterministically."""
+    files: List[Tuple[Path, str]] = []
+    archive_root = source_root.parent
+    for root, directory_names, file_names in os.walk(source_root):
+        directory_names[:] = sorted(
+            name for name in directory_names if not (Path(root) / name).is_symlink()
+        )
+        for name in sorted(file_names):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file() or ".tmp." in path.name:
+                continue
+            files.append((path, path.relative_to(archive_root).as_posix()))
+    files.sort(key=lambda item: item[1])
+    return files
+
+
 def create_deterministic_archive(
     archive_path: Path,
     files: Sequence[Tuple[Path, str]],
@@ -318,6 +335,95 @@ def prepare_proxy(proxy_bundle: Path, workdir: Path) -> Tuple[Path, int]:
     return proxy_path, timeleft
 
 
+def archive_subdag_workspace(
+    *,
+    subdag_root: Path,
+    target_base_url: str,
+    workflow_id: str,
+    workdir: Path,
+    retry_attempts: int,
+    proxy_timeleft: int,
+) -> Dict[str, object]:
+    """Archive a completed ``plan_subdags`` tree and remove it after upload."""
+    result: Dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed",
+        "phase": "workspace_discovery",
+        "source": str(subdag_root),
+        "source_deleted": False,
+        "proxy_timeleft_seconds": proxy_timeleft,
+        "updated_at": utc_now(),
+    }
+    if not subdag_root.is_dir() or subdag_root.is_symlink():
+        result["message"] = f"SubDAG workspace is missing or invalid: {subdag_root}"
+        return result
+
+    archive_name = "plan_subdags.tar.gz"
+    manifest_name = "plan_subdags.json"
+    archive_path = workdir / archive_name
+    manifest_path = workdir / manifest_name
+    remote_dir = join_target(
+        target_base_url, "output", "_workflow_archives", workflow_id
+    )
+    archive_url = join_target(remote_dir, archive_name)
+    manifest_url = join_target(remote_dir, manifest_name)
+    try:
+        files = collect_workspace_files(subdag_root)
+        create_deterministic_archive(archive_path, files)
+        manifest = {
+            **result,
+            "status": "ok",
+            "phase": "archive_uploaded",
+            "message": "SubDAG workspace archive uploaded",
+            "archive": {
+                "name": archive_name,
+                "url": archive_url,
+                "size_bytes": archive_path.stat().st_size,
+                "sha256": sha256_file(archive_path),
+            },
+            "manifest_url": manifest_url,
+            "members": [
+                {"path": relative, "size_bytes": path.stat().st_size}
+                for path, relative in files
+            ],
+        }
+        atomic_write_json(manifest_path, manifest)
+        if remote_dir.startswith("root://"):
+            ensure_remote_directory(remote_dir, retry_attempts)
+        else:
+            Path(remote_dir).mkdir(parents=True, exist_ok=True)
+        upload_file(archive_path, archive_url, retry_attempts)
+        upload_file(manifest_path, manifest_url, retry_attempts)
+    except Exception as exc:
+        result["phase"] = "archive_upload"
+        result["message"] = str(exc)
+        return result
+
+    try:
+        shutil.rmtree(subdag_root)
+    except OSError as exc:
+        manifest["status"] = "partial"
+        manifest["phase"] = "source_cleanup"
+        manifest["message"] = f"Archive uploaded but local cleanup failed: {exc}"
+        manifest["updated_at"] = utc_now()
+        return manifest
+
+    manifest["phase"] = "complete"
+    manifest["source_deleted"] = True
+    manifest["updated_at"] = utc_now()
+    try:
+        atomic_write_json(manifest_path, manifest)
+        upload_file(manifest_path, manifest_url, retry_attempts)
+    except Exception as exc:
+        manifest["status"] = "partial"
+        manifest["phase"] = "cleanup_manifest_upload"
+        manifest["message"] = (
+            "Archive uploaded and local source removed, but final manifest upload "
+            f"failed: {exc}"
+        )
+    return manifest
+
+
 def per_job_status_path(log_root: Path, campaign: str, job_component: str) -> Path:
     return log_root / campaign / "final" / job_component / "log_archive_status.json"
 
@@ -351,6 +457,7 @@ def archive_workflow(
     workflow_id: str,
     proxy_bundle: Path,
     retry_attempts: int,
+    subdag_root: Path | None = None,
 ) -> Dict[str, object]:
     groups = discover_log_groups(log_root)
     overall_path = (
@@ -368,6 +475,8 @@ def archive_workflow(
         "updated_at": utc_now(),
         "results": [],
     }
+    if subdag_root is not None:
+        base_status["subdag_root"] = str(subdag_root)
     if not groups:
         payload = {
             **base_status,
@@ -485,6 +594,17 @@ def archive_workflow(
                 result,
             )
 
+        subdag_result: Dict[str, object] | None = None
+        if subdag_root is not None:
+            subdag_result = archive_subdag_workspace(
+                subdag_root=subdag_root,
+                target_base_url=target_base_url,
+                workflow_id=workflow_id,
+                workdir=workdir,
+                retry_attempts=retry_attempts,
+                proxy_timeleft=proxy_timeleft,
+            )
+
         ok_count = sum(result.get("status") == "ok" for result in results)
         if ok_count == len(results):
             archive_status = "ok"
@@ -500,6 +620,11 @@ def archive_workflow(
             "results": results,
             "updated_at": utc_now(),
         }
+        if subdag_result is not None:
+            payload["subdag_workspace"] = subdag_result
+            if subdag_result.get("status") != "ok" and archive_status == "ok":
+                payload["archive_status"] = "partial"
+                payload["phase"] = "partial_failure"
         atomic_write_json(overall_path, payload)
 
         index_path = workdir / "archive_index.json"
@@ -537,6 +662,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workflow-id", required=True)
     parser.add_argument("--proxy-bundle", required=True)
     parser.add_argument("--retry-attempts", type=int, default=3)
+    parser.add_argument(
+        "--subdag-root",
+        default="",
+        help="Completed plan_subdags directory to archive and remove after upload.",
+    )
     return parser
 
 
@@ -550,6 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         workflow_id=args.workflow_id,
         proxy_bundle=Path(args.proxy_bundle).resolve(),
         retry_attempts=args.retry_attempts,
+        subdag_root=Path(args.subdag_root).resolve() if args.subdag_root else None,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0 if payload.get("archive_status") == "ok" else 1

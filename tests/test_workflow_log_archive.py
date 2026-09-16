@@ -114,6 +114,13 @@ def main() -> int:
 
         proxy_bundle = root / "proxy_bundle.tar.gz"
         write_proxy_bundle(proxy_bundle)
+        subdag_root = root / "workspace" / "plan_subdags"
+        nested_config = subdag_root / "CAMPAIGN_A" / "job_0" / "node_configs" / "MIX_0.json"
+        nested_config.parent.mkdir(parents=True)
+        nested_config.write_text('{"block": 0}\n', encoding="utf-8")
+        (subdag_root / "CAMPAIGN_A" / "job_0" / "blocks_processing.dag").write_text(
+            "JOB MIX_0 processing.sub\n", encoding="utf-8"
+        )
         mock_bin = root / "mock_bin"
         mock_bin.mkdir()
         write_mock_voms(mock_bin / "voms-proxy-info")
@@ -126,11 +133,15 @@ def main() -> int:
                 workflow_id="test-workflow",
                 proxy_bundle=proxy_bundle,
                 retry_attempts=3,
+                subdag_root=subdag_root,
             )
         finally:
             os.environ["PATH"] = old_path
 
         assert payload["archive_status"] == "ok"
+        assert payload["subdag_workspace"]["status"] == "ok"
+        assert payload["subdag_workspace"]["source_deleted"] is True
+        assert not subdag_root.exists()
         assert len(payload["results"]) == 2
         assert payload["index_url"].endswith(
             "output/_log_archives/test-workflow/archive_index.json"
@@ -155,6 +166,16 @@ def main() -> int:
             assert members
             assert all(name.startswith(f"{campaign}/") for name in members)
 
+        subdag_archive = (
+            root / "target" / "output" / "_workflow_archives" / "test-workflow"
+            / "plan_subdags.tar.gz"
+        )
+        with tarfile.open(subdag_archive, "r:gz") as archive:
+            assert archive.getnames() == [
+                "plan_subdags/CAMPAIGN_A/job_0/blocks_processing.dag",
+                "plan_subdags/CAMPAIGN_A/job_0/node_configs/MIX_0.json",
+            ]
+
         status = json.loads(
             (
                 log_root
@@ -167,6 +188,9 @@ def main() -> int:
 
         os.environ["PATH"] = f"{mock_bin}:{old_path}"
         os.environ["MOCK_PROXY_EXPIRED"] = "1"
+        failed_subdag_root = root / "failed_workspace" / "plan_subdags"
+        failed_subdag_root.mkdir(parents=True)
+        (failed_subdag_root / "keep.json").write_text("{}\n", encoding="utf-8")
         try:
             expired = archive_workflow(
                 log_root=log_root,
@@ -174,6 +198,7 @@ def main() -> int:
                 workflow_id="test-workflow-expired",
                 proxy_bundle=proxy_bundle,
                 retry_attempts=3,
+                subdag_root=failed_subdag_root,
             )
         finally:
             os.environ["PATH"] = old_path
@@ -181,6 +206,7 @@ def main() -> int:
         assert expired["archive_status"] == "failed"
         assert expired["phase"] == "proxy_validation"
         assert all(result["phase"] == "proxy_validation" for result in expired["results"])
+        assert failed_subdag_root.is_dir()
 
     print("[OK] top-level FINAL workflow log archive grouping and manifests")
     return 0

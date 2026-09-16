@@ -3352,6 +3352,7 @@ class DAGBuilder:
             and self.options.enable_lhe_block_subdags
         )
         target_base_url = self.options.target_base_url or EOS_BASE
+        subdag_root = os.path.join(self.output_dir, "plan_subdags")
         self.dag_lines.extend([
             "# -------- 汇总与日志归档节点 --------",
             (
@@ -3369,6 +3370,7 @@ class DAGBuilder:
                 f'log_dir="{dag_escape(self.options.local_log_dir)}" '
                 f'log_root="{dag_escape(summary_log_root)}" '
                 f'log_source_root="{dag_escape(self.options.log_root)}" '
+                f'subdag_root="{dag_escape(subdag_root)}" '
                 f'target_base_url="{dag_escape(target_base_url)}" '
                 f'workflow_archive_id="{dag_escape(self.workflow_archive_id)}" '
                 f'archive_enabled="{dag_escape(bool_string(archive_enabled))}"'
@@ -3386,12 +3388,18 @@ class DAGBuilder:
             ("workflow_archive_id", self.workflow_archive_id),
             ("source", "scan-log-root"),
             ("source_log_root", self.options.log_root),
+            ("subdag_source", os.path.join(self.output_dir, "plan_subdags")),
             ("proxy_source", "frozen-runtime-bundle"),
             ("stages", list(("processing", "miniaod_merge", "ntuple", "final"))),
             (
                 "target_layout",
                 "output/<campaign>/<job_component>_logs/<workflow_archive_id>/",
             ),
+            (
+                "subdag_target_layout",
+                "output/_workflow_archives/<workflow_archive_id>/plan_subdags.tar.gz",
+            ),
+            ("subdag_source_cleanup", "after-archive-and-manifest-upload"),
             ("retry_attempts", 3),
         ])
 

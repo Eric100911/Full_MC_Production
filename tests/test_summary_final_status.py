@@ -11,6 +11,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 SUMMARY = BASE_DIR / "processing" / "templates" / "summary.sh"
+SUMMARY_SUBMIT = BASE_DIR / "processing" / "templates" / "summary.sub"
 
 
 def run_summary(
@@ -38,6 +39,7 @@ def run_summary(
             str(bundle),
             str(proxy),
             str(log_root),
+            str(root / "workspace" / "plan_subdags"),
             str(root / "target"),
             "status-test",
             "true" if archive_enabled else "false",
@@ -53,6 +55,9 @@ def run_summary(
 
 
 def main() -> int:
+    submit_text = SUMMARY_SUBMIT.read_text(encoding="utf-8")
+    assert "$(subdag_root:)" in submit_text
+
     with tempfile.TemporaryDirectory(prefix="summary_status_", dir="/tmp/chiw") as tmp:
         root = Path(tmp)
         successful = run_summary(
