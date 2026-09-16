@@ -30,8 +30,9 @@ class CondorContracts(unittest.TestCase):
                 self.assertEqual(saved["state"], "submitting")
                 self.assertEqual(saved["scheduler"], "schedd.example")
                 self.assertIsNone(saved["root_cluster_id"])
-                self.assertEqual(command, ["condor_submit_dag", "-r", "schedd.example", "-no_recurse", "run.dag"])
+                self.assertEqual(command, ["condor_submit_dag", "-no_recurse", "run.dag"])
                 self.assertEqual(kwargs["cwd"], str(root))
+                self.assertEqual(kwargs["env"]["_CONDOR_SCHEDD_HOST"], "schedd.example")
                 return response(stdout="1 job(s) submitted to cluster 91234.\n")
             result = submit_run(root, runner=runner)
             self.assertEqual((result["scheduler"], result["root_cluster_id"]),
@@ -73,8 +74,9 @@ class CondorContracts(unittest.TestCase):
                     return response(stdout="")
                 if command[0] == "condor_history":
                     return response(stdout="42 0 4\n")
-                self.assertEqual(command, ["condor_submit_dag", "-r", "schedd.example", "-no_recurse", "-AutoRescue", "0",
+                self.assertEqual(command, ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
                                            "-RescueFile", "run.dag.rescue002", "run.dag"])
+                self.assertEqual(_kwargs["env"]["_CONDOR_SCHEDD_HOST"], "schedd.example")
                 return response(stdout="submitted to cluster 43")
             result = resume_run(root, runner=runner)
             self.assertEqual(result["root_cluster_id"], "43")

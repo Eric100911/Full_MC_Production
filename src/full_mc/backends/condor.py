@@ -8,6 +8,7 @@ it is never retried automatically.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -75,8 +76,13 @@ def _assert_submittable(spec: Dict[str, Any]) -> None:
         raise RuntimeError("refusing scheduler submission from a dirty runtime source")
 
 
-def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path) -> Any:
-    return runner(command, check=False, text=True, capture_output=True, cwd=str(cwd))
+def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path,
+         scheduler: str | None = None) -> Any:
+    environment = None
+    if scheduler:
+        environment = dict(os.environ, _CONDOR_SCHEDD_HOST=scheduler)
+    return runner(command, check=False, text=True, capture_output=True, cwd=str(cwd),
+                  **({"env": environment} if environment is not None else {}))
 
 
 def _output(completed: Any) -> str:
@@ -162,14 +168,17 @@ def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     spec = _read_json(spec_path)
     _assert_submittable(spec)
     scheduler = _schedd(spec, runner, root)
-    command = ["condor_submit_dag", "-r", scheduler, "-no_recurse", "run.dag"]
+    # ``-Remote`` enables spool submission, which CERN rejects unless the root
+    # DAG declares spool outputs. Select the recorded schedd through HTCondor's
+    # process-local configuration and submit normally instead.
+    command = ["condor_submit_dag", "-no_recurse", "run.dag"]
     record: Dict[str, Any] = {"schema": SCHEMA, "run_dir": str(root),
                               "dag": str(root / "run.dag"), "created_at": _now(),
                               "attempts": []}
     attempt = _begin_attempt(record, kind="submit", scheduler=scheduler, command=command)
     _write(root, record)
     try:
-        completed = _run(command, runner, cwd=root)
+        completed = _run(command, runner, cwd=root, scheduler=scheduler)
     except OSError as exc:
         attempt.update(state="unknown", reconciliation_required=True, finished_at=_now(),
                        submit_output=str(exc))
@@ -264,13 +273,13 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     if rescue is None:
         raise FileNotFoundError("rescue resume requires an explicit run.dag.rescueNNN file")
     scheduler = str(observed["scheduler"])
-    command = ["condor_submit_dag", "-r", scheduler, "-no_recurse", "-AutoRescue", "0",
+    command = ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
                "-RescueFile", rescue.name, "run.dag"]
     attempt = _begin_attempt(record, kind="rescue", scheduler=scheduler, command=command,
                              rescue_file=str(rescue))
     _write(root, record)
     try:
-        completed = _run(command, runner, cwd=root)
+        completed = _run(command, runner, cwd=root, scheduler=scheduler)
     except OSError as exc:
         attempt.update(state="unknown", reconciliation_required=True, finished_at=_now(),
                        submit_output=str(exc))
