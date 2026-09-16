@@ -429,6 +429,8 @@ class LHEPool:
         min_pt_conia: float = 6.0,
         min_pt_bonia: float = 4.0,
         min_pt_q: float = 0.0,
+        min_m_qqp: float = 0.0,
+        min_m_q_beam: float = 0.0,
         notes: str = "",
         seed_offset: int = 0,
         storage_name: Optional[str] = None,
@@ -442,6 +444,8 @@ class LHEPool:
         self.min_pt_conia = min_pt_conia
         self.min_pt_bonia = min_pt_bonia
         self.min_pt_q = min_pt_q
+        self.min_m_qqp = min_m_qqp
+        self.min_m_q_beam = min_m_q_beam
         self.notes = notes
         self.seed_offset = seed_offset
         self.storage_name = storage_name or name
@@ -467,6 +471,8 @@ class LHEPool:
             "min_pt_conia": self.min_pt_conia,
             "min_pt_bonia": self.min_pt_bonia,
             "min_pt_q": self.min_pt_q,
+            "min_m_qqp": self.min_m_qqp,
+            "min_m_q_beam": self.min_m_q_beam,
             "notes": self.notes,
             "storage_name": self.storage_name,
             "variants": self.variants,
@@ -836,6 +842,8 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > cc~(3S11) cc~(3S11) g",),
                 notes="double-J/psi + g SPS 基础池。",
                 seed_offset=70000,
+                min_m_qqp=3.0969,
+                min_m_q_beam=3.0969,
                 longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
@@ -3425,6 +3433,8 @@ class DAGBuilder:
                 "min_pt_conia": pool.min_pt_conia,
                 "min_pt_bonia": pool.min_pt_bonia,
                 "min_pt_q": pool.min_pt_q,
+                "min_m_qqp": pool.min_m_qqp,
+                "min_m_q_beam": pool.min_m_q_beam,
                 "log_level": self.options.log_level,
                 "unwevt": self.options.resolved_lhe_unwevt(),
                 "helac_diagnostics": self.options.helac_diagnostics,

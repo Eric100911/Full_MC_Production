@@ -32,6 +32,10 @@ PARTON_SHOWER_LINE=""
 MIN_PT_CONIA=6.0
 MIN_PT_BONIA=4.0
 MIN_PT_Q=0.0
+# Infrared-safety cuts for a real-emission final-state light parton.
+# The HELAC-Onia NLO* prescription is sqrt(s_ij^min) = 2 m_c.
+MIN_M_QQP=0.0
+MIN_M_Q_BEAM=0.0
 WORKDIR=$(pwd)
 OUTPUT_DIR=""
 CMASS="1.54845"
@@ -350,6 +354,8 @@ stage_out_worker_logs() {
         echo "min_pt_conia=${MIN_PT_CONIA}"
         echo "min_pt_bonia=${MIN_PT_BONIA}"
         echo "min_pt_q=${MIN_PT_Q}"
+        echo "min_m_qqp=${MIN_M_QQP}"
+        echo "min_m_q_beam=${MIN_M_Q_BEAM}"
         echo "unwevt=${UNWEVT}"
         echo "nmc=${NMC}"
         echo "preunw=${PREUNW}"
@@ -862,6 +868,8 @@ prepare_runtime_user_inp() {
         -e "s|^(minptq)[[:space:]].*$|\\1 ${MIN_PT_Q}d0|" \
         -e "s|^(minptconia)[[:space:]].*$|\\1 ${MIN_PT_CONIA}d0|" \
         -e "s|^(minptbonia)[[:space:]].*$|\\1 ${MIN_PT_BONIA}d0|" \
+        -e "s|^(minmqqp)[[:space:]].*$|\\1 ${MIN_M_QQP}d0|" \
+        -e "s|^(minmqbeam)[[:space:]].*$|\\1 ${MIN_M_Q_BEAM}d0|" \
         -e "s|^(preunw)[[:space:]].*$|\\1 ${PREUNW}|" \
         -e "s|^(unwevt)[[:space:]].*$|\\1 ${UNWEVT}|" \
         -e "s|^(nmc)[[:space:]].*$|\\1 ${NMC}|" \
@@ -966,13 +974,14 @@ prepare_crystalball_addon_input() {
     ln -sfn ../../pdf "${addon_dir}/pdf"
     set_user_inp_value "${addon_dir}/input/user.inp" "minpt1c" "${minpt_onia}d0"
     set_user_inp_value "${addon_dir}/input/user.inp" "maxpt1c" "-1d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "-2.4d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "2.4d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "0d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "30d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "absoluterap" "T"
 
     msg_info "CrystalBall addon input:"
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
-    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|absoluterap|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
 }
 
 build_crystalball_addon_if_needed() {
@@ -1042,6 +1051,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --min-pt-q)
             MIN_PT_Q="$2"
+            shift 2
+            ;;
+        --min-m-qqp)
+            MIN_M_QQP="$2"
+            shift 2
+            ;;
+        --min-m-q-beam)
+            MIN_M_Q_BEAM="$2"
             shift 2
             ;;
         --output-dir)
@@ -1269,6 +1286,8 @@ echo "Bottom mass:    ${BMASS} GeV"
 echo "Min pT (conia): $MIN_PT_CONIA GeV"
 echo "Min pT (bonia): $MIN_PT_BONIA GeV"
 echo "Min pT (q):     $MIN_PT_Q GeV"
+echo "Min m (q,q'):   $MIN_M_QQP GeV"
+echo "Min m (q,beam): $MIN_M_Q_BEAM GeV"
 echo "Unw. events:    $UNWEVT"
 echo "Generator:      PHEGAS (gener=${GENER})"
 echo "preunw:         $PREUNW"
@@ -1373,6 +1392,8 @@ set minptconia = ${MIN_PT_CONIA}d0
 set minptbonia = ${MIN_PT_BONIA}d0
 set maxrapconia = 2.4
 set minptq = ${MIN_PT_Q}
+set minmqqp = ${MIN_M_QQP}d0
+set minmqbeam = ${MIN_M_Q_BEAM}d0
 set ranhel = 4
 ${PARTON_SHOWER_LINE}
 ${PROCESS_STRING}

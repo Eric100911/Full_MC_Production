@@ -107,6 +107,8 @@ cmd = [
     "--min-pt-conia", str(cfg["min_pt_conia"]),
     "--min-pt-bonia", str(cfg["min_pt_bonia"]),
     "--min-pt-q", str(cfg["min_pt_q"]),
+    "--min-m-qqp", str(cfg.get("min_m_qqp", 0.0)),
+    "--min-m-q-beam", str(cfg.get("min_m_q_beam", 0.0)),
     "--unwevt", str(cfg["unwevt"]),
     "--test-mode", bool_text(cfg["test_mode"]),
     "--output-dir", str(cfg["output_dir"]),
