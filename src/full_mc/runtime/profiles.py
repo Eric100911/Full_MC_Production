@@ -15,11 +15,15 @@ class RuntimeProfile:
     lcg_view: str = ""
 
 IMAGE = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/"
+# CVMFS CA bundle for GSI proxy auth inside containers (worker images have no
+# /etc/grid-security/certificates and inherit no X509_CERT_DIR under getenv=False).
+GRID_CA_DIR = "/cvmfs/grid.cern.ch/etc/grid-security/certificates"
 PROFILES = {
     "helac-el7": RuntimeProfile("helac-el7", IMAGE+"el7:x86_64",
         lcg_view="/cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh"),
-    "utilities-el9": RuntimeProfile("utilities-el9", IMAGE+"el9:x86_64",
-        lcg_view="/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh"),
+    # Native el9 ships XRootD 5.9.7 with working GSI; LCG_109a's 5.9.1 breaks
+    # GSI proxy auth ("ztn disallowed for non-TLS connections"), so run bare.
+    "utilities-el9": RuntimeProfile("utilities-el9", IMAGE+"el9:x86_64"),
     "pythia-el8": RuntimeProfile("pythia-el8", IMAGE+"el8:x86_64", "el8_amd64_gcc10",
         "/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMSSW_12_4_14"),
     "cmssw12-el8": RuntimeProfile("cmssw12-el8", IMAGE+"el8:x86_64", "el8_amd64_gcc10",
@@ -58,6 +62,7 @@ def run_profile(profile, command, *, cwd, env=None, check=True, stdout=None, std
     (cwd / "tmp").mkdir(exist_ok=True)
     inherited = {k: os.environ[k] for k in
                  ("X509_USER_PROXY", "KRB5CCNAME", "X509_CERT_DIR") if k in os.environ}
+    inherited.setdefault("X509_CERT_DIR", GRID_CA_DIR)
     inherited.update({str(k): str(v) for k, v in (env or {}).items()})
     shell = profile_shell(selected, command, cwd=cwd)
     if os.environ.get("FULL_MC_RUNTIME_PROFILE") == selected.identifier:

@@ -16,7 +16,7 @@ from full_mc.runtime.packages import (_bundle, CORE_PAYLOAD,
                                       validate_cmssw15_source_package)
 from full_mc import settings
 from full_mc.runtime.bootstrap import unpack_runtime
-from full_mc.runtime.profiles import STAGE_RUNTIME, run_profile
+from full_mc.runtime.profiles import STAGE_RUNTIME, GRID_CA_DIR, run_profile
 from full_mc.storage.transfer import TransferClient, artifact_ready
 from full_mc.workers import execute_task
 from full_mc.workers.chain import build_command as chain_command, execute_chain
@@ -127,6 +127,13 @@ class WorkerContracts(unittest.TestCase):
             self.assertIn(str(root / "credentials"), argv)
             self.assertIn(str(root / "payload"), argv)
             self.assertIn("--cleanenv", argv)
+
+    def test_run_profile_defaults_x509_cert_dir_to_cvmfs_ca(self):
+        with patch.dict("os.environ", {"X509_USER_PROXY": "/afs/proxy"}, clear=True), \
+                patch("full_mc.runtime.profiles.subprocess.run") as run:
+            run_profile("utilities-el9", ["xrdcp", "x", "y"], cwd=Path("/tmp/chiw/w"))
+        argv = run.call_args.args[0]
+        self.assertIn("X509_CERT_DIR=" + GRID_CA_DIR, argv)
 
     def test_transfer_does_not_bind_remote_xrdfs_lfns(self):
         with patch("full_mc.runtime.profiles.run_profile") as run:
