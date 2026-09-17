@@ -154,7 +154,7 @@ class WorkerContracts(unittest.TestCase):
                 run.return_value.returncode = 0
                 TransferClient()._run([
                     "xrdcp", "--force", str(source),
-                    "root://eosuser.cern.ch///eos/home-c/chiw/output.root",
+                    "root://eosuser.cern.ch///eos/user/c/chiw/output.root",
                 ])
                 self.assertEqual(run.call_args.kwargs["bind_paths"], [str(source.parent)])
 
@@ -162,7 +162,7 @@ class WorkerContracts(unittest.TestCase):
                 run.reset_mock()
                 TransferClient()._run([
                     "xrdcp", "--force",
-                    "root://eosuser.cern.ch///eos/home-c/chiw/input.root",
+                    "root://eosuser.cern.ch///eos/user/c/chiw/input.root",
                     str(destination),
                 ])
                 self.assertEqual(run.call_args.kwargs["bind_paths"], [str(destination.parent)])
@@ -174,7 +174,7 @@ class WorkerContracts(unittest.TestCase):
                 run.return_value.returncode = 0
                 TransferClient()._run([
                     "xrdcp", "--force", str(missing),
-                    "root://eosuser.cern.ch///eos/home-c/chiw/output.root",
+                    "root://eosuser.cern.ch///eos/user/c/chiw/output.root",
                 ])
             self.assertEqual(run.call_args.kwargs["bind_paths"], [])
 

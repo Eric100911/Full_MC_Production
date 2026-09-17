@@ -1,6 +1,6 @@
 {
   "production_storage": {
-    "cern_staging": "root://eosuser.cern.ch///eos/home-c/chiw/Full_MC_Production/staging",
+    "cern_staging": "root://eosuser.cern.ch///eos/user/c/chiw/Full_MC_Production/staging",
     "ihep_products": "root://cceos.ihep.ac.cn:1094///store/user/chiw/Full_MC_Production/products",
     "ihep_archive": "root://cceos.ihep.ac.cn:1094///store/user/chiw/Full_MC_Production/archives",
     "staging_bytes": 100000000000,
