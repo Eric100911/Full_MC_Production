@@ -1556,7 +1556,8 @@ if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         msg_error "LHE shuffle-split failed"
         exit 1
     fi
-    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}"/block_*.lhe 2>/dev/null | wc -l)
+    # Block filenames carry the seed prefix passed via --filename-prefix above.
+    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe 2>/dev/null | wc -l)
     if (( BLOCK_COUNT == 0 )); then
         msg_error "Shuffle-split produced no block files"
         exit 1
@@ -1599,7 +1600,7 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
     if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         BLOCK_LOCAL_DIR="${LOCAL_DIR}/lhe_blocks"
         mkdir -p "${BLOCK_LOCAL_DIR}"
-        cp "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
+        cp "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
         msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
     fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
@@ -1630,7 +1631,7 @@ else
     if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         BLOCK_REMOTE_DIR="${OUTPUT_DIR}/lhe_blocks"
         make_remote_dir "${BLOCK_REMOTE_DIR}" || true
-        for bf in "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
+        for bf in "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
             bname=$(basename "$bf")
             BLOCK_OUTPUT=$(remote_url_for_spec "$(join_remote_spec "${BLOCK_REMOTE_DIR}" "${bname}")")
             xrdcp --nopbar --force "$bf" "${BLOCK_OUTPUT}" || \
