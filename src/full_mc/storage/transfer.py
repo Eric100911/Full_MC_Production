@@ -31,8 +31,20 @@ class TransferClient:
         else:
             from full_mc.runtime.profiles import run_profile
             scratch = Path("/tmp/chiw/mcprod-transfer")
-            binds = [str(local_path(arg).resolve().parent) for arg in command[1:]
-                     if str(arg).startswith("/") or str(arg).startswith("file:")]
+            # ``xrdfs`` receives a remote endpoint followed by remote LFN
+            # arguments (which are conventionally rooted at /store or /eos),
+            # so none of its positional paths are host paths to bind.  For
+            # xrdcp, retain binds for the local scratch side of a copy while
+            # ignoring the root:// side and paths whose parent is unavailable.
+            binds = []
+            if command[0] != "xrdfs":
+                for arg in command[1:]:
+                    text = str(arg)
+                    if is_remote(text) or not (text.startswith("/") or text.startswith("file:")):
+                        continue
+                    path = local_path(text)
+                    if path.parent.exists():
+                        binds.append(str(path.resolve().parent))
             result = run_profile("utilities-el9", command, cwd=scratch, check=False,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  bind_paths=binds)

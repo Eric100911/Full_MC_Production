@@ -10,6 +10,7 @@ from full_mc.domain.allocation import allocate_wave
 from full_mc.domain.inventory import SourceBlock
 from full_mc.domain.models import Campaign, CampaignSource
 from full_mc.domain.identity import shuffle_seed
+from full_mc.credentials import resolve_proxy_path
 from full_mc.io import atomic_json, read_json
 from full_mc.planning.graph import write_root_dag, write_submit_files, write_tasks_dag, token
 from full_mc.runtime.packages import validate_runtime_release
@@ -66,6 +67,7 @@ def plan_run(spec_path, output_dir, log_level=None):
     spec = load_run_spec(spec_path)
     if log_level:
         spec["log_level"] = log_level
+    proxy_path = resolve_proxy_path()
     _authority(spec)
     limits = spec.setdefault("limits", {})
     for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes"):
@@ -116,8 +118,8 @@ def plan_run(spec_path, output_dir, log_level=None):
         "prepared_sources": [], "blocks": {}, "pool_cursors": {},
         "job_offsets": {}, "resident": {}, "originals": [],
         "merge_buffers": {}, "groups": [], "archives": []})
-    write_submit_files(root, spec["core_root"], runtime_dir)
-    write_root_dag(root, spec, steps)
+    write_submit_files(root, spec["core_root"], runtime_dir, proxy_path)
+    write_root_dag(root, spec, steps, proxy_path)
     prepared = advance_wave(root, 0)
     return {"run_id": spec["run_id"], "run_dir": str(root), "dag": str(root / "run.dag"),
             "runtime_release": spec["runtime_release"], "source_files": len(spec["sources"]),

@@ -8,6 +8,7 @@ from full_mc.runtime.profiles import STAGE_RUNTIME
 
 CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
               "miniaod": "processing", "archive": "lhe_coordination"}
+PRE_SCRIPT_TIMEOUT_SECONDS = 3600
 
 
 def token(value):
@@ -24,7 +25,7 @@ def path_text(path):
     return value
 
 
-def write_submit_files(run_dir, core_root, runtime_dir):
+def write_submit_files(run_dir, core_root, runtime_dir, proxy_path):
     root, core, runtime = map(Path, (run_dir, core_root, runtime_dir))
     descriptor = json.loads((runtime / "runtime.json").read_text())
     submit = root / "submit"
@@ -52,7 +53,8 @@ def write_submit_files(run_dir, core_root, runtime_dir):
             'transfer_output_remaps = "result.json=' + path_text(root / "results")
                 + '/$(task).json;diagnostics.tar.gz=' + path_text(root / "logs")
                 + '/$(task).tar.gz"',
-            "use_x509userproxy = True", "getenv = False",
+            "use_x509userproxy = True", "x509userproxy = " + path_text(proxy_path),
+            "getenv = False",
             f"request_cpus = {cpus}", "request_memory = $(memory)",
             "request_disk = $(disk)",
             '+JobFlavour = "$(flavour)"',
@@ -97,14 +99,20 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
     return path
 
 
-def write_root_dag(root, spec, steps):
+def write_root_dag(root, spec, steps, proxy_path):
     root = Path(root)
-    lines = [f"CONFIG {path_text(root / 'dagman.config')}"]
+    lines = [f"CONFIG {path_text(root / 'dagman.config')}",
+             "ENV SET X509_USER_PROXY=" + path_text(proxy_path)
+             + ";X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates"]
     cli = path_text(Path(spec["core_root"]) / "mcprod")
     pre = root / "advance.sh"
     pre.write_text("#!/bin/bash\nset -euo pipefail\n"
+                   "# DAGMan inherits the submitter PATH; remote entries can block "
+                   "/usr/bin/env before Python starts.\n"
+                   "export PATH=/usr/bin:/bin\n"
                    + f"if [[ -f {path_text(root / '.complete')} ]]; then exit 99; fi\n"
-                   + f'exec {cli} internal advance-wave --run-dir {path_text(root)} --step "$1"\n')
+                   + f'exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} {cli} internal advance-wave '
+                   + f'--run-dir {path_text(root)} --step "$1"\n')
     pre.chmod(0o755)
     for index in range(steps):
         name = f"WAVE_{index:06d}"

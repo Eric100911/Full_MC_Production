@@ -17,7 +17,7 @@ from full_mc.runtime.packages import (_bundle, CORE_PAYLOAD,
 from full_mc import settings
 from full_mc.runtime.bootstrap import unpack_runtime
 from full_mc.runtime.profiles import STAGE_RUNTIME, run_profile
-from full_mc.storage.transfer import artifact_ready
+from full_mc.storage.transfer import TransferClient, artifact_ready
 from full_mc.workers import execute_task
 from full_mc.workers.chain import build_command as chain_command, execute_chain
 from full_mc.workers.lhe import build_command as lhe_command
@@ -127,6 +127,49 @@ class WorkerContracts(unittest.TestCase):
             self.assertIn(str(root / "credentials"), argv)
             self.assertIn(str(root / "payload"), argv)
             self.assertIn("--cleanenv", argv)
+
+    def test_transfer_does_not_bind_remote_xrdfs_lfns(self):
+        with patch("full_mc.runtime.profiles.run_profile") as run:
+            run.return_value.returncode = 0
+            TransferClient()._run([
+                "xrdfs", "root://eosuser.cern.ch/", "stat",
+                "/store/user/chiw/products/file.root",
+            ])
+        self.assertEqual(run.call_args.kwargs["bind_paths"], [])
+
+    def test_transfer_binds_existing_local_xrdcp_side_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "scratch" / "output.root"
+            source.parent.mkdir()
+            source.write_bytes(b"output")
+            with patch("full_mc.runtime.profiles.run_profile") as run:
+                run.return_value.returncode = 0
+                TransferClient()._run([
+                    "xrdcp", "--force", str(source),
+                    "root://eosuser.cern.ch///eos/home-c/chiw/output.root",
+                ])
+                self.assertEqual(run.call_args.kwargs["bind_paths"], [str(source.parent)])
+
+                destination = root / "scratch" / "input.root"
+                run.reset_mock()
+                TransferClient()._run([
+                    "xrdcp", "--force",
+                    "root://eosuser.cern.ch///eos/home-c/chiw/input.root",
+                    str(destination),
+                ])
+                self.assertEqual(run.call_args.kwargs["bind_paths"], [str(destination.parent)])
+
+    def test_transfer_skips_missing_local_bind_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing" / "output.root"
+            with patch("full_mc.runtime.profiles.run_profile") as run:
+                run.return_value.returncode = 0
+                TransferClient()._run([
+                    "xrdcp", "--force", str(missing),
+                    "root://eosuser.cern.ch///eos/home-c/chiw/output.root",
+                ])
+            self.assertEqual(run.call_args.kwargs["bind_paths"], [])
 
     def test_bundle_omits_generated_and_provenance(self):
         core = Path(__file__).resolve().parents[1]

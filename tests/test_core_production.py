@@ -2,6 +2,7 @@
 import gzip
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.application.production import advance_wave, plan_run, restore_archived_sources
 from full_mc.io import atomic_json, read_json
+from full_mc.planning.graph import PRE_SCRIPT_TIMEOUT_SECONDS, write_root_dag
 from full_mc.storage.transfer import artifact_ref, TransferClient
 from full_mc.workers.archive import execute as archive_execute
 from tests.generate_synthetic_lhe import generate
@@ -30,6 +32,8 @@ def sidecar(ref, *, events=None, count_source=None):
     return result
 
 
+@patch("full_mc.application.production.resolve_proxy_path",
+       new=lambda: "/afs/cern.ch/user/test/x509_user_proxy")
 class ProductionLifecycle(unittest.TestCase):
     def fixture(self, root):
         source = root / "input.lhe"
@@ -117,11 +121,22 @@ class ProductionLifecycle(unittest.TestCase):
             root_dag = (run / "run.dag").read_text()
             self.assertIn("PRE_SKIP WAVE_000000 99", root_dag)
             self.assertIn("SCRIPT PRE WAVE_000000", root_dag)
+            advance_script = (run / "advance.sh").read_text()
+            self.assertIn("DAGMan inherits the submitter PATH", advance_script)
+            self.assertIn("export PATH=/usr/bin:/bin", advance_script)
+            self.assertIn(f"exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} ", advance_script)
+            subprocess.run(["bash", "-n", str(run / "advance.sh")], check=True)
             source_dag = Path(read_json(run / "state.json")["pending"]["dag"]).read_text()
             self.assertIn("CONFIG " + str(run / "dagman.config"), source_dag)
             self.assertIn("CATEGORY", source_dag)
             self.assertIn("MAXJOBS lhe", source_dag)
-            self.assertIn("should_transfer_files = YES", (run / "submit/plan.sub").read_text())
+            for submit_path in (run / "submit").glob("*.sub"):
+                submit = submit_path.read_text()
+                self.assertIn("should_transfer_files = YES", submit)
+                self.assertIn("x509userproxy = /afs/cern.ch/user/test/x509_user_proxy", submit)
+                self.assertNotIn("x509up_u", submit)
+            self.assertIn("ENV SET X509_USER_PROXY=/afs/cern.ch/user/test/x509_user_proxy;"
+                          "X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates", root_dag)
             self.assertFalse((run / "submit/merge.sub").exists())
             replay = advance_wave(run, 0)
             self.assertEqual(replay["phase"], "sources")
@@ -147,6 +162,37 @@ class ProductionLifecycle(unittest.TestCase):
             self.assertEqual(len(state["archives"]), 1)
             self.assertEqual(state["terminal_cleanup"], ["BLOCK:pool:s1:000002"])
             self.assertFalse((run / "cern/offline/sources/pool/s1/blocks/block2.lhe.gz").exists())
+
+    def test_pre_timeout_fails_and_complete_sentinel_still_skips(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            core = root / "core"
+            core.mkdir()
+            cli = core / "mcprod"
+            cli.write_text("#!/bin/bash\n/usr/bin/sleep 1\n", encoding="utf-8")
+            cli.chmod(0o755)
+            with patch("full_mc.planning.graph.PRE_SCRIPT_TIMEOUT_SECONDS", 0.01):
+                write_root_dag(root, {"core_root": str(core)}, 1,
+                               "/afs/cern.ch/user/test/x509_user_proxy")
+
+            pre = root / "advance.sh"
+            subprocess.run(["bash", "-n", str(pre)], check=True)
+            timed_out = subprocess.run([str(pre), "0"], check=False)
+            self.assertEqual(timed_out.returncode, 124)
+            self.assertIn("PRE_SKIP WAVE_000000 99", (root / "run.dag").read_text())
+
+            (root / ".complete").touch()
+            skipped = subprocess.run([str(pre), "0"], check=False)
+            self.assertEqual(skipped.returncode, 99)
+
+    def test_proxy_resolution_blocks_artifact_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, run = self.fixture(Path(temporary))
+            with patch("full_mc.application.production.resolve_proxy_path",
+                       side_effect=RuntimeError("missing persistent proxy")):
+                with self.assertRaisesRegex(RuntimeError, "missing persistent proxy"):
+                    plan_run(spec, run)
+            self.assertFalse(run.exists())
 
     def test_missing_referenced_runtime_asset_blocks_planning(self):
         with tempfile.TemporaryDirectory() as temporary:
