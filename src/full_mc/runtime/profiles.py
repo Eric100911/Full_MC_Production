@@ -26,16 +26,40 @@ PROFILES = {
     "utilities-el9": RuntimeProfile("utilities-el9", IMAGE+"el9:x86_64"),
     "pythia-el8": RuntimeProfile("pythia-el8", IMAGE+"el8:x86_64", "el8_amd64_gcc10",
         "/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMSSW_12_4_14"),
-    "cmssw12-el8": RuntimeProfile("cmssw12-el8", IMAGE+"el8:x86_64", "el8_amd64_gcc10",
+    "cmssw12-sim-el8": RuntimeProfile("cmssw12-sim-el8", IMAGE+"el8:x86_64", "el8_amd64_gcc10",
         "/cvmfs/cms.cern.ch/el8_amd64_gcc10/cms/cmssw/CMSSW_12_4_14"),
-    "cmssw15-el9": RuntimeProfile("cmssw15-el9", IMAGE+"el9:x86_64", "el9_amd64_gcc12",
+    "cmssw15-sim-el9": RuntimeProfile("cmssw15-sim-el9", IMAGE+"el9:x86_64", "el9_amd64_gcc12",
+        "/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMSSW_15_0_15"),
+    "cmssw15-ntuple-el9": RuntimeProfile("cmssw15-ntuple-el9", IMAGE+"el9:x86_64", "el9_amd64_gcc12",
         "/cvmfs/cms.cern.ch/el9_amd64_gcc12/cms/cmssw/CMSSW_15_0_15"),
     "analyzer-el9": RuntimeProfile("analyzer-el9", IMAGE+"el9:x86_64",
         lcg_view="/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh"),
 }
+PROFILES.update({
+    # Compatibility names are retained for already prepared non-schema-v2
+    # runtime descriptors; new task JSON uses the explicit role names above.
+    "cmssw12-el8": PROFILES["cmssw12-sim-el8"],
+    "cmssw15-el9": PROFILES["cmssw15-ntuple-el9"],
+})
 STAGE_RUNTIME = dict(lhe="helac-el7", plan="utilities-el9", mix="pythia-el8",
-    miniaod="cmssw12-el8", merge="cmssw12-el8", ntuple="cmssw15-el9",
+    miniaod="cmssw12-sim-el8", merge="cmssw12-sim-el8", ntuple="cmssw15-ntuple-el9",
     selection="analyzer-el9", efficiency="analyzer-el9", archive="utilities-el9")
+
+
+def runtime_for_profile(profile, role: str) -> str:
+    """Return the runtime role frozen by a detector profile."""
+    if role == "simulation":
+        identifier = profile.get("simulation_runtime")
+    elif role == "merge":
+        identifier = profile.get("merge_runtime")
+    elif role == "ntuple":
+        identifier = profile.get("ntuple_runtime")
+    else:
+        raise ValueError(f"unknown detector runtime role: {role}")
+    if not identifier:
+        raise ValueError(f"detector profile lacks {role} runtime")
+    resolve_profile(identifier)
+    return identifier
 
 def resolve_profile(identifier):
     if identifier not in PROFILES:

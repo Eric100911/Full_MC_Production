@@ -7,27 +7,30 @@ from ._common import core_path, count_lhe_events, parameters, prepare, publish, 
 
 def build_command(task, work_dir):
     p = parameters(task)
-    maximum = int(p["max_events"])
-    if maximum <= 0:
-        raise ValueError("HELAC max_events must be positive and finite")
+    profile = p.get("generator_profile")
+    if not isinstance(profile, dict):
+        raise ValueError("HELAC task must carry its resolved generator_profile")
+    nmc = int(profile.get("nmc", 0))
+    unwevt = int(profile.get("unwevt", 0))
+    if nmc <= 0 or unwevt <= 0:
+        raise ValueError("resolved HELAC profile requires positive nmc and unwevt")
     command = ["bash", str(core_path(task, "lhe_generation/run_helac.sh")),
                "--pool", str(p["pool_name"]), "--seed", str(p["seed"]),
-               "--unwevt", str(maximum),
+               "--nmc", str(nmc), "--unwevt", str(unwevt),
                "--output-dir", "lhe", "--compress-lhe",
                "--helac-diagnostics", "none", "--log-level",
                "info" if task.get("log_level") == "debug" else "slim"]
-    process = p.get("process") or "\n".join(p.get("process_lines", []))
+    process = profile.get("process") or "\n".join(profile.get("process_lines", []))
     if process:
         command += ["--process", process]
-    for key, flag in (
-        ("charm_state", "--charm-state"), ("bottom_state", "--bottom-state"),
-        ("extra_gluon", "--extra-gluon"), ("min_pt_conia", "--min-pt-conia"),
-        ("min_pt_bonia", "--min-pt-bonia"), ("min_pt_q", "--min-pt-q"),
-        ("min_m_qqp", "--min-m-qqp"), ("min_m_q_beam", "--min-m-q-beam"),
-        ("nmc", "--nmc")):
-        if key in p and p[key] is not None:
-            value = str(p[key]).lower() if isinstance(p[key], bool) else str(p[key])
-            command += [flag, value]
+    cuts = profile.get("cuts", {})
+    for key, flag in (("min_pt_conia", "--min-pt-conia"),
+                      ("min_pt_bonia", "--min-pt-bonia"),
+                      ("min_pt_q", "--min-pt-q"),
+                      ("min_m_qqp", "--min-m-qqp"),
+                      ("min_m_q_beam", "--min-m-q-beam")):
+        if key in cuts and cuts[key] is not None:
+            command += [flag, str(cuts[key])]
     return command
 
 
@@ -40,6 +43,12 @@ def execute(task, work_dir):
     p = parameters(task)
     output = work_dir / "products/lhe" / f"sample_{p['pool_name']}_{p['seed']}.lhe.gz"
     events = count_lhe_events(output)
-    if not 0 < events <= int(p["max_events"]):
-        raise RuntimeError("HELAC output violates its finite event cap")
+    profile = p.get("generator_profile")
+    if not isinstance(profile, dict):
+        raise ValueError("HELAC task must carry its resolved generator_profile")
+    if events <= 0:
+        raise RuntimeError("HELAC produced no LHE events")
+    if (profile.get("unwevt_semantics") == "main-path-stop-target"
+            and events > int(profile["unwevt"])):
+        raise RuntimeError("main-path output exceeds its accepted-event stop target")
     return result(task, [publish(output, task, events=events)])

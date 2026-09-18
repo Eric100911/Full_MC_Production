@@ -14,7 +14,7 @@ from full_mc.credentials import resolve_proxy_path
 from full_mc.io import atomic_json, read_json
 from full_mc.planning.graph import write_root_dag, write_submit_files, write_tasks_dag, token
 from full_mc.runtime.packages import validate_runtime_release
-from full_mc.runtime.profiles import STAGE_RUNTIME
+from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.settings import load_run_spec
 from full_mc.storage.archive import restore_members
 from full_mc.storage.transfer import TransferClient, artifact_ready
@@ -25,11 +25,19 @@ def _campaigns(spec):
         CampaignSource(s["pool"], s["mode"], int(s["lhe_budget"]),
                        float(s.get("efficiency", 1))) for s in c["sources"]],
         int(c["target_mixed_events"]), int(c["max_processing_nodes"]),
-        int(c["merge_events"])) for c in spec["campaigns"]]
+        int(c["merge_events"]),
+        [profile["profile_id"] for profile in c["resolved_detector_variants"]],
+        list(c["resolved_detector_variants"])) for c in spec["campaigns"]]
 
 
 def _task(spec, identity, stage, inputs, outputs, parameters):
-    return {"task_id": token(identity), "stage": stage, "runtime": STAGE_RUNTIME[stage],
+    profile = parameters.get("detector_profile")
+    if profile and stage in {"miniaod", "merge", "ntuple"}:
+        role = {"miniaod": "simulation", "merge": "merge", "ntuple": "ntuple"}[stage]
+        runtime = runtime_for_profile(profile, role)
+    else:
+        runtime = STAGE_RUNTIME[stage]
+    return {"task_id": token(identity), "stage": stage, "runtime": runtime,
             "runtime_release": spec["runtime_release"], "log_level": spec["log_level"],
             "inputs": inputs, "outputs": outputs, "parameters": parameters}
 
@@ -53,7 +61,7 @@ def _authority(spec):
     if not inventory.get("complete"):
         raise ValueError("authoritative inventory is not complete")
     for source in spec["sources"]:
-        if source.get("generation"):
+        if source.get("generator_profile"):
             continue
         files = inventory["pools"][source["pool"]]["files"]
         match = next((item for item in files if item["path"] == source["url"]), None)
@@ -95,8 +103,11 @@ def plan_run(spec_path, output_dir, log_level=None):
     expected_revision = str(spec.get("core_revision", ""))
     if expected_revision and expected_revision != runtime["git_revision"]:
         raise ValueError("supplied core_revision does not match the prepared runtime")
-    required = {STAGE_RUNTIME[s] for s in ("plan", "mix", "miniaod", "archive")}
-    if any(s.get("generation") for s in spec["sources"]):
+    required = {STAGE_RUNTIME[s] for s in ("plan", "mix", "archive")}
+    required.update(runtime_for_profile(profile, "simulation")
+                    for campaign in spec["campaigns"]
+                    for profile in campaign["resolved_detector_variants"])
+    if any(s.get("generator_profile") for s in spec["sources"]):
         required.add(STAGE_RUNTIME["lhe"])
     if not required <= set(runtime["profiles"]):
         raise ValueError("runtime release lacks required worker profiles")
@@ -171,7 +182,8 @@ def _source_phase(root, step, spec, state):
         if index in state["prepared_sources"] or needed[source["pool"]] <= 0:
             continue
         selected.append(index)
-        hint = source.get("actual_events", source.get("generation", {}).get("max_events", 0))
+        profile = source.get("resolved_generator_profile", {})
+        hint = source.get("actual_events", profile.get("planning_events_hint", 0))
         # Only a preparation hint; allocation later uses the splitter's actual count.
         needed[source["pool"]] -= int(hint)
         if len(selected) == spec["limits"]["source_files_per_step"]:
@@ -189,11 +201,14 @@ def _source_phase(root, step, spec, state):
     for index in selected:
         source = spec["sources"][index]
         base = f"{_staging(spec)}/sources/{source['pool']}/{source['source_id']}"
-        original = _ref(f"LHE_{index:06d}", base + "/source.lhe.gz", "lhe")
-        generation = source.get("generation")
+        generation = source.get("resolved_generator_profile")
+        original_extra = ({"generator_profile": deepcopy(generation)}
+                          if generation else {})
+        original = _ref(f"LHE_{index:06d}", base + "/source.lhe.gz", "lhe",
+                        **original_extra)
         if generation:
             lhe = _task(spec, f"LHE_{index:06d}", "lhe", [], [original], dict(
-                generation, pool_name=source["pool"], seed=int(source["seed"]),
+                generator_profile=generation, pool_name=source["pool"], seed=int(source["seed"]),
                 max_output_bytes=limits["source_lhe_bytes"],
                 scratch_bytes=limits["source_lhe_bytes"] * 4))
             tasks.append(lhe)
@@ -250,13 +265,35 @@ def _process_phase(root, step, spec, state, allocation):
                 dict(parameters, sources=slots, mixing_rng_seed=node["mixing_rng_seed"],
                      max_output_bytes=spec["limits"]["mixed_hepmc_bytes"],
                      scratch_bytes=spec["limits"]["mixed_hepmc_bytes"] * 10))
-            product = _ref("MINIAOD_" + identity,
-                spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"]
-                + "/" + campaign["name"] + "/" + node["job_id"] + ".root", "miniaod")
-            mini = _task(spec, "MINIAOD_" + identity, "miniaod", [hepmc], [product], parameters)
-            tasks += [mix, mini]
-            dependencies.append(([mix["task_id"]], mini["task_id"]))
-            mini_records.append({"campaign": campaign["name"], "task_id": mini["task_id"]})
+            tasks.append(mix)
+            for profile in campaign["resolved_detector_variants"]:
+                variant = profile["profile_id"]
+                detector_identity = f"{campaign['name']}_{variant}_{node['job_id']}"
+                detector_parameters = dict(
+                    parameters,
+                    detector_profile_id=variant,
+                    detector_profile=deepcopy(profile),
+                    simulation_runtime=runtime_for_profile(profile, "simulation"),
+                    merge_runtime=runtime_for_profile(profile, "merge"),
+                    ntuple_runtime=runtime_for_profile(profile, "ntuple"),
+                )
+                product = _ref(
+                    "MINIAOD_" + detector_identity,
+                    spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"]
+                    + "/" + campaign["name"] + "/" + variant + "/" + node["job_id"] + ".root",
+                    "miniaod", detector_profile_id=variant,
+                    detector_profile=deepcopy(profile),
+                )
+                mini = _task(spec, "MINIAOD_" + detector_identity, "miniaod",
+                             [hepmc], [product], detector_parameters)
+                tasks.append(mini)
+                dependencies.append(([mix["task_id"]], mini["task_id"]))
+                mini_records.append({"campaign": campaign["name"],
+                                     "detector_profile_id": variant,
+                                     "detector_profile": deepcopy(profile),
+                                     "mix_task_id": mix["task_id"],
+                                     "job_id": node["job_id"],
+                                     "task_id": mini["task_id"]})
             mixed.append(hepmc)
     archive_inputs = [state["resident"][key] for key in state["originals"]] + mixed
     archive_ref = _ref(f"ARCHIVE_{step:06d}", spec["storage"]["ihep_archive"].rstrip("/")
@@ -418,16 +455,36 @@ def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None
             "restored": restore_members(output, selected, destination)}
 
 
-def _combined(spec, campaign, refs, ordinal):
+def _sample_key(campaign_name, detector_profile_id):
+    return f"{campaign_name}::{detector_profile_id}"
+
+
+def _combined(spec, campaign, detector_profile, refs, ordinal):
     name = campaign["name"]
-    identity = f"{name}_MERGE{ordinal:06d}"
-    base = spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"] + "/" + name
-    parameters = {"campaign": name, "analysis": campaign["analysis"], "merge_group": identity}
+    variant = detector_profile["profile_id"]
+    identity = f"{name}_{variant}_MERGE{ordinal:06d}"
+    base = (spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"]
+            + "/" + name + "/" + variant)
+    parameters = {"campaign": name, "analysis": campaign["analysis"],
+                  "merge_group": identity, "sample_key": _sample_key(name, variant),
+                  "detector_profile_id": variant, "detector_profile": deepcopy(detector_profile),
+                  "simulation_runtime": runtime_for_profile(detector_profile, "simulation"),
+                  "merge_runtime": runtime_for_profile(detector_profile, "merge"),
+                  "ntuple_runtime": runtime_for_profile(detector_profile, "ntuple"),
+                  "mc_global_tag": detector_profile.get("mc_global_tag"),
+                  "era": detector_profile.get("era")}
+    provenance = {"detector_profile_id": variant,
+                  "detector_profile": deepcopy(detector_profile),
+                  "mc_global_tag": detector_profile.get("mc_global_tag"),
+                  "era": detector_profile.get("era"),
+                  "simulation_runtime": runtime_for_profile(detector_profile, "simulation"),
+                  "merge_runtime": runtime_for_profile(detector_profile, "merge"),
+                  "ntuple_runtime": runtime_for_profile(detector_profile, "ntuple")}
     outputs = {
-        "merge": _ref(identity + "_merged", base + "/merged/" + identity + ".root", "miniaod"),
-        "ntuple": _ref(identity + "_raw", base + "/ntuples/" + identity + ".root", "raw-ntuple"),
-        "selection": _ref(identity + "_selected", base + "/selected/" + identity + ".root", "selected-ntuple"),
-        "efficiency": _ref(identity + "_efficiency", base + "/efficiency/" + identity + ".tar", "efficiency-shard")}
+        "merge": _ref(identity + "_merged", base + "/merged/" + identity + ".root", "miniaod", **provenance),
+        "ntuple": _ref(identity + "_raw", base + "/ntuples/" + identity + ".root", "raw-ntuple", **provenance),
+        "selection": _ref(identity + "_selected", base + "/selected/" + identity + ".root", "selected-ntuple", **provenance),
+        "efficiency": _ref(identity + "_efficiency", base + "/efficiency/" + identity + ".tar", "efficiency-shard", **provenance)}
     if campaign["analysis"] == "JUP":
         outputs = {key: value for key, value in outputs.items() if key in ("merge", "ntuple")}
     subtasks = {stage: _task(spec, identity + "_" + stage, stage, refs if stage == "merge" else [],
@@ -439,18 +496,22 @@ def _combined(spec, campaign, refs, ordinal):
 def _merge_groups(spec, state, flush=False):
     for campaign in spec["campaigns"]:
         name = campaign["name"]
-        buffer = state["merge_buffers"].setdefault(name, [])
-        while buffer:
-            total, end = 0, 0
-            while end < len(buffer) and total < int(campaign["merge_events"]):
-                total += int(buffer[end]["events"])
-                end += 1
-            if total < int(campaign["merge_events"]) and not flush:
-                break
-            ordinal = sum(g["subtasks"]["merge"]["parameters"]["campaign"] == name
-                          for g in state["groups"])
-            state["groups"].append(_combined(spec, campaign, buffer[:end], ordinal))
-            del buffer[:end]
+        for detector_profile in campaign["resolved_detector_variants"]:
+            variant = detector_profile["profile_id"]
+            buffer = state["merge_buffers"].setdefault(_sample_key(name, variant), [])
+            while buffer:
+                total, end = 0, 0
+                while end < len(buffer) and total < int(campaign["merge_events"]):
+                    total += int(buffer[end]["events"])
+                    end += 1
+                if total < int(campaign["merge_events"]) and not flush:
+                    break
+                ordinal = sum(
+                    g["subtasks"]["merge"]["parameters"].get("sample_key")
+                    == _sample_key(name, variant) for g in state["groups"])
+                state["groups"].append(
+                    _combined(spec, campaign, detector_profile, buffer[:end], ordinal))
+                del buffer[:end]
 
 
 def _write_groups(root, spec, state):
@@ -485,10 +546,16 @@ def _finish_pending(root, spec, state):
         archive = _result(root, pending["archive_task"], spec, "archive")
         _validate_archive_result(root, spec, pending, archive, client)
         for item in pending["miniaods"]:
+            task = read_json(root / "tasks" / (item["task_id"] + ".json"))
             output = _result(root, item["task_id"], spec, "miniaod")["outputs"][0]
             if not artifact_ready(output, client) or int(output.get("events", 0)) <= 0:
                 raise RuntimeError("component MiniAOD is not verified")
-            state["merge_buffers"].setdefault(item["campaign"], []).append(output)
+            expected_profile = item["detector_profile_id"]
+            if (task["parameters"].get("detector_profile_id") != expected_profile
+                    or output.get("detector_profile_id") != expected_profile):
+                raise RuntimeError("MiniAOD provenance does not match its detector task")
+            state["merge_buffers"].setdefault(
+                _sample_key(item["campaign"], expected_profile), []).append(output)
         allocation = pending["allocation"]
         remove = [state["resident"][key] for key in state["originals"]]
         for pool, cursor in allocation["pool_cursors_after"].items():

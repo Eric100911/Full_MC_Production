@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 from full_mc.io import atomic_json
+from full_mc.storage.reservation import reserve_run_namespaces
 
 
 SCHEMA = "full-mc-condor-submission-v1"
@@ -165,8 +166,14 @@ def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
         record = _load_submission(root)
         raise RuntimeError("submission already recorded as %s; use status or explicit rescue resume" %
                            record.get("state", "unknown"))
+    spec_bytes = spec_path.read_bytes()
     spec = _read_json(spec_path)
     _assert_submittable(spec)
+    # Ownership is established before the durable Condor attempt record and
+    # before invoking condor_submit_dag.  A failed reservation therefore cannot
+    # leave an ambiguous scheduler submission behind.
+    if spec.get("storage"):
+        reserve_run_namespaces(spec, spec_bytes=spec_bytes)
     scheduler = _schedd(spec, runner, root)
     # ``-Remote`` enables spool submission, which CERN rejects unless the root
     # DAG declares spool outputs. Select the recorded schedd through HTCondor's

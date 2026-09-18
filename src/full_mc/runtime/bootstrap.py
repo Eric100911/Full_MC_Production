@@ -52,7 +52,7 @@ def unpack_runtime(release_dir, destination, profile, release):
 
     _extract(bundle("core"), destination, "core")
     core = destination / "core"
-    if profile in ("helac-el7", "cmssw15-el9"):
+    if profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
         asset = bundle(profile)
         packages = core / "common/packages"
         packages.mkdir(parents=True, exist_ok=True)

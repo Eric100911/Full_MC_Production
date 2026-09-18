@@ -46,29 +46,40 @@ class Source:
     pool: str
     source_id: str
     seed: int
-    url: str
-    actual_events: int
-    size_bytes: int
+    url: str = ""
+    actual_events: Optional[int] = None
+    size_bytes: Optional[int] = None
     planned_events: Optional[int] = None
+    generator_profile: Optional[str] = None
+    resolved_generator_profile: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
-        if not self.pool or not self.source_id or not self.url:
-            raise ValueError("source pool, source_id, and url are required")
-        _positive(self.actual_events, "source.actual_events")
-        _positive(self.size_bytes, "source.size_bytes", allow_zero=True)
+        if not self.pool or not self.source_id:
+            raise ValueError("source pool and source_id are required")
+        if bool(self.url) == bool(self.generator_profile):
+            raise ValueError("source must select exactly one URL or generator_profile")
+        if self.url:
+            _positive(self.actual_events, "source.actual_events")
+            _positive(self.size_bytes, "source.size_bytes", allow_zero=True)
+        elif not isinstance(self.resolved_generator_profile, dict):
+            raise ValueError("generated source must carry its resolved profile")
         if self.planned_events is not None:
             _positive(self.planned_events, "source.planned_events", allow_zero=True)
-            if self.planned_events > self.actual_events:
+            if self.actual_events is not None and self.planned_events > self.actual_events:
                 raise ValueError("source.planned_events exceeds actual_events")
 
     @property
     def available_events(self) -> int:
-        return self.actual_events if self.planned_events is None else self.planned_events
+        available = self.actual_events
+        if available is None:
+            available = int(self.resolved_generator_profile["planning_events_hint"])
+        return available if self.planned_events is None else self.planned_events
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Source":
         return cls(**{name: raw.get(name) for name in (
-            "pool", "source_id", "seed", "url", "actual_events", "size_bytes", "planned_events")})
+            "pool", "source_id", "seed", "url", "actual_events", "size_bytes", "planned_events",
+            "generator_profile", "resolved_generator_profile")})
 
     def to_dict(self) -> Dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -97,6 +108,8 @@ class Campaign:
     target_mixed_events: int
     max_processing_nodes: int
     merge_events: int
+    detector_variants: List[str] = field(default_factory=list)
+    resolved_detector_variants: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.name or self.analysis not in {"JJP", "JUP"}:
@@ -106,6 +119,10 @@ class Campaign:
         _positive(self.target_mixed_events, "campaign.target_mixed_events")
         _positive(self.max_processing_nodes, "campaign.max_processing_nodes")
         _positive(self.merge_events, "campaign.merge_events")
+        if not self.detector_variants or len(self.detector_variants) != len(set(self.detector_variants)):
+            raise ValueError("campaign requires distinct detector_variants")
+        if len(self.resolved_detector_variants) != len(self.detector_variants):
+            raise ValueError("campaign detector variants must be resolved")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Campaign":
@@ -115,6 +132,8 @@ class Campaign:
             target_mixed_events=raw.get("target_mixed_events"),
             max_processing_nodes=raw.get("max_processing_nodes"),
             merge_events=raw.get("merge_events"),
+            detector_variants=list(raw.get("detector_variants", [])),
+            resolved_detector_variants=list(raw.get("resolved_detector_variants", [])),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -136,10 +155,10 @@ class RunSpec:
     profiles: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only run-spec schema_version 1 is supported")
-        if not self.run_id or not self.core_revision or not self.runtime_release:
-            raise ValueError("run_id, core_revision, and runtime_release are required")
+        if self.schema_version != 2:
+            raise ValueError("only run-spec schema_version 2 is supported")
+        if not self.run_id or not self.runtime_release:
+            raise ValueError("run_id and runtime_release are required")
         _positive(self.block_events, "block_events")
         required_storage = {"cern_staging", "ihep_products", "ihep_archive", "staging_bytes", "reserve_bytes"}
         missing = required_storage - set(self.storage)

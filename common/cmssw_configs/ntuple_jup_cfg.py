@@ -26,6 +26,16 @@ ivars.register('runOnMC',
                VarParsing.VarParsing.multiplicity.singleton,
                VarParsing.VarParsing.varType.bool,
                "Run on MC (True) or Data (False)")
+ivars.register('era',
+               'Run2022',
+               VarParsing.VarParsing.multiplicity.singleton,
+               VarParsing.VarParsing.varType.string,
+               "MC era used for provenance")
+ivars.register('globalTag',
+               '',
+               VarParsing.VarParsing.multiplicity.singleton,
+               VarParsing.VarParsing.varType.string,
+               "Explicit GlobalTag override for MC provenance")
 
 # Note: maxEvents is already registered by VarParsing('analysis')
 # Set default value instead of re-registering
@@ -68,7 +78,8 @@ process.load('Configuration.StandardSequences.FrontierConditions_GlobalTag_cff')
 from Configuration.AlCa.GlobalTag import GlobalTag
 
 if runOnMC:
-    process.GlobalTag.globaltag = cms.string('124X_mcRun3_2022_realistic_v12')
+    process.GlobalTag.globaltag = cms.string(
+        ivars.globalTag or '124X_mcRun3_2022_realistic_v12')
 else:
     process.GlobalTag = GlobalTag(process.GlobalTag, '124X_dataRun3_PromptAnalysis_v1', '')
 

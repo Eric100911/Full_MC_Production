@@ -72,6 +72,9 @@ def _original_output(task, inputs, work_dir):
         TransferClient().copy_out(retained, url)
     original = artifact_ref(retained, output["artifact_id"], output["kind"],
                             source_ref["events"], url)
+    for key in ("generator_profile", "detector_profile_id", "detector_profile"):
+        if key in output:
+            original[key] = output[key]
     # Fresh LHE generation already published this exact URL and its sidecar.
     # Preserve it for later archive/reclamation without making another sidecar.
     if url == str(source_ref["url"]) and source_ref.get("sidecar_url"):

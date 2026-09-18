@@ -47,11 +47,12 @@ class ProductionLifecycle(unittest.TestCase):
         atomic_json(runtime / "runtime.json", {
             "runtime_release": "test-release", "site": "cern", "git_revision": "deadbeef",
             "source_dirty": False,
-            "profiles": ["utilities-el9", "pythia-el8", "cmssw12-el8"],
+            "profiles": ["utilities-el9", "pythia-el8", "cmssw12-sim-el8"],
             "bundles": {"core": "core.tgz", "utilities-el9": "utilities.tgz",
-                        "pythia-el8": "pythia.tgz", "cmssw12-el8": "cmssw12.tgz"}})
+                        "pythia-el8": "pythia.tgz", "cmssw12-sim-el8": "cmssw12.tgz"}})
         spec = {
-            "run_id": "offline", "runtime_release": "test-release", "runtime_dir": str(runtime),
+            "schema_version": 2, "run_id": "offline", "runtime_release": "test-release",
+            "runtime_dir": str(runtime),
             "block_events": 5,
             "storage": {"cern_staging": str(root / "cern"),
                         "ihep_products": str(root / "ihep/products"),
@@ -64,9 +65,11 @@ class ProductionLifecycle(unittest.TestCase):
                                         "block_processing": 2, "processing": 2,
                                         "lhe_coordination": 1}},
             "sources": [{"pool": "pool", "source_id": "s1", "seed": 19,
-                         "url": str(source), "actual_events": 15}],
+                         "url": str(source), "actual_events": 15,
+                         "size_bytes": source.stat().st_size}],
             "campaigns": [{"name": "C", "analysis": "JJP", "target_mixed_events": 1,
                            "max_processing_nodes": 1, "merge_events": 1,
+                           "detector_variants": ["run3_2022_legacy_premix_v1"],
                            "sources": [{"pool": "pool", "mode": "normal", "lhe_budget": 5},
                                        {"pool": "pool", "mode": "normal", "lhe_budget": 5}]}]}
         spec_path = root / "spec.json"
@@ -157,7 +160,7 @@ class ProductionLifecycle(unittest.TestCase):
             self.assertEqual(done["status"], "complete")
             state = read_json(run / "state.json")
             self.assertEqual(state["pool_cursors"], {"pool": 2})
-            self.assertEqual(len(state["merge_buffers"]["C"]), 0)
+            self.assertEqual(len(state["merge_buffers"]["C::run3_2022_legacy_premix_v1"]), 0)
             self.assertEqual(len(state["groups"]), 1)
             self.assertEqual(len(state["archives"]), 1)
             self.assertEqual(state["terminal_cleanup"], ["BLOCK:pool:s1:000002"])

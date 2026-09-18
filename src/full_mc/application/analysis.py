@@ -31,9 +31,14 @@ def prepare_aggregate(handoff_path, output_path, campaign="JJP", log_level=None)
         selection, efficiency = subtasks["selection"], subtasks["efficiency"]
         parameters = efficiency["parameters"]
         sample = parameters["campaign"]
+        detector_profile_id = parameters.get("detector_profile_id")
+        if not detector_profile_id:
+            raise ValueError("aggregation task is missing detector_profile_id")
+        sample_key = f"{sample}::{detector_profile_id}"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", sample):
             raise ValueError("sample must be a path-safe campaign identifier")
-        pair = {}
+        pair = {"detector_profile_id": detector_profile_id,
+                "detector_profile": parameters.get("detector_profile")}
         for name, stage, kind in (("selection", selection, "selected-ntuple"),
                                    ("efficiency", efficiency, "efficiency-shard")):
             outputs = stage["outputs"]
@@ -46,18 +51,23 @@ def prepare_aggregate(handoff_path, output_path, campaign="JJP", log_level=None)
                 raise ValueError(f"unverified aggregation input: {ref['artifact_id']}")
             seen.add(ref["artifact_id"])
             pair[name] = ref
-        groups.setdefault(sample, []).append(pair)
+        groups.setdefault(sample_key, []).append(pair)
     if not groups:
         raise ValueError("no validated selection/efficiency pairs to aggregate")
     output_path = Path(output_path).resolve()
     base = str(handoff.get("analysis_output", output_path.parent / "analysis-products")).rstrip("/")
     outputs = []
     for sample in groups:
+        campaign, detector_profile_id = sample.split("::", 1)
+        profile = next((pair.get("detector_profile") for pair in groups[sample]
+                        if pair.get("detector_profile") is not None), None)
         outputs.extend([
             {"artifact_id": f"aggregate:{sample}:selected", "kind": "selected-ntuple",
-             "url": f"{base}/{sample}/selected.root"},
+             "url": f"{base}/{campaign}/{detector_profile_id}/selected.root",
+             "detector_profile_id": detector_profile_id, "detector_profile": profile},
             {"artifact_id": f"aggregate:{sample}:efficiency", "kind": "efficiency-maps",
-             "url": f"{base}/{sample}/efficiency.tar"},
+             "url": f"{base}/{campaign}/{detector_profile_id}/efficiency.tar",
+             "detector_profile_id": detector_profile_id, "detector_profile": profile},
         ])
     task = {"schema": "full-mc-aggregate-v1", "task_id": handoff["run_id"] + ":aggregate",
             "stage": "aggregate", "runtime": "analyzer-el9",
@@ -100,6 +110,7 @@ def run_aggregate_task(prepared_path, work_dir, log_level=None):
     analyzer = CORE_ROOT / "external/NtupleAnalyzer"
     products = []
     for sample, pairs in task["groups"].items():
+        campaign, _detector_profile_id = sample.split("::", 1)
         sample_root = root / sample
         # A fresh attempt avoids accepting files left by a failed aggregation.
         import tempfile
@@ -107,12 +118,12 @@ def run_aggregate_task(prepared_path, work_dir, log_level=None):
         attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=sample_root))
         selected, used = [], set()
         for pair in pairs:
-            for ref in pair.values():
+            for ref in (pair["selection"], pair["efficiency"]):
                 if not artifact_ready(ref):
                     raise RuntimeError(f"aggregation input is no longer valid: {ref['artifact_id']}")
             selected.append(str(materialize_input(pair["selection"], attempt)))
             shard = materialize_input(pair["efficiency"], attempt)
-            _extract_shard(shard, attempt / "shards", sample, used)
+            _extract_shard(shard, attempt / "shards", campaign, used)
         input_list = attempt / "selected-inputs.json"
         atomic_json(input_list, selected)
         selected_output = attempt / "selected.root"
@@ -126,7 +137,7 @@ def run_aggregate_task(prepared_path, work_dir, log_level=None):
         run(task, "analyzer-el9", ["python3", "-c", merge_script], attempt)
         maps = attempt / "efficiency"
         run(task, "analyzer-el9", [
-            "python3", analyzer / "merge_efficiency_shards.py", "--sample", sample,
+            "python3", analyzer / "merge_efficiency_shards.py", "--sample", campaign,
             "--shards-dir", attempt / "shards", "--output-dir", maps], attempt)
         run(task, "analyzer-el9", [
             "python3", analyzer / "build_derived_efficiency.py",

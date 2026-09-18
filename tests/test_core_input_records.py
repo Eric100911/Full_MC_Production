@@ -16,7 +16,7 @@ class InputRecordTests(unittest.TestCase):
             (root / "mini.root.json").write_text(
                 "{\"status\":\"ok\",\"complete\":true,\"artifact_id\":\"a1\",\"url\":\"%s\",\"kind\":\"miniaod\",\"events\":7,\"size_bytes\":7,\"runtime_release\":\"r1\",\"count_source\":\"edmFileUtil\"}" % payload
             )
-            task = {"stage":"miniaod", "runtime":"cmssw12-el8",
+            task = {"stage":"miniaod", "runtime":"cmssw12-sim-el8",
                     "runtime_release":"r1", "inputs":[{"artifact_id":"a1",
                     "url":str(payload), "kind":"miniaod"}]}
             with patch("full_mc.workers.import_module") as loader:

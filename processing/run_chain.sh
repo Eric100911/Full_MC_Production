@@ -989,7 +989,7 @@ host_needs_cmssw12_container() {
     # The new stage launcher already selected the exact image. Do not infer a
     # different runtime or start a nested container from host libraries.
     case "${FULL_MC_STAGE_RUNTIME:-}" in
-        pythia-el8|cmssw12-el8) return 1 ;;
+        pythia-el8|cmssw12-sim-el8|cmssw12-el8) return 1 ;;
     esac
     if [[ -r /etc/os-release ]] && grep -Eq '^VERSION_ID="9(\.[0-9]+)?"$' /etc/os-release; then
         return 0
@@ -2351,10 +2351,18 @@ run_ntuple() {
     fi
 
     msg_info "Running ${ANALYSIS_TYPE} Ntuple analysis via ${cfg_path}..."
+    local -a ntuple_profile_args=( )
+    if [[ -n "${NTUPLE_ERA}" ]]; then
+        ntuple_profile_args+=("era=${NTUPLE_ERA}")
+    fi
+    if [[ -n "${NTUPLE_GLOBAL_TAG}" ]]; then
+        ntuple_profile_args+=("globalTag=${NTUPLE_GLOBAL_TAG}")
+    fi
     run_cmsrun_cmssw15 "${cfg_path}" \
         inputFiles="file:${MINIAOD_OUTPUT}" \
         outputFile="${NTUPLE_OUTPUT}" \
         runOnMC=True \
+        "${ntuple_profile_args[@]}" \
         maxEvents=-1
     
     if [[ ! -f "${NTUPLE_OUTPUT}" ]]; then
@@ -2487,6 +2495,9 @@ Optional:
   --skip-to STEP          Skip to specified step (shower|mix|gensim|raw|reco|miniaod|ntuple)
   --stop-at STEP          Stop after specified step
   --miniaod-input PATH    Existing MiniAOD input for standalone ntuple nodes
+  --detector-profile-id ID Resolved detector profile identity for provenance
+  --ntuple-era ERA         Explicit MC era for the ntuple configuration
+  --ntuple-global-tag GT   Explicit MC GlobalTag for the ntuple configuration
   --transfer-miniaod BOOL Whether transfer step should upload MiniAOD (true|false)
   --stageout-recovery MODE Validate an existing stageout (none|validate-existing)
   --max-events N          Limit events for fast local test (default: -1 = all)
@@ -2531,6 +2542,9 @@ FIRST_LUMINOSITY_BLOCK=1
 FIRST_EVENT=1
 N_EVENTS_IN_LUMI=0
 STAGEOUT_RECOVERY_MODE="${PROCESSING_STAGEOUT_RECOVERY:-none}"
+DETECTOR_PROFILE_ID=""
+NTUPLE_ERA=""
+NTUPLE_GLOBAL_TAG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -2592,6 +2606,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --miniaod-input)
             MINIAOD_INPUT="$2"
+            shift 2
+            ;;
+        --detector-profile-id)
+            DETECTOR_PROFILE_ID="$2"
+            shift 2
+            ;;
+        --ntuple-era)
+            NTUPLE_ERA="$2"
+            shift 2
+            ;;
+        --ntuple-global-tag)
+            NTUPLE_GLOBAL_TAG="$2"
             shift 2
             ;;
         --transfer-miniaod)
@@ -2743,7 +2769,7 @@ fi
 
 LHE_FILES=()
 if [[ "${SKIP_TO}" == "ntuple" ]] || \
-   [[ "${FULL_MC_STAGE_RUNTIME:-}" == "cmssw12-el8" && "${SKIP_TO}" == "gensim" ]]; then
+   [[ "${FULL_MC_STAGE_RUNTIME:-}" =~ ^cmssw12(-sim)?-el8$ && "${SKIP_TO}" == "gensim" ]]; then
     msg_info "Skipping LHE resolution for a staged downstream node"
 elif [[ "${USE_SOURCE_CONFIG}" == "true" ]]; then
     msg_info "Using source-slot config; LHE inputs will be resolved per source during shower"

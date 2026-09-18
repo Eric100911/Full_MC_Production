@@ -35,7 +35,7 @@ def runtime(root, release="r1", revision="core1"):
     (controller / "bootstrap.py").write_text("# bootstrap\n", encoding="utf-8")
     atomic_json(root / "runtime.json", {"runtime_release": release, "site": "ihep",
                                          "git_revision": revision,
-                                         "profiles": ["cmssw12-el8", "cmssw15-el9", "analyzer-el9"],
+                                         "profiles": ["cmssw12-sim-el8", "cmssw15-ntuple-el9", "analyzer-el9"],
                                          "bundles": {"core": "core.tgz"}})
     return root
 

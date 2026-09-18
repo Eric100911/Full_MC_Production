@@ -26,6 +26,10 @@ def aggregation_handoff(root, groups=1):
                             "selected-%d" % index, "selected-ntuple")
         shard = artifact(root / ("shard-%d.tar" % index),
                          "shard-%d" % index, "efficiency-shard")
+        detector_profile = {
+            "profile_id": "run3_2022_legacy_premix_v1",
+            "mc_global_tag": "124X_mcRun3_2022_realistic_v12",
+        }
         stages = {
             "merge": {"task_id": "g%d:merge" % index, "stage": "merge",
                       "parameters": {"analysis": "JJP", "merge_group": "g%d" % index},
@@ -33,7 +37,9 @@ def aggregation_handoff(root, groups=1):
             "selection": {"task_id": "g%d:selection" % index, "stage": "selection",
                           "outputs": [selected]},
             "efficiency": {"task_id": "g%d:efficiency" % index, "stage": "efficiency",
-                           "parameters": {"campaign": sample},
+                           "parameters": {"campaign": sample,
+                                          "detector_profile_id": detector_profile["profile_id"],
+                                          "detector_profile": detector_profile},
                            "outputs": [shard]},
         }
         tasks.append({"task_id": "g%d" % index, "stage": "combined",
@@ -58,7 +64,9 @@ class AggregationContracts(unittest.TestCase):
             self.assertEqual(summary["output_count"], 4)
             self.assertEqual(task["log_level"], "warning")
             self.assertEqual(task["runtime"], "analyzer-el9")
-            self.assertEqual(list(task["groups"]), ["JJP_DPS1", "JJP_DPS2"])
+            self.assertEqual(list(task["groups"]), [
+                "JJP_DPS1::run3_2022_legacy_premix_v1",
+                "JJP_DPS2::run3_2022_legacy_premix_v1"])
             self.assertEqual([out["kind"] for out in task["outputs"]],
                              ["selected-ntuple", "efficiency-maps"] * 2)
 
@@ -87,13 +95,13 @@ class AggregationContracts(unittest.TestCase):
                 "schema": "full-mc-aggregate-v1", "task_id": "run-1:aggregate",
                 "stage": "aggregate",
                 "runtime": "analyzer-el9", "runtime_release": "release-1",
-                "groups": {"JJP_DPS1": [{"selection": selected_ref,
+                "groups": {"JJP_DPS1::run3_2022_legacy_premix_v1": [{"selection": selected_ref,
                                           "efficiency": shard_ref}]},
                 "outputs": [
                     artifact(root / "published-selected.root",
-                             "aggregate:JJP_DPS1:selected", "selected-ntuple"),
+                             "aggregate:JJP_DPS1::run3_2022_legacy_premix_v1:selected", "selected-ntuple"),
                     artifact(root / "published-efficiency.tar",
-                             "aggregate:JJP_DPS1:efficiency", "efficiency-maps"),
+                             "aggregate:JJP_DPS1::run3_2022_legacy_premix_v1:efficiency", "efficiency-maps"),
                 ],
                 "log_level": "info",
             }
@@ -104,7 +112,8 @@ class AggregationContracts(unittest.TestCase):
             def fake_run(run_task, runtime, command, work_dir):
                 calls.append((run_task, runtime, list(map(str, command))))
                 if "merge_efficiency_shards.py" in str(command):
-                    output_dir = Path(work_dir) / "efficiency" / "JJP_DPS1"
+                    output_dir = (Path(work_dir) / "efficiency"
+                                  / "JJP_DPS1::run3_2022_legacy_premix_v1")
                     output_dir.mkdir(parents=True)
                     (output_dir / "efficiency_maps.parquet").write_bytes(b"maps")
 

@@ -119,7 +119,11 @@ def _runtime_for_handoff(handoff, runtime_dir):
         raise ValueError("IHEP runtime core revision does not match the handoff")
     if runtime.get("source_dirty"):
         raise ValueError("refusing a receiving runtime built from a dirty core source")
-    required = {"cmssw12-el8", "cmssw15-el9"}
+    available_profiles = set(runtime["profiles"])
+    required = {
+        "cmssw12-sim-el8" if "cmssw12-sim-el8" in available_profiles else "cmssw12-el8",
+        "cmssw15-ntuple-el9" if "cmssw15-ntuple-el9" in available_profiles else "cmssw15-el9",
+    }
     analyses = {str(task.get("parameters", {}).get("analysis", "JJP"))
                 for task in handoff.get("tasks", []) if task.get("stage") != "combined"}
     analyses.update(str(task.get("subtasks", {}).get("merge", {}).get("parameters", {}).get("analysis", "JJP"))

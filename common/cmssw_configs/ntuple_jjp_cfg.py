@@ -49,6 +49,12 @@ ivars.register('era',
     mytype=VarParsing.VarParsing.varType.string,
     info='Data-taking era (e.g. Run2023C, Run2023BPix). Required for GT selection.'
 )
+ivars.register('globalTag',
+    default='',
+    mult=VarParsing.VarParsing.multiplicity.singleton,
+    mytype=VarParsing.VarParsing.varType.string,
+    info='Explicit GlobalTag override for MC provenance.'
+)
 ivars.register('eventRange',
     default='',
     mult=VarParsing.VarParsing.multiplicity.singleton,
@@ -247,6 +253,8 @@ if ivars.runOnMC:
     myGlobalTag = globalTagDict['MC'][ivars.era]
 else:
     myGlobalTag = globalTagDict['data'][ivars.era]
+if ivars.globalTag:
+    myGlobalTag = ivars.globalTag
 # Pass the selected Global Tag to the process configuration.
 process.GlobalTag = GlobalTag(process.GlobalTag, myGlobalTag, '')
 

@@ -16,7 +16,9 @@ def campaign(max_nodes=2, repeated=False):
     slots = [CampaignSource("pool", "normal", 10, 1.0)]
     if repeated:
         slots.append(CampaignSource("pool", "normal", 10, 1.0))
-    return Campaign("JJP_DPS1", "JJP", slots, 5, max_nodes, 100)
+    return Campaign("JJP_DPS1", "JJP", slots, 5, max_nodes, 100,
+                    ["run3_2022_legacy_premix_v1"],
+                    [{"profile_id": "run3_2022_legacy_premix_v1"}])
 
 
 class AllocationContracts(unittest.TestCase):

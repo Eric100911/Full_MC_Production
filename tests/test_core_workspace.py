@@ -40,10 +40,13 @@ class WorkspaceTests(unittest.TestCase):
             self.assertTrue((target / "campaigns" / "example.json").is_file())
             example = load_run_spec(target / "campaigns" / "example.json")
             self.assertEqual(example["campaigns"][0]["name"], "JJP_SPS_CS")
-            self.assertEqual(example["sources"][0]["generation"]["max_events"], 10000)
+            self.assertEqual(example["sources"][0]["generator_profile"],
+                             "helac_2jpsi_cs_v1")
+            self.assertEqual(example["sources"][0]["resolved_generator_profile"]["nmc"],
+                             500000)
             self.assertEqual(example["sources"][0]["seed"], 1)
             self.assertEqual(example["runtime_dir"],
-                             str((target / "runtimes/production-v1/cern").resolve()))
+                             str((target / "runtimes/production-v2/cern").resolve()))
             self.assertEqual(example["limits"]["source_lhe_bytes"], 2000000000)
             self.assertEqual(example["limits"]["processing_nodes_per_wave"], 1)
             self.assertTrue((target / "history" / "README.md").is_file())

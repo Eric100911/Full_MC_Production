@@ -5,7 +5,7 @@ from .chain import execute_chain
 
 
 def execute(task, work_dir):
-    work_dir = prepare(task, work_dir, "cmssw15-el9")
+    work_dir = prepare(task, work_dir, task["runtime"])
     execute_chain(task, work_dir)
     output = work_dir / "output_ntuple.root"
     # A ROOT header/positive byte count alone does not establish the expected tree.
@@ -16,7 +16,7 @@ def execute(task, work_dir):
         "json.dump({'entries':int(t.GetEntries())},open("
         + repr(str(work_dir / "tree_count.json")) + ",'w'))"
     )
-    run(task, "cmssw15-el9", ["python3", "-c", script], work_dir)
+    run(task, task["runtime"], ["python3", "-c", script], work_dir)
     entries = json.loads((work_dir / "tree_count.json").read_text())["entries"]
     return result(task, [publish(output, task, metadata={"entries": entries,
                          "tree": "mkcands/X_data"})])

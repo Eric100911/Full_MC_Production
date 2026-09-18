@@ -72,6 +72,62 @@ class TransferClient:
         else:
             local_path(destination).parent.mkdir(parents=True, exist_ok=True)
 
+    def mkdir(self, url, parents=True):
+        """Create exactly one configured directory tree."""
+        if is_remote(url):
+            endpoint, lfn = _remote_parts(url)
+            command = ["xrdfs", endpoint, "mkdir"]
+            if parents:
+                command.append("-p")
+            command.append(lfn)
+            self._run(command)
+        else:
+            local_path(url).mkdir(parents=True, exist_ok=True)
+
+    def read_json_if_exists(self, url):
+        try:
+            return self.read_json(url)
+        except FileNotFoundError:
+            return None
+
+    def directory_has_entries(self, url):
+        if not is_remote(url):
+            path = local_path(url)
+            return path.is_dir() and any(path.iterdir())
+        endpoint, lfn = _remote_parts(url)
+        try:
+            output = self._run(["xrdfs", endpoint, "ls", lfn]).stdout
+        except FileNotFoundError:
+            return False
+        return bool(str(output).strip())
+
+    def copy_json_if_absent(self, payload, destination):
+        """Create a JSON marker without replacing a competing marker."""
+        encoded = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+        if not is_remote(destination):
+            target = local_path(destination)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with target.open("x", encoding="utf-8") as handle:
+                    handle.write(encoded)
+            except FileExistsError:
+                pass
+            return
+        Path("/tmp/chiw").mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir="/tmp/chiw",
+                                         prefix="mcprod-marker-", delete=False) as handle:
+            handle.write(encoded)
+            temporary = Path(handle.name)
+        try:
+            self._run(["xrdcp", "--nopbar", str(temporary), str(destination)])
+        except (FileNotFoundError, RuntimeError) as exc:
+            # A no-replace copy reports an existing marker as an error.  The
+            # caller reads it immediately afterwards and rejects mismatches.
+            if "exists" not in str(exc).lower() and "file exists" not in str(exc).lower():
+                raise
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def copy_out(self, source, destination):
         source = Path(source)
         if source.stat().st_size <= 0:

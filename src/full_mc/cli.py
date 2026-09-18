@@ -25,7 +25,7 @@ def build_parser():
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--log-level", choices=LOG_LEVELS, default=None)
     commands = parser.add_subparsers(dest="command", required=True)
-    _leaf(commands, "catalog", "List supported physics campaigns")
+    _leaf(commands, "catalog", "List supported campaigns and profile catalogues")
     runtime = commands.add_parser("runtime").add_subparsers(dest="action", required=True)
     p = _leaf(runtime, "prepare", "Prepare one reusable runtime release")
     p.add_argument("--site", choices=("cern", "ihep"), required=True)

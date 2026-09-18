@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from full_mc.io import atomic_json, read_json
 from full_mc.storage.transfer import artifact_ready
-from full_mc.runtime.profiles import STAGE_RUNTIME
+from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 
 PIPELINE = ("merge", "ntuple", "selection", "efficiency")
 PARENT = {"ntuple": "merge", "selection": "ntuple", "efficiency": "ntuple"}
@@ -63,7 +63,13 @@ def run_combined_task(taskfile, work_dir, log_level=None):
         current = dict(subtasks[stage])
         current.setdefault("task_id", task["task_id"] + ":" + stage)
         current["stage"] = stage
-        current.setdefault("runtime", STAGE_RUNTIME[stage])
+        if "runtime" not in current:
+            detector_profile = current.get("parameters", {}).get("detector_profile")
+            if detector_profile and stage in {"merge", "ntuple"}:
+                role = {"merge": "merge", "ntuple": "ntuple"}[stage]
+                current["runtime"] = runtime_for_profile(detector_profile, role)
+            else:
+                current["runtime"] = STAGE_RUNTIME[stage]
         current.setdefault("runtime_release", task["runtime_release"])
         current.setdefault("log_level", task.get("log_level", "info"))
         if log_level:

@@ -54,6 +54,12 @@ def build_command(task, work_dir, script, config):
                       ("num_events_in_lumi", "--number-events-in-lumi")):
         if key in p.get("edm_event_id", {}):
             command += [flag, str(p["edm_event_id"][key])]
+    profile = p.get("detector_profile")
+    if isinstance(profile, dict):
+        command += ["--detector-profile-id", str(profile["profile_id"])]
+        if stage == "ntuple":
+            command += ["--ntuple-era", str(profile.get("ntuple_era", profile.get("era", "Run3"))),
+                        "--ntuple-global-tag", str(profile["mc_global_tag"])]
     return command
 
 
@@ -66,6 +72,9 @@ def execute_chain(task, work_dir):
                 "phi_consumption_mode", "edm_event_id", "processing_environment"):
         if key in p:
             config[key] = p[key]
+    if isinstance(p.get("detector_profile"), dict):
+        profile = p["detector_profile"]
+        config["detector_profile"] = profile
     if task["stage"] == "mix":
         references = {ref["artifact_id"]: ref for ref in task["inputs"]}
         if len(references) != len(task["inputs"]):

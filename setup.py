@@ -7,6 +7,6 @@ setup(
     python_requires=">=3.9",
     package_dir={"": "src"},
     packages=find_packages("src"),
-    package_data={"full_mc.resources": ["*.json"]},
+    package_data={"full_mc.resources": ["*.json", "profiles/*.json"]},
     entry_points={"console_scripts": ["mcprod=full_mc.cli:main"]},
 )

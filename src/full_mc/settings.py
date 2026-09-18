@@ -8,6 +8,8 @@ import os
 import re
 from pathlib import Path
 
+from .profiles import load_catalogues, resolve_detector_variants, resolve_source
+
 CORE_ROOT = Path(__file__).resolve().parents[2]
 LOG_LEVELS = ("debug", "info", "warning", "error")
 
@@ -34,7 +36,16 @@ def _resource_json(name):
 
 
 def catalog():
-    return _resource_json("catalog.json")
+    value = _resource_json("catalog.json")
+    profiles = load_catalogues()
+    value["generator_profiles"] = profiles["generator"].as_dict()["profiles"]
+    value["detector_profiles"] = profiles["detector"].as_dict()["profiles"]
+    return value
+
+
+def profile_catalogs():
+    """Return the settings-boundary profile catalogues."""
+    return load_catalogues()
 
 
 def defaults():
@@ -105,9 +116,9 @@ def _validate_scheduler_and_resources(spec):
 def load_run_spec(path):
     path = Path(path).resolve()
     spec = copy.deepcopy(read_json(path))
-    if spec.get("schema_version", 1) != 1:
+    if spec.get("schema_version") != 2:
         raise ValueError("unsupported run schema_version")
-    spec["schema_version"] = 1
+    spec["schema_version"] = 2
     run_id = str(spec.get("run_id", ""))
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_id):
         raise ValueError("run_id must be a nonempty path-safe identifier")
@@ -136,11 +147,18 @@ def load_run_spec(path):
     spec["block_events"] = int(spec.get("block_events", 1000))
     if spec["block_events"] <= 0:
         raise ValueError("block_events must be positive")
-    spec.setdefault("runtime_release", "production-v1")
+    spec.setdefault("runtime_release", "production-v2")
     spec.setdefault("core_revision", "")
     spec.setdefault("normal_shortfall_policy", "report-and-truncate")
     spec.setdefault("unused_hepmc_warning_fraction", 0.15)
     spec.setdefault("processing_environment", defaults()["processing_environment"])
+    limits = spec.setdefault("limits", {})
+    for key, value in (("source_lhe_bytes", 2_000_000_000),
+                       ("source_block_bytes", 2_000_000_000),
+                       ("mixed_hepmc_bytes", 2_000_000_000),
+                       ("source_files_per_step", 4),
+                       ("processing_nodes_per_wave", 10)):
+        limits.setdefault(key, value)
     _validate_scheduler_and_resources(spec)
     for key in ("runtime_dir", "analyzer_path", "inventory_path"):
         if spec.get(key):
@@ -148,6 +166,7 @@ def load_run_spec(path):
     if not isinstance(spec.get("campaigns"), list) or not spec["campaigns"]:
         raise ValueError("campaigns must be a nonempty list")
     known = catalog()
+    profile_catalog = profile_catalogs()
     names = set()
     for campaign in spec["campaigns"]:
         name = campaign.get("name", "")
@@ -182,29 +201,30 @@ def load_run_spec(path):
             slot["efficiency"] = efficiency
         for field in ("target_mixed_events", "max_processing_nodes", "merge_events"):
             campaign[field] = _integer(campaign.get(field, 0), f"{name}: {field}", minimum=1)
+        resolved = resolve_detector_variants(campaign, profile_catalog["detector"])
+        campaign["resolved_detector_variants"] = resolved
     if not isinstance(spec.get("sources"), list) or not spec["sources"]:
         raise ValueError("sources must declare an exact finite source inventory")
     ids = set()
-    for source in spec["sources"]:
+    for source_index, source in enumerate(spec["sources"]):
         key = (source.get("pool"), source.get("source_id"))
         if not all(key) or key in ids:
             raise ValueError(f"invalid or duplicate source identity: {key}")
         ids.add(key)
         source["seed"] = _integer(source.get("seed", 0), f"{key}: seed", minimum=1)
-        if source.get("generation"):
-            if not isinstance(source["generation"], dict):
-                raise ValueError("fresh generation must be an object")
-            source["generation"]["max_events"] = _integer(
-                source["generation"].get("max_events", 0), "fresh generation max_events", minimum=1)
-            available = source["generation"]["max_events"]
-            pool = known["pools"].get(source["pool"], {})
-            source["generation"] = dict(pool, **source["generation"])
+        source = resolve_source(source, profile_catalog["generator"])
+        # Replace the caller's mutable input with the immutable resolved record.
+        spec["sources"][source_index] = source
+        if source.get("generator_profile"):
+            available = int(source["resolved_generator_profile"]["planning_events_hint"])
         else:
             source["actual_events"] = _integer(source.get("actual_events", 0),
                                                  f"{key}: actual_events", minimum=1)
             available = source["actual_events"]
             if not source.get("url"):
                 raise ValueError(f"{key}: existing input requires URL and exact counted events")
+            source["size_bytes"] = _integer(source.get("size_bytes", 0),
+                                             f"{key}: size_bytes", minimum=0)
         if "planned_events" in source and source["planned_events"] is not None:
             source["planned_events"] = _integer(source["planned_events"],
                                                   f"{key}: planned_events", minimum=1)
@@ -212,4 +232,15 @@ def load_run_spec(path):
                 raise ValueError(f"{key}: planned_events exceeds exact source capacity")
         if source.get("url") and not str(source["url"]).startswith("root://"):
             source["url"] = _path(str(source["url"]).removeprefix("file:"), path.parent)
+    # Inline controls are intentionally not accepted even if no source loop
+    # happened to reference them (for example an empty malformed source list).
+    if any("generation" in source for source in spec["sources"]):
+        raise ValueError("inline generation settings are not supported; use generator_profile")
+    declared_pools = {source["pool"] for source in spec["sources"]}
+    referenced_pools = {slot["pool"] for campaign in spec["campaigns"]
+                        for slot in campaign["sources"]}
+    unknown_pools = referenced_pools - declared_pools
+    if unknown_pools:
+        raise ValueError("campaign references undeclared source pool(s): "
+                         + ", ".join(sorted(unknown_pools)))
     return spec

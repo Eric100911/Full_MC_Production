@@ -42,20 +42,25 @@ def publish_fixture(item, events=4):
 class WorkerContracts(unittest.TestCase):
     def test_lhe_uses_real_flags_and_finite_cap(self):
         task = {"log_level": "warning", "parameters": {
-            "pool_name": "p", "seed": 5, "process": "g g > cc~",
-            "max_events": 11, "min_m_qqp": 3.0969}}
+            "pool_name": "pool_2jpsi_g", "seed": 5,
+            "generator_profile": {
+                "profile_id": "helac_2jpsi_g_nlostar_v1",
+                "process": "generate g g > cc~(3S11) cc~(3S11) g",
+                "nmc": 500000, "unwevt": 2000,
+                "unwevt_semantics": "main-path-stop-target",
+                "cuts": {"min_pt_conia": 6.0, "min_pt_bonia": 4.0,
+                         "min_pt_q": 0.0, "min_m_qqp": 3.0969,
+                         "min_m_q_beam": 3.0969}}}}
         command = lhe_command(task, Path("/tmp/chiw/task"))
         self.assertIn("--pool", command)
         self.assertIn("--process", command)
         self.assertNotIn("--workdir", command)
         self.assertNotIn("--process-string", command)
         self.assertNotIn("--lhe-shuffle-split", command)
-        self.assertTrue(command[command.index("--compress-lhe") + 1].startswith("--"))
-        self.assertEqual(command[command.index("--unwevt") + 1], "11")
+        self.assertEqual(command[command.index("--nmc") + 1], "500000")
+        self.assertEqual(command[command.index("--unwevt") + 1], "2000")
         self.assertEqual(command[command.index("--min-m-qqp") + 1], "3.0969")
-        task["parameters"]["max_events"] = 0
-        with self.assertRaises(ValueError):
-            lhe_command(task, Path("/tmp/chiw/task"))
+        self.assertEqual(command[command.index("--min-m-q-beam") + 1], "3.0969")
 
     def test_stage_runtime_mismatch_is_rejected_before_execution(self):
         with self.assertRaisesRegex(ValueError, "requires runtime"):

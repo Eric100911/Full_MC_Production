@@ -4,6 +4,7 @@ from pathlib import Path
 from full_mc.runtime.profiles import STAGE_RUNTIME
 from full_mc.settings import LOG_LEVELS
 from full_mc.storage.transfer import TransferClient, validated_record
+from ._common import expected_runtime
 
 _HYDRATE_ALL = {"miniaod", "merge", "ntuple", "selection", "efficiency"}
 
@@ -34,8 +35,9 @@ def execute_task(task, work_dir):
     stage = task.get("stage")
     if stage not in STAGE_RUNTIME:
         raise ValueError(f"unknown worker stage: {stage}")
-    if task.get("runtime") != STAGE_RUNTIME[stage]:
-        raise ValueError(f"{stage} requires runtime {STAGE_RUNTIME[stage]}")
+    required_runtime = expected_runtime(task)
+    if task.get("runtime") != required_runtime:
+        raise ValueError(f"{stage} requires runtime {required_runtime}")
     if task.get("log_level", "info") not in LOG_LEVELS:
         raise ValueError("invalid worker log level")
     if not task.get("runtime_release"):

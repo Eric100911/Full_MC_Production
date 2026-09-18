@@ -5,7 +5,7 @@ from .edm import count_events
 
 
 def execute(task, work_dir):
-    work_dir = prepare(task, work_dir, "cmssw12-el8")
+    work_dir = prepare(task, work_dir, task["runtime"])
     inputs = task.get("inputs", [])
     if not inputs or len({x["artifact_id"] for x in inputs}) != len(inputs):
         raise ValueError("merge requires distinct input artifacts")
@@ -19,7 +19,7 @@ def execute(task, work_dir):
     input_list.write_text("".join("file:" + str(path) + "\n" for path in paths),
                           encoding="utf-8")
     output = work_dir / "merged_MINIAOD.root"
-    run(task, "cmssw12-el8", [
+    run(task, task["runtime"], [
         "edmCopyPickMerge", "inputFiles_load=" + str(input_list),
         "outputFile=" + str(output), "maxSize=0"], work_dir)
     events = count_events(task, output, work_dir)

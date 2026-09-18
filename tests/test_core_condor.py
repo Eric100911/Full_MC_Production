@@ -1,10 +1,11 @@
 """Offline contracts for exact, durable DAGMan submission attempts."""
 from pathlib import Path
+import json
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.backends.condor import resume_run, status_run, submit_run
@@ -52,6 +53,25 @@ class CondorContracts(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 submit_run(root2, runner=Mock(side_effect=KeyboardInterrupt))
             self.assertEqual(read_json(root2 / "submission.json")["state"], "submitting")
+
+    def test_storage_reservation_failure_prevents_scheduler_submission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            payload = {
+                "condor": {"schedd": "schedd.example"},
+                "run_id": "reservation-test", "runtime_release": "r1",
+                "storage": {"cern_staging": str(root / "cern"),
+                            "ihep_products": str(root / "products"),
+                            "ihep_archive": str(root / "archive")},
+            }
+            (root / "run.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            runner = Mock(side_effect=AssertionError("scheduler must not be called"))
+            with patch("full_mc.backends.condor.reserve_run_namespaces",
+                       side_effect=RuntimeError("namespace is owned")):
+                with self.assertRaisesRegex(RuntimeError, "namespace is owned"):
+                    submit_run(root, runner=runner)
+            runner.assert_not_called()
+            self.assertFalse((root / "submission.json").exists())
 
     def test_status_queries_only_the_recorded_root_on_recorded_schedd(self):
         with tempfile.TemporaryDirectory() as temporary:

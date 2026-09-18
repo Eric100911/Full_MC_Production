@@ -5,7 +5,7 @@ from .edm import count_events
 
 
 def execute(task, work_dir):
-    work_dir = prepare(task, work_dir, "cmssw12-el8")
+    work_dir = prepare(task, work_dir, task["runtime"])
     expected = int(task["inputs"][0]["events"])
     if expected <= 0 or not parameters(task).get("edm_event_id"):
         raise ValueError("MiniAOD requires positive HepMC count and frozen EDM IDs")

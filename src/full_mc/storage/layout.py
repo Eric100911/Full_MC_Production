@@ -12,8 +12,9 @@ def _root_url(value: str) -> str:
     if not value.startswith("root://"):
         raise ValueError(f"storage URL must be root://: {value!r}")
     parsed = urlsplit(value)
-    if not parsed.netloc or not parsed.path.startswith("///store/"):
-        raise ValueError(f"storage URL must use root://host///store/...: {value!r}")
+    if not parsed.netloc or not (parsed.path.startswith("///store/")
+                                 or parsed.path.startswith("///eos/")):
+        raise ValueError(f"storage URL must use root://host///store/... or root://host///eos/...: {value!r}")
     return value.rstrip("/")
 
 

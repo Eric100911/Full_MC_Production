@@ -20,13 +20,14 @@ CMSSW15_REQUIRED = (
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/",
 )
 SITE_PROFILES = {
-    "cern": ("helac-el7", "utilities-el9", "pythia-el8", "cmssw12-el8"),
-    "ihep": ("utilities-el9", "cmssw12-el8", "cmssw15-el9", "analyzer-el9"),
+    "cern": ("helac-el7", "utilities-el9", "pythia-el8", "cmssw12-sim-el8"),
+    "ihep": ("utilities-el9", "cmssw12-sim-el8", "cmssw15-sim-el9",
+             "cmssw15-ntuple-el9", "analyzer-el9"),
 }
 # Never recursively bundle generated/, tests/, inventories, Git data, or packages/.
 CORE_PAYLOAD = (
     "mcprod", "src/full_mc", "common/node_config_defaults.json",
-    "common/campaigns/catalog.json", "common/cmssw_configs",
+    "common/campaigns/catalog.json", "common/profiles", "common/cmssw_configs",
     "common/compression_helpers.sh", "common/compression_util.py",
     "common/octet_pdg.py", "processing/run_chain.sh",
     "processing/cmssw_helpers", "processing/pythia_shower",
@@ -147,7 +148,8 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
     controller = root / "controller/core"
     if not (controller / "mcprod").is_file() or not (controller / "src/full_mc/runtime/bootstrap.py").is_file():
         raise ValueError("runtime release lacks its frozen submit-host controller")
-    cmssw_asset = bundles.get("cmssw15-el9")
+    cmssw_asset = bundles.get("cmssw15-ntuple-el9") or bundles.get("cmssw15-sim-el9") \
+        or bundles.get("cmssw15-el9")
     if cmssw_asset:
         asset = root / cmssw_asset
         if cmssw_asset == CMSSW15_RUNTIME:
@@ -190,16 +192,19 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                 raise FileNotFoundError(source)
             shutil.copy2(source, staging / source.name)
             bundles["helac-el7"] = source.name
-        if "cmssw15-el9" in selected:
+        cmssw15_profiles = [name for name in
+                            ("cmssw15-ntuple-el9", "cmssw15-sim-el9", "cmssw15-el9")
+                            if name in selected]
+        if cmssw15_profiles:
             source = core / "common/packages" / CMSSW15_RUNTIME
             if source.is_file():
                 validate_cmssw15_runtime(source)
                 shutil.copy2(source, staging / source.name)
-                bundles["cmssw15-el9"] = source.name
+                bundles.update({profile: source.name for profile in cmssw15_profiles})
             else:
                 fallback = staging / CMSSW15_SOURCE_PACKAGE
                 _package_tpsonia2mumu_source(core, fallback)
-                bundles["cmssw15-el9"] = fallback.name
+                bundles.update({profile: fallback.name for profile in cmssw15_profiles})
         analyzer_revision = None
         if "analyzer-el9" in selected:
             analyzer = core / "external/NtupleAnalyzer"
