@@ -3441,7 +3441,8 @@ class DAGBuilder:
                 f'subdag_root="{dag_escape(subdag_root)}" '
                 f'target_base_url="{dag_escape(target_base_url)}" '
                 f'workflow_archive_id="{dag_escape(self.workflow_archive_id)}" '
-                f'archive_enabled="{dag_escape(bool_string(archive_enabled))}"'
+                f'archive_enabled="{dag_escape(bool_string(archive_enabled))}" '
+                f'log_level="{dag_escape(self.options.log_level)}"'
             ),
         ])
 

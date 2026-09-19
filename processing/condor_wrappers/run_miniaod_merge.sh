@@ -23,13 +23,33 @@ else
     exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
 fi
 
-echo "=== MiniAOD merge wrapper ==="
-echo "Host: $(hostname)"
-echo "Date: $(date -Iseconds)"
-echo "Working dir: $(pwd)"
-echo "Config: ${CONFIG_NAME}"
+read_log_level() {
+    python3 - "$1" <<'PY'
+import json
+import sys
 
-echo "--- Extracting proxy bundle ---"
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("log_level") or "info")
+except Exception:
+    print("info")
+PY
+}
+
+# The merge config carries the workflow log level; honor it so this node
+# matches the LHE/planner/processing nodes under --log-level slim.
+WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-$(read_log_level "${CONFIG_PATH}")}"
+export WORKFLOW_LOG_LEVEL
+_slim() { [[ "${WORKFLOW_LOG_LEVEL}" == "slim" ]]; }
+msg_info() { _slim || echo "$@"; }
+
+msg_info "=== MiniAOD merge wrapper ==="
+msg_info "Host: $(hostname)"
+msg_info "Date: $(date -Iseconds)"
+msg_info "Working dir: $(pwd)"
+msg_info "Config: ${CONFIG_NAME}"
+
+msg_info "--- Extracting proxy bundle ---"
 tar -xzf "${PROXY_BUNDLE}"
 PROXY_TARGET="${PWD}/credentials/x509_user_proxy"
 chmod 600 "${PROXY_TARGET}"
@@ -354,4 +374,4 @@ if __name__ == "__main__":
     main()
 PY
 
-echo "=== MiniAOD merge completed successfully ==="
+msg_info "=== MiniAOD merge completed successfully ==="

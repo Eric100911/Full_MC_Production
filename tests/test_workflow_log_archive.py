@@ -208,6 +208,40 @@ def main() -> int:
         assert all(result["phase"] == "proxy_validation" for result in expired["results"])
         assert failed_subdag_root.is_dir()
 
+        # A failed DAG still archives the workspace, but must keep the local
+        # copy: it holds the SUBDAG EXTERNAL targets that -dorescue needs.
+        os.environ["PATH"] = f"{mock_bin}:{old_path}"
+        retained_root = root / "retained_workspace" / "plan_subdags"
+        nested = retained_root / "CAMPAIGN_A" / "job_0"
+        nested.mkdir(parents=True)
+        (nested / "blocks_processing.dag").write_text(
+            "JOB MIX_0 processing.sub\n", encoding="utf-8"
+        )
+        try:
+            retained = archive_workflow(
+                log_root=log_root,
+                target_base_url=str(root / "target"),
+                workflow_id="test-workflow-failed-dag",
+                proxy_bundle=proxy_bundle,
+                retry_attempts=3,
+                subdag_root=retained_root,
+                dag_status=1,
+                failed_count=1,
+            )
+        finally:
+            os.environ["PATH"] = old_path
+        workspace = retained["subdag_workspace"]
+        assert workspace["status"] == "ok"
+        assert workspace["phase"] == "complete_retained"
+        assert workspace["source_deleted"] is False
+        assert workspace["cleanup_skipped"] is True
+        assert retained_root.is_dir()
+        assert (nested / "blocks_processing.dag").is_file()
+        assert (
+            root / "target" / "output" / "_workflow_archives"
+            / "test-workflow-failed-dag" / "plan_subdags.tar.gz"
+        ).is_file()
+
     print("[OK] top-level FINAL workflow log archive grouping and manifests")
     return 0
 

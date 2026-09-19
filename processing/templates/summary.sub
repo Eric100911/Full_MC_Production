@@ -28,6 +28,9 @@ request_disk = 10GB
 +MaxRuntime = 21600
 +SingularityImage = "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el9:x86_64"
 
-Environment = "HOME=/srv"
+# ``log_level`` is delivered through the environment rather than argv so the
+# positional summary_final.sh argument contract stays fixed; an empty default
+# means info for DAGs generated before the variable existed.
+Environment = "HOME=/srv WORKFLOW_LOG_LEVEL=$(log_level:)"
 
 Queue 1

@@ -343,8 +343,16 @@ def archive_subdag_workspace(
     workdir: Path,
     retry_attempts: int,
     proxy_timeleft: int,
+    cleanup: bool = True,
 ) -> Dict[str, object]:
-    """Archive a completed ``plan_subdags`` tree and remove it after upload."""
+    """Archive a ``plan_subdags`` tree, removing the local copy only on success.
+
+    ``cleanup`` must stay ``False`` for a workflow that did not succeed: the
+    tree holds the ``SUBDAG EXTERNAL`` targets and every SubDAG node config, so
+    deleting it would break ``condor_submit_dag -dorescue`` and per-SubDAG
+    iteration exactly when they are needed. The uploaded archive is the durable
+    copy either way.
+    """
     result: Dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "status": "failed",
@@ -398,6 +406,27 @@ def archive_subdag_workspace(
         result["phase"] = "archive_upload"
         result["message"] = str(exc)
         return result
+
+    if not cleanup:
+        # The DAG did not succeed; keep the workspace usable for rescue.
+        manifest["phase"] = "complete_retained"
+        manifest["source_deleted"] = False
+        manifest["cleanup_skipped"] = True
+        manifest["message"] = (
+            "SubDAG workspace archived; local copy retained because the DAG did not succeed"
+        )
+        manifest["updated_at"] = utc_now()
+        try:
+            atomic_write_json(manifest_path, manifest)
+            upload_file(manifest_path, manifest_url, retry_attempts)
+        except Exception as exc:
+            manifest["status"] = "partial"
+            manifest["phase"] = "retained_manifest_upload"
+            manifest["message"] = (
+                f"Archive uploaded but retaining manifest upload failed: {exc}"
+            )
+            manifest["updated_at"] = utc_now()
+        return manifest
 
     try:
         shutil.rmtree(subdag_root)
@@ -458,6 +487,8 @@ def archive_workflow(
     proxy_bundle: Path,
     retry_attempts: int,
     subdag_root: Path | None = None,
+    dag_status: int = 0,
+    failed_count: int = 0,
 ) -> Dict[str, object]:
     groups = discover_log_groups(log_root)
     overall_path = (
@@ -603,6 +634,7 @@ def archive_workflow(
                 workdir=workdir,
                 retry_attempts=retry_attempts,
                 proxy_timeleft=proxy_timeleft,
+                cleanup=(dag_status == 0 and failed_count == 0),
             )
 
         ok_count = sum(result.get("status") == "ok" for result in results)
@@ -665,7 +697,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subdag-root",
         default="",
-        help="Completed plan_subdags directory to archive and remove after upload.",
+        help="plan_subdags directory to archive; removed after upload on success.",
+    )
+    parser.add_argument(
+        "--dag-status",
+        type=int,
+        default=0,
+        help="DAGMan DAG_STATUS of the finished workflow; non-zero keeps the workspace.",
+    )
+    parser.add_argument(
+        "--failed-count",
+        type=int,
+        default=0,
+        help="DAGMan FAILED_COUNT of the finished workflow; non-zero keeps the workspace.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=("info", "slim"),
+        help=(
+            "slim prints a one-line archive summary instead of the full payload; "
+            "the status JSON on the log root is written either way."
+        ),
     )
     return parser
 
@@ -681,8 +734,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         proxy_bundle=Path(args.proxy_bundle).resolve(),
         retry_attempts=args.retry_attempts,
         subdag_root=Path(args.subdag_root).resolve() if args.subdag_root else None,
+        dag_status=args.dag_status,
+        failed_count=args.failed_count,
     )
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.log_level == "slim":
+        # The full payload is already durable at
+        # <log_root>/_shared/summary/workflow_log_archive_status_<id>.json.
+        print(
+            f"archive_status={payload.get('archive_status')} "
+            f"phase={payload.get('phase')} "
+            f"jobs={len(payload.get('results', []))} "
+            f"workflow_archive_id={args.workflow_id}",
+            flush=True,
+        )
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
     return 0 if payload.get("archive_status") == "ok" else 1
 
 

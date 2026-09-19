@@ -27,15 +27,21 @@ else
     exec >"${WRAPPER_LOG_DIR}/wrapper.stdout" 2>"${WRAPPER_LOG_DIR}/wrapper.stderr"
 fi
 
-echo "=========================================="
-echo "Top-level FINAL summary"
+# The submit environment carries the workflow log level (empty for DAGs
+# generated before the variable existed, hence the info fallback).
+WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-info}"
+_slim() { [[ "${WORKFLOW_LOG_LEVEL}" == "slim" ]]; }
+msg_info() { _slim || echo "$@"; }
+
+msg_info "=========================================="
+msg_info "Top-level FINAL summary"
 echo "workflow_archive_id=${workflow_archive_id}"
 echo "dag_status=${dag_status}"
 echo "failed_count=${failed_count}"
-echo "archive_enabled=${archive_enabled}"
-echo "log_root=${log_root}"
-echo "subdag_root=${subdag_root}"
-echo "target_base_url=${target_base_url}"
+msg_info "archive_enabled=${archive_enabled}"
+msg_info "log_root=${log_root}"
+msg_info "subdag_root=${subdag_root}"
+msg_info "target_base_url=${target_base_url}"
 
 archive_rc=0
 if [[ "${archive_enabled}" == "true" ]]; then
@@ -49,7 +55,10 @@ if [[ "${archive_enabled}" == "true" ]]; then
         --target-base-url "${target_base_url}" \
         --workflow-id "${workflow_archive_id}" \
         --proxy-bundle "${proxy_bundle}" \
-        --retry-attempts 3
+        --retry-attempts 3 \
+        --dag-status "${dag_status}" \
+        --failed-count "${failed_count}" \
+        --log-level "${WORKFLOW_LOG_LEVEL}"
         archive_rc=$?
         # The helper owns persistent diagnostics. Its failure is intentionally
         # fail-soft relative to the upstream physics DAG.
