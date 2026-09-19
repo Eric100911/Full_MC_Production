@@ -27,6 +27,14 @@ _JOB_STATUS = {
     "5": "held", "6": "transferring_output", "7": "suspended",
 }
 _TERMINAL = {"removed", "completed"}
+# -limit/-match bound only the jobs condor_history displays; without -scanlimit
+# the schedd still walks its whole history, which costs minutes on a shared
+# CERN schedd and scales with how deep the requested cluster sits.  10000 is
+# below the ~15000 rotation boundary where per-job cost jumps ~14x.  The client
+# timeout only releases this process; the schedd-side scan is capped by
+# -scanlimit alone.
+_HISTORY_SCAN_LIMIT = 10000
+_STATUS_QUERY_TIMEOUT_SECONDS = 60
 
 
 def _now() -> str:
@@ -78,11 +86,12 @@ def _assert_submittable(spec: Dict[str, Any]) -> None:
 
 
 def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path,
-         scheduler: str | None = None) -> Any:
+         scheduler: str | None = None, timeout: float | None = None) -> Any:
     environment = None
     if scheduler:
         environment = dict(os.environ, _CONDOR_SCHEDD_HOST=scheduler)
     return runner(command, check=False, text=True, capture_output=True, cwd=str(cwd),
+                  timeout=timeout,
                   **({"env": environment} if environment is not None else {}))
 
 
@@ -212,9 +221,12 @@ def _query(root: Path, scheduler: str, cluster: str, executable: str,
            runner: Callable[..., Any]) -> List[tuple[str, str | None]] | None:
     command = [executable, "-name", scheduler, cluster, "-autoformat",
                "ClusterId", "ProcId", "JobStatus", "ExitCode"]
+    if executable == "condor_history":
+        command[1:1] = ["-scanlimit", str(_HISTORY_SCAN_LIMIT)]
     try:
-        completed = _run(command, runner, cwd=root)
-    except OSError:
+        completed = _run(command, runner, cwd=root,
+                         timeout=_STATUS_QUERY_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if getattr(completed, "returncode", 1) != 0:
         return None

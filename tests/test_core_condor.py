@@ -82,6 +82,21 @@ class CondorContracts(unittest.TestCase):
             self.assertEqual(status["state"], "active")
             self.assertEqual(runner.call_args.args[0][:4], ["condor_q", "-name", "schedd.example", "42"])
 
+    def test_history_query_bounds_the_schedd_side_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            seen = {}
+            def runner(command, **kwargs):
+                seen[command[0]] = (command, kwargs)
+                return response(stdout="" if command[0] == "condor_q" else "42 0 4\n")
+            status = status_run(root, runner=runner)
+            self.assertEqual(status["query"], "history")
+            self.assertNotIn("-scanlimit", seen["condor_q"][0])
+            history, kwargs = seen["condor_history"]
+            self.assertEqual(history[history.index("-scanlimit") + 1], "10000")
+            self.assertEqual(kwargs["timeout"], 60)
+
     def test_resume_requires_terminal_state_and_a_concrete_rescue_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
