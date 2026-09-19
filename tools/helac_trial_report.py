@@ -40,6 +40,11 @@ STATUS_NAMES = {
 }
 
 
+# -limit/-match bound only the displayed jobs; without -scanlimit the schedd
+# still walks its whole history, which costs minutes on a shared CERN schedd.
+HISTORY_SCAN_LIMIT = 10000
+
+
 MappingKey = Tuple[Optional[str], str]
 
 
@@ -132,7 +137,8 @@ def queue_status(schedd: str, job: str) -> Dict[str, Any]:
 
 def history_status(schedd: str, job: str) -> Dict[str, Any]:
     command = [
-        "condor_history", "-name", schedd, job, "-af",
+        "condor_history", "-name", schedd, job,
+        "-scanlimit", str(HISTORY_SCAN_LIMIT), "-af",
         "JobStatus", "ExitCode", "ExitBySignal", "CompletionDate", "HoldReason",
     ]
     try:
@@ -143,7 +149,12 @@ def history_status(schedd: str, job: str) -> Dict[str, Any]:
         return {"state": "not-found", "queue_error": "condor_history timed out"}
     fields = result.stdout.strip().split()
     if not fields or not fields[0].isdigit():
-        return {"state": "not-found"}
+        # The scan is bounded, so an empty result means "no match within the
+        # first HISTORY_SCAN_LIMIT records", not "absent from history".  Deep
+        # clusters reach this path; keep the state name for callers but say so.
+        return {"state": "not-found",
+                "queue_error": "no match within %d scanned history records"
+                               % HISTORY_SCAN_LIMIT}
     code = int(fields[0])
     return {
         "state": STATUS_NAMES.get(code, "unknown"),

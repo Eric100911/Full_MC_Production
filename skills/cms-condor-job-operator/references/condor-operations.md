@@ -66,8 +66,17 @@ condor_q -name <schedd> <cluster>.<proc> \
 Inspect a completed job:
 
 ```bash
-condor_history -name <schedd> <cluster>.<proc> -long
+condor_history -name <schedd> <cluster>.<proc> -scanlimit 10000 -limit 3 -long
 ```
+
+Always pass `-scanlimit`. `-limit`/`-match` bound only the jobs *displayed*; the
+schedd still walks its whole history to satisfy the job-id argument, which takes
+minutes on a shared CERN schedd and occupies it for every other user meanwhile.
+Measured on HTCondor 24.12.16, same query and schedd: >25 min without
+`-scanlimit`, 3.4 s with it. `-backwards` does not substitute for it. Keep the
+value at or below 10000 — past roughly 15000 the scan crosses a history-rotation
+boundary and per-job cost jumps ~14x. A bounded scan that returns nothing means
+"no match within the scanned records", not "absent from history".
 
 Important `JobStatus` values are:
 
