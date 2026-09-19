@@ -34,8 +34,10 @@ burns `iseed` RANDA draws before integrating.
 (sha256 `407a62f3bdc29774f9537a8326a69e6665dd1c17a02d5c952e242a7d3cd55760`).
 Provenance (upstream `RANDA_init.inc` sha256 `820898de…`, patched source `1f2d67e6…`,
 input package `addacf1a…`) is in `common/packages/helac_package_cbseed_v1.manifest.json`.
-The unpatched original is backed up as `helac_package.tar.gz.pre-cbseed`. The tarballs
-are gitignored (`*.tar.gz`); only the manifest is tracked.
+The unpatched original is backed up as `helac_package.tar.gz.pre-cbseed`. The
+versioned release `helac_package_cbseed_v1.tar.gz` is **tracked in git** (force-added,
+commit `e124496`); the mutable runtime name `helac_package.tar.gz` remains gitignored
+(a copy of the same bytes).
 
 ## Validation already done (E0–E3 + nmc sweep)
 
@@ -48,9 +50,10 @@ are gitignored (`*.tar.gz`); only the manifest is tracked.
 
 ## What the refactor must port
 
-1. **Use the patched package** — copy `common/packages/helac_package.tar.gz` into
-   the refactor's package location, or run `tools/repack_helac_crystalball_seed.py`
-   against its own copy. Do not ship the stale unpatched tarball.
+1. **Use the patched package** — the tracked `common/packages/helac_package_cbseed_v1.tar.gz`
+   (sha256 `407a62f3…`) checks out via git; copy it to the runtime name
+   `helac_package.tar.gz`, or run `tools/repack_helac_crystalball_seed.py` against its
+   own copy. Do not ship the stale unpatched tarball.
 2. **Seed bridge** — if the refactor worker runs the CrystalBall addon directly,
    write `MY_SEED` into `addon/pp_psiX_CrystalBall/input/seed.input` before launch.
 3. **Write-side resolver** — generated LHE must go to `<target-base>/lhe_pools/<pool>`,
