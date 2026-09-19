@@ -1,0 +1,15 @@
+{
+  "created_utc": "2026-09-19T02:43:42.442395+00:00",
+  "input_package": "/afs/cern.ch/user/c/chiw/condor/Full_MC_Production/common/packages/helac_package.tar.gz",
+  "input_package_sha256": "addacf1aeff27bc928ef3c272d9082bce4d9938bd444df5d56a0117e2ece9241",
+  "nested_tarball_sha256": "00beff995474bd980ca077b31242aeeaeadf113c2f0e4dfa4bff44ec45f9290a",
+  "outer_package_sha256": "407a62f3bdc29774f9537a8326a69e6665dd1c17a02d5c952e242a7d3cd55760",
+  "output_package": "/tmp/chiw/helac_cbseed_v1/helac_package.tar.gz",
+  "patch_anchor": "INTEGER::beam1_pdf,beam2_pdf",
+  "patch_include": "INCLUDE \"../../../src/RANDA_init.inc\"",
+  "patch_inserted": true,
+  "patched_pp_psiX_cb_f90_sha256": "1f2d67e68e9709f23abd11024dc09aa1fca9d7b62095aaa2f0867af9b65db5e8",
+  "tool": "tools/repack_helac_crystalball_seed.py",
+  "tool_version": 1,
+  "upstream_randa_init_inc_sha256": "820898dea874531aaf19ae2294749a07b30b7113359029ff47a31e21dfb61ade"
+}
