@@ -83,7 +83,7 @@ EOS_REDIRECTOR="cceos.ihep.ac.cn"
 EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="root://${EOS_HOST}"
 EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}///${EOS_LFN_BASE#/}}"
 EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_OUTPUT="${EOS_BASE}/output"
 EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
@@ -310,7 +310,9 @@ resolve_remote_target() {
         path=$(normalize_remote_path "${EOS_PATH_BASE}/${spec}")
     fi
 
-    url="root://${host#root://}/${path}"
+    # "${path}" is always absolute with exactly one leading slash, so the
+    # extra two slashes preserve the required root://host:port///store/... form.
+    url="root://${host#root://}///${path#/}"
     printf '%s\t%s\t%s\n' "${host}" "${path}" "${url}"
 }
 
@@ -718,6 +720,9 @@ normalize_prebuilt_helac_links() {
     if [[ -L addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS ]] && [[ "$(readlink addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS)" = /* ]]; then
         ln -sfn ../../../bin/HO_pp_NOnia_MPS addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS
     fi
+    if [[ -L addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall ]] && [[ "$(readlink addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall)" = /* ]]; then
+        ln -sfn ../../../bin/HO_pp_psiX_CrystalBall addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall
+    fi
 
     cd "${WORKDIR}"
 }
@@ -983,6 +988,9 @@ prepare_crystalball_addon_input() {
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
     grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|absoluterap|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    # Number of initial RANDA draws to discard -- a "skip seed", NOT a direct DSEED assignment; this bridge goes away once ho_cluster:set_seed() owns the invocation.
+    printf '%s\n' "${MY_SEED}" > "${addon_dir}/input/seed.input"
+    msg_info "CrystalBall RANDA skip seed: ${MY_SEED}"
 }
 
 build_crystalball_addon_if_needed() {

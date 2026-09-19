@@ -139,6 +139,15 @@ python3 "${SCRIPT_DIR}/test_existing_lhe_inventory.py"
 echo "[INFO] 检查 plain-Condor existing-LHE inventory counting"
 python3 "${SCRIPT_DIR}/test_condor_lhe_inventory.py"
 
+echo "[INFO] 检查 generated-LHE 输出位置与 inventory 写入护栏"
+python3 "${SCRIPT_DIR}/test_generated_lhe_output_location.py"
+
+echo "[INFO] 检查 CrystalBall HELAC seed 补丁与 seed.input 桥接"
+python3 "${SCRIPT_DIR}/test_crystalball_seed_repack.py"
+
+echo "[INFO] 检查 worker 端 XRootD URL 的三段斜杠重建"
+"${SCRIPT_DIR}/test_helac_remote_url.sh"
+
 echo "[INFO] 检查 block SubDAG final inventory 与日志归档 mock"
 "${SCRIPT_DIR}/test_subdag_final_and_archive.sh"
 "${SCRIPT_DIR}/test_miniaod_merge_partial.sh"

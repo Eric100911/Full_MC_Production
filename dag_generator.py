@@ -1061,6 +1061,74 @@ def existing_lhe_pool_dir(pool_name: str, existing_lhe_base: str = "") -> str:
     return configured_path
 
 
+def generated_lhe_pool_dir(pool_name: str, target_eos_base: str = "") -> str:
+    """Write-side resolver: directory for freshly generated LHE of one pool.
+
+    Deliberately distinct from :func:`existing_lhe_pool_dir`, which resolves the
+    read-only immutable inventory. Generated LHE always lives below
+    ``<target-base>/lhe_pools/<pool-storage-name>/``.
+    """
+
+    base = str(node_storage_config(target_eos_base)["generated_lhe_base"])
+    return f"{base.rstrip('/')}/{pool_storage_name(pool_name)}"
+
+
+def _xrootd_storage_path(url: str) -> str:
+    """Reduce an XRootD URL or plain path to its storage path for comparison.
+
+    Scheme and authority are dropped deliberately. ``run_helac.sh`` maps a plain
+    ``/store/...`` spec and ``root://<host>[:1094]/store/...`` onto the same
+    location, so comparing those spellings textually would let an inventory
+    overlap slip past the guardrail. ``.`` and ``..`` segments are resolved for
+    the same reason: a traversal must not sidestep the check either.
+    """
+
+    text = str(url).strip()
+    if text.startswith("root://"):
+        _, _, text = text[len("root://"):].partition("/")
+        text = "/" + text
+    parts: List[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/" + "/".join(parts)
+
+
+def assert_generated_dir_not_inventory(output_dir: str) -> None:
+    """Reject a generated-LHE directory that overlaps an immutable inventory path.
+
+    Generation may never write into (or below) a configured exact
+    ``lhe_pool_directories.<pool>.path``. This runs at DAG-generation time,
+    before the node config for that job is written.
+
+    The comparison is on the storage path, so equivalent spellings of the same
+    inventory directory (a bare ``/store/...`` LFN, a port-less or
+    ``:1094``-bearing authority, or a ``..`` traversal) are rejected alike. That
+    deliberately ignores which endpoint a path names: every LHE pool in this
+    repository lives on the single IHEP EOS, and rejecting a same-LFN target on
+    another host is the safe direction.
+    """
+
+    target = _xrootd_storage_path(output_dir)
+    for pool_name, entry in LHE_POOL_DIRECTORY_CONFIG.items():
+        configured = str(entry.get("path", "")).strip()
+        if not configured:
+            continue
+        inv = _xrootd_storage_path(configured)
+        if target == inv or target.startswith(inv + "/"):
+            raise ValueError(
+                "Refusing to generate LHE into the immutable inventory directory for "
+                + pool_name + ": " + str(output_dir)
+                + ". Generated LHE must go under <target-base>/lhe_pools/<pool>. "
+                + "See docs/lhe_output_location_and_crystalball_nmc_2026-09-18.md."
+            )
+
+
 def machine_env_choices() -> Tuple[str, ...]:
     choices = ["auto"]
     for name, machine_env in MACHINE_ENVS.items():
@@ -3460,6 +3528,8 @@ class DAGBuilder:
             seed = self.seed_for_pool_index(pool_name, index)
             job_name = f"LHE_{pool_dag_label(pool_name)}_{index}"
             request_cpus, request_memory, request_disk = self.lhe_resource_request()
+            output_dir = self._resolve_generated_lhe_output_dir(pool.name)
+            assert_generated_dir_not_inventory(output_dir)
             lhe_config = {
                 "pool": pool.name,
                 "seed": seed,
@@ -3481,7 +3551,7 @@ class DAGBuilder:
                 "lhe_shuffle_mode": self.options.lhe_shuffle_mode,
                 "lhe_n_strata": self.options.lhe_n_strata,
                 "lhe_drop_incomplete_last_block": self.options.lhe_drop_incomplete_last_block,
-                "output_dir": existing_lhe_pool_dir(pool.name, self.options.existing_lhe_base),
+                "output_dir": output_dir,
                 "storage": node_storage_config(self.options.target_base_url),
             }
             config_path, config_name = self.write_node_config(
@@ -3706,16 +3776,34 @@ class DAGBuilder:
     # Block SubDAG methods
     # ------------------------------------------------------------------
 
+    def _resolve_generated_lhe_output_dir(self, pool_name: str) -> str:
+        """Worker-visible directory for freshly generated LHE (relative when local).
+
+        The local branch must stay relative: ``run_helac.sh`` prepends
+        ``LOCAL_OUTPUT_BASE`` to ``OUTPUT_DIR`` before staging out.
+        """
+
+        storage = pool_storage_name(pool_name)
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join("lhe_pools", storage)
+        return generated_lhe_pool_dir(pool_name, self.options.target_base_url)
+
     def _resolve_lhe_path(self, pool_name: str, seed: int) -> str:
         """Return the full path (EOS URL or local) to the HELAC LHE output."""
         storage = pool_storage_name(pool_name)
+        # run_helac.sh only stages a compressed sample when compression is on,
+        # so the extension has to follow the flag rather than be assumed.
+        extension = "lhe.gz" if self.options.compress_lhe else "lhe"
         if self.options.machine_env.uses_local_storage and self.options.local_output_base:
             return os.path.join(
                 self.options.local_output_base,
                 "lhe_pools", storage,
-                f"sample_{storage}_{seed}.lhe.gz",
+                f"sample_{storage}_{seed}.{extension}",
             )
-        return f"{existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)}/sample_{storage}_{seed}.lhe.gz"
+        return (
+            f"{generated_lhe_pool_dir(pool_name, self.options.target_base_url)}/"
+            f"sample_{storage}_{seed}.{extension}"
+        )
 
     def _resolve_block_output_dir(self, pool_name: str, seed: int) -> str:
         """Return the directory where block .lhe.gz files should be stored."""
@@ -3723,9 +3811,13 @@ class DAGBuilder:
         base = str(node_storage_config(self.options.target_base_url)["generated_lhe_base"])
         if self.options.machine_env.uses_local_storage and self.options.local_output_base:
             return os.path.join(
-                self.options.local_output_base, storage, "lhe_blocks",
+                self.options.local_output_base, "lhe_pools", storage, "lhe_blocks",
             )
-        return f"{base.rstrip('/')}/{storage}/lhe_blocks"
+        block_output_dir = f"{base.rstrip('/')}/{storage}/lhe_blocks"
+        # Blocks are a generated product too, and this path is reachable in
+        # skip-LHE mode where ensure_lhe_jobs() returns before guarding.
+        assert_generated_dir_not_inventory(block_output_dir)
+        return block_output_dir
 
     def _resolve_plan_manifest_path(self, pool_name: str, seed: int) -> str:
         """Return the path where the plan manifest JSON will be written."""
