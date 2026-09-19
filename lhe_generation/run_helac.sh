@@ -83,7 +83,7 @@ EOS_REDIRECTOR="cceos.ihep.ac.cn"
 EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="root://${EOS_HOST}"
 EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
-EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}/${EOS_LFN_BASE}}"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}///${EOS_LFN_BASE#/}}"
 EOS_PATH_BASE="${EOS_LFN_BASE}"
 EOS_OUTPUT="${EOS_BASE}/output"
 EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
@@ -310,7 +310,9 @@ resolve_remote_target() {
         path=$(normalize_remote_path "${EOS_PATH_BASE}/${spec}")
     fi
 
-    url="root://${host#root://}/${path}"
+    # path is normalized to exactly one leading slash; preserve the canonical
+    # root://host[:port]///path XRootD spelling.
+    url="root://${host#root://}///${path#/}"
     printf '%s\t%s\t%s\n' "${host}" "${path}" "${url}"
 }
 
@@ -718,6 +720,9 @@ normalize_prebuilt_helac_links() {
     if [[ -L addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS ]] && [[ "$(readlink addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS)" = /* ]]; then
         ln -sfn ../../../bin/HO_pp_NOnia_MPS addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS
     fi
+    if [[ -L addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall ]] && [[ "$(readlink addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall)" = /* ]]; then
+        ln -sfn ../../../bin/HO_pp_psiX_CrystalBall addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall
+    fi
 
     cd "${WORKDIR}"
 }
@@ -852,7 +857,10 @@ set_user_inp_value() {
 prepare_runtime_user_inp() {
     local helac_dir="$1"
     local runtime_user_inp="${helac_dir}/input/user.inp"
-    local template_user_inp="../input_templates/user.inp"
+    # The worker runs HELAC from its stage scratch directory, while the
+    # template is shipped in the runtime core.  Resolve it from the script
+    # location instead of relying on the caller's current directory.
+    local template_user_inp="${BASE_DIR}/lhe_generation/input_templates/user.inp"
 
     if [[ -f "${template_user_inp}" ]]; then
         cp "${template_user_inp}" "${runtime_user_inp}"
@@ -983,6 +991,10 @@ prepare_crystalball_addon_input() {
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
     grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|absoluterap|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    # RANDA_init.inc interprets this as the number of initial draws to discard.
+    # It is a skip seed, not a direct replacement for the compiled DSEED value.
+    printf '%s\n' "${MY_SEED}" > "${addon_dir}/input/seed.input"
+    msg_info "CrystalBall RANDA skip seed: ${MY_SEED}"
 }
 
 build_crystalball_addon_if_needed() {
@@ -1556,7 +1568,8 @@ if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         msg_error "LHE shuffle-split failed"
         exit 1
     fi
-    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}"/block_*.lhe 2>/dev/null | wc -l)
+    # Block filenames carry the seed prefix passed via --filename-prefix above.
+    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe 2>/dev/null | wc -l)
     if (( BLOCK_COUNT == 0 )); then
         msg_error "Shuffle-split produced no block files"
         exit 1
@@ -1599,7 +1612,7 @@ if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
     if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         BLOCK_LOCAL_DIR="${LOCAL_DIR}/lhe_blocks"
         mkdir -p "${BLOCK_LOCAL_DIR}"
-        cp "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
+        cp "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
         msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
     fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
@@ -1630,7 +1643,7 @@ else
     if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
         BLOCK_REMOTE_DIR="${OUTPUT_DIR}/lhe_blocks"
         make_remote_dir "${BLOCK_REMOTE_DIR}" || true
-        for bf in "${SHUFFLE_SPLIT_DIR}"/block_*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
+        for bf in "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
             bname=$(basename "$bf")
             BLOCK_OUTPUT=$(remote_url_for_spec "$(join_remote_spec "${BLOCK_REMOTE_DIR}" "${bname}")")
             xrdcp --nopbar --force "$bf" "${BLOCK_OUTPUT}" || \

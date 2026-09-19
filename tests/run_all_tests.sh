@@ -119,6 +119,21 @@ python3 "${SCRIPT_DIR}/test_coordinate_wrapper_large_manifest.py"
 echo "[INFO] 检查 exposure recovery 的非连续 inventory job spec"
 python3 "${SCRIPT_DIR}/test_campaign_job_specs.py"
 
+echo "[INFO] 检查 CrystalBall HELAC seed 补丁与 seed.input 桥接"
+python3 "${SCRIPT_DIR}/test_crystalball_seed_repack.py"
+
+echo "[INFO] 检查 worker 端 XRootD URL 的三段斜杠重建"
+"${SCRIPT_DIR}/test_helac_remote_url.sh"
+
+echo "[INFO] 检查 inline shuffle-split 的 seed-prefixed block globs"
+"${SCRIPT_DIR}/test_helac_inline_split_globs.sh"
+
+echo "[INFO] 检查 generated-LHE 输出位置与 inventory 写入护栏"
+python3 "${SCRIPT_DIR}/test_generated_lhe_output_location.py"
+
+echo "[INFO] 检查 production-core storage namespace 与 runtime package safety"
+PYTHONPATH="${BASE_DIR}/src:${BASE_DIR}" python3 -m unittest tests.test_core_storage_safety
+
 echo "[INFO] 检查 CMSSW worker entrypoints 与 runtime bundle"
 "${SCRIPT_DIR}/test_cmssw_helpers.sh"
 

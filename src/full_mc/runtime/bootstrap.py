@@ -54,12 +54,22 @@ def unpack_runtime(release_dir, destination, profile, release):
     core = destination / "core"
     if profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
         asset = bundle(profile)
+        if not asset.is_file() and profile == "helac-el7":
+            # Some Condor schedds transfer the package under its source
+            # basename even when the release descriptor uses the stable
+            # runtime basename.  Accept that transfer spelling, but always
+            # install the package under the descriptor name expected by the
+            # worker.
+            source_alias = source / "helac_package_cbseed_v1.tar.gz"
+            if source_alias.is_file():
+                asset = source_alias
         packages = core / "common/packages"
         packages.mkdir(parents=True, exist_ok=True)
+        target = packages / Path(descriptor["bundles"][profile]).name
         try:
-            os.link(asset, packages / asset.name)
+            os.link(asset, target)
         except OSError:
-            shutil.copy2(asset, packages / asset.name)
+            shutil.copy2(asset, target)
     elif profile == "analyzer-el9":
         _extract(bundle(profile), core / "external", "NtupleAnalyzer")
     return core

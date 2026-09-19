@@ -3,7 +3,15 @@
 
 This directory should contain the tarballs transferred to worker nodes.
 
-## 1. `helac_package.tar.gz` (required)
+## 1. Seeded HELAC package (required)
+
+The tracked source artifact is `helac_package_cbseed_v1.tar.gz`; its published
+SHA-256 is recorded in `helac_package_cbseed_v1.manifest.json`. Runtime
+preparation verifies that artifact once and installs a copy under the stable
+worker-facing name `helac_package.tar.gz`. Workers and `run_helac.sh` should
+continue to use only that stable runtime basename.
+
+`helac_package.tar.gz` (required at runtime)
 
 `run_helac.sh` accepts either source tarballs or a prebuilt HELAC-Onia runtime.
 When a compiled `HELAC-Onia-2.7.6/ho_cluster` is present, the worker reuses it
@@ -15,7 +23,19 @@ Contents:
 - `HELAC-Onia-2.7.6.tar.gz`
 - `hepmc2.06.11.tgz`
 
-Create it with:
+The versioned package is the reproducibility anchor. Create a replacement only
+through `tools/repack_helac_crystalball_seed.py`, then update the versioned
+artifact and manifest together; never overwrite the input package in place.
+
+Verify the checked-in pair with:
+
+```bash
+python3 tools/repack_helac_crystalball_seed.py --check \
+  --package common/packages/helac_package_cbseed_v1.tar.gz \
+  --manifest common/packages/helac_package_cbseed_v1.manifest.json
+```
+
+For an unseeded source package, the historical packaging shape was:
 
 ```bash
 cd <directory-containing-the-HELAC-source-tarballs>

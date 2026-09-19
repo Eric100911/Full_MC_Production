@@ -9,6 +9,11 @@ import re
 from pathlib import Path
 
 from .profiles import load_catalogues, resolve_detector_variants, resolve_source
+from .storage.layout import (
+    canonical_storage_location,
+    storage_location_is_within,
+    storage_location_parent,
+)
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -111,6 +116,33 @@ def _validate_scheduler_and_resources(spec):
         if "flavour" in resource and not re.fullmatch(r"[A-Za-z0-9_.-]+", str(resource["flavour"])):
             raise ValueError(f"resources.{stage}.flavour is not a DAG token")
     spec["resources"] = resources
+
+
+def _validate_generated_staging(spec):
+    """Fail closed when run-scoped generated output overlaps immutable LHE."""
+    generated_root = (
+        str(spec["storage"]["cern_staging"]).rstrip("/")
+        + "/"
+        + spec["run_id"]
+    )
+    immutable_locations = []
+    configured = defaults().get("lhe_pool_directories", {})
+    if isinstance(configured, dict):
+        for entry in configured.values():
+            if not isinstance(entry, dict) or not entry.get("path"):
+                continue
+            immutable_locations.append(canonical_storage_location(entry["path"]))
+    for source in spec.get("sources", []):
+        if source.get("url"):
+            immutable_locations.append(storage_location_parent(source["url"]))
+
+    candidate = canonical_storage_location(generated_root)
+    for inventory_location in immutable_locations:
+        if storage_location_is_within(candidate, inventory_location):
+            raise ValueError(
+                "generated staging overlaps immutable LHE inventory: "
+                + generated_root
+            )
 
 
 def load_run_spec(path):
@@ -243,4 +275,5 @@ def load_run_spec(path):
     if unknown_pools:
         raise ValueError("campaign references undeclared source pool(s): "
                          + ", ".join(sorted(unknown_pools)))
+    _validate_generated_staging(spec)
     return spec

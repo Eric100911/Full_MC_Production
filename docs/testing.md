@@ -37,9 +37,15 @@ bash -n \
   tests/submit_lhe_matrix.sh \
   tests/mock_test_worker.sh \
   tests/mock_test_edm_eventid.sh \
-  tests/test_lhe_shuffle_split.sh
+  tests/test_lhe_shuffle_split.sh \
+  tests/test_helac_remote_url.sh \
+  tests/test_helac_inline_split_globs.sh
 python3 -m py_compile \
   dag_generator.py \
+  tools/repack_helac_crystalball_seed.py \
+  src/full_mc/runtime/packages.py \
+  src/full_mc/storage/layout.py \
+  src/full_mc/settings.py \
   tools/compile_node_config.py \
   tools/coordinate_lhe_blocks.py \
   tools/dag_progress.py \
@@ -50,6 +56,7 @@ python3 -m unittest tests.test_dag_progress
 python3 tests/test_coordinate_lhe_blocks.py
 python3 tests/test_campaign_job_specs.py
 python3 tests/test_lhe_planner_cap_generation.py
+PYTHONPATH=src python3 -m unittest tests.test_core_storage_safety
 ./tests/run_all_tests.sh
 ./tests/mock_test_worker.sh
 ./tests/test_lhe_shuffle_split.sh

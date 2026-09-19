@@ -5,6 +5,7 @@ processing/pythia_shower/shower_normal
 processing/pythia_shower/shower_phi
 processing/pythia_shower/shower_sps
 *.tar.gz
+!common/packages/helac_package_cbseed_v1.tar.gz
 *.tar.gz.bak
 *.root
 *.lhe

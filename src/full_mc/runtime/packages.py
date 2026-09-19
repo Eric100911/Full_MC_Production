@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,11 @@ from .profiles import PROFILES
 
 CMSSW15_RUNTIME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 CMSSW15_SOURCE_PACKAGE = "tpsonia2mumu_code.tar.gz"
+HELAC_SOURCE_PACKAGE = "helac_package_cbseed_v1.tar.gz"
+HELAC_RUNTIME_PACKAGE = "helac_package.tar.gz"
+HELAC_PACKAGE_SHA256 = (
+    "407a62f3bdc29774f9537a8326a69e6665dd1c17a02d5c952e242a7d3cd55760"
+)
 CMSSW15_REQUIRED = (
     "CMSSW_15_0_15/src/",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/",
@@ -58,6 +64,14 @@ def validate_cmssw15_source_package(path):
     required = "HeavyFlavorAnalysis/TPS-Onia2MuMu/"
     if not any(name.startswith(required) for name in names):
         raise ValueError("CMSSW15 source package lacks " + required)
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def runtime_identity(release, git_revision):
@@ -158,6 +172,20 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
             validate_cmssw15_source_package(asset)
         else:
             raise ValueError("unrecognized CMSSW15 runtime asset: %s" % cmssw_asset)
+    if "helac-el7" in bundles:
+        if bundles["helac-el7"] != HELAC_RUNTIME_PACKAGE:
+            raise ValueError("helac-el7 must use the stable runtime package basename")
+        metadata = descriptor.get("helac_package")
+        expected = {
+            "source": HELAC_SOURCE_PACKAGE,
+            "runtime_name": HELAC_RUNTIME_PACKAGE,
+            "sha256": HELAC_PACKAGE_SHA256,
+        }
+        if metadata != expected:
+            raise ValueError("runtime descriptor has invalid HELAC package provenance")
+        asset = root / HELAC_RUNTIME_PACKAGE
+        if _sha256(asset) != HELAC_PACKAGE_SHA256:
+            raise ValueError("HELAC runtime package sha256 does not match published artifact")
     return descriptor
 
 
@@ -187,11 +215,16 @@ def prepare_runtime(core, destination, release, site, profiles=None):
         _extract(staging / "core.tar.gz", staging / "controller", "core")
         bundles = {"core": "core.tar.gz"}
         if "helac-el7" in selected:
-            source = core / "common/packages/helac_package.tar.gz"
+            source = core / "common/packages" / HELAC_SOURCE_PACKAGE
             if not source.is_file() or source.stat().st_size <= 0:
                 raise FileNotFoundError(source)
-            shutil.copy2(source, staging / source.name)
-            bundles["helac-el7"] = source.name
+            if _sha256(source) != HELAC_PACKAGE_SHA256:
+                raise ValueError("HELAC source package sha256 does not match published artifact")
+            runtime_asset = staging / HELAC_RUNTIME_PACKAGE
+            shutil.copy2(source, runtime_asset)
+            if _sha256(runtime_asset) != HELAC_PACKAGE_SHA256:
+                raise ValueError("copied HELAC runtime package sha256 does not match published artifact")
+            bundles["helac-el7"] = HELAC_RUNTIME_PACKAGE
         cmssw15_profiles = [name for name in
                             ("cmssw15-ntuple-el9", "cmssw15-sim-el9", "cmssw15-el9")
                             if name in selected]
@@ -220,6 +253,12 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                       source_dirty=dirty, profiles=selected, bundles=bundles,
                       bundle_bytes={name: (staging / name).stat().st_size
                                     for name in bundles.values()})
+        if "helac-el7" in selected:
+            record["helac_package"] = {
+                "source": HELAC_SOURCE_PACKAGE,
+                "runtime_name": HELAC_RUNTIME_PACKAGE,
+                "sha256": HELAC_PACKAGE_SHA256,
+            }
         if analyzer_revision:
             record["analyzer_revision"] = analyzer_revision
         atomic_json(staging / "runtime.json", record)
