@@ -2,9 +2,10 @@
 import json
 from pathlib import Path
 import re
+import shlex
 
 from full_mc.io import atomic_json
-from full_mc.runtime.profiles import STAGE_RUNTIME
+from full_mc.runtime.profiles import GRID_CA_DIR, STAGE_RUNTIME
 
 CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
               "miniaod": "processing", "archive": "lhe_coordination"}
@@ -101,15 +102,27 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
 
 def write_root_dag(root, spec, steps, proxy_path):
     root = Path(root)
-    lines = [f"CONFIG {path_text(root / 'dagman.config')}",
-             "ENV SET X509_USER_PROXY=" + path_text(proxy_path)
-             + ";X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates"]
+    # Worker submit files carry the exact proxy and CA settings.  Avoid root
+    # ENV SET propagation: recursive external-SubDAG generation turns these
+    # values into command-line insertion flags and can stall on submit hosts.
+    lines = [f"CONFIG {path_text(root / 'dagman.config')}"]
     cli = path_text(Path(spec["core_root"]) / "mcprod")
     pre = root / "advance.sh"
+    # SCRIPT PRE runs in the DAGMan process, not in a worker .sub job.  Give
+    # that launcher the same explicit credential context without putting ENV
+    # SET directives in the root DAG (which would be propagated recursively).
+    proxy = shlex.quote(path_text(proxy_path))
+    ca_dir = shlex.quote(GRID_CA_DIR)
     pre.write_text("#!/bin/bash\nset -euo pipefail\n"
                    "# DAGMan inherits the submitter PATH; remote entries can block "
                    "/usr/bin/env before Python starts.\n"
                    "export PATH=/usr/bin:/bin\n"
+                   f"export X509_USER_PROXY={proxy}\n"
+                   f"export X509_CERT_DIR={ca_dir}\n"
+                   'if [[ ! -s "$X509_USER_PROXY" || ! -r "$X509_USER_PROXY" ]]; then\n'
+                   '    echo "PRE script proxy is unavailable: $X509_USER_PROXY" >&2\n'
+                   "    exit 2\n"
+                   "fi\n"
                    + f"if [[ -f {path_text(root / '.complete')} ]]; then exit 99; fi\n"
                    + f'exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} {cli} internal advance-wave '
                    + f'--run-dir {path_text(root)} --step "$1"\n')

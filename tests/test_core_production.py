@@ -36,7 +36,8 @@ def sidecar(ref, *, events=None, count_source=None):
        new=lambda: "/afs/cern.ch/user/test/x509_user_proxy")
 class ProductionLifecycle(unittest.TestCase):
     def fixture(self, root):
-        source = root / "input.lhe"
+        source = root / "input" / "input.lhe"
+        source.parent.mkdir(parents=True)
         generate(str(source), 15)
         runtime = root / "runtime"
         (runtime / "controller/core/src/full_mc/runtime").mkdir(parents=True)
@@ -127,6 +128,11 @@ class ProductionLifecycle(unittest.TestCase):
             advance_script = (run / "advance.sh").read_text()
             self.assertIn("DAGMan inherits the submitter PATH", advance_script)
             self.assertIn("export PATH=/usr/bin:/bin", advance_script)
+            self.assertIn("export X509_USER_PROXY=/afs/cern.ch/user/test/x509_user_proxy",
+                          advance_script)
+            self.assertIn("export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates",
+                          advance_script)
+            self.assertIn("PRE script proxy is unavailable", advance_script)
             self.assertIn(f"exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} ", advance_script)
             subprocess.run(["bash", "-n", str(run / "advance.sh")], check=True)
             source_dag = Path(read_json(run / "state.json")["pending"]["dag"]).read_text()
@@ -138,8 +144,7 @@ class ProductionLifecycle(unittest.TestCase):
                 self.assertIn("should_transfer_files = YES", submit)
                 self.assertIn("x509userproxy = /afs/cern.ch/user/test/x509_user_proxy", submit)
                 self.assertNotIn("x509up_u", submit)
-            self.assertIn("ENV SET X509_USER_PROXY=/afs/cern.ch/user/test/x509_user_proxy;"
-                          "X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates", root_dag)
+            self.assertNotIn("ENV SET X509_USER_PROXY=", root_dag)
             self.assertFalse((run / "submit/merge.sub").exists())
             replay = advance_wave(run, 0)
             self.assertEqual(replay["phase"], "sources")
@@ -174,9 +179,11 @@ class ProductionLifecycle(unittest.TestCase):
             cli = core / "mcprod"
             cli.write_text("#!/bin/bash\n/usr/bin/sleep 1\n", encoding="utf-8")
             cli.chmod(0o755)
+            proxy = root / "proxy"
+            proxy.write_text("test-proxy\n", encoding="utf-8")
             with patch("full_mc.planning.graph.PRE_SCRIPT_TIMEOUT_SECONDS", 0.01):
                 write_root_dag(root, {"core_root": str(core)}, 1,
-                               "/afs/cern.ch/user/test/x509_user_proxy")
+                               str(proxy))
 
             pre = root / "advance.sh"
             subprocess.run(["bash", "-n", str(pre)], check=True)
@@ -187,6 +194,34 @@ class ProductionLifecycle(unittest.TestCase):
             (root / ".complete").touch()
             skipped = subprocess.run([str(pre), "0"], check=False)
             self.assertEqual(skipped.returncode, 99)
+
+    def test_pre_script_exports_auth_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            core = root / "core"
+            core.mkdir()
+            env_dump = root / "pre-env.txt"
+            proxy = root / "proxy"
+            proxy.write_text("test-proxy\n", encoding="utf-8")
+            cli = core / "mcprod"
+            cli.write_text(
+                "#!/bin/bash\n"
+                "printf 'X509_USER_PROXY=%s\\nX509_CERT_DIR=%s\\n' "
+                '"$X509_USER_PROXY" "$X509_CERT_DIR" > "' + str(env_dump) + '"\n',
+                encoding="utf-8",
+            )
+            cli.chmod(0o755)
+            write_root_dag(root, {"core_root": str(core)}, 1, str(proxy))
+
+            outcome = subprocess.run([str(root / "advance.sh"), "0"], check=False)
+
+            self.assertEqual(outcome.returncode, 0)
+            self.assertEqual(
+                env_dump.read_text(encoding="utf-8"),
+                "X509_USER_PROXY=" + str(proxy.resolve()) + "\n"
+                "X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates\n",
+            )
+            self.assertNotIn("ENV SET X509_USER_PROXY=", (root / "run.dag").read_text())
 
     def test_proxy_resolution_blocks_artifact_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
