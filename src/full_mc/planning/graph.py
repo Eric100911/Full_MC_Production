@@ -8,7 +8,8 @@ from full_mc.io import atomic_json
 from full_mc.runtime.profiles import GRID_CA_DIR, STAGE_RUNTIME
 
 CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
-              "miniaod": "processing", "archive": "lhe_coordination"}
+              "miniaod": "processing", "archive": "lhe_coordination",
+              "reclaim": "lhe_coordination"}
 PRE_SCRIPT_TIMEOUT_SECONDS = 3600
 
 
@@ -113,19 +114,34 @@ def write_root_dag(root, spec, steps, proxy_path):
     # SET directives in the root DAG (which would be propagated recursively).
     proxy = shlex.quote(path_text(proxy_path))
     ca_dir = shlex.quote(GRID_CA_DIR)
-    pre.write_text("#!/bin/bash\nset -euo pipefail\n"
-                   "# DAGMan inherits the submitter PATH; remote entries can block "
-                   "/usr/bin/env before Python starts.\n"
-                   "export PATH=/usr/bin:/bin\n"
-                   f"export X509_USER_PROXY={proxy}\n"
-                   f"export X509_CERT_DIR={ca_dir}\n"
-                   'if [[ ! -s "$X509_USER_PROXY" || ! -r "$X509_USER_PROXY" ]]; then\n'
-                   '    echo "PRE script proxy is unavailable: $X509_USER_PROXY" >&2\n'
-                   "    exit 2\n"
-                   "fi\n"
-                   + f"if [[ -f {path_text(root / '.complete')} ]]; then exit 99; fi\n"
-                   + f'exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} {cli} internal advance-wave '
-                   + f'--run-dir {path_text(root)} --step "$1"\n')
+    logs = path_text(root / "logs")
+    release = shlex.quote(str(spec.get("runtime_release") or "unknown"))
+    # DAGMan keeps PRE stdout/stderr in its own log, where a failing seam
+    # leaves no exception text.  Tee both streams into a per-step file instead:
+    # the step number is part of the name, so a rescued or retried wave cannot
+    # overwrite the log of the attempt it is replaying.  The script creates the
+    # directory itself because it also runs against a bare run root.
+    pre.write_text(
+        "#!/bin/bash\nset -euo pipefail\n"
+        'step="${1:?missing wave step}"\n'
+        "printf -v step_name '%06d' \"${step}\"\n"
+        f"mkdir -p {logs}\n"
+        f'log={logs}/advance_${{step_name}}.log\n'
+        'exec >>"${log}" 2>&1\n'
+        "printf '[%s] advance-wave step=%s runtime=%s\\n' "
+        f'"$(date --iso-8601=seconds)" "${{step}}" {release}\n'
+        "# DAGMan inherits the submitter PATH; remote entries can block "
+        "/usr/bin/env before Python starts.\n"
+        "export PATH=/usr/bin:/bin\n"
+        f"export X509_USER_PROXY={proxy}\n"
+        f"export X509_CERT_DIR={ca_dir}\n"
+        'if [[ ! -s "$X509_USER_PROXY" || ! -r "$X509_USER_PROXY" ]]; then\n'
+        '    echo "PRE script proxy is unavailable: $X509_USER_PROXY" >&2\n'
+        "    exit 2\n"
+        "fi\n"
+        + f"if [[ -f {path_text(root / '.complete')} ]]; then exit 99; fi\n"
+        + f'exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} {cli} internal advance-wave '
+        + f'--run-dir {path_text(root)} --step "$1"\n')
     pre.chmod(0o755)
     for index in range(steps):
         name = f"WAVE_{index:06d}"

@@ -102,7 +102,8 @@ def _validate_scheduler_and_resources(spec):
         resources = {}
     if not isinstance(resources, dict):
         raise ValueError("resources must be an object")
-    expected_cpus = {"lhe": 1, "plan": 1, "mix": 1, "miniaod": 2, "archive": 1}
+    expected_cpus = {"lhe": 1, "plan": 1, "mix": 1, "miniaod": 2, "archive": 1,
+                     "reclaim": 1}
     for stage, resource in resources.items():
         if stage not in expected_cpus or not isinstance(resource, dict):
             raise ValueError("resources must use known worker-stage objects")

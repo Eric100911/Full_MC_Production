@@ -1,6 +1,6 @@
 """Offline lifecycle contracts for the lazy CERN production controller."""
 import gzip
-import json
+from contextlib import ExitStack
 from pathlib import Path
 import subprocess
 import sys
@@ -9,12 +9,22 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from full_mc.application import production
+from full_mc.application.ledger import (archive_path, group_path, inventory_path,
+                                        load_archives, load_groups, load_wave, sample_key)
 from full_mc.application.production import advance_wave, plan_run, restore_archived_sources
 from full_mc.io import atomic_json, read_json
 from full_mc.planning.graph import PRE_SCRIPT_TIMEOUT_SECONDS, write_root_dag
 from full_mc.storage.transfer import artifact_ref, TransferClient
 from full_mc.workers.archive import execute as archive_execute
 from tests.generate_synthetic_lhe import generate
+
+STATE_KEYS = {"state_schema", "status", "next_step", "pending", "pool_cursors",
+              "job_offsets", "merge_buffers", "merge_group_counts"}
+REMOTE_METHODS = ("size", "mkdir_parent", "mkdir", "read_json_if_exists",
+                  "directory_has_entries", "copy_json_if_absent", "copy_out",
+                  "copy_in", "read_json", "remove")
+SAMPLE = sample_key("C", "run3_2022_legacy_premix_v1")
 
 
 def sidecar(ref, *, events=None, count_source=None):
@@ -30,6 +40,16 @@ def sidecar(ref, *, events=None, count_source=None):
         result["count_source"] = count_source
     atomic_json(str(path) + ".json", result)
     return result
+
+
+def remote_io_blocked():
+    """Every TransferClient operation raises; the seam must not call any of them."""
+    stack = ExitStack()
+    for name in REMOTE_METHODS:
+        stack.enter_context(patch.object(
+            TransferClient, name,
+            side_effect=AssertionError("seam touched remote storage")))
+    return stack
 
 
 @patch("full_mc.application.production.resolve_proxy_path",
@@ -77,23 +97,34 @@ class ProductionLifecycle(unittest.TestCase):
         atomic_json(spec_path, spec)
         return spec_path, root / "run"
 
-    def planner_results(self, run):
+    def planner_results(self, run, staged=True):
         pending = read_json(run / "state.json")["pending"]
         plan_id = pending["records"][0]["plan_task"]
         task = read_json(run / "tasks" / (plan_id + ".json"))
         original = task["parameters"]["original_output"]
         original_path = Path(original["url"])
-        original_path.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(original_path, "wb") as stream:
-            stream.write(b"<LesHouchesEvents>\n<event>\n1\n</event>\n</LesHouchesEvents>\n")
-        original = artifact_ref(original_path, original["artifact_id"], original["kind"], 15, original["url"])
         blocks = []
-        for index in range(3):
-            path = original_path.parent / "blocks" / ("block%d.lhe.gz" % index)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(path, "wb") as stream:
-                stream.write(b"<event>\n%d\n</event>\n" % index)
-            blocks.append(artifact_ref(path, "BLOCK:pool:s1:%06d" % index, "lhe-block", 5, str(path)))
+        if staged:
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(original_path, "wb") as stream:
+                stream.write(b"<LesHouchesEvents>\n<event>\n1\n</event>\n</LesHouchesEvents>\n")
+            original = artifact_ref(original_path, original["artifact_id"], original["kind"],
+                                    15, original["url"])
+            for index in range(3):
+                path = original_path.parent / "blocks" / ("block%d.lhe.gz" % index)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with gzip.open(path, "wb") as stream:
+                    stream.write(b"<event>\n%d\n</event>\n" % index)
+                blocks.append(artifact_ref(path, "BLOCK:pool:s1:%06d" % index, "lhe-block",
+                                           5, str(path)))
+        else:
+            # A valid manifest whose URLs were never materialized here: the seam
+            # validates the record, not the remote objects.
+            original = dict(original, events=15, size_bytes=999)
+            blocks = [{"artifact_id": "BLOCK:pool:s1:%06d" % index, "kind": "lhe-block",
+                       "events": 5, "size_bytes": 999,
+                       "url": str(original_path.parent / "blocks" / ("block%d.lhe.gz" % index))}
+                      for index in range(3)]
         atomic_json(run / "results" / (plan_id + ".json"), {"task_id": plan_id, "stage": "plan",
                     "status": "ok", "runtime_release": "test-release", "outputs": blocks,
                     "originals": [original], "planned_events": 15,
@@ -135,7 +166,11 @@ class ProductionLifecycle(unittest.TestCase):
             self.assertIn("PRE script proxy is unavailable", advance_script)
             self.assertIn(f"exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} ", advance_script)
             subprocess.run(["bash", "-n", str(run / "advance.sh")], check=True)
-            source_dag = Path(read_json(run / "state.json")["pending"]["dag"]).read_text()
+            state = read_json(run / "state.json")
+            self.assertEqual(set(state), STATE_KEYS)
+            self.assertEqual(state["state_schema"], "mcprod-state-v2")
+            self.assertEqual(state["merge_group_counts"], {})
+            source_dag = Path(state["pending"]["dag"]).read_text()
             self.assertIn("CONFIG " + str(run / "dagman.config"), source_dag)
             self.assertIn("CATEGORY", source_dag)
             self.assertIn("MAXJOBS lhe", source_dag)
@@ -146,6 +181,7 @@ class ProductionLifecycle(unittest.TestCase):
                 self.assertNotIn("x509up_u", submit)
             self.assertNotIn("ENV SET X509_USER_PROXY=", root_dag)
             self.assertFalse((run / "submit/merge.sub").exists())
+            self.assertTrue((run / "submit/reclaim.sub").exists())
             replay = advance_wave(run, 0)
             self.assertEqual(replay["phase"], "sources")
             self.planner_results(run)
@@ -154,22 +190,96 @@ class ProductionLifecycle(unittest.TestCase):
             process_dag = Path(processing["dag"]).read_text()
             self.assertRegex(process_dag, r"PARENT MIX_[^ ]+ CHILD MINIAOD_[^ ]+")
             self.assertRegex(process_dag, r"PARENT MINIAOD_[^ ]+ CHILD ARCHIVE_")
+            pending = read_json(run / "state.json")["pending"]
+            self.assertEqual([item["artifact_id"] for item in pending["reclaim"]],
+                             ["LHE_000000", "BLOCK:pool:s1:000000", "BLOCK:pool:s1:000001",
+                              "HEPMC_C_JOB000000_BLOCK000000"])
             self.processing_results(run)
-            with patch.object(TransferClient, "remove", side_effect=RuntimeError("cleanup interruption")):
-                with self.assertRaisesRegex(RuntimeError, "cleanup interruption"):
-                    advance_wave(run, 2)
-            failed = read_json(run / "state.json")
-            self.assertEqual(failed["pool_cursors"], {})
-            self.assertEqual(failed["merge_buffers"], {})
-            done = advance_wave(run, 2)
+            with remote_io_blocked():
+                done = advance_wave(run, 2)
             self.assertEqual(done["status"], "complete")
             state = read_json(run / "state.json")
+            self.assertEqual(set(state), STATE_KEYS)
+            self.assertEqual(state["status"], "complete")
+            self.assertEqual(state["next_step"], 2)
             self.assertEqual(state["pool_cursors"], {"pool": 2})
-            self.assertEqual(len(state["merge_buffers"]["C::run3_2022_legacy_premix_v1"]), 0)
-            self.assertEqual(len(state["groups"]), 1)
-            self.assertEqual(len(state["archives"]), 1)
-            self.assertEqual(state["terminal_cleanup"], ["BLOCK:pool:s1:000002"])
-            self.assertFalse((run / "cern/offline/sources/pool/s1/blocks/block2.lhe.gz").exists())
+            self.assertEqual(state["merge_buffers"][SAMPLE], [])
+            self.assertEqual(state["merge_group_counts"], {SAMPLE: 1})
+            # Nothing that grows with the run comes back into state.json; the
+            # seam no longer deletes staged products, so the unused block stays.
+            self.assertNotIn("terminal_cleanup", state)
+            self.assertTrue(
+                (run.parent / "cern/offline/sources/pool/s1/blocks/block2.lhe.gz").is_file())
+            # Committed ledger records, and only those, describe the run.
+            inventory = read_json(inventory_path(run, "pool", "s1"))
+            self.assertEqual(inventory["accepted_step"], 0)
+            self.assertEqual(len(inventory["producer_result"]["outputs"]), 3)
+            self.assertEqual([item["step"] for item in
+                              load_archives(run, read_json(run / "run.json"), 2)], [1])
+            self.assertEqual(load_wave(run, 1)["phase"], "processing")
+            self.assertEqual(len(load_groups(run, read_json(run / "run.json"),
+                                             state["merge_group_counts"])), 1)
+            self.assertTrue(group_path(run, "C", "run3_2022_legacy_premix_v1", 0).exists())
+            self.assertEqual(len(read_json(run / "merge_groups.json")["groups"]), 1)
+            self.assertTrue((run / ".complete").is_file())
+            # Completed replays stay no-ops.
+            self.assertEqual(advance_wave(run, 2)["status"], "complete")
+
+    def test_state_commit_is_the_retry_safe_fold_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, run = self.fixture(Path(temporary))
+            plan_run(spec, run)
+            self.planner_results(run)
+            advance_wave(run, 1)
+            self.processing_results(run)
+            commit = production.atomic_json
+
+            def interrupted(path, value):
+                if Path(path).name == "state.json":
+                    raise RuntimeError("state commit interrupted")
+                return commit(path, value)
+
+            with patch("full_mc.application.production.atomic_json", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "state commit interrupted"):
+                    advance_wave(run, 2)
+            # The fold reached every immutable write; only the marker is missing.
+            failed = read_json(run / "state.json")
+            self.assertEqual(failed["next_step"], 1)
+            self.assertEqual(failed["pending"]["step"], 1)
+            self.assertEqual(len(load_archives(run, read_json(run / "run.json"), 2)), 1)
+            pending = failed["pending"]
+            for task_id in pending["task_ids"]:
+                self.assertFalse((run / "results" / (task_id + ".json")).exists())
+            # The wave receipt alone replays the interrupted fold.
+            with remote_io_blocked():
+                retried = advance_wave(run, 2)
+            self.assertEqual(retried["status"], "complete")
+            state = read_json(run / "state.json")
+            self.assertEqual(state["merge_group_counts"], {SAMPLE: 1})
+            self.assertEqual(len(load_groups(run, read_json(run / "run.json"),
+                                             state["merge_group_counts"])), 1)
+            self.assertEqual(len(read_json(run / "merge_groups.json")["groups"]), 1)
+
+    def test_valid_planner_result_advances_with_unreachable_urls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, run = self.fixture(Path(temporary))
+            plan_run(spec, run)
+            self.planner_results(run, staged=False)
+            with remote_io_blocked():
+                processing = advance_wave(run, 1)
+            self.assertEqual(processing["phase"], "processing")
+            inventory = read_json(inventory_path(run, "pool", "s1"))
+            self.assertEqual(inventory["accepted_step"], 0)
+
+    def test_older_state_format_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, run = self.fixture(Path(temporary))
+            plan_run(spec, run)
+            state = read_json(run / "state.json")
+            state["state_schema"] = "mcprod-state-v1"
+            atomic_json(run / "state.json", state)
+            with self.assertRaisesRegex(RuntimeError, "mcprod-state-v2"):
+                advance_wave(run, 1)
 
     def test_pre_timeout_fails_and_complete_sentinel_still_skips(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -254,8 +364,10 @@ class ProductionLifecycle(unittest.TestCase):
             atomic_json(result_path, result)
             with self.assertRaisesRegex(RuntimeError, "identities"):
                 advance_wave(run, 1)
+            self.assertEqual(read_json(run / "state.json")["next_step"], 0)
+            self.assertFalse((run / "ledger").exists())
 
-    def test_restores_only_recorded_original_after_terminal_cleanup(self):
+    def test_restores_only_committed_recorded_original(self):
         with tempfile.TemporaryDirectory() as temporary:
             spec, run = self.fixture(Path(temporary))
             plan_run(spec, run)
@@ -263,12 +375,23 @@ class ProductionLifecycle(unittest.TestCase):
             advance_wave(run, 1)
             self.processing_results(run)
             self.assertEqual(advance_wave(run, 2)["status"], "complete")
-            archive_id = read_json(run / "state.json")["archives"][0]["outputs"][0]["artifact_id"]
+            receipts = load_archives(run, read_json(run / "run.json"), 2)
+            archive_id = receipts[0]["outputs"][0]["artifact_id"]
             restored = restore_archived_sources(run, archive_id, run / "recovered")
             self.assertEqual([item["artifact_id"] for item in restored["restored"]], ["LHE_000000"])
             self.assertTrue(Path(restored["restored"][0]["url"]).is_file())
             with self.assertRaises(FileExistsError):
                 restore_archived_sources(run, archive_id, run / "recovered")
+            # Receipts the state has not accepted are not restoration material.
+            atomic_json(archive_path(run, 99), {
+                "schema": "mcprod-archive-receipt-v1", "step": 99, "task_id": "ARCHIVE_000099",
+                "outputs": [{"artifact_id": "ARCHIVE_000099", "url": "root://elsewhere/x.tar",
+                             "kind": "upstream-archive"}],
+                "members": [{"artifact_id": "LHE_000000", "member": "000000_source.lhe.gz",
+                             "url": "root://elsewhere/source.lhe.gz", "kind": "lhe",
+                             "events": 15, "size_bytes": 1}]})
+            with self.assertRaisesRegex(ValueError, "unknown verified archive"):
+                restore_archived_sources(run, "ARCHIVE_000099", run / "recovered")
 
     def test_rejects_invalid_source_caps_and_revision_expectations(self):
         with tempfile.TemporaryDirectory() as temporary:

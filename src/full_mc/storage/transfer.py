@@ -172,15 +172,25 @@ class TransferClient:
 
 def materialize_input(reference, work_dir, transfer=None):
     url = str(reference["url"])
+    expected = reference.get("size_bytes")
     cached = reference.get("local_path")
-    if cached and Path(cached).is_file() and Path(cached).stat().st_size == reference.get("size_bytes"):
+    if cached and Path(cached).is_file() and Path(cached).stat().st_size == expected:
         return Path(cached).resolve()
     if not is_remote(url) and local_path(url).is_file():
-        return local_path(url).resolve()
-    name = Path(urlsplit(url).path).name
-    # Artifact IDs distinguish equally named inputs from different source pools.
-    identifier = str(reference.get("artifact_id", "input")).replace("/", "_").replace(":", "_")
-    return (transfer or TransferClient()).copy_in(url, Path(work_dir)/"inputs"/identifier/name)
+        destination = local_path(url).resolve()
+    else:
+        name = Path(urlsplit(url).path).name
+        # Artifact IDs distinguish equally named inputs from different source pools.
+        identifier = str(reference.get("artifact_id", "input")).replace("/", "_").replace(":", "_")
+        destination = (transfer or TransferClient()).copy_in(
+            url, Path(work_dir)/"inputs"/identifier/name)
+    # A producer manifest is not proof that this copy is intact: a truncated or
+    # stale file would otherwise be showered silently.  A mismatch is a hard
+    # failure, so remove the bad copy rather than leave it to be reused.
+    if expected is not None and destination.stat().st_size != int(expected):
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(f"downloaded size disagrees with {reference['artifact_id']}")
+    return destination
 
 def artifact_ref(path, artifact_id, kind, events=None, url=None):
     value = {"artifact_id":artifact_id, "url":url or str(path), "kind":kind,

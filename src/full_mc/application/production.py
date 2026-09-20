@@ -1,4 +1,11 @@
-"""Single-root bounded production, from source preparation to archival handoff."""
+"""Single-root bounded production, from source preparation to archival handoff.
+
+``state.json`` is bounded by the configured wave width.  Everything that grows
+with the run - planned sources, verified archives, completed merge groups,
+folded waves - is an immutable record under ``ledger/``, read back by position.
+The PRE seam therefore never contacts EOS: it validates the local records a
+producer already published, commits the previous wave, and prepares the next.
+"""
 from collections import defaultdict
 from copy import deepcopy
 import hashlib
@@ -6,6 +13,11 @@ import math
 from pathlib import Path
 import subprocess
 
+from full_mc.application.ledger import (STATE_SCHEMA, archive_record, inventory_record,
+                                        load_archives, load_groups, load_inventory,
+                                        load_wave, sample_key, wave_path, wave_receipt,
+                                        write_archive, write_group, write_inventory,
+                                        write_wave)
 from full_mc.domain.allocation import allocate_wave
 from full_mc.domain.inventory import SourceBlock
 from full_mc.domain.models import Campaign, CampaignSource
@@ -17,7 +29,9 @@ from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.settings import load_run_spec
 from full_mc.storage.archive import restore_members
-from full_mc.storage.transfer import TransferClient, artifact_ready
+# A pure URL predicate, not a storage client: the seam must be able to tell
+# run-owned XRootD staging from a local path without opening a connection.
+from full_mc.storage.transfer import is_remote
 
 
 def _campaigns(spec):
@@ -122,13 +136,18 @@ def plan_run(spec_path, output_dir, log_level=None):
         raise FileExistsError("run directory is not empty; use the existing run for recovery")
     root.mkdir(parents=True, exist_ok=True)
     atomic_json(root / "run.json", spec)
-    # Bound lazy phases without expanding any per-worker source inventory.
-    steps = len(spec["sources"]) + sum(c.max_processing_nodes for c in campaigns) + 1
+    # Bound lazy phases without expanding any per-worker source inventory.  The
+    # two trailing slots are structural rather than slack: a wave's PRE folds
+    # wave i-1 and prepares wave i, so even the last real wave needs a successor
+    # to fold it, and the terminal reclaim wave is prepared into a slot that
+    # needs that successor in turn.  One slot short of this and the root DAG
+    # runs every wave it declares, reports success, and never writes .complete.
+    # Unused slots are not wasted: their PRE sees .complete and skips.
+    steps = len(spec["sources"]) + sum(c.max_processing_nodes for c in campaigns) + 2
     atomic_json(root / "state.json", {
-        "status": "planned", "next_step": 0, "pending": None,
-        "prepared_sources": [], "blocks": {}, "pool_cursors": {},
-        "job_offsets": {}, "resident": {}, "originals": [],
-        "merge_buffers": {}, "groups": [], "archives": []})
+        "state_schema": STATE_SCHEMA, "status": "planned", "next_step": 0,
+        "pending": {}, "pool_cursors": {}, "job_offsets": {},
+        "merge_buffers": {}, "merge_group_counts": {}})
     write_submit_files(root, spec["core_root"], runtime_dir, proxy_path)
     write_root_dag(root, spec, steps, proxy_path)
     prepared = advance_wave(root, 0)
@@ -138,34 +157,111 @@ def plan_run(spec_path, output_dir, log_level=None):
             "lazy_steps": steps, "first_phase": prepared["phase"], "submitted": False}
 
 
-def _blocks(state):
+def _committed(root, spec, state):
+    """Committed inventory records, at or below this state's commit marker."""
+    return load_inventory(root, spec, state["next_step"])
+
+
+def _archived_ids(root, spec, state):
+    """Artifact IDs a committed archive receipt proves durable."""
+    return {member["artifact_id"]
+            for receipt in load_archives(root, spec, state["next_step"])
+            for member in receipt.get("members", [])}
+
+
+def _staging_view(root, spec, state):
+    """Ledger-derived view of the objects still occupying run-owned CERN staging.
+
+    Blocks come from committed PLAN records in run-spec source order, which is
+    the order the planner recorded.  Only blocks below a pool cursor (already
+    consumed) and originals inside a committed archive receipt stop counting;
+    no reader here contacts EOS.
+    """
+    blocks, resident, originals, prepared = {}, {}, [], set()
+    archived = _archived_ids(root, spec, state)
+    for record in _committed(root, spec, state):
+        pool, source_id = record["pool"], record["source_id"]
+        prepared.add(record["source_index"])
+        for ref in record["producer_result"]["outputs"]:
+            blocks.setdefault(pool, []).append(dict(ref, pool=pool, source_id=source_id))
+        for ref in record["producer_result"]["originals"]:
+            item = dict(ref, pool=pool, source_id=source_id)
+            if item["artifact_id"] in archived:
+                continue
+            resident[item["artifact_id"]] = item
+            originals.append(item["artifact_id"])
+    for pool, refs in blocks.items():
+        for ref in refs[int(state["pool_cursors"].get(pool, 0)):]:
+            resident[ref["artifact_id"]] = ref
+    return {"blocks": blocks, "resident": resident, "originals": originals,
+            "prepared": prepared}
+
+
+def _blocks(view):
     return {pool: [SourceBlock(ref["artifact_id"], pool, ref["source_id"], index,
-                                int(ref["events"]), ref["url"])
+                               int(ref["events"]), ref["url"])
                    for index, ref in enumerate(refs)]
-            for pool, refs in state["blocks"].items()}
+            for pool, refs in view["blocks"].items()}
 
 
-def _allocation(spec, state):
+def _allocation(spec, state, view):
     usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
-    fitting = (usable - _used_bytes(state)) // spec["limits"]["mixed_hepmc_bytes"]
+    fitting = (usable - _used_bytes(view)) // spec["limits"]["mixed_hepmc_bytes"]
     limit = min(spec["limits"]["processing_nodes_per_wave"], max(1, fitting))
-    return allocate_wave(_campaigns(spec), _blocks(state), state["pool_cursors"],
+    return allocate_wave(_campaigns(spec), _blocks(view), state["pool_cursors"],
                          limit, state["job_offsets"])
 
 
-def _used_bytes(state):
-    return sum(int(ref["size_bytes"]) for ref in state["resident"].values())
+def _used_bytes(view):
+    return sum(int(ref["size_bytes"]) for ref in view["resident"].values())
 
 
-def _check_bytes(spec, state, requested):
+def _check_bytes(spec, view, requested):
     usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
-    if _used_bytes(state) + requested > usable:
+    if _used_bytes(view) + requested > usable:
         raise RuntimeError("bounded wave cannot fit CERN staging; retain state and adjust explicit limits")
 
 
-def _source_phase(root, step, spec, state):
+def _reclaim_refs(refs):
+    """Exact staged objects a reclaim task may delete, deduplicated by identity.
+
+    Only an explicitly recorded ``sidecar_url`` travels with a reference: PLAN
+    blocks publish no EOS sidecar, so manufacturing ``url + ".json"`` would
+    delete an object this run never staged.
+    """
+    seen, values = set(), []
+    for ref in refs:
+        identity = ref["artifact_id"]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        item = {key: ref[key] for key in ("artifact_id", "url", "kind") if key in ref}
+        if "sidecar_url" in ref:
+            item["sidecar_url"] = ref["sidecar_url"]
+        values.append(item)
+    return values
+
+
+def _remote_staging_refs(refs):
+    """The subset of recorded references a reclaim worker can delete over XRootD.
+
+    The run spec always pins ``cern_staging`` to an EOS URL, so in production
+    this is every reference.  A run whose staging root is a local filesystem
+    path (a hermetic test run) has no remote staging to reclaim, so the seam
+    issues no reclaim task and gates no cursor on one.
+    """
+    return [ref for ref in refs if is_remote(ref["url"])]
+
+
+def _reclaim_task(spec, step, refs):
+    """One reclaim task for exactly the references the seam recorded."""
+    return _task(spec, f"RECLAIM_{step:06d}", "reclaim", refs, [],
+                 {"staging_prefix": _staging(spec)})
+
+
+def _source_phase(root, step, spec, state, view):
     needed = defaultdict(int)
-    blocks = _blocks(state)
+    blocks = _blocks(view)
     from full_mc.domain.allocation import _take_budget
     for campaign in _campaigns(spec):
         if state["job_offsets"].get(campaign.name, 0) >= campaign.max_processing_nodes:
@@ -179,7 +275,7 @@ def _source_phase(root, step, spec, state):
                 cursors[slot.pool] = picked[0]
     selected = []
     for index, source in enumerate(spec["sources"]):
-        if index in state["prepared_sources"] or needed[source["pool"]] <= 0:
+        if index in view["prepared"] or needed[source["pool"]] <= 0:
             continue
         selected.append(index)
         profile = source.get("resolved_generator_profile", {})
@@ -193,7 +289,7 @@ def _source_phase(root, step, spec, state):
     limits = spec["limits"]
     per_source = limits["source_lhe_bytes"] + limits["source_block_bytes"]
     usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
-    fit = (usable - _used_bytes(state)) // per_source
+    fit = (usable - _used_bytes(view)) // per_source
     selected = selected[:max(0, fit)]
     if not selected:
         raise RuntimeError("no additional source fits the available CERN staging budget")
@@ -231,15 +327,15 @@ def _source_phase(root, step, spec, state):
         records.append({"source_index": index, "plan_task": planner["task_id"]})
     path = write_tasks_dag(root, step, tasks, dependencies, spec)
     return {"step": step, "phase": "sources", "records": records,
-            "task_ids": [t["task_id"] for t in tasks], "dag": str(path)}
+            "task_ids": [t["task_id"] for t in tasks], "reclaim": [], "dag": str(path)}
 
 
-def _process_phase(root, step, spec, state, allocation):
+def _process_phase(root, step, spec, view, allocation):
     tasks, dependencies, mini_records, mixed = [], [], [], []
-    index = {ref["artifact_id"]: ref for refs in state["blocks"].values() for ref in refs}
+    index = {ref["artifact_id"]: ref for refs in view["blocks"].values() for ref in refs}
     campaigns = {c["name"]: c for c in spec["campaigns"]}
     count = sum(len(c["nodes"]) for c in allocation["campaigns"])
-    _check_bytes(spec, state, count * spec["limits"]["mixed_hepmc_bytes"])
+    _check_bytes(spec, view, count * spec["limits"]["mixed_hepmc_bytes"])
     for group in allocation["campaigns"]:
         campaign = campaigns[group["campaign"]]
         for node in group["nodes"]:
@@ -295,34 +391,79 @@ def _process_phase(root, step, spec, state, allocation):
                                      "job_id": node["job_id"],
                                      "task_id": mini["task_id"]})
             mixed.append(hepmc)
-    archive_inputs = [state["resident"][key] for key in state["originals"]] + mixed
+    archive_inputs = [view["resident"][key] for key in view["originals"]] + mixed
     archive_ref = _ref(f"ARCHIVE_{step:06d}", spec["storage"]["ihep_archive"].rstrip("/")
                        + "/" + spec["run_id"] + f"/wave_{step:06d}.tar", "upstream-archive")
     archive = _task(spec, f"ARCHIVE_{step:06d}", "archive", archive_inputs, [archive_ref], {
         "component_miniaods": [task["outputs"][0] for task in tasks if task["stage"] == "miniaod"],
-        "scratch_bytes": 3 * (_used_bytes(state) + count * spec["limits"]["mixed_hepmc_bytes"])})
+        "scratch_bytes": 3 * (_used_bytes(view) + count * spec["limits"]["mixed_hepmc_bytes"])})
     tasks.append(archive)
     dependencies.append(([r["task_id"] for r in mini_records], archive["task_id"]))
+    # Deleting these is a separate worker task; recording them here keeps the
+    # exact reference set a retried wave must delete in the wave receipt.
+    deletable = [view["resident"][key] for key in view["originals"]]
+    for pool, cursor in allocation.get("pool_cursors_after", {}).items():
+        before = allocation.get("pool_cursors_before", {}).get(pool, 0)
+        deletable.extend(view["blocks"].get(pool, [])[before:cursor])
+    deletable.extend(mixed)
+    reclaim = _reclaim_refs(deletable)
+    reclaim_task = None
+    reclaim_refs = _remote_staging_refs(reclaim)
+    if reclaim_refs:
+        reclaim_task = _reclaim_task(spec, step, reclaim_refs)
+        tasks.append(reclaim_task)
+        dependencies.append(([archive["task_id"]], reclaim_task["task_id"]))
     path = write_tasks_dag(root, step, tasks, dependencies, spec)
     return {"step": step, "phase": "processing", "allocation": allocation,
             "task_ids": [t["task_id"] for t in tasks], "miniaods": mini_records,
-            "mixed": mixed, "archive_task": archive["task_id"], "dag": str(path)}
+            "mixed": mixed, "archive_task": archive["task_id"],
+            "reclaim": reclaim, "reclaim_task": reclaim_task and reclaim_task["task_id"],
+            "dag": str(path)}
 
 
-def _result(root, identity, spec, expected_stage):
-    outcome = read_json(root / "results" / (identity + ".json"))
-    if (outcome.get("task_id") != identity or outcome.get("status") != "ok"
-            or outcome.get("runtime_release") != spec["runtime_release"]
-            or outcome.get("stage") != expected_stage):
-        raise RuntimeError(f"worker result is not successful for this release: {identity}")
-    return outcome
+def validate_result_envelope(task, outcome, runtime_release):
+    """Structural check that a worker result belongs to its frozen task.
+
+    The seam has no storage client: a producer already verified its upload, so
+    only local consistency can be checked here.
+    """
+    if outcome.get("task_id") != task["task_id"]:
+        raise RuntimeError("worker result has the wrong task ID")
+    if outcome.get("stage") != task["stage"]:
+        raise RuntimeError("worker result has the wrong stage")
+    if outcome.get("status") != "ok":
+        raise RuntimeError("worker result is not successful")
+    if outcome.get("runtime_release") != runtime_release:
+        raise RuntimeError("worker result has the wrong runtime release")
 
 
-def _validate_planner_result(root, spec, item, outcome, client):
+def validate_planner_ref(ref, source, parameters, index):
+    """One staged block, checked against its frozen PLAN task and source."""
+    expected_id = f"BLOCK:{source['pool']}:{source['source_id']}:{index:06d}"
+    expected_prefix = str(parameters["block_output_dir"]).rstrip("/") + "/"
+    events = ref.get("events")
+    if ref.get("artifact_id") != expected_id:
+        raise RuntimeError("planner block identity is invalid")
+    if ref.get("kind") != "lhe-block":
+        raise RuntimeError("planner output is not an LHE block")
+    if not str(ref.get("url", "")).startswith(expected_prefix):
+        raise RuntimeError("planner block URL is outside its output directory")
+    if not str(ref.get("url", "")).endswith(".lhe.gz"):
+        raise RuntimeError("planner block is not compressed LHE")
+    if not isinstance(events, int) or isinstance(events, bool) or events <= 0:
+        raise RuntimeError("planner block event count is invalid")
+    if events > int(parameters["events_per_block"]):
+        raise RuntimeError("planner block exceeds the configured block size")
+    if int(ref.get("size_bytes", 0)) <= 0:
+        raise RuntimeError("planner block has no declared byte size")
+
+
+def _validate_planner_result(root, spec, item, outcome):
     """Verify a planner result against the immutable task written for its source."""
     task = read_json(root / "tasks" / (item["plan_task"] + ".json"))
     source = spec["sources"][item["source_index"]]
     parameters = task["parameters"]
+    validate_result_envelope(task, outcome, spec["runtime_release"])
     declared_counts = [ref.get("events") for ref in task["inputs"]]
     input_events = sum(int(value) for value in declared_counts) if all(
         isinstance(value, int) and not isinstance(value, bool) and value > 0
@@ -344,19 +485,10 @@ def _validate_planner_result(root, spec, item, outcome, client):
         raise RuntimeError("planner block identities do not match the frozen source")
     planned = 0
     for index, ref in enumerate(refs):
-        events = ref.get("events")
-        if (ref.get("kind") != "lhe-block" or not isinstance(events, int)
-                or isinstance(events, bool) or events <= 0
-                or events > int(parameters["events_per_block"])
-                or not str(ref.get("url", "")).startswith(
-                    str(parameters["block_output_dir"]).rstrip("/") + "/")
-                or not str(ref.get("url", "")).endswith(".lhe.gz")
-                or int(ref.get("size_bytes", 0)) <= 0
-                or client.size(ref["url"]) != int(ref["size_bytes"])):
-            raise RuntimeError("planner block result fails the frozen-task contract")
-        if index + 1 < len(refs) and events != int(parameters["events_per_block"]):
+        validate_planner_ref(ref, source, parameters, index)
+        if index + 1 < len(refs) and ref["events"] != int(parameters["events_per_block"]):
             raise RuntimeError("only the final planner block may be partial")
-        planned += events
+        planned += ref["events"]
     if planned != int(outcome.get("planned_events", -1)) or planned > limit:
         raise RuntimeError("planner result has an invalid planned event total")
     originals = outcome.get("originals")
@@ -367,21 +499,26 @@ def _validate_planner_result(root, spec, item, outcome, client):
     for key in ("artifact_id", "url", "kind"):
         if original.get(key) != expected_original.get(key):
             raise RuntimeError("planner original does not match the frozen source task")
-    if (original.get("events") != actual_input_events or int(original.get("size_bytes", 0)) <= 0
-            or client.size(original["url"]) != int(original["size_bytes"])):
+    if original.get("events") != actual_input_events or int(original.get("size_bytes", 0)) <= 0:
         raise RuntimeError("planner original fails count or size verification")
 
 
-def _validate_archive_result(root, spec, pending, outcome, client):
+def _validate_archive_result(root, spec, pending, outcome):
+    """Verify an archive result against its frozen task, locally.
+
+    The archive worker downloaded every member and verified the published
+    archive before returning, so the seam repeats the structural contract only:
+    member identity, URL, kind, event count and declared size still have to
+    match the frozen archive inputs.
+    """
     task = read_json(root / "tasks" / (pending["archive_task"] + ".json"))
+    validate_result_envelope(task, outcome, spec["runtime_release"])
     outputs = outcome.get("outputs")
     if not isinstance(outputs, list) or len(outputs) != 1 or len(task["outputs"]) != 1:
         raise RuntimeError("archive result must publish exactly its declared archive")
     for key in ("artifact_id", "url", "kind"):
         if outputs[0].get(key) != task["outputs"][0].get(key):
             raise RuntimeError("archive output does not match its frozen task")
-    if not artifact_ready(outputs[0], client):
-        raise RuntimeError("upstream archive is not verified")
     members = outcome.get("members")
     expected = {ref["artifact_id"]: ref for ref in task["inputs"]}
     if not isinstance(members, list) or {item.get("artifact_id") for item in members} != set(expected):
@@ -394,51 +531,139 @@ def _validate_archive_result(root, spec, pending, outcome, client):
                 or any(item.get(key) != reference.get(key) for key in ("url", "kind"))
                 or ("events" in reference and item.get("events") != reference["events"])
                 or int(item.get("size_bytes", 0)) <= 0
-                or client.size(reference["url"]) != int(item["size_bytes"])):
+                or ("size_bytes" in reference
+                    and int(item["size_bytes"]) != int(reference["size_bytes"]))):
             raise RuntimeError("archive member result fails the frozen-task contract")
         seen_names.add(name)
 
 
-def _reclaim_staging(spec, state, refs, client):
-    """Delete only exact, run-owned artifacts; unchanged state makes retries safe."""
-    seen = set()
-    for ref in refs:
-        identity = ref["artifact_id"]
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if not ref["url"].startswith(_staging(spec) + "/"):
-            raise ValueError("refusing to reclaim an object outside this run's staging")
-        for url in (ref["url"], ref.get("sidecar_url", ref["url"] + ".json")):
-            try:
-                client.remove(url)
-            except FileNotFoundError:
-                pass
-        state["resident"].pop(identity, None)
+def _validate_reclaim_result(root, spec, pending, outcome):
+    """Every reference the reclaim task declared has to be accounted for.
+
+    The seam advances pool cursors and job offsets only on this result: a wave
+    whose staged deletions are unconfirmed is not a consumed wave, so a retry
+    after a partial deletion replays it instead of moving on.
+    """
+    task = read_json(root / "tasks" / (pending["reclaim_task"] + ".json"))
+    validate_result_envelope(task, outcome, spec["runtime_release"])
+    entries = outcome.get("reclaimed")
+    if not isinstance(entries, list):
+        raise RuntimeError("reclaim result has no reclaimed objects")
+    reported = {}
+    for entry in entries:
+        identity = entry.get("artifact_id")
+        if not isinstance(identity, str) or identity in reported:
+            raise RuntimeError("reclaim result reports an unknown or repeated artifact")
+        reported[identity] = entry
+    declared = {ref["artifact_id"]: ref for ref in task["inputs"]}
+    if set(reported) != set(declared):
+        raise RuntimeError("reclaim result does not account for every declared reference")
+    for identity, entry in reported.items():
+        expected = {("payload", str(declared[identity]["url"]))}
+        if "sidecar_url" in declared[identity]:
+            expected.add(("sidecar", str(declared[identity]["sidecar_url"])))
+        objects = entry.get("objects")
+        if not isinstance(objects, list):
+            raise RuntimeError("reclaim result has no objects for " + identity)
+        seen = set()
+        for item in objects:
+            key = (item.get("kind"), str(item.get("url")))
+            if key not in expected or key in seen:
+                raise RuntimeError("reclaim result objects disagree with " + identity)
+            if item.get("disposition") not in ("removed", "already-missing"):
+                raise RuntimeError("reclaim result has an unknown disposition")
+            seen.add(key)
+        if seen != expected:
+            raise RuntimeError("reclaim result misses an object of " + identity)
 
 
-def _terminal_cleanup(spec, state, client):
-    """Reclaim unused staged blocks only after their retained originals are archived."""
-    archived = {member["artifact_id"] for archive in state["archives"]
-                for member in archive["members"]}
-    originals = {(source["pool"], source["source_id"]): "LHE_%06d" % index
-                 for index, source in enumerate(spec["sources"])}
-    remaining = list(state["resident"].values())
-    for ref in remaining:
-        if ref.get("kind") == "lhe-block":
-            source = (ref.get("pool"), ref.get("source_id"))
-            if originals.get(source) not in archived:
+def _validate_pending_results(root, spec, pending, results):
+    """Every structural check the seam can make from local records alone."""
+    if pending["phase"] == "sources":
+        for item in pending["records"]:
+            _validate_planner_result(root, spec, item, results[item["plan_task"]])
+        return
+    if pending["phase"] == "reclaim":
+        _validate_reclaim_result(root, spec, pending, results[pending["reclaim_task"]])
+        return
+    _validate_archive_result(root, spec, pending, results[pending["archive_task"]])
+    for item in pending["miniaods"]:
+        task = read_json(root / "tasks" / (item["task_id"] + ".json"))
+        outcome = results[item["task_id"]]
+        validate_result_envelope(task, outcome, spec["runtime_release"])
+        output = outcome["outputs"][0]
+        expected_profile = item["detector_profile_id"]
+        if int(output.get("events", 0)) <= 0:
+            raise RuntimeError("component MiniAOD has no verified event count")
+        if (task["parameters"].get("detector_profile_id") != expected_profile
+                or output.get("detector_profile_id") != expected_profile):
+            raise RuntimeError("MiniAOD provenance does not match its detector task")
+    if pending.get("reclaim_task"):
+        _validate_reclaim_result(root, spec, pending, results[pending["reclaim_task"]])
+
+
+def _wave_results(root, spec, pending):
+    """Worker results the fold consumes, from raw fragments or the wave receipt.
+
+    Fragments are removed only once the receipt is durable, so a retry after a
+    crash in that window must recover them from the receipt instead.
+    """
+    if pending["phase"] == "sources":
+        needed = [item["plan_task"] for item in pending["records"]]
+    elif pending["phase"] == "reclaim":
+        needed = [pending["reclaim_task"]]
+    else:
+        needed = [pending["archive_task"]] + [item["task_id"] for item in pending["miniaods"]]
+        if pending.get("reclaim_task"):
+            needed.append(pending["reclaim_task"])
+    results, missing = {}, []
+    for task_id in needed:
+        path = root / "results" / (task_id + ".json")
+        if path.exists():
+            results[task_id] = read_json(path)
+        else:
+            missing.append(task_id)
+    if missing:
+        if not wave_path(root, pending["step"]).exists():
+            # Nothing was folded yet: say which worker the seam is waiting for
+            # instead of blaming an absent receipt.
+            raise RuntimeError("wave results are incomplete: " + ", ".join(missing))
+        receipt = load_wave(root, pending["step"])
+        if receipt.get("pending") != pending:
+            raise RuntimeError("wave receipt does not describe the pending wave")
+        for task_id in missing:
+            if task_id not in receipt["results"]:
+                raise RuntimeError("wave receipt misses the result for " + task_id)
+            results[task_id] = receipt["results"][task_id]
+    return results
+
+
+def terminal_reclaim_refs(root, spec, state):
+    """Staged blocks this run will never process, once their originals are archived.
+
+    The terminal reclaim task publishes these instead of the submit host
+    deleting them.  An unused block whose original is not yet inside a committed
+    archive receipt is a hard error: the retained LHE has to be proven durable
+    before the only other copy is removed.
+    """
+    archived = _archived_ids(root, spec, state)
+    by_source = {(record["pool"], record["source_id"]): "LHE_%06d" % record["source_index"]
+                 for record in _committed(root, spec, state)}
+    candidates = []
+    for pool, refs in _staging_view(root, spec, state)["blocks"].items():
+        for ref in refs[int(state["pool_cursors"].get(pool, 0)):]:
+            if by_source.get((ref["pool"], ref["source_id"])) not in archived:
                 raise RuntimeError("unused block cannot be reclaimed before its original is archived")
-    _reclaim_staging(spec, state, remaining, client)
-    state["blocks"] = {pool: [] for pool in state["blocks"]}
-    state["terminal_cleanup"] = sorted(ref["artifact_id"] for ref in remaining)
+            candidates.append(ref)
+    return _reclaim_refs(candidates)
 
 
 def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None):
     """Restore recorded original LHE members for an operator recovery or replan."""
     root = Path(run_dir).resolve()
+    spec = read_json(root / "run.json")
     state = read_json(root / "state.json")
-    archive = next((item for item in state.get("archives", [])
+    archive = next((item for item in load_archives(root, spec, state["next_step"])
                     if any(ref.get("artifact_id") == archive_id for ref in item.get("outputs", []))), None)
     if archive is None:
         raise ValueError("unknown verified archive artifact")
@@ -455,10 +680,6 @@ def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None
             "restored": restore_members(output, selected, destination)}
 
 
-def _sample_key(campaign_name, detector_profile_id):
-    return f"{campaign_name}::{detector_profile_id}"
-
-
 def _combined(spec, campaign, detector_profile, refs, ordinal):
     name = campaign["name"]
     variant = detector_profile["profile_id"]
@@ -466,7 +687,7 @@ def _combined(spec, campaign, detector_profile, refs, ordinal):
     base = (spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"]
             + "/" + name + "/" + variant)
     parameters = {"campaign": name, "analysis": campaign["analysis"],
-                  "merge_group": identity, "sample_key": _sample_key(name, variant),
+                  "merge_group": identity, "sample_key": sample_key(name, variant),
                   "detector_profile_id": variant, "detector_profile": deepcopy(detector_profile),
                   "simulation_runtime": runtime_for_profile(detector_profile, "simulation"),
                   "merge_runtime": runtime_for_profile(detector_profile, "merge"),
@@ -494,11 +715,19 @@ def _combined(spec, campaign, detector_profile, refs, ordinal):
 
 
 def _merge_groups(spec, state, flush=False):
+    """Complete merge groups as ``(campaign, profile, ordinal, group)`` records.
+
+    Ordinals count the committed groups of one sample stream, so a retry that
+    replays this function always derives the same identity for the same group.
+    """
+    written = []
     for campaign in spec["campaigns"]:
         name = campaign["name"]
         for detector_profile in campaign["resolved_detector_variants"]:
             variant = detector_profile["profile_id"]
-            buffer = state["merge_buffers"].setdefault(_sample_key(name, variant), [])
+            key = sample_key(name, variant)
+            buffer = state["merge_buffers"].setdefault(key, [])
+            ordinal = int(state["merge_group_counts"].get(key, 0))
             while buffer:
                 total, end = 0, 0
                 while end < len(buffer) and total < int(campaign["merge_events"]):
@@ -506,104 +735,141 @@ def _merge_groups(spec, state, flush=False):
                     end += 1
                 if total < int(campaign["merge_events"]) and not flush:
                     break
-                ordinal = sum(
-                    g["subtasks"]["merge"]["parameters"].get("sample_key")
-                    == _sample_key(name, variant) for g in state["groups"])
-                state["groups"].append(
-                    _combined(spec, campaign, detector_profile, buffer[:end], ordinal))
+                written.append((name, variant, ordinal,
+                                _combined(spec, campaign, detector_profile, buffer[:end], ordinal)))
                 del buffer[:end]
+                ordinal += 1
+            state["merge_group_counts"][key] = ordinal
+    return written
 
 
 def _write_groups(root, spec, state):
+    """Derived operator snapshot; the immutable ledger holds the real records."""
     atomic_json(root / "merge_groups.json", {
         "run_id": spec["run_id"], "runtime_release": spec["runtime_release"],
-        "core_revision": spec["core_revision"], "groups": state["groups"]})
+        "core_revision": spec["core_revision"],
+        "groups": load_groups(root, spec, state["merge_group_counts"])})
 
 
 def _finish_pending(root, spec, state):
+    """Fold one prepared wave in the plan's retry-safe order.
+
+    Every record write is create-or-compare, so an interrupted fold replays from
+    wherever it stopped.  Raw result fragments are removed only after the wave
+    receipt is durable, and ``state.json`` is the commit marker: a record written
+    before that commit stays invisible to every reader.  A processing wave also
+    has to account for its reclaim result before its cursors may advance, so a
+    wave whose staged deletions are unconfirmed is replayed rather than skipped.
+    """
     pending = state["pending"]
-    client = TransferClient()
+    # 1. results, from the raw fragments or (after a retry) the wave receipt
+    results = _wave_results(root, spec, pending)
+    _validate_pending_results(root, spec, pending, results)
+
+    # 2. immutable inventory and archive records
+    for item in pending.get("records", []):
+        write_inventory(root, inventory_record(item["source_index"],
+                                               spec["sources"][item["source_index"]],
+                                               pending["step"], results[item["plan_task"]]))
+    archive = results.get(pending.get("archive_task"))
+    if archive is not None:
+        write_archive(root, archive_record(pending["step"], pending["archive_task"],
+                                           archive["outputs"], archive["members"]))
+
+    # 3. bounded next state plus the merge groups this wave completes
+    next_state = deepcopy(state)
+    next_state["next_step"] = pending["step"] + 1
+    next_state["pending"] = {}
     if pending["phase"] == "sources":
-        for item in pending["records"]:
-            source = spec["sources"][item["source_index"]]
-            outcome = _result(root, item["plan_task"], spec, "plan")
-            _validate_planner_result(root, spec, item, outcome, client)
-            pool = state["blocks"].setdefault(source["pool"], [])
-            for ref in outcome["outputs"]:
-                ref = dict(ref, pool=source["pool"], source_id=source["source_id"])
-                if ref["artifact_id"] in state["resident"]:
-                    raise RuntimeError("planner result reuses an existing staged block identity")
-                pool.append(ref)
-                state["resident"][ref["artifact_id"]] = ref
-            original = dict(outcome["originals"][0], pool=source["pool"], source_id=source["source_id"])
-            if original["artifact_id"] in state["resident"] or original["artifact_id"] in state["originals"]:
-                raise RuntimeError("planner result reuses an existing retained original identity")
-            state["resident"][original["artifact_id"]] = original
-            state["originals"].append(original["artifact_id"])
-            state["prepared_sources"].append(item["source_index"])
-        _check_bytes(spec, state, 0)
+        groups = []
+        _check_bytes(spec, _staging_view(root, spec, next_state), 0)
+    elif pending["phase"] == "reclaim":
+        # The terminal reclaim only removes leftovers of a finished run; the
+        # cursors it is gated on already advanced with its processing wave.
+        groups = []
     else:
-        archive = _result(root, pending["archive_task"], spec, "archive")
-        _validate_archive_result(root, spec, pending, archive, client)
         for item in pending["miniaods"]:
-            task = read_json(root / "tasks" / (item["task_id"] + ".json"))
-            output = _result(root, item["task_id"], spec, "miniaod")["outputs"][0]
-            if not artifact_ready(output, client) or int(output.get("events", 0)) <= 0:
-                raise RuntimeError("component MiniAOD is not verified")
-            expected_profile = item["detector_profile_id"]
-            if (task["parameters"].get("detector_profile_id") != expected_profile
-                    or output.get("detector_profile_id") != expected_profile):
-                raise RuntimeError("MiniAOD provenance does not match its detector task")
-            state["merge_buffers"].setdefault(
-                _sample_key(item["campaign"], expected_profile), []).append(output)
-        allocation = pending["allocation"]
-        remove = [state["resident"][key] for key in state["originals"]]
-        for pool, cursor in allocation["pool_cursors_after"].items():
-            before = state["pool_cursors"].get(pool, 0)
-            remove.extend(state["blocks"].get(pool, [])[before:cursor])
-        remove += pending["mixed"]
-        _reclaim_staging(spec, state, remove, client)
-        state["pool_cursors"] = allocation["pool_cursors_after"]
-        state["job_offsets"] = allocation["job_offsets_after"]
-        state["originals"] = []
-        state["archives"].append({"outputs": archive["outputs"], "members": archive["members"]})
-        _merge_groups(spec, state)
-    state["next_step"] = pending["step"] + 1
-    state["pending"] = None
-    atomic_json(root / "state.json", state)
-    _write_groups(root, spec, state)
+            next_state["merge_buffers"].setdefault(
+                sample_key(item["campaign"], item["detector_profile_id"]),
+                []).append(results[item["task_id"]]["outputs"][0])
+        next_state["pool_cursors"] = pending["allocation"]["pool_cursors_after"]
+        next_state["job_offsets"] = pending["allocation"]["job_offsets_after"]
+        groups = _merge_groups(spec, next_state)
+
+    # 4. one immutable file per completed merge group
+    for campaign, profile, ordinal, group in groups:
+        write_group(root, campaign, profile, ordinal, group)
+    # 5. the receipt is what a retry replays once the fragments are gone
+    write_wave(root, wave_receipt(pending, results, [item[3] for item in groups]))
+    # 6. fragments are removed only after that receipt is durable
+    for task_id in pending["task_ids"]:
+        (root / "results" / (task_id + ".json")).unlink(missing_ok=True)
+    # 7. the commit marker: every record above becomes visible exactly here
+    atomic_json(root / "state.json", next_state)
+    return next_state
+
 
 def advance_wave(run_dir, step=None):
     root = Path(run_dir).resolve()
     spec, state = read_json(root / "run.json"), read_json(root / "state.json")
+    if state.get("state_schema") != STATE_SCHEMA:
+        raise RuntimeError("run state is not " + STATE_SCHEMA
+                           + "; existing runs keep their frozen runtime and are not migrated")
+    # Completion is terminal.  A rescue, a manual `internal advance-wave`, or a
+    # crash between the completion commit and the sentinel write re-enters here
+    # with .complete possibly missing.  Re-deriving leftover work instead would
+    # re-prepare a reclaim wave that no longer has a successor to fold it, flip
+    # the run back to "running", and wedge it with the sentinel never written.
+    if state.get("status") == "complete":
+        (root / ".complete").touch()
+        return {"skip": True, "status": "complete",
+                "merge_groups": sum(state.get("merge_group_counts", {}).values())}
     _write_groups(root, spec, state)
     requested = state["next_step"] if step is None else int(step)
     if requested < state["next_step"]:
         return {"skip": True, "status": state["status"]}
+    folded = state["pending"].get("phase") if state["pending"] else None
     if state["pending"]:
         if requested == state["pending"]["step"]:
             return {"phase": state["pending"]["phase"], "dag": state["pending"]["dag"],
                     "status": "prepared"}
         if requested != state["pending"]["step"] + 1:
             raise ValueError("wave advancement must be sequential")
-        _finish_pending(root, spec, state)
+        state = _finish_pending(root, spec, state)
     elif requested != state["next_step"]:
         raise ValueError("wave advancement must be sequential")
     complete = all(state["job_offsets"].get(c["name"], 0) >= int(c["max_processing_nodes"])
                    for c in spec["campaigns"])
     if complete:
-        _merge_groups(spec, state, flush=True)
-        _terminal_cleanup(spec, state, TransferClient())
+        for campaign, profile, ordinal, group in _merge_groups(spec, state, flush=True):
+            write_group(root, campaign, profile, ordinal, group)
+        # A terminal reclaim still runs before completion is committed; the
+        # wave that just folded was that reclaim when the spare slot was used.
+        leftovers = ([] if folded == "reclaim"
+                     else _remote_staging_refs(terminal_reclaim_refs(root, spec, state)))
+        if leftovers:
+            reclaim = _reclaim_task(spec, requested, leftovers)
+            path = write_tasks_dag(root, requested, [reclaim], [], spec)
+            state["pending"] = {"step": requested, "phase": "reclaim",
+                                "task_ids": [reclaim["task_id"]],
+                                "reclaim_task": reclaim["task_id"], "reclaim": leftovers,
+                                "dag": str(path)}
+            state["status"] = "running"
+            atomic_json(root / "state.json", state)
+            _write_groups(root, spec, state)
+            return {"phase": "reclaim", "dag": str(path), "status": "prepared"}
         state["status"] = "complete"
         atomic_json(root / "state.json", state)
         _write_groups(root, spec, state)
         (root / ".complete").touch()
-        return {"skip": True, "status": "complete", "merge_groups": len(state["groups"])}
-    allocation = _allocation(spec, state)
+        return {"skip": True, "status": "complete",
+                "merge_groups": sum(state["merge_group_counts"].values())}
+    view = _staging_view(root, spec, state)
+    allocation = _allocation(spec, state, view)
     if any(group["nodes"] for group in allocation["campaigns"]):
-        pending = _process_phase(root, requested, spec, state, allocation)
+        pending = _process_phase(root, requested, spec, view, allocation)
     else:
-        pending = _source_phase(root, requested, spec, state)
+        pending = _source_phase(root, requested, spec, state, view)
     state["pending"], state["status"] = pending, "running"
     atomic_json(root / "state.json", state)
     return {"phase": pending["phase"], "dag": pending["dag"], "status": "prepared"}

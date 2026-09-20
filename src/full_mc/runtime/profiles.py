@@ -43,7 +43,8 @@ PROFILES.update({
 })
 STAGE_RUNTIME = dict(lhe="helac-el7", plan="utilities-el9", mix="pythia-el8",
     miniaod="cmssw12-sim-el8", merge="cmssw12-sim-el8", ntuple="cmssw15-ntuple-el9",
-    selection="analyzer-el9", efficiency="analyzer-el9", archive="utilities-el9")
+    selection="analyzer-el9", efficiency="analyzer-el9", archive="utilities-el9",
+    reclaim="utilities-el9")
 
 
 def runtime_for_profile(profile, role: str) -> str:

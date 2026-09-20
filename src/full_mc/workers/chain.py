@@ -7,7 +7,7 @@ import shutil
 
 from full_mc.io import read_json, atomic_json
 from full_mc.storage.transfer import materialize_input
-from ._common import core_path, parameters, run
+from ._common import core_path, count_lhe_events, parameters, run
 
 
 def native_tree(task, work_dir, shower=False):
@@ -94,7 +94,18 @@ def execute_chain(task, work_dir):
                 if identity in used:
                     raise ValueError(f"LHE block reused across source slots: {identity}")
                 used.add(identity)
-                local[identity] = materialize_input(references[identity], work_dir)
+                reference = references[identity]
+                local[identity] = materialize_input(reference, work_dir)
+                # A declared manifest is not proof the block is intact; verify
+                # each block by name because the combined-source check below
+                # cannot say which entry is wrong.  This is a hard failure, not
+                # a shortfall subject to report-and-truncate.
+                if "events" in reference:
+                    actual_events = count_lhe_events(local[identity])
+                    if actual_events != int(reference["events"]):
+                        raise RuntimeError(
+                            f"{identity}: read {actual_events} LHE events, "
+                            f"expected {reference['events']}")
                 paths.append("file:" + str(local[identity]))
             if int(entry.get("rng_seed", 0)) <= 0:
                 raise ValueError("every source slot requires its frozen RNG seed")
