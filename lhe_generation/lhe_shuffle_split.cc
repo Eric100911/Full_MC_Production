@@ -580,14 +580,24 @@ static vector<vector<size_t>> fill_blocks_stratified(
         shuffle(order.begin(), order.end(), order_rng);
 
         int target_block_size = min(events_per_block, remaining_allowed);
-        int per_stratum = (target_block_size + n_active - 1) / n_active;
         vector<size_t> block;
-        for (int s : order) {
-            if (block.size() >= (size_t)target_block_size) break;
-            int take = (int)min((size_t)(target_block_size - (int)block.size()),
-                                min((size_t)per_stratum, states[s].remaining()));
-            for (int t = 0; t < take; ++t) {
-                block.push_back((*states[s].events)[states[s].pos++]);
+        // Round-robin draw: take one event per stratum per pass until the
+        // block is full or every stratum is exhausted.  This guarantees every
+        // block except the final one is exactly target_block_size events.  The
+        // previous greedy ``per_stratum = ceil(target / n_active)`` cap left a
+        // ragged tail of several under-filled blocks whenever strata were
+        // unevenly sized (the stratified auto n_strata rule caps at 100, so
+        // round-robin strata sizes differ by one), which downstream consumers
+        // forbid ("only the final planner block may be partial").
+        bool advanced = true;
+        while (block.size() < (size_t)target_block_size && advanced) {
+            advanced = false;
+            for (int s : order) {
+                if (block.size() >= (size_t)target_block_size) break;
+                if (!states[s].exhausted()) {
+                    block.push_back((*states[s].events)[states[s].pos++]);
+                    advanced = true;
+                }
             }
         }
 
