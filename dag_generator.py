@@ -186,6 +186,20 @@ PROCESSING_SUBMIT_TEMPLATE_HEPTHU = "processing/templates/processing_hepthu.sub"
 LHE_SUBMIT_TEMPLATE_LOCAL = "processing/templates/lhe_gen_local.sub"
 PROCESSING_SUBMIT_TEMPLATE_LOCAL = "processing/templates/processing_local.sub"
 SUMMARY_SUBMIT_TEMPLATE = "processing/templates/summary.sub"
+
+# Default LHE worker resource request. HELAC-Onia generation is single-threaded
+# (no mpirun/mpiexec/OMP_NUM_THREADS anywhere under lhe_generation/); the only
+# parallel step is the `make -j 2` HELAC build. Keeping the request near the
+# true footprint matters because the eligible slot pool collapses with an
+# oversized ask: measured 2026-09-20, 8cpu/15GB/10GB matched ~270 slots
+# pool-wide while 3cpu/9GB/5GB matched ~6,050 -- and the oversized profile left
+# 2,000 LHE jobs idle for 50 minutes with zero starts. Note the CERN schedd
+# applies its own floor (observed ~3 CPUs / 9000 MB) regardless of what is
+# requested here; the disk value passes through unchanged.
+DEFAULT_LHE_REQUEST_CPUS = "1"
+DEFAULT_LHE_REQUEST_MEMORY = "8GB"
+DEFAULT_LHE_REQUEST_DISK = "5GB"
+
 # Log and proxy paths are workspace-relative or user-provided; no hardcoded user paths.
 DEFAULT_HEPTHU_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
 DEFAULT_LOCAL_CONDOR_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
@@ -615,9 +629,9 @@ class WorkflowOptions:
         log_level: str = "info",
         helac_diagnostics: str = "legacy",
         lhe_nmc: Optional[int] = None,
-        lhe_request_cpus: str = "8",
-        lhe_request_memory: str = "15GB",
-        lhe_request_disk: str = "10GB",
+        lhe_request_cpus: str = DEFAULT_LHE_REQUEST_CPUS,
+        lhe_request_memory: str = DEFAULT_LHE_REQUEST_MEMORY,
+        lhe_request_disk: str = DEFAULT_LHE_REQUEST_DISK,
         lhe_job_flavour: str = "nextweek",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
@@ -3484,12 +3498,10 @@ class DAGBuilder:
         return bool(info.get("use_existing"))
 
     def lhe_resource_request(self) -> Tuple[str, str, str]:
-        if self.options.test_mode and (
-            self.options.lhe_request_cpus == "8"
-            and self.options.lhe_request_memory == "15GB"
-            and self.options.lhe_request_disk == "10GB"
-        ):
-            return "4", "8GB", "8GB"
+        # Test mode previously shrank the request relative to the (then larger)
+        # production defaults. The defaults are now the minimal profile, so a
+        # test-mode override would only make smoke-test jobs harder to schedule
+        # than production jobs. Test mode uses the same values.
         return (
             self.options.lhe_request_cpus,
             self.options.lhe_request_memory,
@@ -6114,9 +6126,24 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional HELAC nmc override for every generated LHE node.",
     )
-    parser.add_argument("--lhe-request-cpus", default="8")
-    parser.add_argument("--lhe-request-memory", default="15GB")
-    parser.add_argument("--lhe-request-disk", default="10GB")
+    parser.add_argument(
+        "--lhe-request-cpus",
+        default=DEFAULT_LHE_REQUEST_CPUS,
+        help=(
+            "CPU request per LHE node. HELAC-Onia generation is single-threaded; "
+            "the only parallel step is the `make -j 2` HELAC build."
+        ),
+    )
+    parser.add_argument(
+        "--lhe-request-memory",
+        default=DEFAULT_LHE_REQUEST_MEMORY,
+        help="Memory request per LHE node.",
+    )
+    parser.add_argument(
+        "--lhe-request-disk",
+        default=DEFAULT_LHE_REQUEST_DISK,
+        help="Disk request per LHE node.",
+    )
     parser.add_argument("--lhe-job-flavour", default="nextweek")
     parser.add_argument(
         "--helac-diagnostics",
