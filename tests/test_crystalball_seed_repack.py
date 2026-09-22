@@ -14,7 +14,7 @@ Two artifacts must stay in lockstep:
    reads (``OPEN(777,FILE=TRIM(input_dir)//'seed.input',status='OLD')``).
 
 The tests are fast and fully offline. They never open the 57 MB delivery
-tarball (``common/packages/helac_package.tar.gz``); instead the fixture below
+tarball (``common/packages/helac_package_cbseed_v1.tar.gz``); instead the fixture below
 reproduces the shipped declaration block verbatim. Frozen identity of the
 shipped source this fixture mirrors:
 
@@ -378,6 +378,26 @@ class RunHelacSeedBridgeTest(unittest.TestCase):
         self.assertGreater(int(default.group(1)), 0)
         self.assertIn('if [ "$MY_SEED" -le 10 ]', self.script)
         self.assertIn('if ! [[ "$MY_SEED" =~ ^[0-9]+$ ]]', self.script)
+
+    def test_runtime_user_template_is_resolved_from_the_script_tree(self):
+        body = function_body(self.script, "prepare_runtime_user_inp")
+        self.assertIn(
+            'local template_user_inp="${BASE_DIR}/lhe_generation/input_templates/user.inp"',
+            body,
+        )
+        self.assertNotIn('../input_templates/user.inp', body)
+
+
+class VersionedPackageDefaultsTest(unittest.TestCase):
+    def test_repack_defaults_name_the_tracked_versioned_artifacts(self):
+        self.assertEqual(
+            repack.DEFAULT_PACKAGE,
+            "common/packages/helac_package_cbseed_v1.tar.gz",
+        )
+        self.assertEqual(
+            repack.OUTPUT_MANIFEST_NAME,
+            "helac_package_cbseed_v1.manifest.json",
+        )
 
 
 if __name__ == "__main__":

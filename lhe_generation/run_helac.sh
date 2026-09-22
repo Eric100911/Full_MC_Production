@@ -857,7 +857,10 @@ set_user_inp_value() {
 prepare_runtime_user_inp() {
     local helac_dir="$1"
     local runtime_user_inp="${helac_dir}/input/user.inp"
-    local template_user_inp="../input_templates/user.inp"
+    # The worker runs HELAC from its stage scratch directory, while the
+    # template is shipped in the runtime core. Resolve it from the script
+    # location instead of relying on the caller's current directory.
+    local template_user_inp="${BASE_DIR}/lhe_generation/input_templates/user.inp"
 
     if [[ -f "${template_user_inp}" ]]; then
         cp "${template_user_inp}" "${runtime_user_inp}"

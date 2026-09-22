@@ -381,6 +381,32 @@ PY
 check_pass "Test 13: capped manifest records full input and selected output"
 
 # ---------------------------------------------------------------------------
+# Test 14: Uneven strata must not create a partial block before the tail
+# ---------------------------------------------------------------------------
+msg_info "Test 14: 101 events, 17/block -> 5 full + 1 partial"
+mkdir -p "${TMP_DIR}/test14"
+python3 "${GEN_PY}" --n-events 101 --output "${TMP_DIR}/test14/input.lhe"
+shuffle_split --input "${TMP_DIR}/test14/input.lhe" \
+    --output-dir "${TMP_DIR}/test14/out" \
+    --events-per-block 17 --seed 42 --mode stratified --n-strata auto
+mapfile -t TEST14_BLOCKS < <(find "${TMP_DIR}/test14/out" -maxdepth 1 \
+    -name 'block_*.lhe' -print | sort)
+if [[ "${#TEST14_BLOCKS[@]}" -eq 6 ]]; then
+    check_pass "Test 14: produced 6 blocks"
+else
+    check_fail "Test 14: expected 6 blocks, got ${#TEST14_BLOCKS[@]}"
+fi
+for idx in "${!TEST14_BLOCKS[@]}"; do
+    N=$(grep -c '<event>' "${TEST14_BLOCKS[$idx]}" || true)
+    if [[ "${idx}" -lt 5 && "${N}" -ne 17 ]]; then
+        check_fail "Test 14: non-final block ${idx} has ${N} events (expected 17)"
+    elif [[ "${idx}" -eq 5 && "${N}" -ne 16 ]]; then
+        check_fail "Test 14: final block has ${N} events (expected 16)"
+    fi
+done
+check_pass "Test 14: only the final block is partial"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

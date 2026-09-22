@@ -16,7 +16,9 @@ the unmodified upstream ``src/RANDA_init.inc`` and of every produced artifact.
 Usage:
   python3 tools/repack_helac_crystalball_seed.py
   python3 tools/repack_helac_crystalball_seed.py --output-dir /tmp/chiw/helac_cbseed_v1
-  python3 tools/repack_helac_crystalball_seed.py --check --package common/packages/helac_package.tar.gz
+  python3 tools/repack_helac_crystalball_seed.py --check \
+      --package common/packages/helac_package_cbseed_v1.tar.gz \
+      --manifest common/packages/helac_package_cbseed_v1.manifest.json
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
-DEFAULT_PACKAGE = "common/packages/helac_package.tar.gz"
+DEFAULT_PACKAGE = "common/packages/helac_package_cbseed_v1.tar.gz"
 DEFAULT_OUTPUT_DIR = "/tmp/chiw/helac_cbseed_v1"
 SCRATCH_ROOT = "/tmp/chiw"
 
@@ -54,7 +56,7 @@ CRYSTALBALL_SRC_REL = os.path.join(
 RANDA_INIT_REL = os.path.join("src", "RANDA_init.inc")
 
 OUTPUT_PACKAGE_NAME = "helac_package.tar.gz"
-OUTPUT_MANIFEST_NAME = "helac_package_cbseed.manifest.json"
+OUTPUT_MANIFEST_NAME = "helac_package_cbseed_v1.manifest.json"
 TOOL_NAME = "tools/repack_helac_crystalball_seed.py"
 TOOL_VERSION = 1
 
@@ -439,20 +441,33 @@ def run_check(package_path: str, manifest_path: str = "") -> int:
                     f"{recorded_randa}, found {info['randa_init_sha256']}"
                 )
             recorded_src = manifest.get("patched_pp_psiX_cb_f90_sha256")
-            if recorded_src and recorded_src != info["crystalball_src_sha256"]:
+            if not recorded_src:
+                failures.append(
+                    f"manifest {resolved_manifest} has no "
+                    "patched_pp_psiX_cb_f90_sha256 entry"
+                )
+            elif recorded_src != info["crystalball_src_sha256"]:
                 failures.append(
                     f"{CRYSTALBALL_SRC_REL} sha256 mismatch: recorded "
                     f"{recorded_src}, found {info['crystalball_src_sha256']}"
                 )
             recorded_outer = manifest.get("outer_package_sha256")
             actual_outer = sha256_file(package_path)
-            if recorded_outer and recorded_outer != actual_outer:
+            if not recorded_outer:
+                failures.append(
+                    f"manifest {resolved_manifest} has no outer_package_sha256 entry"
+                )
+            elif recorded_outer != actual_outer:
                 failures.append(
                     f"outer package sha256 mismatch: recorded {recorded_outer}, "
                     f"found {actual_outer}"
                 )
             recorded_nested = manifest.get("nested_tarball_sha256")
-            if recorded_nested:
+            if not recorded_nested:
+                failures.append(
+                    f"manifest {resolved_manifest} has no nested_tarball_sha256 entry"
+                )
+            else:
                 actual_nested = sha256_file(layout["nested_tar"])
                 if recorded_nested != actual_nested:
                     failures.append(
@@ -517,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "manifest to compare against in --check mode "
-            "(default: sibling helac_package_cbseed.manifest.json, if present)"
+            "(default: sibling helac_package_cbseed_v1.manifest.json, if present)"
         ),
     )
     return parser
