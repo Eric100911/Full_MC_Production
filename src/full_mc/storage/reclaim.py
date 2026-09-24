@@ -72,15 +72,22 @@ def _remove_remote(entries, *, runner, work_dir):
         finished = runner(command, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, check=False)
     else:
-        finished = run_profile(UTILITIES_PROFILE, command, cwd=work_dir, text=True,
-                               check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        finished = run_profile(UTILITIES_PROFILE, command, cwd=work_dir,
+                               check=False, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    stdout = finished.stdout or ""
+    stderr = finished.stderr or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
     reported = {}
-    for line in (finished.stdout or "").splitlines():
+    for line in stdout.splitlines():
         index, separator, disposition = line.partition("\t")
         if separator and index.isdigit() and disposition in ("removed", "already-missing"):
             reported[int(index)] = disposition
     if finished.returncode:
-        raise RuntimeError("reclaim command failed: " + (finished.stderr or "")[-2000:])
+        raise RuntimeError("reclaim command failed: " + stderr[-2000:])
     unreported = [url for index, url in entries if index not in reported]
     if unreported:
         raise RuntimeError("reclaim reported no disposition for: " + ", ".join(unreported))
