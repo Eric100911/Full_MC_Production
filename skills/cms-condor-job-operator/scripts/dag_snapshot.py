@@ -146,9 +146,11 @@ def build_snapshot(
     controllers = live_counts(live, controllers=True)
     total = sum(logical.values())
     done = logical["done"]
+    skipped = logical["skipped"]
+    completed = done + skipped
     if logical["failed"] or logical["held"] or payload["held"]:
         assessment = "blocked"
-    elif total and done == total:
+    elif total and completed == total:
         assessment = "complete"
     elif logical["running"] or logical["idle"]:
         assessment = "active"
@@ -162,6 +164,8 @@ def build_snapshot(
         "dag_file": str(root_dag),
         "logical": {
             "done": done,
+            "skipped": skipped,
+            "completed": completed,
             "total": total,
             "running": logical["running"],
             "idle": logical["idle"],
@@ -189,7 +193,8 @@ def render_text(snapshot: dict, max_active: int) -> str:
             f"{snapshot['assessment']}"
         ),
         (
-            f"Logical: {logical['done']}/{logical['total']} done; "
+            f"Logical: {logical['completed']}/{logical['total']} complete "
+            f"({logical['done']} done, {logical['skipped']} skipped); "
             f"{logical['running']} running, {logical['idle']} idle, "
             f"{logical['held']} held, {logical['failed']} failed, "
             f"{logical['waiting']} waiting"

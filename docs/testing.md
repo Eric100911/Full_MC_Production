@@ -612,6 +612,23 @@ python3 tools/review_phase2_shower_efficiency.py \
 Run `--fetch-remote` only from a normal CERN/IHEP shell or with approved
 unsandboxed network access and a valid proxy.
 
+## One-shot read-only DAG monitoring
+
+For an mcprod run, use:
+
+```bash
+python3 tools/mcprod_snapshot.py --run <run-dir>
+```
+
+The snapshot selects `current_attempt`, queries only its recorded root, and
+uses matching logs and ledger evidence after that root leaves the queue. It
+does not stat remote artifacts.
+
+For a legacy DAG, use `dag_snapshot.py <root-cluster> --schedd <host>` and add
+`--dag-file <root.dag>` after the root leaves the queue. Use
+`tools/dag_progress.py <root-cluster> --schedd <host> --structure=collapsed`
+for detailed topology.
+
 ## CERN MIX / IHEP MERGE+NTUPLE split
 
 ### Preconditions and invariants

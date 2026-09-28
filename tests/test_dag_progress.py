@@ -99,6 +99,119 @@ class DagProgressTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(record_status(records[0]), "done")
 
+    def test_pre_skip_transitions_to_skipped_only_on_preskip_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dag = Path(tmp) / "root.dag"
+            dag.write_text(
+                "\n".join(
+                    (
+                        "SUBDAG EXTERNAL WAVE_MATCH child.dag",
+                        "PRE_SKIP WAVE_MATCH 99",
+                        "SUBDAG EXTERNAL WAVE_MISMATCH child.dag",
+                        "PRE_SKIP WAVE_MISMATCH 99",
+                        "JOB PLAN_FAILED plan.sub",
+                        "PRE_SKIP PLAN_FAILED 99",
+                        "JOB PLAN_HELD held.sub",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            Path(f"{dag}.dagman.out").write_text(
+                "PRE Script of Node WAVE_MATCH failed with status 99\n",
+                encoding="utf-8",
+            )
+            planned = parse_dag_tree(dag)
+            before_preskip = completed_records_from_logs(planned)
+            self.assertNotIn(
+                "WAVE_MATCH",
+                {item["DAGNodeName"] for item in before_preskip},
+            )
+            Path(f"{dag}.dagman.out").write_text(
+                "\n".join(
+                    (
+                        "PRE Script of Node WAVE_MATCH failed with status 99",
+                        "PRE Script of Node WAVE_MATCH failed with status 99",
+                        "Event: ULOG_PRESKIP for HTCondor Node WAVE_MATCH (0.1.0)",
+                        "PRE Script of Node WAVE_MISMATCH failed with status 98",
+                        "Node PLAN_FAILED job proc (12.0.0) failed.",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            planned = parse_dag_tree(dag)
+            records = completed_records_from_logs(planned)
+
+        by_name = {item["DAGNodeName"]: item for item in records}
+        self.assertEqual(record_status(by_name["WAVE_MATCH"]), "skipped")
+        self.assertTrue(by_name["WAVE_MATCH"]["PreSkipped"])
+        self.assertEqual(record_status(by_name["WAVE_MISMATCH"]), "failed")
+        self.assertEqual(record_status(by_name["PLAN_FAILED"]), "failed")
+        self.assertEqual(record_status({"JobStatus": 5}), "held")
+
+    def test_collapsed_structure_reports_wave_subdags_and_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root.dag"
+            child = Path(tmp) / "wave.dag"
+            root.write_text(
+                "\n".join(
+                    (
+                        "SUBDAG EXTERNAL WAVE_000000 wave.dag",
+                        "PRE_SKIP WAVE_000000 99",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            child.write_text("JOB PLAN_000000 plan.sub\n", encoding="utf-8")
+            graph = parse_dag_graph(root)
+            output = "\n".join(
+                render_structure(
+                    graph,
+                    {
+                        "WAVE_000000": {
+                            "JobStatus": 4,
+                            "ExitCode": 0,
+                            "PreSkipped": True,
+                        },
+                        "PLAN_000000": {"JobStatus": 4, "ExitCode": 0},
+                    },
+                    "collapsed",
+                    100,
+                    False,
+                )
+            )
+
+        self.assertIn("Wave/SubDAGs:", output)
+        self.assertIn("WAVE_000000: Plan ×1", output)
+        self.assertIn("↷ WAVE_000000", output)
+
+    def test_dashboard_counts_skips_as_successful_terminal_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dag = Path(tmp) / "root.dag"
+            dag.write_text(
+                "\n".join(
+                    (
+                        "JOB PLAN_DONE plan.sub",
+                        "JOB PLAN_SKIPPED plan.sub",
+                        "PRE_SKIP PLAN_SKIPPED 99",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            Path(f"{dag}.dagman.out").write_text(
+                "\n".join(
+                    (
+                        "Node PLAN_DONE job proc (1.0.0) completed successfully.",
+                        "PRE Script of Node PLAN_SKIPPED failed with status 99",
+                        "Event: ULOG_PRESKIP for HTCondor Node PLAN_SKIPPED (0.1.0)",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            output = render("schedd", 1, dag, [], False)
+
+        self.assertIn("2/2 complete (1 done, 1 skipped)", output)
+        self.assertIn("Done/Skip", output)
+
     def test_nonzero_completed_exit_is_failed(self):
         self.assertEqual(
             record_status({"JobStatus": 4, "ExitCode": 17}),

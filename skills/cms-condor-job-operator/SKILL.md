@@ -43,14 +43,25 @@ existing DAG; continue to operate an existing DAG on its original schedd.
 For a normal status request, run one concise snapshot and return immediately:
 
 ```bash
+python3 tools/mcprod_snapshot.py --run <run-dir>
+```
+
+For mcprod, this selects the unique attempt named by `submission.json`'s
+`current_attempt`, queries only that root cluster on its recorded schedd, and
+falls back to matching persistent DAGMan and ledger evidence after the root
+leaves the queue. Optional `--schedd` and `--cluster` arguments assert the
+recorded identity. This is the one-shot, read-only monitoring path for mcprod.
+
+For an existing legacy DAG, use:
+
+```bash
 python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py \
   <dag-cluster> --schedd <schedd>
 ```
 
-Do not poll or wait unless the user explicitly asks for continuous monitoring.
-The snapshot separates logical DAG nodes, live payloads, and DAGMan controller
-processes. Use `--dag-file <path>` when a completed or disconnected root DAG
-cannot be inferred from the live ClassAd.
+Add `--dag-file <path>` when the root has left the queue. Do not poll or wait
+unless the user explicitly asks for continuous monitoring. For topology, use
+`./tools/dag_progress.py <dag-cluster> --schedd <schedd> --structure=collapsed`.
 
 For diagnosis or a requested detailed view, add queue and DAG evidence:
 

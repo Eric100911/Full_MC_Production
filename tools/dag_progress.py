@@ -31,9 +31,10 @@ STAGES = (
 )
 STAGE_LABELS = dict(STAGES)
 STAGE_INDEX = {stage: index for index, (stage, _) in enumerate(STAGES)}
-STATUS_ORDER = ("done", "running", "idle", "held", "failed", "pending")
+STATUS_ORDER = ("done", "skipped", "running", "idle", "held", "failed", "pending")
 STATUS_LABELS = {
     "done": "DONE",
+    "skipped": "SKIP",
     "running": "RUN",
     "idle": "IDLE",
     "held": "HELD",
@@ -42,6 +43,7 @@ STATUS_LABELS = {
 }
 STATUS_SYMBOLS = {
     "done": "✓",
+    "skipped": "↷",
     "running": "▶",
     "idle": "○",
     "held": "!",
@@ -50,6 +52,7 @@ STATUS_SYMBOLS = {
 }
 STATUS_COLORS = {
     "done": "32",
+    "skipped": "32",
     "running": "36",
     "idle": "33",
     "held": "35",
@@ -91,6 +94,7 @@ class PlannedNode:
     directive: str = "JOB"
     category: str | None = None
     child_dag: Path | None = None
+    pre_skip_code: int | None = None
 
 
 @dataclass
@@ -185,6 +189,7 @@ def parse_dag_graph(root_dag: Path) -> DagGraph:
         graph = DagGraph(dag_file=dag_file)
         categories: dict[str, str] = {}
         child_paths: dict[str, Path] = {}
+        pre_skip_codes: dict[str, int] = {}
         for raw_line in dag_file.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -247,6 +252,12 @@ def parse_dag_graph(root_dag: Path) -> DagGraph:
                 )
             elif directive == "CATEGORY" and len(fields) >= 3:
                 categories[fields[1]] = fields[2]
+            elif directive == "PRE_SKIP" and len(fields) >= 3:
+                try:
+                    code = int(fields[2])
+                except ValueError:
+                    continue
+                pre_skip_codes[fields[1]] = code
             elif directive == "MAXJOBS" and len(fields) >= 3:
                 try:
                     graph.maxjobs[fields[1]] = int(fields[2])
@@ -256,6 +267,9 @@ def parse_dag_graph(root_dag: Path) -> DagGraph:
         for name, category in categories.items():
             if name in graph.nodes:
                 graph.nodes[name].category = category
+        for name, code in pre_skip_codes.items():
+            if name in graph.nodes:
+                graph.nodes[name].pre_skip_code = code
         for name, child_path in child_paths.items():
             graph.children[name] = visit(child_path)
         visited.remove(dag_file)
@@ -286,6 +300,13 @@ def parse_dag_tree(root_dag: Path) -> dict[str, PlannedNode]:
 
 SUCCESS_PATTERN = re.compile(r"\bNode\s+(\S+).* completed successfully\.")
 NODE_PATTERN = re.compile(r"\bNode\s+(\S+)\b")
+PRE_FAILURE_PATTERN = re.compile(
+    r"\bPRE Script of Node (?P<name>\S+) failed with status (?P<code>\d+)",
+    re.IGNORECASE,
+)
+PRESKIP_EVENT_PATTERN = re.compile(
+    r"\bEvent: ULOG_PRESKIP for HTCondor Node (?P<name>\S+)\b"
+)
 
 
 def completed_records_from_logs(
@@ -301,6 +322,34 @@ def completed_records_from_logs(
         for line in dagman_out.read_text(
             encoding="utf-8", errors="replace"
         ).splitlines():
+            pre_failure = PRE_FAILURE_PATTERN.search(line)
+            if pre_failure:
+                name = pre_failure.group("name")
+                node = planned.get(name)
+                if node and node.pre_skip_code == int(pre_failure.group("code")):
+                    # PRE_SKIP failures are transitional. DAGMan records the
+                    # successful skipped terminal state in a later ULOG event.
+                    continue
+                if name in planned:
+                    states[name] = {
+                        "DAGNodeName": name,
+                        "JobStatus": 4,
+                        "ExitCode": 1,
+                    }
+                continue
+
+            preskip = PRESKIP_EVENT_PATTERN.search(line)
+            if preskip:
+                name = preskip.group("name")
+                if name in planned:
+                    states[name] = {
+                        "DAGNodeName": name,
+                        "JobStatus": 4,
+                        "ExitCode": 0,
+                        "PreSkipped": True,
+                    }
+                continue
+
             success = SUCCESS_PATTERN.search(line)
             if success:
                 name = success.group(1)
@@ -335,6 +384,8 @@ def record_timestamp(record: dict) -> int:
 
 def record_status(record: dict) -> str:
     status = CONDOR_STATUS.get(int(record.get("JobStatus", 0)), "failed")
+    if status == "done" and record.get("PreSkipped"):
+        return "skipped"
     if status == "done" and record.get("ExitCode") not in (None, 0):
         return "failed"
     return status
@@ -461,7 +512,7 @@ def validate_structure_graph(graph: DagGraph) -> None:
         if node.directive == "FINAL":
             supported = node.name == "SUMMARY" or node.name.startswith("FINAL_")
         elif node.directive == "SUBDAG":
-            supported = node.name.startswith("MIX_")
+            supported = node.name.startswith(("MIX_", "WAVE_"))
         else:
             supported = node.name.startswith(SUPPORTED_JOB_PREFIXES)
         if not supported:
@@ -663,6 +714,41 @@ def render_collapsed_structure(
         "DAG structure (campaign-collapsed):",
     ]
     append_wrapped(lines, "  Root MAXJOBS: ", controls_text(graph), width)
+
+    waves = [
+        node for node in graph.nodes.values()
+        if node.directive == "SUBDAG" and node.name.startswith("WAVE_")
+    ]
+    if waves:
+        lines.append("  Wave/SubDAGs:")
+        for wave in sorted(waves, key=lambda item: item.name):
+            record = records.get(wave.name)
+            status = record_status(record) if record else "pending"
+            marker = status_marker(status, color_enabled)
+            child = graph.children.get(wave.name)
+            if child is None:
+                lines.append(f"    {marker} {wave.name}: child DAG pending")
+                continue
+            stage_counts: dict[str, Counter] = defaultdict(Counter)
+            stage_totals = Counter()
+            for child_node in collect_graph_nodes(child):
+                child_record = records.get(child_node.name)
+                child_status = (
+                    record_status(child_record) if child_record else "pending"
+                )
+                stage_counts[child_node.stage][child_status] += 1
+                stage_totals[child_node.stage] += 1
+            summaries = []
+            for stage, label in STAGES:
+                total = stage_totals[stage]
+                if total:
+                    summaries.append(
+                        f"{label} ×{total} "
+                        f"[{status_counts_text(stage_counts[stage], color_enabled)}]"
+                    )
+            suffix = "; ".join(summaries) if summaries else "no child nodes"
+            lines.append(f"    {marker} {wave.name}: {suffix}")
+
     root_campaigns = {
         name: campaign_for_root_node(node)
         for name, node in graph.nodes.items()
@@ -895,13 +981,15 @@ def render(
         "",
         "LHE → Plan → Coordinate → SubDAG → Process → Merge → Ntuple → Final",
         "",
-        "Stage          Progress                    Done  Run Idle Held Fail Wait",
-        "-------------  --------------------------  ----  --- ---- ---- ---- ----",
+        "Stage          Progress                    Done/Skip Run Idle Held Fail Wait",
+        "-------------  --------------------------  --------- --- ---- ---- ---- ----",
     ]
     for stage, label in STAGES:
         stage_counts = counts[stage]
         total = sum(stage_counts.values())
-        bar = progress_bar(stage_counts["done"], total)
+        bar = progress_bar(
+            stage_counts["done"] + stage_counts["skipped"], total
+        )
         if color_enabled:
             done_length = len(bar) - len(bar.lstrip("█"))
             bar = (
@@ -917,7 +1005,8 @@ def render(
 
         lines.append(
             f"{label:<13}  [{bar}]"
-            f" {count_cell('done')} {count_cell('running')}"
+            f" {count_cell('done')}/{count_cell('skipped')}"
+            f" {count_cell('running')}"
             f" {count_cell('idle')} {count_cell('held')}"
             f" {count_cell('failed')} {count_cell('pending')}"
         )
@@ -929,7 +1018,9 @@ def render(
     lines.extend(
         (
             "",
-            f"Logical nodes: {total_counts['done']}/{total} done; "
+            f"Logical nodes: "
+            f"{total_counts['done'] + total_counts['skipped']}/{total} complete "
+            f"({total_counts['done']} done, {total_counts['skipped']} skipped); "
             f"{total_counts['running']} running, {total_counts['idle']} idle, "
             f"{total_counts['held']} held, {total_counts['failed']} failed, "
             f"{total_counts['pending']} waiting",

@@ -23,15 +23,29 @@ condor_q -name <schedd> -dag <dag-cluster> -nobatch
 
 ## DAG progress
 
-For a one-shot status summary in `Full_MC_Production`, prefer:
+For a one-shot status summary of an mcprod run, use its explicit run directory:
+
+```bash
+python3 tools/mcprod_snapshot.py --run <run-dir>
+```
+
+This resolves the unique `current_attempt` in `submission.json`, checks any
+optional `--schedd` or `--cluster` assertion against that attempt, and queries
+only its root DAG on the recorded schedd. It falls back to the matching
+attempt's persistent logs and committed ledger after the root leaves the queue.
+The snapshot is read-only; artifact URLs come from local records and the JSON
+reports `remote_stat_checked=false`.
+
+For a legacy DAG, prefer:
 
 ```bash
 python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py \
   <dag-cluster> --schedd <schedd>
 ```
 
-This command is read-only and does not poll. Use the full dashboard for
-diagnosis or when the user requests topology:
+Add `--dag-file <path>` when the root has left the queue. This command is
+read-only and does not poll. Use the full dashboard for diagnosis or when the
+user requests topology:
 
 ```bash
 ./tools/dag_progress.py <dag-cluster> \
