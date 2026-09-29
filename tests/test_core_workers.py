@@ -19,10 +19,11 @@ from full_mc.runtime.bootstrap import unpack_runtime
 from full_mc.runtime.profiles import STAGE_RUNTIME, GRID_CA_DIR, run_profile
 from full_mc.storage.transfer import TransferClient, artifact_ready
 from full_mc.workers import execute_task
-from full_mc.workers.chain import build_command as chain_command, execute_chain
+from full_mc.workers._common import batch_runtime_asset
+from full_mc.workers.chain import build_command as chain_command, execute_chain, native_tree
 from full_mc.workers.lhe import build_command as lhe_command
 from full_mc.workers.edm import parse_event_count
-from full_mc.workers.analysis import build_command as analysis_command
+from full_mc.workers.analysis import build_command as analysis_command, analyzer_tree
 from full_mc.workers.mix import execute as mix_execute
 
 
@@ -198,6 +199,61 @@ class WorkerContracts(unittest.TestCase):
 
 
 class RuntimeBootstrap(unittest.TestCase):
+    def test_batch_stages_use_private_profile_bundles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release"
+            core = release / "controller/core"
+            (core / "processing/cmssw_helpers").mkdir(parents=True)
+            (core / "processing/run_chain.sh").write_text("#!/bin/bash\n")
+            (core / "common/cmssw_configs").mkdir(parents=True)
+            (core / "common/cmssw_configs/ntuple_jjp_cfg.py").write_text("# cfg\n")
+            cmssw = release / "cmssw15_tpsonia2mumu_runtime.tar.gz"
+            cmssw.write_bytes(b"prebuilt runtime")
+            analyzer = release / "analyzer.tar.gz"
+            with tarfile.open(analyzer, "w:gz") as archive:
+                for name in ("merge_apply_cuts.py", "run_efficiency.py"):
+                    script = root / name
+                    script.write_text("# fixture\n")
+                    archive.add(script, arcname="NtupleAnalyzer/" + name)
+            atomic_json(release / "runtime.json", {
+                "runtime_release": "r1",
+                "profiles": ["cmssw15-ntuple-el9", "analyzer-el9"],
+                "bundles": {"cmssw15-ntuple-el9": cmssw.name,
+                            "analyzer-el9": analyzer.name},
+                "bundle_bytes": {cmssw.name: cmssw.stat().st_size,
+                                 analyzer.name: analyzer.stat().st_size}})
+            base = {"runtime_release": "r1", "runtime_dir": str(release),
+                    "parameters": {"core_root": str(core), "analysis": "JJP",
+                                   "campaign": "JJP_DPS1", "merge_group": "g"}}
+            ntuple_task = dict(base, stage="ntuple", runtime="cmssw15-ntuple-el9")
+            native_tree(ntuple_task, root / "worker/ntuple")
+            local_common = root / "worker/ntuple/native/common"
+            self.assertFalse(local_common.is_symlink())
+            self.assertEqual((local_common / "packages" / cmssw.name).read_bytes(),
+                             cmssw.read_bytes())
+            self.assertTrue((local_common / "cmssw_configs/ntuple_jjp_cfg.py").is_file())
+            self.assertFalse((core / "common/packages").exists())
+
+            for stage, script in (("selection", "merge_apply_cuts.py"),
+                                  ("efficiency", "run_efficiency.py")):
+                task = dict(base, stage=stage, runtime="analyzer-el9")
+                work = root / "worker" / stage
+                path = analyzer_tree(task, work)
+                command = analysis_command(task, root / "raw.root", work, path)
+                self.assertTrue((path / script).is_file())
+                self.assertEqual(command[1], str(path / script))
+            self.assertFalse((core / "external/NtupleAnalyzer").exists())
+
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                batch_runtime_asset(dict(ntuple_task, runtime_release="other"),
+                                    "cmssw15-ntuple-el9")
+            with self.assertRaisesRegex(ValueError, "lacks profile"):
+                batch_runtime_asset(ntuple_task, "cmssw15-sim-el9")
+            cmssw.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "runtime asset"):
+                batch_runtime_asset(ntuple_task, "cmssw15-ntuple-el9")
+
     def test_transferred_release_is_self_contained_and_profile_checked(self):
         core = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
@@ -288,6 +344,27 @@ class CombinedRecovery(unittest.TestCase):
                 atomic_json(root / "task.json", task)
                 run_combined_task(root / "task.json", root / "work")
             self.assertEqual(calls, ["efficiency"])
+
+    def test_runtime_directory_does_not_invalidate_merge_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = self.task(root)
+            task["runtime_dir"] = str(root / "release-a")
+            atomic_json(root / "task.json", task)
+            calls = []
+            def execute(stage, work):
+                calls.append(stage["stage"])
+                return dict(task_id=stage["task_id"], stage=stage["stage"], status="ok",
+                            runtime_release=stage["runtime_release"],
+                            outputs=[publish_fixture(stage["outputs"][0])])
+            with patch("full_mc.workers.execute_task", side_effect=execute):
+                run_combined_task(root / "task.json", root / "work")
+                self.assertEqual(calls, ["merge", "ntuple", "selection", "efficiency"])
+                calls.clear()
+                task["runtime_dir"] = str(root / "release-b")
+                atomic_json(root / "task.json", task)
+                run_combined_task(root / "task.json", root / "work")
+            self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

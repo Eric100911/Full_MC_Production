@@ -152,6 +152,8 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
     for index, combined in enumerate(_combined_tasks(handoff)):
         task_path = root / "tasks" / ("%04d.json" % index)
         combined["checkpoint_dir"] = str(root / "checkpoints" / ("%04d" % index))
+        if pinned_core:
+            combined["runtime_dir"] = str(Path(runtime_dir).resolve())
         level = _log_level(log_level or combined.get("log_level"))
         combined["log_level"] = level
         if not combined.get("runtime_release"):

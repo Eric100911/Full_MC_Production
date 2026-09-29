@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import gzip
+import os
 from pathlib import Path
 import shutil
 
 from full_mc.io import read_json, atomic_json
 from full_mc.storage.transfer import materialize_input
-from ._common import core_path, count_lhe_events, parameters, run
+from ._common import batch_runtime_asset, core_path, count_lhe_events, parameters, run
 
 
 def native_tree(task, work_dir, shower=False):
@@ -22,8 +23,24 @@ def native_tree(task, work_dir, shower=False):
         shutil.copytree(core_path(task, "processing/pythia_shower"),
                         processing / "pythia_shower", dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("*.o", "__pycache__"))
-    if not (root / "common").exists():
-        (root / "common").symlink_to(core_path(task, "common"), target_is_directory=True)
+    common = root / "common"
+    if task["stage"] == "ntuple" and task.get("runtime_dir"):
+        asset = batch_runtime_asset(task, task["runtime"])
+        if common.is_symlink():
+            common.unlink()
+        elif common.exists():
+            shutil.rmtree(common)
+        shutil.copytree(core_path(task, "common"), common,
+                        ignore=shutil.ignore_patterns("packages"))
+        packages = common / "packages"
+        packages.mkdir()
+        target = packages / asset.name
+        try:
+            os.link(asset, target)
+        except OSError:
+            shutil.copy2(asset, target)
+    elif not common.exists():
+        common.symlink_to(core_path(task, "common"), target_is_directory=True)
     return processing / "run_chain.sh"
 
 

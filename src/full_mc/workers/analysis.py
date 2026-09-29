@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 import tarfile
+from full_mc.runtime.bootstrap import _extract
 from full_mc.storage.transfer import materialize_input
-from ._common import core_path, parameters, prepare, publish, result, run
+from ._common import batch_runtime_asset, core_path, parameters, prepare, publish, result, run
 
 
-def build_command(task, raw_ntuple, work_dir):
+def build_command(task, raw_ntuple, work_dir, analyzer_path=None):
     p = parameters(task)
-    analyzer = Path(p.get("analyzer_path", core_path(task, "external/NtupleAnalyzer")))
+    analyzer = Path(analyzer_path or p.get("analyzer_path", core_path(task, "external/NtupleAnalyzer")))
     if p.get("analysis") != "JJP":
         raise ValueError("the full efficiency workflow currently supports JJP only")
     if task["stage"] == "selection":
@@ -30,12 +32,29 @@ def build_command(task, raw_ntuple, work_dir):
             "--skip-plots"]
 
 
+def analyzer_tree(task, work_dir):
+    if parameters(task).get("analyzer_path"):
+        return Path(parameters(task)["analyzer_path"])
+    if not task.get("runtime_dir"):
+        return core_path(task, "external/NtupleAnalyzer")
+    asset = batch_runtime_asset(task, "analyzer-el9")
+    external = work_dir / "external"
+    analyzer = external / "NtupleAnalyzer"
+    if analyzer.is_symlink():
+        analyzer.unlink()
+    elif analyzer.exists():
+        shutil.rmtree(analyzer)
+    _extract(asset, external, "NtupleAnalyzer")
+    return analyzer
+
+
 def execute(task, work_dir):
     work_dir = prepare(task, work_dir, "analyzer-el9")
     if len(task.get("inputs", [])) != 1 or task["inputs"][0]["kind"] != "raw-ntuple":
         raise ValueError("analysis requires exactly one full raw-ntuple input")
     raw = materialize_input(task["inputs"][0], work_dir)
-    run(task, "analyzer-el9", build_command(task, raw, work_dir), work_dir)
+    analyzer = analyzer_tree(task, work_dir)
+    run(task, "analyzer-el9", build_command(task, raw, work_dir, analyzer), work_dir)
     if task["stage"] == "selection":
         output = work_dir / "selected.root"
     else:

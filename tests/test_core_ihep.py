@@ -117,6 +117,7 @@ class IhepContracts(unittest.TestCase):
             release = runtime(root / "runtime")
             batch = prepare_batch(root / "handoff.json", root / "batch", runtime_dir=release)
             task = read_json(batch["jobs"][0]["task_path"])
+            self.assertEqual(task["runtime_dir"], str(release))
             self.assertEqual(task["subtasks"]["merge"]["parameters"]["core_root"],
                              str(release / "controller/core"))
 

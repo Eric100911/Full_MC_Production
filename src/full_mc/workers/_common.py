@@ -4,7 +4,7 @@ import gzip
 import json
 import os
 from pathlib import Path
-from full_mc.io import atomic_json
+from full_mc.io import atomic_json, read_json
 from full_mc.runtime.profiles import STAGE_RUNTIME, resolve_profile, runtime_for_profile
 from full_mc.runtime.launch import launch
 from full_mc.storage.transfer import TransferClient, artifact_ref
@@ -30,6 +30,26 @@ def expected_runtime(task):
 
 def core_path(task, relative):
     return Path(parameters(task).get("core_root", CORE_ROOT)) / relative
+
+def batch_runtime_asset(task, profile):
+    """Find one profile asset in the pinned IHEP release, without changing it."""
+    release_dir = Path(task["runtime_dir"]).resolve()
+    descriptor = read_json(release_dir / "runtime.json")
+    if descriptor.get("runtime_release") != task.get("runtime_release"):
+        raise ValueError("batch runtime release does not match the task")
+    if core_path(task, "").resolve() != (release_dir / "controller/core").resolve():
+        raise ValueError("batch core does not belong to the runtime release")
+    if profile not in descriptor.get("profiles", []):
+        raise ValueError(f"batch runtime lacks profile {profile}")
+    name = descriptor.get("bundles", {}).get(profile)
+    if not name or Path(name).name != name:
+        raise ValueError(f"batch runtime lacks a valid bundle for {profile}")
+    asset = release_dir / name
+    recorded_size = descriptor.get("bundle_bytes", {}).get(name)
+    if (not asset.is_file() or asset.stat().st_size <= 0 or
+            (recorded_size is not None and asset.stat().st_size != int(recorded_size))):
+        raise FileNotFoundError(f"batch runtime asset is missing or has the wrong size: {asset}")
+    return asset
 
 def prepare(task, work_dir, expected_runtime):
     task_id(task)

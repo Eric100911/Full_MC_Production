@@ -71,6 +71,8 @@ def run_combined_task(taskfile, work_dir, log_level=None):
             else:
                 current["runtime"] = STAGE_RUNTIME[stage]
         current.setdefault("runtime_release", task["runtime_release"])
+        if task.get("runtime_dir"):
+            current["runtime_dir"] = task["runtime_dir"]
         current.setdefault("log_level", task.get("log_level", "info"))
         if log_level:
             current["log_level"] = log_level
