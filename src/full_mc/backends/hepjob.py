@@ -25,9 +25,8 @@ SAFE_NTUPLE_NODES = (
     "ams017", "ams018", "ams019", "ams020", "cws047", "cws048", "cws049",
     "cws051", "cws052", "cws053", "cws054",
 )
-_ACTIVE_STATES = {"idle", "queued", "pending", "running", "run", "held"}
-_COMPLETE_STATES = {"completed", "complete", "done", "finished"}
-_FAILED_STATES = {"failed", "error", "removed", "aborted", "killed"}
+_ACTIVE_CODES = {"I", "R", "H", "S"}
+_FAILED_CODES = {"E", "F", "X"}
 
 
 def _log_level(value):
@@ -278,14 +277,39 @@ def _hep_q(job_id, runner):
     return "", None
 
 
-def _hep_state(text):
+def _hep_state(text, job_id):
+    """Read only the requested job row, never hep_q's aggregate counters."""
     if not text or re.search(r"(?im)^\s*(?:usage:|.*\berror:)", text):
         return "unknown"
-    lowered = text.lower()
-    for states, result in ((_FAILED_STATES, "failed"), (_COMPLETE_STATES, "completed"),
-                           (_ACTIVE_STATES, "active")):
-        if any(re.search(r"\b%s\b" % re.escape(state), lowered) for state in states):
-            return result
+    requested = str(job_id)
+    if not re.fullmatch(r"\d+(?:\.\d+)?", requested):
+        return "unknown"
+    rows = []
+    in_table = False
+    for line in text.splitlines():
+        if re.match(r"^\s*JOBID\s+OWNER\s+SUBMITTED\s+RUN_TIME\s+ST\b", line):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        # SUBMITTED occupies a date and time column in HepJob's table.
+        match = re.match(
+            r"^\s*(?P<id>\d+(?:\.\d+)?)\s+\S+\s+\S+\s+\S+\s+\S+\s+"
+            r"(?P<state>[A-Z])(?:\s|$)", line
+        )
+        if not match:
+            continue
+        row_id = match.group("id")
+        if row_id == requested or ("." not in requested and row_id.split(".")[0] == requested):
+            rows.append(match.group("state"))
+    if len(rows) != 1:
+        return "unknown"
+    if rows[0] in _ACTIVE_CODES:
+        return "active"
+    if rows[0] in _FAILED_CODES:
+        return "failed"
+    if rows[0] == "C":
+        return "completed"
     return "unknown"
 
 
@@ -300,15 +324,19 @@ def status_batch(manifest_path: str | Path,
         if job.get("state") != "submitted" or not job.get("job_id"):
             continue
         text, error = _hep_q(job["job_id"], runner)
-        observed = _hep_state(text or "") if error is None else "unknown"
+        observed = _hep_state(text or "", job["job_id"]) if error is None else "unknown"
         job.update(scheduler_query=["hep_q", "-i", str(job["job_id"])],
                    scheduler_output=(text or error or "")[-4000:],
                    scheduler_state=observed,
                    reconciled_at=datetime.now(timezone.utc).isoformat())
         if observed == "failed":
-            job.update(state="failed", recovery_eligible=True)
+            job.update(state="failed", recovery_eligible=True,
+                       reconciliation_required=False)
         elif observed == "completed":
-            job.update(state="completed", recovery_eligible=False)
+            job.update(state="completed", recovery_eligible=False,
+                       reconciliation_required=False)
+        elif observed == "active":
+            job.update(recovery_eligible=False, reconciliation_required=False)
         elif observed == "unknown":
             job["reconciliation_required"] = True
     _atomic_json(path, manifest)

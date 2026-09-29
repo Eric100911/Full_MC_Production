@@ -392,10 +392,9 @@ For a blocked DAG whose failed worker is held, use this recovery order:
    monitoring; use it only during an explicitly supervised interactive
    diagnostic.
 
-The current pilot's `MERGE` payload is held rather than running, so
-`condor_ssh_to_job` cannot provide evidence for that already-finished attempt.
-Submitting rescue before obtaining the failure output is therefore a fallback
-diagnostic step, not the first explanation of the failure.
+For a held `MERGE` payload, `condor_ssh_to_job` cannot inspect the
+already-finished attempt. Obtain its persistent failure output before
+considering rescue submission.
 
 ### HELAC diagnostics and live progress
 
@@ -708,14 +707,14 @@ before submission. A ready IHEP cutover requires all of the following:
    job-private `credentials/x509_user_proxy`, and pin CMSSW15 ntuple tasks to
    the AVX2-safe hosts listed in the HepJob reference.
 
-Monitor exact recorded root/job IDs. An empty queue result is not completion;
-retry it once, then reconcile against persistent logs, task results, and
-checkpoints. Never remove or resume a DAG/batch merely because it looks idle.
-For the replacement DPS1 pair, use the active IDs, AFS run paths, and
-15-minute cutover-monitoring instructions in
-`docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md`. The earlier
-`docs/mcprod_dps1_pilot_monitor_prompt_2026-09-24.md` records the first failed
-attempt and is historical; do not use its root IDs for the replacement pair.
+Monitor exact recorded root/job IDs. An empty queue result or an aggregate
+`0 completed`/`0 removed` counter is not a job outcome; retry an empty query
+once, then reconcile against persistent logs, task results, checkpoints, and
+EOS outputs. `batch status` reads only a row matching the recorded HepJob ID;
+an absent or ambiguous row remains unknown. Never remove or resume a DAG/batch
+merely because it looks idle. For a completed small DPS1 cutover example, see
+`docs/mcprod_ihep_cutover_pilot_lessons_2026-09-29.md`. The 2026-09-24 DPS1
+monitor prompts are historical and their IDs must not be reused.
 
 ## Legacy CERN MIX / IHEP MERGE+NTUPLE split
 

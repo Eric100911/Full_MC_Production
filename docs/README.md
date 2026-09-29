@@ -74,6 +74,7 @@ prepare one combined IHEP allocation per merge group:
 ./mcprod handoff transfer --run /path/to/production-wrapper/work/example/cern \
   --site-config /path/to/production-wrapper/sites/ihep.json
 ./mcprod batch prepare --handoff /path/to/handoff.json --output-dir /path/to/batch \
+  --runtime-dir /path/to/matching-ihep-runtime \
   --proxy /path/to/x509_proxy --log-level info
 ```
 
@@ -127,13 +128,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_core_*.py'
 Use `docs/testing.md` for mcprod pilot/cutover procedures, the retained legacy
 workflow, live scheduler checks, and storage or CMSSW validation.
 
-As of 2026-09-24, the first DPS1 pair (roots `13486220` and `13486223` on
-`bigbird27.cern.ch`) failed at reclaim with an unsupported `text` argument to
-`run_profile`; those runs and their AFS rescue records remain preserved. The
-narrow fix is committed as `1449aa9`. Replacement CERN and cutover runs were
-submitted on `bigbird26.cern.ch` as roots `12740955` and `12740959`; both were
-active at 10:06 CEST. Their clean pinned CERN/IHEP runtime, plan specs, AFS
-logs, and 15-minute handoff/monitoring instructions are recorded in
-`docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md`. No handoff has yet
-been exported. The specs set LHE resources to 1 CPU / 3072 MB; these runs use
-an existing LHE and therefore do not schedule an LHE-generation worker.
+The 2026-09-29 DPS1 cutover pilot completed at core revision `ae60528` and
+NtupleAnalyzer revision `1cd1a5a`. Its CERN and IHEP job IDs, product counts,
+and operational lessons are recorded in
+`docs/mcprod_ihep_cutover_pilot_lessons_2026-09-29.md`. The earlier
+`docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md` describes a
+historical attempt and must not supply job IDs or runtime paths for a new run.

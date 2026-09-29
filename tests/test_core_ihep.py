@@ -40,6 +40,15 @@ def runtime(root, release="r1", revision="core1"):
     return root
 
 
+def hep_q_output(job_id=None, state="I"):
+    row = (f"{job_id}.0      wangchi         09/28 21:56     0+00:00:00      "
+           f"{state}  0   0.0  0000-persistent.sh \n") if job_id else ""
+    count = 1 if job_id else 0
+    return ("JOBID\t\tOWNER\t\tSUBMITTED\tRUN_TIME\tST PRI SIZE CMD\n"
+            + row + f"{count} jobs; 0 completed, 0 removed, {count} idle, "
+            "0 running, 0 held, 0 suspended\n")
+
+
 class IhepContracts(unittest.TestCase):
     def test_prepared_wrappers_are_private_and_nodes_round_robin(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -91,12 +100,12 @@ class IhepContracts(unittest.TestCase):
             batch = prepare_batch(handoff(root), root / "batch")
             submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
                 returncode=0, stdout="submitted to cluster 27", stderr="")))
-            active = Mock(return_value=Mock(returncode=0, stdout="27 running", stderr=""))
+            active = Mock(return_value=Mock(returncode=0, stdout=hep_q_output("27"), stderr=""))
             status_batch(batch["manifest_path"], runner=active)
             self.assertEqual(active.call_args.args[0], ["hep_q", "-i", "27"])
             self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"], "submitted")
 
-            failed = Mock(return_value=Mock(returncode=0, stdout="27 failed", stderr=""))
+            failed = Mock(return_value=Mock(returncode=0, stdout=hep_q_output("27", "F"), stderr=""))
             status_batch(batch["manifest_path"], runner=failed)
             self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"], "failed")
             recovered = resume_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
@@ -105,6 +114,36 @@ class IhepContracts(unittest.TestCase):
             self.assertEqual((job["state"], job["job_id"], job["recovery_of"]),
                              ("submitted", "28", "27"))
             self.assertEqual(len(job["attempts"]), 2)
+
+    def test_hep_q_summary_and_other_jobs_cannot_authorize_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch = prepare_batch(handoff(root), root / "batch")
+            submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
+                returncode=0, stdout="submitted to cluster 27", stderr="")))
+            for output, expected in (
+                (hep_q_output("27"), "active"),
+                (hep_q_output(), "unknown"),
+                (hep_q_output("28", "F"), "unknown"),
+                (hep_q_output("27") + hep_q_output("27", "F"), "unknown"),
+            ):
+                with self.subTest(output=output):
+                    result = Mock(return_value=Mock(returncode=0, stdout=output, stderr=""))
+                    status_batch(batch["manifest_path"], runner=result)
+                    job = read_json(batch["manifest_path"])["jobs"][0]
+                    self.assertEqual(job["state"], "submitted")
+                    self.assertEqual(job["scheduler_state"], expected)
+                    self.assertFalse(job.get("recovery_eligible", False))
+                    self.assertEqual(job.get("reconciliation_required", False),
+                                     expected == "unknown")
+
+            def query_only(command, **_kwargs):
+                self.assertEqual(command, ["hep_q", "-i", "27"])
+                return Mock(returncode=0, stdout=hep_q_output(), stderr="")
+
+            resume_batch(batch["manifest_path"], runner=query_only)
+            self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"],
+                             "submitted")
 
     def test_hep_q_cli_diagnostic_never_marks_a_job_failed(self):
         with tempfile.TemporaryDirectory() as temporary:
