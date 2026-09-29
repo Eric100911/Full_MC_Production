@@ -779,7 +779,7 @@ class CrashSafety(AcceptanceFixture):
             self.assertEqual(len(load_archives(run, spec_payload, 3)), 1)
             self.assertEqual(len(load_groups(run, spec_payload,
                                              state["merge_group_counts"])), 1)
-            self.assertEqual(len(read_json(run / "merge_groups.json")["groups"]), 1)
+            self.assertFalse((run / "merge_groups.json").exists())
 
 
 @patch("full_mc.application.production.resolve_proxy_path",

@@ -38,6 +38,7 @@ STATUS_NAMES = {
     6: "transferring-output",
     7: "suspended",
 }
+HISTORY_SCAN_LIMIT = 10000
 
 
 MappingKey = Tuple[Optional[str], str]
@@ -132,7 +133,8 @@ def queue_status(schedd: str, job: str) -> Dict[str, Any]:
 
 def history_status(schedd: str, job: str) -> Dict[str, Any]:
     command = [
-        "condor_history", "-name", schedd, job, "-af",
+        "condor_history", "-name", schedd, job,
+        "-scanlimit", str(HISTORY_SCAN_LIMIT), "-af",
         "JobStatus", "ExitCode", "ExitBySignal", "CompletionDate", "HoldReason",
     ]
     try:
@@ -143,7 +145,12 @@ def history_status(schedd: str, job: str) -> Dict[str, Any]:
         return {"state": "not-found", "queue_error": "condor_history timed out"}
     fields = result.stdout.strip().split()
     if not fields or not fields[0].isdigit():
-        return {"state": "not-found"}
+        return {
+            "state": "not-found",
+            "queue_error": (
+                f"no match within {HISTORY_SCAN_LIMIT} scanned history records"
+            ),
+        }
     code = int(fields[0])
     return {
         "state": STATUS_NAMES.get(code, "unknown"),

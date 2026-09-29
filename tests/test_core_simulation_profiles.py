@@ -19,7 +19,7 @@ class SimulationProfileContracts(unittest.TestCase):
             "runtime_release": "test-release",
             "block_events": 100,
             "storage": {
-                "cern_staging": str(root / "cern"),
+                "cern_staging": "root://eosuser.cern.ch///eos/user/c/chiw/staging",
                 "ihep_products": str(root / "products"),
                 "ihep_archive": str(root / "archive"),
             },

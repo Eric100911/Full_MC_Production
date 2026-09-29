@@ -14,7 +14,7 @@ from pathlib import Path
 import subprocess
 
 from full_mc.application.ledger import (STATE_SCHEMA, archive_record, inventory_record,
-                                        load_archives, load_groups, load_inventory,
+                                        load_archives, load_inventory,
                                         load_wave, sample_key, wave_path, wave_receipt,
                                         write_archive, write_group, write_inventory,
                                         write_wave)
@@ -242,15 +242,17 @@ def _reclaim_refs(refs):
     return values
 
 
-def _remote_staging_refs(refs):
-    """The subset of recorded references a reclaim worker can delete over XRootD.
-
-    The run spec always pins ``cern_staging`` to an EOS URL, so in production
-    this is every reference.  A run whose staging root is a local filesystem
-    path (a hermetic test run) has no remote staging to reclaim, so the seam
-    issues no reclaim task and gates no cursor on one.
-    """
-    return [ref for ref in refs if is_remote(ref["url"])]
+def _staging_refs(refs):
+    """Require every reclaim reference to use the production XRootD contract."""
+    refs = list(refs)
+    non_remote = [str(ref.get("url", "")) for ref in refs
+                  if not is_remote(ref.get("url", ""))]
+    if non_remote:
+        raise RuntimeError(
+            "production staging reference is not an XRootD URL: "
+            + ", ".join(non_remote)
+        )
+    return refs
 
 
 def _reclaim_task(spec, step, refs):
@@ -408,7 +410,7 @@ def _process_phase(root, step, spec, view, allocation):
     deletable.extend(mixed)
     reclaim = _reclaim_refs(deletable)
     reclaim_task = None
-    reclaim_refs = _remote_staging_refs(reclaim)
+    reclaim_refs = _staging_refs(reclaim)
     if reclaim_refs:
         reclaim_task = _reclaim_task(spec, step, reclaim_refs)
         tasks.append(reclaim_task)
@@ -506,10 +508,11 @@ def _validate_planner_result(root, spec, item, outcome):
 def _validate_archive_result(root, spec, pending, outcome):
     """Verify an archive result against its frozen task, locally.
 
-    The archive worker downloaded every member and verified the published
-    archive before returning, so the seam repeats the structural contract only:
-    member identity, URL, kind, event count and declared size still have to
-    match the frozen archive inputs.
+    The archive worker already validated producer metadata and the downloaded
+    member size before verifying the published archive. The local PRE seam
+    repeats only structural checks: member identity, URL, kind, event count and
+    declared size still have to match the frozen archive inputs. PRE does not
+    remotely re-stat the HepMC.
     """
     task = read_json(root / "tasks" / (pending["archive_task"] + ".json"))
     validate_result_envelope(task, outcome, spec["runtime_release"])
@@ -743,14 +746,6 @@ def _merge_groups(spec, state, flush=False):
     return written
 
 
-def _write_groups(root, spec, state):
-    """Derived operator snapshot; the immutable ledger holds the real records."""
-    atomic_json(root / "merge_groups.json", {
-        "run_id": spec["run_id"], "runtime_release": spec["runtime_release"],
-        "core_revision": spec["core_revision"],
-        "groups": load_groups(root, spec, state["merge_group_counts"])})
-
-
 def _finish_pending(root, spec, state):
     """Fold one prepared wave in the plan's retry-safe order.
 
@@ -824,7 +819,6 @@ def advance_wave(run_dir, step=None):
         (root / ".complete").touch()
         return {"skip": True, "status": "complete",
                 "merge_groups": sum(state.get("merge_group_counts", {}).values())}
-    _write_groups(root, spec, state)
     requested = state["next_step"] if step is None else int(step)
     if requested < state["next_step"]:
         return {"skip": True, "status": state["status"]}
@@ -846,7 +840,7 @@ def advance_wave(run_dir, step=None):
         # A terminal reclaim still runs before completion is committed; the
         # wave that just folded was that reclaim when the spare slot was used.
         leftovers = ([] if folded == "reclaim"
-                     else _remote_staging_refs(terminal_reclaim_refs(root, spec, state)))
+                     else _staging_refs(terminal_reclaim_refs(root, spec, state)))
         if leftovers:
             reclaim = _reclaim_task(spec, requested, leftovers)
             path = write_tasks_dag(root, requested, [reclaim], [], spec)
@@ -856,11 +850,9 @@ def advance_wave(run_dir, step=None):
                                 "dag": str(path)}
             state["status"] = "running"
             atomic_json(root / "state.json", state)
-            _write_groups(root, spec, state)
             return {"phase": "reclaim", "dag": str(path), "status": "prepared"}
         state["status"] = "complete"
         atomic_json(root / "state.json", state)
-        _write_groups(root, spec, state)
         (root / ".complete").touch()
         return {"skip": True, "status": "complete",
                 "merge_groups": sum(state["merge_group_counts"].values())}

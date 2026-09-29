@@ -138,8 +138,11 @@ controller records archive verification, reclamation, and continuation as
 separate lifecycle transitions. Live storage validation is still required before
 production use.
 
-Handoff export reads the coordinator's explicit `merge_groups.json` index. It
-checks component MiniAODs, not the future merge output, and carries actual event
+The immutable group ledger plus `state.json`'s committed
+`merge_group_counts` are the authoritative state source. Handoff export reads
+those committed records, materializes `merge_groups.json` as a derived operator
+snapshot, and checks component MiniAODs rather than the future merge output.
+`handoff.json` is the formal downstream interface and carries actual event
 counts into the IHEP task. Batch preparation uses job-private proxy and scratch
 paths and distinct checkpoint directories. Submission attempts are persisted
 before contacting HepJob; ambiguous or interrupted attempts require exact

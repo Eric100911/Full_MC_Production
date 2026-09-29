@@ -92,6 +92,19 @@ class RunSpecStorageGuardTests(unittest.TestCase):
             )
             self.assertEqual(resolved["run_id"], "safety-test")
 
+    def test_cern_staging_requires_an_explicit_xrootd_url(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for spelling in (
+                "/eos/user/c/chiw/staging",
+                "file:/eos/user/c/chiw/staging",
+                str(root / "staging"),
+            ):
+                with self.subTest(spelling=spelling), self.assertRaisesRegex(
+                    ValueError, "storage.cern_staging must be an XRootD URL"
+                ):
+                    self.load(root, cern_staging=spelling)
+
     def test_configured_inventory_and_descendants_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

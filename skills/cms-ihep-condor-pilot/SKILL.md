@@ -37,9 +37,10 @@ Keep this skill responsible for:
 - Do not diagnose IHEP XRootD from the restricted Codex sandbox. Sandbox
   `xrdfs`/`xrdcp` can fail with `[FATAL] Invalid address` even when live shell
   access works. Use approved unsandboxed commands for XRootD and HTCondor.
-- Put scratch, live logs, and preserved test outputs under `/tmp/chiw/`.
-  Keep DAG bundles under repo `generated/` or another submit-visible persistent
-  filesystem.
+- Put scratch files under `/tmp/chiw/`. Put live logs and preserved test
+  outputs under the submit-visible persistent AFS output bundle, normally
+  `<output-dir>/logs`; keep DAG bundles under repo `generated/` or another
+  submit-visible persistent filesystem.
 - For known existing-LHE pilots, use `--skip-lhe-generation --no-scan-existing`
   with configured exact paths. Avoid remote-scan-dependent generation from
   sandboxed or unreliable-network contexts.
@@ -98,8 +99,8 @@ Check for:
 - configured LHE URLs use `root://cceos.ihep.ac.cn:1094///store/...`;
 - coordinator config has `enable_ntuple: true`;
 - merge mode has `miniaod_merge_events > 0`;
-- log root is under `/tmp/chiw/` unless the user intentionally chose another
-  non-AFS log filesystem.
+- log root is under the submit-visible persistent AFS output bundle, normally
+  `<output-dir>/logs`; `/tmp/chiw/` is scratch-only.
 
 ## Live monitoring
 

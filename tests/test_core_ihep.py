@@ -93,7 +93,7 @@ class IhepContracts(unittest.TestCase):
                 returncode=0, stdout="submitted to cluster 27", stderr="")))
             active = Mock(return_value=Mock(returncode=0, stdout="27 running", stderr=""))
             status_batch(batch["manifest_path"], runner=active)
-            self.assertEqual(active.call_args.args[0], ["hep_q", "27"])
+            self.assertEqual(active.call_args.args[0], ["hep_q", "-i", "27"])
             self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"], "submitted")
 
             failed = Mock(return_value=Mock(returncode=0, stdout="27 failed", stderr=""))
@@ -105,6 +105,26 @@ class IhepContracts(unittest.TestCase):
             self.assertEqual((job["state"], job["job_id"], job["recovery_of"]),
                              ("submitted", "28", "27"))
             self.assertEqual(len(job["attempts"]), 2)
+
+    def test_hep_q_cli_diagnostic_never_marks_a_job_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch = prepare_batch(handoff(root), root / "batch")
+            submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
+                returncode=0, stdout="submitted to cluster 27", stderr="")))
+
+            usage_error = (
+                "usage: hep_q.py [-h] [-i ID]\n"
+                "hep_q.py: error: unrecognized arguments: 27")
+            for stdout, stderr in (("", usage_error), (usage_error, "")):
+                diagnostic = Mock(return_value=Mock(returncode=0, stdout=stdout,
+                                                    stderr=stderr))
+                status_batch(batch["manifest_path"], runner=diagnostic)
+                job = read_json(batch["manifest_path"])["jobs"][0]
+                self.assertEqual(job["state"], "submitted")
+                self.assertEqual(job["scheduler_state"], "unknown")
+                self.assertTrue(job["reconciliation_required"])
+                self.assertEqual(job["scheduler_query"], ["hep_q", "-i", "27"])
 
     def test_pinned_handoff_requires_matching_ihep_runtime_controller(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -163,8 +163,16 @@ def load_run_spec(path):
     storage = dict(defaults()["production_storage"])
     storage.update(site.get("storage", {}))
     storage.update(spec.get("storage", {}))
-    for key in ("cern_staging", "ihep_products", "ihep_archive"):
-        value = str(storage[key])
+    cern_staging = str(storage.get("cern_staging", ""))
+    if not cern_staging:
+        raise ValueError("missing storage.cern_staging")
+    if not cern_staging.startswith("root://"):
+        raise ValueError(
+            "storage.cern_staging must be an XRootD URL beginning with root://"
+        )
+    storage["cern_staging"] = cern_staging
+    for key in ("ihep_products", "ihep_archive"):
+        value = str(storage.get(key, ""))
         if not value:
             raise ValueError(f"missing storage.{key}")
         if not value.startswith("root://"):

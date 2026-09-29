@@ -38,6 +38,16 @@ the task matches:
 - Pilot operations must reuse the Condor skill for live queue inspection and
   mutations.
 
+## Technical language
+
+For Chinese technical explanations, review reports, planning documents, and
+agent-facing discussion, follow `docs/technical_language_style.md`.
+
+Use Chinese as the main explanatory language. Preserve English identifiers when
+they map directly to code, but explain uncommon English terms and ordinary
+English words used with repository-specific/software-engineering meanings on
+first use.
+
 ## Development Commands
 
 - List campaigns: `./mcprod catalog`
@@ -52,6 +62,15 @@ the task matches:
 
 For pilot submission, monitoring, output verification, and optional MiniAOD
 merge smoke tests, follow `docs/testing.md`.
+
+New production and cutover pilots use `./mcprod`; `dag_generator.py` commands
+are for legacy compatibility only. Keep runtime releases, run directories,
+Condor logs, and operator records on submit-visible CERN AFS. The `lhe` worker
+requests 1 CPU and 3072 MB RAM; keep its explicit scratch/disk ceiling separate.
+For mcprod command syntax and lifecycle, consult `docs/README.md` and
+`docs/testing.md` before querying `--help`. Use CLI help only to resolve an
+undocumented or conflicting interface, then update the durable docs with the
+verified command so the same discovery is not repeated.
 
 ## Coding and Naming
 
@@ -117,6 +136,9 @@ the changed workflow. If touching:
 
 ## Production Operations
 
+- Pin a clean runtime release and keep its `git_revision` with the schedd and
+  root cluster ID. For new mcprod pilots, keep `run.json`, `submission.json`,
+  DAGMan logs, worker logs, and handoff records under the persistent AFS run.
 - Before submitting a pilot or production DAG, state event count, source-file
   count, events per block, expected blocks per source, merge target, and
   subprocess coverage. In block mode, `--jobs` counts source LHE files, not
@@ -127,6 +149,9 @@ the changed workflow. If touching:
 - For small existing-LHE `generate-test` pilots, keep a positive `--max-events`
   so it auto-caps each planner via `--lhe-max-events-per-plan`; otherwise tiny
   `--lhe-events-per-block` values can split the whole full-size source file.
+- Set `--log-root` to a submit-visible persistent AFS directory, normally
+  `<output-dir>/logs`. Use `/tmp/chiw/` only for scratch data, never as the
+  durable Condor stdout/stderr and wrapper-log destination.
 - Repeated inputs within one subprocess must consume distinct non-overlapping
   blocks. Deterministic shuffling must be preserved.
 - Treat counted inventory events and the campaign job-spec checksum as
@@ -147,6 +172,16 @@ the changed workflow. If touching:
 - Record the schedd and top DAGMan cluster ID together. Query progress from
   that root ID on the recorded schedd rather than using a recent time window;
   completed jobs normally leave the live `condor_q` total.
+- For `condor_history`, always pass the recorded schedd with `-name` and use
+  exact `cluster.proc` IDs or a narrowly bounded `-constraint`. Keep both the
+  returned rows (`-limit`) and scanned ads (`-scanlimit`) bounded; never use a
+  broad owner/time-window query when exact job IDs are available.
+- Do not use direct `ssh` to a Condor schedd for job or worker diagnosis. The
+  schedd is the control-plane service: use schedd-qualified Condor queries,
+  DAGMan logs, and persisted worker logs. For a running vanilla/container
+  worker job only, `condor_ssh_to_job -name <schedd> <cluster.proc>` is the
+  supported execute-node access path when the site enables it; this is
+  Condor-protocol access to the worker, not an SSH login to the schedd.
 - Before removing or forcing a DAG, inspect completed nodes, active children,
   deterministic outputs, and rescue files. Prefer rescue/recovery resubmission.
 - Verify operational changes in live DAGMan and worker logs; generated configs

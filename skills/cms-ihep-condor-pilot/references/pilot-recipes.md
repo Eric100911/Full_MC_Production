@@ -29,7 +29,7 @@ Generate:
 ```bash
 ts=$(date +%Y%m%d_%H%M%S)
 out="generated/miniaod_merge_existing_pilot_${ts}"
-log="/tmp/chiw/miniaod_merge_existing_pilot_logs_${ts}"
+log="$out/logs"
 mkdir -p "$out" "$log"
 
 python3 dag_generator.py generate-test \
@@ -129,6 +129,8 @@ root://cceos.ihep.ac.cn:1094///store/user/chiw/MC_Production_v3/LHE_pool/SPS-Jps
 
 - Top-level DAGMan: `<output-dir>/<dag>.dagman.out`
 - Top-level node log: `<output-dir>/<dag>.nodes.log`
-- Live Condor logs: the `--log-root` path, normally under `/tmp/chiw/...`
+- Live Condor logs: the `--log-root` path under the AFS-generated output bundle,
+  normally `<output-dir>/logs`. Reserve `/tmp/chiw/` for scratch files only;
+  do not use it as the persistent Condor log root.
 - Generated block SubDAG: `<output-dir>/plan_subdags/<campaign>/job_0/blocks_processing.dag`
 - Coordinator manifest: `<output-dir>/plan_subdags/<campaign>/job_0/coord_manifest_<campaign>_0.json`

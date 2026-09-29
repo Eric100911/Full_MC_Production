@@ -255,23 +255,32 @@ def _hep_q(job_id, runner):
     An empty response can be IHEP login-node fork exhaustion or a completed job
     that has left the queue. It is never completion evidence.
     """
-    command = ["hep_q", str(job_id)]
+    command = ["hep_q", "-i", str(job_id)]
     for attempt in range(2):
         try:
             completed = runner(command, check=False, text=True, capture_output=True,
                                env=_environment())
         except OSError as exc:
             return None, "error: %s" % exc
-        text = (str(getattr(completed, "stdout", "")) + "\n" +
-                str(getattr(completed, "stderr", ""))).strip()
+        stdout = str(getattr(completed, "stdout", "")).strip()
+        stderr = str(getattr(completed, "stderr", "")).strip()
         if getattr(completed, "returncode", 1) != 0:
-            return None, text[-4000:]
-        if text or attempt:
-            return text, None
+            return None, (stderr or stdout)[-4000:]
+        # hep_q can print argparse diagnostics to stderr while returning 0.
+        # Never treat that text as a scheduler state: doing so can mark a live
+        # job failed and make explicit recovery duplicate its allocation.
+        if stdout:
+            return stdout[-4000:], None
+        if stderr:
+            return None, stderr[-4000:]
+        if attempt:
+            return "", None
     return "", None
 
 
 def _hep_state(text):
+    if not text or re.search(r"(?im)^\s*(?:usage:|.*\berror:)", text):
+        return "unknown"
     lowered = text.lower()
     for states, result in ((_FAILED_STATES, "failed"), (_COMPLETE_STATES, "completed"),
                            (_ACTIVE_STATES, "active")):
@@ -292,7 +301,7 @@ def status_batch(manifest_path: str | Path,
             continue
         text, error = _hep_q(job["job_id"], runner)
         observed = _hep_state(text or "") if error is None else "unknown"
-        job.update(scheduler_query=["hep_q", str(job["job_id"])],
+        job.update(scheduler_query=["hep_q", "-i", str(job["job_id"])],
                    scheduler_output=(text or error or "")[-4000:],
                    scheduler_state=observed,
                    reconciled_at=datetime.now(timezone.utc).isoformat())

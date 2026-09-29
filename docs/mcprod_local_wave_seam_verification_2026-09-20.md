@@ -1,7 +1,7 @@
 # mcprod local wave seam: implementation record and open verification targets
 
 Date: 2026-09-20
-Status: **implemented in the working tree; committed but not merged**
+Status: **baseline record plus follow-up hardening implemented in the working tree**
 Scope: `production-core` (`mcprod`) wave controller only. Legacy `dag_generator.py` is untouched.
 
 This document exists so an independent session can try to **falsify** the claims
@@ -106,7 +106,7 @@ everything it calls perform zero EOS operations.
 | 3.4 | Handoff fails closed on a v1 state | PROVEN | same module |
 | 3.5 | Allocation/job IDs/RNG seeds unchanged by the refactor | READ | `test_50k_blocks_allocate_identically_and_keep_state_bounded` |
 | 3.6 | The completing wave is skipped, not failed, by DAGMan | **READ** | §7 item 1 — the biggest open one |
-| 3.7 | Reclaim is safe against every ordering | **ASSUMED** | §7 items 3–4 |
+| 3.7 | Reclaim is safe against every ordering | **READ** | §7 items 3–4 plus reclaim-wiring tests |
 
 ---
 
@@ -159,7 +159,7 @@ file. Their harness tested itself, not the artifact.
 semantics from source. I did **not** run a live DAGMan. PRE_SKIP is load-bearing
 for the entire lazy-wave design (every unused slot relies on it), but see §7.1.
 
-### 4.3 Left open — see §6
+### 4.3 Follow-up targets — resolved in §6
 
 Their #3, #5, #8. Two underlying issues, both real, both with non-obvious fixes.
 
@@ -201,88 +201,93 @@ Every step purged `__pycache__` first (§0).
 
 ---
 
-## 6. The two open problems, explained
+## 6. Follow-up hardening results
 
 ### 6.1 Reclaim is gated on URL spelling
 
-`_remote_staging_refs` (`production.py:245`) filters the deletable set through
-`is_remote`, a `str.startswith("root://")` test. When empty, `_process_phase`
-(`production.py:409-415`) emits **no reclaim task and no cursor gate at all**.
+At the reviewed baseline, `_remote_staging_refs` silently discarded local
+references, so a local `cern_staging` value could advance the cursor without a
+reclaim task. That was the source of the original storage-accounting gap.
 
-Its docstring claims "The run spec always pins `cern_staging` to an EOS URL".
-**That is false.** `load_run_spec` (`settings.py:165-171`) does not reject a
-local path — it silently rewrites it:
+**[PROVEN]** The follow-up makes `storage.cern_staging` an explicit XRootD-only
+contract in `load_run_spec()`. A CERN User EOS URL such as
+`root://eosuser.cern.ch///eos/user/c/chiw/staging` is accepted; `/eos/...`,
+`file:/...`, and ordinary local paths fail before planning. The reclaim path now
+raises an explicit error for any non-XRootD reference instead of filtering it
+out. The storage tests cover all four spellings and the lifecycle fixtures use
+XRootD references while keeping worker results hermetic.
 
-```python
-if not value.startswith("root://"):
-    storage[key] = _path(value, path.parent)     # becomes an absolute local path
+Evidence:
+
+```bash
+find . -path ./tests/generated -prune -o -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; true
+PYTHONPATH=src python3 -m unittest tests.test_core_storage_safety tests.test_core_production
 ```
 
-`_validate_generated_staging` only checks overlap with the immutable LHE
-inventory, which such a path does not have. So the spec is accepted and
-reclamation never happens.
-
-**The sharper half is the byte accounting.** `_staging_view`
-(`production.py:189-191`) counts a block as resident only if its index is **at or
-after** the pool cursor, encoding the invariant "cursor past a block ⇒ that
-block has been reclaimed and is gone". `_used_bytes` (`:215`), `_allocation`
-(`:207`) and `_check_bytes` (`:219`) all rest on it. If reclamation never runs,
-the files stay on disk while the accounting reports them gone: **the guard
-designed to prevent staging overflow reads false free space**, `fitting` stays
-large, and the run allocates waves until the filesystem itself fills.
-
-The filter was introduced to keep a fixture green: `tests/test_core_production.py:78`
-pins `cern_staging` to a local path and never writes a reclaim result. That
-fixture's assertion was inverted to accommodate it — it now asserts the staged
-block **still exists**, commented "the seam no longer deletes staged products".
-
-Not hypothetical spelling-wise: `cern_staging` has already been misconfigured in
-this project (`/eos/home-c/` vs the `/eos/user/` that `eosuser.cern.ch` serves).
-
-Two candidate fixes, both requiring fixture changes:
-
-1. **Drop the scheme filter** — reclaim covers local and remote (the worker's
-   `remove_many` already `unlink`s local paths). Matches the plan, and is the
-   only option that also repairs the accounting.
-2. **Enforce `root://` for `cern_staging` at plan time** — fail fast. Does not
-   repair the accounting if local staging is ever legitimately needed.
+The accounting invariant therefore remains explicit: a cursor may advance only
+after the worker has reported deletion of the exact XRootD references recorded
+for that wave.
 
 ### 6.2 Archive member size validation is vacuous
 
-The HepMC reference is built at plan time (`production.py:359`):
+At the reviewed baseline, the HepMC reference was created before MIX produced
+the file and had no `size_bytes`. Archive hydration was absent, so a short
+download could be tarred and recorded as if it were intact.
 
-```python
-hepmc = _ref("HEPMC_" + identity, _staging(spec) + "/mixed/" + identity + ".hepmc.gz", "hepmc")
+**[PROVEN]** Archive dispatch now selectively hydrates only `kind == "hepmc"`
+references. It reads and validates the MIX producer sidecar through the existing
+`validated_record()` checks (identity, URL, completion, and remote size), copies
+the sidecar's positive `size_bytes` and event metadata into the frozen
+reference, and then lets `materialize_input()` verify the downloaded local file.
+Retained original LHE references are not selected and continue to use their
+PLAN-supplied size without a MIX sidecar.
+
+The regression test sets the producer sidecar and remote object size to 100
+bytes but makes the archive download 80 bytes. The worker fails before archive
+publication and removes the truncated local copy. A complementary test archives
+a retained original LHE without a MIX-style sidecar successfully.
+
+The terminology is deliberate: **hydrate** means supplementing the reference
+from producer metadata; **materialize** means preparing the actual local file.
+
+Evidence:
+
+```bash
+find . -path ./tests/generated -prune -o -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; true
+PYTHONPATH=src python3 -m unittest tests.test_core_workers tests.test_core_input_validation
 ```
 
-`_ref` sets no `size_bytes`, and cannot: the file does not exist yet — MIX
-produces it later. Those refs become the archive task's inputs.
+The local PRE seam remains unchanged: it performs structural checks on the
+worker's result and does not remotely re-stat the HepMC.
 
-At HEAD the seam compared the staged object's real size against the archived
-size (`client.size(...) != int(item["size_bytes"])`) — that remote stat was
-exactly what the refactor set out to remove, but it was **the only thing covering
-these members**. The replacement is guarded by `"size_bytes" in reference`, which
-is false for HepMC members, so it is skipped. The consumer-side check added by
-this refactor (`transfer.py materialize_input`) is guarded the same way and
-skips identically. Hydration does not fill the gap either: `workers/__init__.py:9`
-hydrates `{miniaod, merge, ntuple, selection, efficiency}` — **`archive` is not
-in the set**.
+### 6.3 PRE proxy validation
 
-Net: a short HepMC download is tarred and recorded as contract-verified.
+**[PROVEN]** Generated PRE scripts establish per-wave logging first, check the
+local `.complete` sentinel before touching credentials, and return 99 for a
+completed run. An incomplete run requires the pinned proxy to be readable and
+nonempty, requires `voms-proxy-info`, and runs:
 
-Blast radius is bounded and nastier for it. `create_archive` verifies the tar
-against *local* files, so it cannot catch a short download — the local file *is*
-the short one. MiniAOD is unaffected (it hydrates from the sidecar). So the
-corruption is confined to **the preservation archive**, whose entire purpose is
-to be the durable copy after staging is reclaimed. It surfaces only at restore
-time.
+```bash
+voms-proxy-info --file "$X509_USER_PROXY" --timeleft
+```
 
-**The naive fix breaks archive.** Adding `"archive"` to `_HYDRATE_ALL` looks
-obvious but `archive_inputs` also contains the retained LHE originals, whose refs
-point at canonical pool URLs with no `complete: true` sidecar. `validated_record`
-would return `None`, `_hydrate_inputs` would raise `ValueError("input artifact is
-not ready")`, and every archive task would fail. The fix must be **selective** —
-hydrate only members that actually have a sidecar.
+Values below 3600 seconds, command failure, unavailable command, and malformed
+output return 98 with a `proxy-validity` diagnostic. The diagnostic includes the
+remaining lifetime when available, the 3600-second requirement, the pinned path,
+and the instruction to refresh that same path before resuming. A value of 3600
+or more lets PRE invoke the local controller. Every root wave has:
+
+```text
+PRE_SKIP <wave> 99
+ABORT-DAG-ON <wave> 98 RETURN 1
+```
+
+The focused PRE tests use a deterministic generated PATH shim and cover missing
+sentinel credentials, missing/failed `voms-proxy-info`, 3599, 3600, larger and
+malformed time-left values. They do not submit a DAG. Therefore the script
+generation and exit-code behavior are **[PROVEN]**, while the live DAGMan
+abort/Rescue-DAG semantics remain **[READ]** until an actual DAGMan process is
+run.
 
 ---
 
@@ -290,12 +295,14 @@ hydrate only members that actually have a sidecar.
 
 These are the things I could not settle. Each is stated so it can be falsified.
 
-1. **Does a live DAGMan really skip the completing wave?** (§4.2)
+1. **Does a live DAGMan really skip the completing wave? [READ]** (§4.2)
    I claim yes, from the exit-code chain plus `PRE_SKIP`. Build the real
    generated DAG and run `condor_dagman` on it. If DAGMan reports the node as
    `STATUS_ERROR` or aborts, my rejection of reviewer finding #6 is wrong and
    the fix is to write a real (possibly empty) sub-DAG for the completing wave.
-   **This needs a Condor submission, which I did not make.**
+   **This needs a Condor submission, which I did not make.** The generated DAG
+   now also contains `ABORT-DAG-ON <wave> 98 RETURN 1`; no live DAGMan semantic
+   test was authorized for this follow-up.
 
 2. **Is `steps = ... + 2` sufficient in every configuration?**
    My argument is `ceil(x/y) <= x` for positive `x`, so two extra slots always
@@ -306,18 +313,19 @@ These are the things I could not settle. Each is stated so it can be falsified.
    partial wave. `tests/test_core_wave_budget.py` only covers the 1-source,
    1-node shape.
 
-3. **Can the per-wave reclaim delete an original before ARCHIVE consumed it?**
-   The DAG orders `ARCHIVE -> RECLAIM`, and the archive worker materializes
-   members before writing the tar. But the archive also validates its gates via
-   `artifact_ready`, which is remote. I did not construct an interleaving that
-   breaks it. **[ASSUMED]**
+3. **Can the per-wave reclaim delete an original before ARCHIVE consumed it? [READ]**
+   The generated task DAG has an explicit `ARCHIVE -> RECLAIM` dependency, and
+   the archive worker materializes every member before publishing its result.
+   The seam accepts a reclaim result only after the archive result has passed its
+   structural checks. The source inspection and offline DAG-wiring tests support
+   the ordering; no concurrent scheduler interleaving was executed.
 
 4. **Can `terminal_reclaim_refs` pass its guard while the original is not
-   actually archived?** Its rule is "an unused block may not be reclaimed before
-   its original appears in a committed archive receipt". Receipts are committed
-   only below `next_step`. Try to construct a state where the guard passes but
-   the receipt is not yet committed, or where an archive's member list omits the
-   original. **[ASSUMED]**
+   actually archived? [READ]** Its rule is "an unused block may not be reclaimed
+   before its original appears in a committed archive receipt". Receipts are
+   committed only below `next_step`; the committed archive member set is the
+   guard input. The reclaim-wiring and seam-acceptance tests exercise this
+   committed-ledger gate. No live scheduler interleaving was executed.
 
 5. **Is the 50,000-block identity claim real?**
    `test_50k_blocks_allocate_identically_and_keep_state_bounded` claims identical
@@ -329,9 +337,12 @@ These are the things I could not settle. Each is stated so it can be falsified.
    not grow with block count. Check the assertion is a real bound and not a
    tautology.
 
-7. **Is `merge_groups.json` still consistent?** It is now a *derived* snapshot
-   written by both the seam and handoff export. Check no reader treats it as a
-   source of truth, and that the two writers cannot disagree.
+7. **Is `merge_groups.json` still consistent? [PROVEN]** The follow-up removes
+   the production-side writer. `handoff.py` is the sole production-code writer,
+   and it reconstructs the derived operator snapshot from committed ledger
+   records plus `merge_group_counts`. `handoff.json` remains the formal
+   downstream interface. Handoff tests cover stale snapshots, uncommitted
+   ordinals, and preserved `analysis_output` metadata.
 
 ---
 
@@ -341,7 +352,7 @@ These are the things I could not settle. Each is stated so it can be falsified.
 cd <repo>/.worktrees/production-core
 PURGE='find . -path ./tests/generated -prune -o -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; true'
 
-# whole suite, cache purged per module (22 modules, 147 tests)
+# whole suite, cache purged per module (22 modules, 158 tests)
 for t in test_core_production test_core_seam_acceptance test_core_seam_recovery \
          test_core_wave_budget test_core_reclaim_wiring test_core_reclaim \
          test_core_ledger test_core_pre_logging test_core_input_validation \
@@ -355,8 +366,8 @@ for t in test_core_production test_core_seam_acceptance test_core_seam_recovery 
 done
 ```
 
-Result at the time of writing: **147 tests, 0 failing modules** (20 modules
-before this change).
+Result at the time of writing: **158 tests, 0 failing modules** across the 22
+focused core modules.
 
 Independent probes written during the session and kept out of the tree
 (`/tmp/chiw/`): `root_dag_budget.py` (drives only the declared waves),
@@ -370,5 +381,6 @@ Independent probes written during the session and kept out of the tree
   (`mcprod runtime prepare` + a new pilot) was not executed. It requires a
   proxy and submits real Condor jobs.
 - **No live DAGMan run** (see §7.1).
-- §6.1 and §6.2 are **unfixed** — they need a decision, because both "obvious"
-  fixes break existing fixtures or the archive path.
+- §6.1 and §6.2 are resolved by the explicit XRootD contract and selective
+  archive hydration described above. No CERN pilot, HTCondor submission, or
+  live DAGMan semantic test was performed.

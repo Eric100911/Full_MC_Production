@@ -7,6 +7,16 @@ URL conventions, testing expectations, branch scope, and PR descriptions.
 Detailed testing procedures live in `docs/testing.md`; path details in
 `docs/directory_path_reference.md`.
 
+## Technical language
+
+For Chinese technical explanations, review reports, planning documents, and
+agent-facing discussion, follow `docs/technical_language_style.md`.
+
+Use Chinese as the main explanatory language. Preserve English identifiers when
+they map directly to code, but explain uncommon English terms and ordinary
+English words used with repository-specific/software-engineering meanings on
+first use.
+
 ## Plan Mode
 
 When entering plan mode, make comprehensive plans based on careful code reading of all relevant files. Plans should include relevant code snippets with line number references to existing functions, classes, and patterns that should be reused. Do not propose new implementations when suitable ones already exist.
@@ -128,6 +138,9 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
   merge target, and included subprocesses. In block SubDAG mode, `--jobs`
   counts source LHE files, while planner manifests determine the number of
   processing blocks.
+- Set `--log-root` to a submit-visible persistent AFS directory, normally
+  `<output-dir>/logs`. Reserve `/tmp/chiw/` for scratch data; do not use it as
+  the durable Condor stdout/stderr and wrapper-log destination.
 - Reuse of a source block across different subprocess classes is acceptable.
   Repeated inputs within one subprocess must consume distinct, non-overlapping
   blocks. Keep shuffling deterministic and use
@@ -139,6 +152,12 @@ Selected via `--machine-env` on every `dag_generator.py` command. Defined in `MA
   before `condor_submit_dag`). Query progress from that root ID on the recorded
   schedd rather than by a recent time window; completed jobs normally leave the
   live `condor_q` total.
+- Never use direct `ssh` to a Condor schedd for diagnosis; use explicit
+  `condor_q`/`condor_history`, DAGMan logs, and transferred worker logs. To
+  inspect a live vanilla/container worker, use
+  `condor_ssh_to_job -name <schedd> <cluster.proc>` only when site policy allows
+  it. That command uses the Condor schedd/starter protocol and does not mean
+  SSH-ing into the schedd host.
 - `report-and-truncate` may preserve a valid common mixed-event prefix while
   reporting source shortfalls. The 0.15 unused-HepMC threshold is a warning and
   planning diagnostic, not a hard production target or halt condition.

@@ -198,6 +198,112 @@ class WorkerContracts(unittest.TestCase):
                                  or "__pycache__" in name for name in names))
 
 
+class ArchiveHydrationTests(unittest.TestCase):
+    class FakeTransfer:
+        def __init__(self, sidecars, remote_sizes, download_size=None):
+            self.sidecars = sidecars
+            self.remote_sizes = dict(remote_sizes)
+            self.download_size = download_size
+            self.copy_out_calls = []
+
+        def read_json(self, url):
+            return self.sidecars[url]
+
+        def size(self, url):
+            return self.remote_sizes[url]
+
+        def copy_in(self, source, destination):
+            destination = Path(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"x" * int(self.download_size))
+            return destination
+
+        def mkdir_parent(self, destination):
+            return None
+
+        def copy_out(self, source, destination):
+            self.copy_out_calls.append(str(destination))
+            self.remote_sizes[str(destination)] = Path(source).stat().st_size
+            return self.remote_sizes[str(destination)]
+
+    def mini_ref(self, root):
+        url = "root://eosuser.cern.ch///eos/user/c/chiw/mini.root"
+        ref = {"artifact_id": "mini", "url": url, "kind": "miniaod"}
+        return ref, url
+
+    def task(self, root, inputs, mini_ref):
+        return {
+            "task_id": "ARCHIVE_000001", "stage": "archive",
+            "runtime": "utilities-el9", "runtime_release": "r1",
+            "inputs": inputs,
+            "outputs": [{"artifact_id": "archive", "url":
+                         "root://cceos.ihep.ac.cn:1094///store/archive.tar",
+                         "kind": "upstream-archive"}],
+            "parameters": {"component_miniaods": [mini_ref]},
+        }
+
+    def test_truncated_mixed_hepmc_is_rejected_before_archive_publish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hepmc_url = "root://eosuser.cern.ch///eos/user/c/chiw/mixed.hepmc.gz"
+            mini, mini_url = self.mini_ref(root)
+            hepmc = {"artifact_id": "mixed", "url": hepmc_url, "kind": "hepmc"}
+            sidecars = {
+                hepmc_url + ".json": {
+                    "status": "ok", "complete": True, "artifact_id": "mixed",
+                    "url": hepmc_url, "kind": "hepmc", "events": 3,
+                    "size_bytes": 100, "runtime_release": "r1",
+                },
+                mini_url + ".json": {
+                    "status": "ok", "complete": True, "artifact_id": "mini",
+                    "url": mini_url, "kind": "miniaod", "events": 1,
+                    "size_bytes": 7, "runtime_release": "r1",
+                    "count_source": "edmFileUtil",
+                },
+            }
+            client = self.FakeTransfer(
+                sidecars, {hepmc_url: 100, mini_url: 7}, download_size=80)
+            task = self.task(root, [hepmc], mini)
+
+            with patch("full_mc.workers.TransferClient", return_value=client), \
+                    patch("full_mc.workers._common.TransferClient", return_value=client), \
+                    patch("full_mc.storage.transfer.TransferClient", return_value=client):
+                with self.assertRaisesRegex(RuntimeError, "downloaded size disagrees with mixed"):
+                    execute_task(task, root / "work")
+
+            self.assertEqual(task["inputs"][0]["size_bytes"], 100)
+            self.assertFalse(client.copy_out_calls)
+            self.assertFalse((root / "work" / "inputs" / "mixed" / "mixed.hepmc.gz").exists())
+
+    def test_retained_lhe_uses_plan_size_without_a_mix_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / "original.lhe.gz"
+            with gzip.open(original, "wb") as stream:
+                stream.write(b"<LesHouchesEvents>\n</LesHouchesEvents>\n")
+            mini, mini_url = self.mini_ref(root)
+            sidecars = {mini_url + ".json": {
+                "status": "ok", "complete": True, "artifact_id": "mini",
+                "url": mini_url, "kind": "miniaod", "events": 1,
+                "size_bytes": 7, "runtime_release": "r1",
+                "count_source": "edmFileUtil",
+            }}
+            client = self.FakeTransfer(sidecars, {mini_url: 7})
+            original_ref = {"artifact_id": "original", "url": str(original),
+                            "kind": "lhe", "events": 1,
+                            "size_bytes": original.stat().st_size}
+            task = self.task(root, [original_ref], mini)
+
+            with patch("full_mc.workers.TransferClient", return_value=client), \
+                    patch("full_mc.workers._common.TransferClient", return_value=client), \
+                    patch("full_mc.storage.transfer.TransferClient", return_value=client):
+                outcome = execute_task(task, root / "work")
+
+            self.assertEqual(outcome["status"], "ok")
+            self.assertEqual(outcome["members"][0]["artifact_id"], "original")
+            self.assertNotIn("sidecar_url", original_ref)
+
+
 class RuntimeBootstrap(unittest.TestCase):
     def test_batch_stages_use_private_profile_bundles(self):
         with tempfile.TemporaryDirectory() as temporary:

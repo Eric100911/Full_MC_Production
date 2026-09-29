@@ -349,6 +349,54 @@ through a compatible pager or `--color=never` for plain logs. If the root
 DAGMan job has already left the queue, also pass the persistent root DAG path
 with `--dag-file`.
 
+### Condor control-plane and worker access boundary
+
+Do not use direct `ssh` to a Condor schedd. A schedd is the control-plane
+service, not the worker execution environment; direct login does not provide a
+useful or reliable way to inspect a payload. Use the recorded schedd name with
+`condor_q`, bounded `condor_history`, `dag_snapshot.py`, `dag_progress.py`, and
+the persistent DAGMan/worker logs instead.
+
+`condor_ssh_to_job` is a different mechanism. It uses the Condor protocol to
+reach the `condor_starter` on the execute node and is allowed only for a
+currently running job, subject to the job universe and site configuration. It
+cannot inspect a held or completed worker sandbox retroactively, and it cannot
+be used to enter the scheduler-universe DAGMan controller. Keep any attached
+session read-only and short-lived because its processes count toward the job's
+resource usage.
+
+For a blocked DAG whose failed worker is held, use this recovery order:
+
+1. Capture the exact hold reason, job ID, DAGMan/sub-DAG logs, and any
+   transferred `wrapper_logs` before changing queue state.
+2. If the failure evidence is insufficient and recovery is explicitly
+   authorized, remove the root DAGMan job on its original schedd. On Unix,
+   DAGMan writes rescue state on removal and removes the child jobs; nested
+   SubDAGs have their own rescue state.
+3. Re-submit the original DAG on the same schedd without `-force`. The rescue
+   state skips nodes already recorded as successful, but re-runs every part of
+   an unfinished node. Rescue preserves workflow state; it does not repair an
+   unchanged application failure.
+4. Once the retried payload is actually `RUNNING`, resolve its new
+   `cluster.proc` has `JobStatus=2`, and, if needed, use a one-shot command
+   such as:
+
+   ```bash
+   condor_ssh_to_job -name bigbirdNN.cern.ch <cluster.proc> \
+     /bin/bash -lc 'pwd; ps -ef; find . -maxdepth 2 -type f -printf "%p\\n" | sort | head -200'
+   ```
+
+   Do not use `-remove-on-interrupt`, do not edit inputs from the session, and
+   close the session promptly. `-auto-retry` is intentionally not used in the
+   normal recipe because it waits for a non-running job and can become implicit
+   monitoring; use it only during an explicitly supervised interactive
+   diagnostic.
+
+The current pilot's `MERGE` payload is held rather than running, so
+`condor_ssh_to_job` cannot provide evidence for that already-finished attempt.
+Submitting rescue before obtaining the failure output is therefore a fallback
+diagnostic step, not the first explanation of the failure.
+
 ### HELAC diagnostics and live progress
 
 ### Unified worker logging and held-job diagnostics
@@ -612,24 +660,67 @@ python3 tools/review_phase2_shower_efficiency.py \
 Run `--fetch-remote` only from a normal CERN/IHEP shell or with approved
 unsandboxed network access and a valid proxy.
 
-## One-shot read-only DAG monitoring
+## New production and cutover pilots with `mcprod`
 
-For an mcprod run, use:
+Use `./mcprod` for new refactored production. The legacy `dag_generator.py`
+split-DAG procedure below is retained for existing workspaces only; do not use
+it to build a second controller around a new mcprod run.
 
-```bash
-python3 tools/mcprod_snapshot.py --run <run-dir>
-```
+Prepare the site-specific runtime from a clean committed core revision and
+store it, the run directory, and operator logs on CERN AFS. A submitted mcprod
+run records its attempts and current root DAGMan identity in `submission.json`;
+use `python3 tools/mcprod_snapshot.py --run <run-dir>` for one-shot, read-only
+monitoring. It validates the current attempt, queries only its recorded root,
+and uses matching persisted logs and artifact credentials after the root leaves
+the queue. Optional `--schedd` and `--cluster` values assert that identity.
 
-The snapshot selects `current_attempt`, queries only its recorded root, and
-uses matching logs and ledger evidence after that root leaves the queue. It
-does not stat remote artifacts.
+For an existing legacy DAG, use
+`python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py <root-cluster> --schedd <host>`;
+when the root has left the queue, also pass `--dag-file <root.dag>`. For
+detailed topology, use
+`python3 tools/dag_progress.py <root-cluster> --schedd <host> --structure=collapsed`.
 
-For a legacy DAG, use `dag_snapshot.py <root-cluster> --schedd <host>` and add
-`--dag-file <root.dag>` after the root leaves the queue. Use
-`tools/dag_progress.py <root-cluster> --schedd <host> --structure=collapsed`
-for detailed topology.
+The generated Condor event log, DAGMan logs, PRE-script logs, worker
+stdout/stderr, and diagnostic archives are all placed below the AFS run
+directory.
 
-## CERN MIX / IHEP MERGE+NTUPLE split
+LHE worker requests are 1 CPU and 3072 MB RAM. Keep explicit `scratch_bytes`
+ceilings and their derived disk requests intact. A campaign using an existing
+counted LHE has a `plan` task but no LHE-generation worker, so the LHE resource
+setting is not exercised by that pilot.
+
+For an existing-LHE DPS1 pilot, preserve the inventory checksum and source ID,
+use a positive finite `planned_events`, and state the expected source files,
+block size/count, subprocess modes, processing-node count, and merge target
+before submission. A ready IHEP cutover requires all of the following:
+
+1. `python3 tools/mcprod_snapshot.py --run <run-dir>` reports the CERN run
+   complete and the AFS run contains `.complete` plus its committed archive
+   receipts.
+2. `mcprod handoff export` reports no rejected groups; inspect its explicit
+   `tasks`, `runtime_release`, and `core_revision` before transfer.
+3. `mcprod handoff transfer` uses the explicit IHEP site configuration.
+4. The IHEP receiving runtime is clean and matches both the handoff release and
+   core revision. Stage the handoff JSON into an IHEP-visible persistent
+   workspace before preparing its batch.
+5. Inspect `batch_manifest.json` before the one-time submit. Keep batch logs and
+   checkpoints on persistent IHEP storage, install the proxy into the
+   job-private `credentials/x509_user_proxy`, and pin CMSSW15 ntuple tasks to
+   the AVX2-safe hosts listed in the HepJob reference.
+
+Monitor exact recorded root/job IDs. An empty queue result is not completion;
+retry it once, then reconcile against persistent logs, task results, and
+checkpoints. Never remove or resume a DAG/batch merely because it looks idle.
+For the replacement DPS1 pair, use the active IDs, AFS run paths, and
+15-minute cutover-monitoring instructions in
+`docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md`. The earlier
+`docs/mcprod_dps1_pilot_monitor_prompt_2026-09-24.md` records the first failed
+attempt and is historical; do not use its root IDs for the replacement pair.
+
+## Legacy CERN MIX / IHEP MERGE+NTUPLE split
+
+The following split-DAG procedure applies only to existing legacy workspaces.
+New runs must follow the mcprod lifecycle above.
 
 ### Preconditions and invariants
 

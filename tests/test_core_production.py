@@ -1,9 +1,10 @@
 """Offline lifecycle contracts for the lazy CERN production controller."""
-import gzip
 from contextlib import ExitStack
+import io
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,8 +16,7 @@ from full_mc.application.ledger import (archive_path, group_path, inventory_path
 from full_mc.application.production import advance_wave, plan_run, restore_archived_sources
 from full_mc.io import atomic_json, read_json
 from full_mc.planning.graph import PRE_SCRIPT_TIMEOUT_SECONDS, write_root_dag
-from full_mc.storage.transfer import artifact_ref, TransferClient
-from full_mc.workers.archive import execute as archive_execute
+from full_mc.storage.transfer import TransferClient
 from tests.generate_synthetic_lhe import generate
 
 STATE_KEYS = {"state_schema", "status", "next_step", "pending", "pool_cursors",
@@ -25,6 +25,22 @@ REMOTE_METHODS = ("size", "mkdir_parent", "mkdir", "read_json_if_exists",
                   "directory_has_entries", "copy_json_if_absent", "copy_out",
                   "copy_in", "read_json", "remove")
 SAMPLE = sample_key("C", "run3_2022_legacy_premix_v1")
+
+
+def install_voms_stub(root, output="7200"):
+    path_root = root / "voms-bin"
+    path_root.mkdir()
+    shim = path_root / "voms-proxy-info"
+    shim.write_text("#!/bin/bash\nprintf '%s\\n' '" + output + "'\n", encoding="utf-8")
+    shim.chmod(0o755)
+    script = root / "advance.sh"
+    script.write_text(
+        script.read_text(encoding="utf-8").replace(
+            "export PATH=/usr/bin:/bin",
+            "export PATH=" + str(path_root) + ":/usr/bin:/bin",
+        ),
+        encoding="utf-8",
+    )
 
 
 def sidecar(ref, *, events=None, count_source=None):
@@ -75,7 +91,7 @@ class ProductionLifecycle(unittest.TestCase):
             "schema_version": 2, "run_id": "offline", "runtime_release": "test-release",
             "runtime_dir": str(runtime),
             "block_events": 5,
-            "storage": {"cern_staging": str(root / "cern"),
+            "storage": {"cern_staging": "root://eosuser.cern.ch///eos/user/c/chiw/staging",
                         "ihep_products": str(root / "ihep/products"),
                         "ihep_archive": str(root / "ihep/archive"),
                         "staging_bytes": 100000, "reserve_bytes": 1000},
@@ -102,51 +118,61 @@ class ProductionLifecycle(unittest.TestCase):
         plan_id = pending["records"][0]["plan_task"]
         task = read_json(run / "tasks" / (plan_id + ".json"))
         original = task["parameters"]["original_output"]
-        original_path = Path(original["url"])
         blocks = []
-        if staged:
-            original_path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(original_path, "wb") as stream:
-                stream.write(b"<LesHouchesEvents>\n<event>\n1\n</event>\n</LesHouchesEvents>\n")
-            original = artifact_ref(original_path, original["artifact_id"], original["kind"],
-                                    15, original["url"])
-            for index in range(3):
-                path = original_path.parent / "blocks" / ("block%d.lhe.gz" % index)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with gzip.open(path, "wb") as stream:
-                    stream.write(b"<event>\n%d\n</event>\n" % index)
-                blocks.append(artifact_ref(path, "BLOCK:pool:s1:%06d" % index, "lhe-block",
-                                           5, str(path)))
-        else:
-            # A valid manifest whose URLs were never materialized here: the seam
-            # validates the record, not the remote objects.
-            original = dict(original, events=15, size_bytes=999)
-            blocks = [{"artifact_id": "BLOCK:pool:s1:%06d" % index, "kind": "lhe-block",
-                       "events": 5, "size_bytes": 999,
-                       "url": str(original_path.parent / "blocks" / ("block%d.lhe.gz" % index))}
-                      for index in range(3)]
+        # A valid manifest whose XRootD URLs are never materialized here: the
+        # seam validates the record, not the remote objects.
+        original = dict(original, events=15, size_bytes=999)
+        directory = str(task["parameters"]["block_output_dir"]).rstrip("/")
+        blocks = [{"artifact_id": "BLOCK:pool:s1:%06d" % index, "kind": "lhe-block",
+                   "events": 5, "size_bytes": 999,
+                   "url": directory + "/block%d.lhe.gz" % index}
+                  for index in range(2)]
         atomic_json(run / "results" / (plan_id + ".json"), {"task_id": plan_id, "stage": "plan",
                     "status": "ok", "runtime_release": "test-release", "outputs": blocks,
-                    "originals": [original], "planned_events": 15,
+                    "originals": [original], "planned_events": 10,
                     "actual_input_events": 15})
 
     def processing_results(self, run):
         pending = read_json(run / "state.json")["pending"]
         archive_task = read_json(run / "tasks" / (pending["archive_task"] + ".json"))
-        for mixed in pending["mixed"]:
-            mixed_path = Path(mixed["url"])
-            mixed_path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(mixed_path, "wb") as stream:
-                stream.write(b"HepMC::Version 3\n")
         for item in pending["miniaods"]:
             task = read_json(run / "tasks" / (item["task_id"] + ".json"))
             output = sidecar(task["outputs"][0], events=1, count_source="edmFileUtil")
             atomic_json(run / "results" / (item["task_id"] + ".json"), {"task_id": item["task_id"],
                         "stage": "miniaod", "status": "ok", "runtime_release": "test-release",
                         "outputs": [output]})
-        # Archive is a real local worker execution; MiniAOD gates use the sidecars above.
-        outcome = archive_execute(archive_task, run / "archive-work")
+        members = []
+        for index, ref in enumerate(archive_task["inputs"]):
+            member = {"artifact_id": ref["artifact_id"],
+                      "member": "%06d_%s" % (index, Path(ref["url"]).name),
+                      "url": ref["url"], "kind": ref["kind"],
+                      "size_bytes": int(ref.get("size_bytes") or 999)}
+            if "events" in ref:
+                member["events"] = int(ref["events"])
+            members.append(member)
+        outcome = {"task_id": pending["archive_task"], "stage": "archive", "status": "ok",
+                   "runtime_release": "test-release", "outputs": [dict(archive_task["outputs"][0])],
+                   "members": members}
+        archive_path = Path(archive_task["outputs"][0]["url"])
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "w") as stream:
+            for item in members:
+                info = tarfile.TarInfo(item["member"])
+                info.size = int(item["size_bytes"])
+                stream.addfile(info, io.BytesIO(b"x" * info.size))
         atomic_json(run / "results" / (pending["archive_task"] + ".json"), outcome)
+
+    def reclaim_result(self, run):
+        pending = read_json(run / "state.json")["pending"]
+        task = read_json(run / "tasks" / (pending["reclaim_task"] + ".json"))
+        reclaimed = [{"artifact_id": ref["artifact_id"],
+                      "objects": [{"kind": "payload", "url": ref["url"],
+                                   "disposition": "removed"}]}
+                     for ref in task["inputs"]]
+        atomic_json(run / "results" / (pending["reclaim_task"] + ".json"), {
+            "task_id": pending["reclaim_task"], "stage": "reclaim", "status": "ok",
+            "runtime_release": "test-release", "outputs": [], "reclaimed": reclaimed,
+        })
 
     def test_lazy_lifecycle_replay_and_reclaim_are_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -163,7 +189,7 @@ class ProductionLifecycle(unittest.TestCase):
                           advance_script)
             self.assertIn("export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates",
                           advance_script)
-            self.assertIn("PRE script proxy is unavailable", advance_script)
+            self.assertIn("proxy-validity", advance_script)
             self.assertIn(f"exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} ", advance_script)
             subprocess.run(["bash", "-n", str(run / "advance.sh")], check=True)
             state = read_json(run / "state.json")
@@ -195,6 +221,7 @@ class ProductionLifecycle(unittest.TestCase):
                              ["LHE_000000", "BLOCK:pool:s1:000000", "BLOCK:pool:s1:000001",
                               "HEPMC_C_JOB000000_BLOCK000000"])
             self.processing_results(run)
+            self.reclaim_result(run)
             with remote_io_blocked():
                 done = advance_wave(run, 2)
             self.assertEqual(done["status"], "complete")
@@ -206,21 +233,20 @@ class ProductionLifecycle(unittest.TestCase):
             self.assertEqual(state["merge_buffers"][SAMPLE], [])
             self.assertEqual(state["merge_group_counts"], {SAMPLE: 1})
             # Nothing that grows with the run comes back into state.json; the
-            # seam no longer deletes staged products, so the unused block stays.
+            # seam does not materialize an aggregate snapshot.
             self.assertNotIn("terminal_cleanup", state)
-            self.assertTrue(
-                (run.parent / "cern/offline/sources/pool/s1/blocks/block2.lhe.gz").is_file())
+            self.assertFalse((run / "merge_groups.json").exists())
             # Committed ledger records, and only those, describe the run.
             inventory = read_json(inventory_path(run, "pool", "s1"))
             self.assertEqual(inventory["accepted_step"], 0)
-            self.assertEqual(len(inventory["producer_result"]["outputs"]), 3)
+            self.assertEqual(len(inventory["producer_result"]["outputs"]), 2)
             self.assertEqual([item["step"] for item in
                               load_archives(run, read_json(run / "run.json"), 2)], [1])
             self.assertEqual(load_wave(run, 1)["phase"], "processing")
             self.assertEqual(len(load_groups(run, read_json(run / "run.json"),
                                              state["merge_group_counts"])), 1)
             self.assertTrue(group_path(run, "C", "run3_2022_legacy_premix_v1", 0).exists())
-            self.assertEqual(len(read_json(run / "merge_groups.json")["groups"]), 1)
+            self.assertFalse((run / "merge_groups.json").exists())
             self.assertTrue((run / ".complete").is_file())
             # Completed replays stay no-ops.
             self.assertEqual(advance_wave(run, 2)["status"], "complete")
@@ -232,6 +258,7 @@ class ProductionLifecycle(unittest.TestCase):
             self.planner_results(run)
             advance_wave(run, 1)
             self.processing_results(run)
+            self.reclaim_result(run)
             commit = production.atomic_json
 
             def interrupted(path, value):
@@ -258,7 +285,7 @@ class ProductionLifecycle(unittest.TestCase):
             self.assertEqual(state["merge_group_counts"], {SAMPLE: 1})
             self.assertEqual(len(load_groups(run, read_json(run / "run.json"),
                                              state["merge_group_counts"])), 1)
-            self.assertEqual(len(read_json(run / "merge_groups.json")["groups"]), 1)
+            self.assertFalse((run / "merge_groups.json").exists())
 
     def test_valid_planner_result_advances_with_unreachable_urls(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -294,6 +321,7 @@ class ProductionLifecycle(unittest.TestCase):
             with patch("full_mc.planning.graph.PRE_SCRIPT_TIMEOUT_SECONDS", 0.01):
                 write_root_dag(root, {"core_root": str(core)}, 1,
                                str(proxy))
+            install_voms_stub(root)
 
             pre = root / "advance.sh"
             subprocess.run(["bash", "-n", str(pre)], check=True)
@@ -322,6 +350,7 @@ class ProductionLifecycle(unittest.TestCase):
             )
             cli.chmod(0o755)
             write_root_dag(root, {"core_root": str(core)}, 1, str(proxy))
+            install_voms_stub(root)
 
             outcome = subprocess.run([str(root / "advance.sh"), "0"], check=False)
 
@@ -374,6 +403,7 @@ class ProductionLifecycle(unittest.TestCase):
             self.planner_results(run)
             advance_wave(run, 1)
             self.processing_results(run)
+            self.reclaim_result(run)
             self.assertEqual(advance_wave(run, 2)["status"], "complete")
             receipts = load_archives(run, read_json(run / "run.json"), 2)
             archive_id = receipts[0]["outputs"][0]["artifact_id"]

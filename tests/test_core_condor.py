@@ -60,7 +60,7 @@ class CondorContracts(unittest.TestCase):
             payload = {
                 "condor": {"schedd": "schedd.example"},
                 "run_id": "reservation-test", "runtime_release": "r1",
-                "storage": {"cern_staging": str(root / "cern"),
+                "storage": {"cern_staging": "root://eosuser.cern.ch///eos/user/c/chiw/staging",
                             "ihep_products": str(root / "products"),
                             "ihep_archive": str(root / "archive")},
             }

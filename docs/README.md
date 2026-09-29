@@ -9,6 +9,11 @@ from validated products. Commands print a JSON summary and accept
 Run it from this checkout with `./mcprod`. An installed checkout also
 provides the `mcprod` console script.
 
+For pilot operations, use `docs/testing.md` as the procedure and this page as
+the command/lifecycle reference. Check these before querying CLI help; if a
+verified command or option is missing or stale, update the docs after checking
+the parser/source.
+
 ## Run lifecycle
 
 Start by listing the physics catalogue:
@@ -52,6 +57,14 @@ Freeze and prepare a bounded CERN run without submitting it:
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
+
+The operational command map is:
+
+- `runtime prepare` pins a clean site-specific runtime release.
+- `run plan`, `run status`, `run submit`, and `run resume` manage one CERN run.
+- `handoff export` and `handoff transfer` advance a completed CERN run to IHEP.
+- `batch prepare`, `batch status`, `batch submit`, and `batch resume` manage
+  the IHEP batch associated with that handoff.
 
 Export a ready component handoff, transfer it with the site configuration, and
 prepare one combined IHEP allocation per merge group:
@@ -111,6 +124,16 @@ The core contract suite can run offline:
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_core_*.py'
 ```
 
-Use `docs/testing.md` for the retained legacy workflow, live scheduler checks,
-and storage or CMSSW validation. The refactored controller has not been
-validated against a production CERN or IHEP submission in this checkout.
+Use `docs/testing.md` for mcprod pilot/cutover procedures, the retained legacy
+workflow, live scheduler checks, and storage or CMSSW validation.
+
+As of 2026-09-24, the first DPS1 pair (roots `13486220` and `13486223` on
+`bigbird27.cern.ch`) failed at reclaim with an unsupported `text` argument to
+`run_profile`; those runs and their AFS rescue records remain preserved. The
+narrow fix is committed as `1449aa9`. Replacement CERN and cutover runs were
+submitted on `bigbird26.cern.ch` as roots `12740955` and `12740959`; both were
+active at 10:06 CEST. Their clean pinned CERN/IHEP runtime, plan specs, AFS
+logs, and 15-minute handoff/monitoring instructions are recorded in
+`docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md`. No handoff has yet
+been exported. The specs set LHE resources to 1 CPU / 3072 MB; these runs use
+an existing LHE and therefore do not schedule an LHE-generation worker.

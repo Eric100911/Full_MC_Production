@@ -25,16 +25,19 @@ def combined(task_id, root, inputs):
         for stage in STAGES}}
 
 
-def run_dir(root, groups, committed):
+def run_dir(root, groups, committed, analysis_output=None):
     """A run whose committed ledger ordinals are the only handoff source.
 
     ``groups`` is written in ordinal order; only the first ``committed`` of them
     are below the state counter and therefore committed.
     """
-    atomic_json(root / "run.json", {
+    run_spec = {
         "run_id": "r", "runtime_release": "r1", "core_revision": "abc",
         "campaigns": [{"name": CAMPAIGN,
-                       "resolved_detector_variants": [{"profile_id": PROFILE}]}]})
+                       "resolved_detector_variants": [{"profile_id": PROFILE}]}]}
+    if analysis_output is not None:
+        run_spec["analysis_output"] = analysis_output
+    atomic_json(root / "run.json", run_spec)
     atomic_json(root / "state.json",
                 {"state_schema": STATE_SCHEMA, "status": "complete", "next_step": 1,
                  "pending": {}, "pool_cursors": {}, "job_offsets": {},
@@ -100,7 +103,9 @@ class HandoffContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             ref = mini_ref(root)
-            run_dir(root, [combined("group", root, [ref])], committed=1)
+            analysis_output = {"url": "root://cceos.ihep.ac.cn:1094///store/analysis.tar"}
+            run_dir(root, [combined("group", root, [ref])], committed=1,
+                    analysis_output=analysis_output)
             payload = export_handoff(root)
             self.assertEqual(payload["schema"], "full-mc-handoff-v1")
             self.assertEqual(payload["run_id"], "r")
@@ -108,6 +113,9 @@ class HandoffContracts(unittest.TestCase):
             self.assertEqual(payload["core_revision"], "abc")
             self.assertEqual(payload["tasks"][0]["runtime_release"], "r1")
             self.assertEqual(payload["rejected"], [])
+            self.assertEqual(read_json(root / "merge_groups.json")["analysis_output"],
+                             analysis_output)
+            self.assertEqual(payload["analysis_output"], analysis_output)
 
     def test_ready_only_false_rejects_unready_groups(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -13,6 +13,26 @@ import helac_trial_report
 
 
 class HelacTrialReportTest(unittest.TestCase):
+    @patch("helac_trial_report.subprocess.run")
+    def test_history_status_bounds_scan_and_explains_no_match(self, run):
+        run.return_value.stdout = ""
+        run.return_value.returncode = 0
+
+        status = helac_trial_report.history_status(
+            "bigbird22.cern.ch", "16639181.0"
+        )
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[command.index("-scanlimit") + 1],
+            "10000",
+        )
+        self.assertEqual(status["state"], "not-found")
+        self.assertEqual(
+            status["queue_error"],
+            "no match within 10000 scanned history records",
+        )
+
     def test_mapping_preserves_process_and_schedd(self):
         mappings = helac_trial_report.parse_mapping(
             [

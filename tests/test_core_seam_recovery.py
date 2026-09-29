@@ -43,7 +43,7 @@ class CompletedRunIsTerminal(AcceptanceFixture):
             dags_before = sorted(p.name for p in (run / "steps").glob("*.dag"))
 
             # Model a crash in the window between the completion commit and the
-            # sentinel write (an atomic_json plus a merge_groups.json write).
+            # sentinel write.
             (run / ".complete").unlink()
 
             replayed = advance_wave(run)
