@@ -673,6 +673,12 @@ monitoring. It validates the current attempt, queries only its recorded root,
 and uses matching persisted logs and artifact credentials after the root leaves
 the queue. Optional `--schedd` and `--cluster` values assert that identity.
 
+`mcprod run status` can confirm success after the exact root leaves both queue
+and bounded history when `.complete`, controller state, and root DAGMan metrics
+agree on completion and cluster ID. The snapshot reader also recognizes the
+`Workflow batch-id` marker in newer DAGMan logs. `dag_progress.py` labels a
+PRE-skipped wave without a generated child DAG as skipped rather than pending.
+
 `mcprod run submit` checks the proxy pinned in the generated worker submit files
 before reserving storage or submitting the root DAG. The proxy certificate must
 have more than 48 hours remaining according to `voms-proxy-info --timeleft`.

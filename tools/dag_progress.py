@@ -25,8 +25,11 @@ STAGES = (
     ("coordinate", "Coordinate"),
     ("subdag", "SubDAG"),
     ("processing", "Process"),
+    ("miniaod", "MiniAOD"),
     ("merge", "Merge"),
     ("ntuple", "Ntuple"),
+    ("archive", "Archive"),
+    ("reclaim", "Reclaim"),
     ("final", "Final"),
 )
 STAGE_LABELS = dict(STAGES)
@@ -165,8 +168,14 @@ def node_stage(name: str, directive: str) -> str:
         return "plan"
     if name.startswith("COORD_"):
         return "coordinate"
+    if name.startswith("MINIAOD_"):
+        return "miniaod"
     if name.startswith("MERGE_"):
         return "merge"
+    if name.startswith("ARCHIVE_"):
+        return "archive"
+    if name.startswith("RECLAIM_"):
+        return "reclaim"
     if name.startswith("NTUPLE_"):
         return "ntuple"
     if name.startswith("FINAL_"):
@@ -501,8 +510,11 @@ SUPPORTED_JOB_PREFIXES = (
     "PROC_",
     "PROCESS_",
     "MIX_",
+    "MINIAOD_",
     "MERGE_",
     "NTUPLE_",
+    "ARCHIVE_",
+    "RECLAIM_",
 )
 
 
@@ -587,6 +599,16 @@ def append_wrapped(
     lines.extend(continuation + part for part in wrapped[1:])
 
 
+def missing_child_description(status: str) -> str:
+    if status == "skipped":
+        return "child DAG not generated (parent skipped)"
+    if status == "done":
+        return "child DAG evidence missing (parent completed)"
+    if status == "failed":
+        return "child DAG not available (parent failed)"
+    return "child DAG pending"
+
+
 def render_full_structure(
     graph: DagGraph,
     records: dict[str, dict],
@@ -640,7 +662,8 @@ def render_full_structure(
                         width - len(indent) - 16,
                     )
                     lines.append(
-                        f"{indent}      ↳ child DAG pending: {shown_path}"
+                        f"{indent}      ↳ {missing_child_description(status)}: "
+                        f"{shown_path}"
                     )
 
         finals = [
@@ -727,7 +750,10 @@ def render_collapsed_structure(
             marker = status_marker(status, color_enabled)
             child = graph.children.get(wave.name)
             if child is None:
-                lines.append(f"    {marker} {wave.name}: child DAG pending")
+                lines.append(
+                    f"    {marker} {wave.name}: "
+                    f"{missing_child_description(status)}"
+                )
                 continue
             stage_counts: dict[str, Counter] = defaultdict(Counter)
             stage_totals = Counter()
@@ -863,12 +889,22 @@ def render_collapsed_structure(
                 ] += 1
         child_controls = Counter()
         missing_children = 0
+        skipped_children = 0
+        terminal_children_without_logs = 0
         for name in root_names:
             if name not in graph.children:
                 continue
             child = graph.children[name]
             if child is None:
-                missing_children += 1
+                status = (
+                    record_status(records[name]) if name in records else "pending"
+                )
+                if status == "skipped":
+                    skipped_children += 1
+                elif status in {"done", "failed"}:
+                    terminal_children_without_logs += 1
+                else:
+                    missing_children += 1
                 continue
             for parent, child_name in child.edges:
                 edge_types[
@@ -909,6 +945,16 @@ def render_collapsed_structure(
         if missing_children:
             lines.append(
                 f"    Child DAG pending: {missing_children} controller(s)"
+            )
+        if skipped_children:
+            lines.append(
+                "    Child DAG not generated for "
+                f"{skipped_children} skipped node(s)"
+            )
+        if terminal_children_without_logs:
+            lines.append(
+                "    Child DAG evidence missing for "
+                f"{terminal_children_without_logs} terminal node(s)"
             )
 
     finals = [

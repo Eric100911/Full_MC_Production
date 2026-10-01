@@ -41,6 +41,13 @@ QUEUE_PRIORITY = {"held": 0, "running": 1, "queued": 2, "failed": 3, "done": 4}
 STARTUP_PATTERN = re.compile(
     r"condor_scheduniv_exec\.(?P<cluster>\d+)\.0 .*STARTING UP"
 )
+# HTCondor 25.13+ no longer includes the condor_scheduniv_exec.<id>.0
+# banner in DAGMan's stdout log. It emits the DAGMan identity separately;
+# ignoring this format makes every node in a completed run look pending once
+# the live queue has drained.
+WORKFLOW_BATCH_PATTERN = re.compile(
+    r"Workflow batch-id:\s*<(?P<cluster>\d+)\.\d+>"
+)
 DAG_EVENT_PATTERN = re.compile(
     r"\bEvent: ULOG_(?P<event>[A-Z_]+) for HTCondor Node "
     r"(?P<name>\S+) \((?P<cluster>\d+)\.\d+\.\d+\)"
@@ -182,16 +189,22 @@ def read_lines(path: Path) -> list[str] | None:
         return None
 
 
-def current_startup_segment(lines: list[str] | None, cluster: int) -> list[str] | None:
+def current_startup_segment(
+    lines: list[str] | None,
+    cluster: int,
+    *,
+    additional_clusters: Iterable[int] = (),
+) -> list[str] | None:
     """Return the last contiguous run segment for a cluster, or no evidence."""
     if lines is None:
         return None
     starts = []
     for index, line in enumerate(lines):
-        match = STARTUP_PATTERN.search(line)
+        match = STARTUP_PATTERN.search(line) or WORKFLOW_BATCH_PATTERN.search(line)
         if match:
             starts.append((index, int(match.group("cluster"))))
-    if not starts or starts[-1][1] != cluster:
+    allowed_clusters = {cluster, *additional_clusters}
+    if not starts or starts[-1][1] not in allowed_clusters:
         return None
     first = len(starts) - 1
     while first and starts[first - 1][1] == cluster:
@@ -850,7 +863,12 @@ def build_snapshot(
         if submitted_cluster is not None and child_graph is not None:
             child_out = Path(f"{child_graph.dag_file}.dagman.out")
             child_segment = current_startup_segment(
-                read_lines(child_out), submitted_cluster
+                read_lines(child_out), submitted_cluster,
+                # Modern HTCondor writes the root DAGMan batch ID into each
+                # recursively submitted SubDAG log, not the SubDAG node's
+                # submit cluster ID. Accept that root identity while still
+                # rejecting a segment from another attempt.
+                additional_clusters=(identity["cluster"],),
             )
             if child_segment is None:
                 evidence_missing.append(f"current {node.name} SubDAG log segment")
@@ -924,7 +942,9 @@ def build_snapshot(
         dag_states = {}
         child_out = Path(f"{child.dag_file}.dagman.out")
         segment = current_startup_segment(
-            read_lines(child_out), int(wave["cluster"]) if wave["cluster"] else -1
+            read_lines(child_out),
+            int(wave["cluster"]) if wave["cluster"] else -1,
+            additional_clusters=(identity["cluster"],),
         )
         if segment is not None:
             dag_states, _ = parse_dagman_states(segment, child.nodes, str(child_out))

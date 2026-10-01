@@ -106,6 +106,45 @@ class CondorContracts(unittest.TestCase):
             self.assertEqual(history[history.index("-scanlimit") + 1], "10000")
             self.assertEqual(kwargs["timeout"], 60)
 
+    def test_empty_queue_and_history_use_exact_local_success_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            (root / "state.json").write_text('{"status":"complete"}\n', encoding="utf-8")
+            (root / ".complete").write_text("", encoding="utf-8")
+            (root / "run.dag.metrics").write_text(json.dumps({
+                "dagman_id": "42", "exitcode": 0, "DagStatus": 0,
+                "dag_nodes": 28, "dag_nodes_succeeded": 28,
+                "dag_nodes_failed": 0,
+            }), encoding="utf-8")
+            runner = Mock(return_value=response(stdout=""))
+
+            status = status_run(root, runner=runner)
+
+        self.assertEqual(status["state"], "terminal")
+        self.assertTrue(status["terminal"])
+        self.assertTrue(status["successful"])
+        self.assertEqual(status["query"], "local-evidence")
+        self.assertEqual(status["root_cluster_id"], "42")
+        self.assertEqual(status["local_evidence"]["dag_nodes_succeeded"], 28)
+
+    def test_local_success_evidence_rejects_metrics_from_another_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            (root / "state.json").write_text('{"status":"complete"}\n', encoding="utf-8")
+            (root / ".complete").write_text("", encoding="utf-8")
+            (root / "run.dag.metrics").write_text(json.dumps({
+                "dagman_id": "41", "exitcode": 0, "DagStatus": 0,
+                "dag_nodes": 28, "dag_nodes_succeeded": 28,
+                "dag_nodes_failed": 0,
+            }), encoding="utf-8")
+
+            status = status_run(root, runner=Mock(return_value=response(stdout="")))
+
+        self.assertEqual(status["state"], "unknown")
+        self.assertFalse(status["terminal"])
+
     def test_resume_requires_terminal_state_and_a_concrete_rescue_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)

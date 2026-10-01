@@ -362,6 +362,37 @@ class McprodSnapshotTest(unittest.TestCase):
         )
         self.assertTrue(block["reclaimed_staging"])
 
+    def test_htcondor_25_workflow_batch_id_restores_completed_stage_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(Path(tmp))
+            root_log = run / "run.dag.dagman.out"
+            root_text = root_log.read_text(encoding="utf-8")
+            root_text = root_text.replace(
+                "09/28/26 ** condor_scheduniv_exec.200.0 "
+                "(CONDOR_DAGMAN) STARTING UP",
+                "09/28/26 Workflow batch-id: <200.0>",
+            )
+            root_log.write_text(root_text, encoding="utf-8")
+            for step, cluster in ((0, 201), (1, 202)):
+                child_log = run / "steps" / f"{step:06d}.dag.dagman.out"
+                child_text = child_log.read_text(encoding="utf-8")
+                child_text = child_text.replace(
+                    f"09/28/26 ** condor_scheduniv_exec.{cluster}.0 "
+                    "(CONDOR_DAGMAN) STARTING UP",
+                    "09/28/26 Workflow batch-id: <200.0>",
+                )
+                child_log.write_text(child_text, encoding="utf-8")
+            snapshot = build_snapshot(run, queue_query=lambda _schedd, _cluster: [])
+
+        self.assertEqual(snapshot["overall"], "complete")
+        self.assertTrue(snapshot["evidence"]["dagman_out_segment"])
+        self.assertEqual(snapshot["root"]["counts"]["done"], 2)
+        self.assertEqual(snapshot["root"]["counts"]["skipped"], 3)
+        wave = next(item for item in snapshot["waves"] if item["name"] == "WAVE_000001")
+        self.assertTrue(wave["child_log_matched"])
+        self.assertEqual(wave["stages"]["mix"]["counts"]["done"], 1)
+        self.assertEqual(wave["stages"]["miniaod"]["counts"]["done"], 1)
+
     def test_queue_failure_falls_back_to_persistent_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = self.make_run(Path(tmp))

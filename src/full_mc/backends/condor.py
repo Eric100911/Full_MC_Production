@@ -251,6 +251,51 @@ def _query(root: Path, scheduler: str, cluster: str, executable: str,
     return _parse_status(str(getattr(completed, "stdout", "")), cluster)
 
 
+def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
+    """Confirm mcprod success after the exact DAGMan proc leaves queue/history.
+
+    A blank queue and a rotated/empty history scan do not prove failure. The
+    run-owned completion marker, completed controller state, and metrics tied
+    to this root cluster together provide durable success evidence.
+    """
+    try:
+        state = _read_json(root / "state.json")
+        metrics = _read_json(root / "run.dag.metrics")
+        metrics_cluster = str(metrics.get("dagman_id", ""))
+        dag_nodes = int(metrics["dag_nodes"])
+        succeeded = int(metrics["dag_nodes_succeeded"])
+        failed = int(metrics["dag_nodes_failed"])
+        exit_code = int(metrics["exitcode"])
+        dag_status = int(metrics["DagStatus"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    if not (
+        state.get("status") == "complete"
+        and (root / ".complete").is_file()
+        and metrics_cluster == cluster
+        and exit_code == 0
+        and dag_status == 0
+        and failed == 0
+        and succeeded == dag_nodes
+    ):
+        return None
+    return {
+        "state": "terminal",
+        "terminal": True,
+        "successful": True,
+        "query": "local-evidence",
+        "local_evidence": {
+            "state_complete": True,
+            "complete_marker": True,
+            "metrics_cluster": metrics_cluster,
+            "dag_status": dag_status,
+            "root_exit_code": exit_code,
+            "dag_nodes_succeeded": succeeded,
+            "dag_nodes_failed": failed,
+        },
+    }
+
+
 def status_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
     """Report the state of the recorded root DAGMan job, never a queue window."""
     root, _dag, _spec = _run_paths(run_dir)
@@ -267,12 +312,13 @@ def status_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     if states == []:
         states = _query(root, scheduler, cluster, "condor_history", runner)
         source = "history"
-    if states is None:
-        result = {"state": "unknown", "terminal": False, "scheduler": scheduler,
-                  "root_cluster_id": cluster, "query": source}
-    elif not states:
-        result = {"state": "unknown", "terminal": False, "scheduler": scheduler,
-                  "root_cluster_id": cluster, "query": source}
+    if states is None or not states:
+        result = _local_success_evidence(root, cluster)
+        if result is None:
+            result = {"state": "unknown", "terminal": False, "scheduler": scheduler,
+                      "root_cluster_id": cluster, "query": source}
+        else:
+            result.update(scheduler=scheduler, root_cluster_id=cluster)
     else:
         unique = sorted({state for state, _exit_code in states})
         terminal = all(state in _TERMINAL for state in unique)

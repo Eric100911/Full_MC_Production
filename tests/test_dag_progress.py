@@ -44,6 +44,9 @@ class DagProgressTest(unittest.TestCase):
                         "JOB MIX_CAMPAIGN_1_BLOCK000000 processing.sub",
                         "JOB MERGE_CAMPAIGN_1_GROUP000000 merge.sub",
                         "JOB NTUPLE_CAMPAIGN_1_MERGE000000 ntuple.sub",
+                        "JOB MINIAOD_CAMPAIGN_1_BLOCK000000 miniaod.sub",
+                        "JOB ARCHIVE_000001 archive.sub",
+                        "JOB RECLAIM_000001 reclaim.sub",
                         "FINAL FINAL_CAMPAIGN_1 final.sub",
                     )
                 ),
@@ -59,7 +62,31 @@ class DagProgressTest(unittest.TestCase):
         self.assertEqual(stages["MIX_CAMPAIGN_1_BLOCK000000"], "processing")
         self.assertEqual(stages["MERGE_CAMPAIGN_1_GROUP000000"], "merge")
         self.assertEqual(stages["NTUPLE_CAMPAIGN_1_MERGE000000"], "ntuple")
+        self.assertEqual(stages["MINIAOD_CAMPAIGN_1_BLOCK000000"], "miniaod")
+        self.assertEqual(stages["ARCHIVE_000001"], "archive")
+        self.assertEqual(stages["RECLAIM_000001"], "reclaim")
         self.assertEqual(stages["FINAL_CAMPAIGN_1"], "final")
+
+    def test_structure_accepts_production_miniaod_archive_and_reclaim_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root.dag"
+            root.write_text(
+                "\n".join((
+                    "JOB MIX_CAMPAIGN_BLOCK000000 mix.sub",
+                    "JOB MINIAOD_CAMPAIGN_BLOCK000000 miniaod.sub",
+                    "JOB ARCHIVE_000001 archive.sub",
+                    "JOB RECLAIM_000001 reclaim.sub",
+                )),
+                encoding="utf-8",
+            )
+            graph = parse_dag_graph(root)
+            output = "\n".join(render_structure(
+                graph, {}, "full", width=120, color_enabled=False
+            ))
+
+        self.assertIn("MINIAOD_CAMPAIGN_BLOCK000000", output)
+        self.assertIn("ARCHIVE_000001", output)
+        self.assertIn("RECLAIM_000001", output)
 
     def test_live_retry_wins_over_failed_history_attempt(self):
         history = [
@@ -323,6 +350,33 @@ class DagProgressTest(unittest.TestCase):
         self.assertIn("child DAG pending:", output)
         self.assertIn("[FINAL: after DAG termination]", output)
         self.assertIn("Shortened node names:", output)
+
+    def test_skipped_subdag_is_not_reported_as_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root.dag"
+            root.write_text(
+                "SUBDAG EXTERNAL WAVE_000000 not_generated.dag\n",
+                encoding="utf-8",
+            )
+            graph = parse_dag_graph(root)
+            records = {
+                "WAVE_000000": {
+                    "JobStatus": 4,
+                    "ExitCode": 0,
+                    "PreSkipped": True,
+                }
+            }
+            collapsed = "\n".join(
+                render_structure(graph, records, "collapsed", 100, False)
+            )
+            full = "\n".join(
+                render_structure(graph, records, "full", 100, False)
+            )
+
+        expected = "child DAG not generated (parent skipped)"
+        self.assertIn(expected, collapsed)
+        self.assertIn(expected, full)
+        self.assertNotIn("child DAG pending", collapsed)
 
     def test_collapsed_structure_preserves_shared_plan_fanout(self):
         with tempfile.TemporaryDirectory() as tmp:
