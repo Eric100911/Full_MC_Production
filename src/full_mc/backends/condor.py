@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+from full_mc.credentials import require_initial_proxy_lifetime
 from full_mc.io import atomic_json
 from full_mc.storage.reservation import reserve_run_namespaces
 
@@ -83,6 +84,21 @@ def _configured_schedd(spec: Dict[str, Any]) -> str | None:
 def _assert_submittable(spec: Dict[str, Any]) -> None:
     if spec.get("runtime_source_dirty"):
         raise RuntimeError("refusing scheduler submission from a dirty runtime source")
+
+
+def _worker_proxy_paths(root: Path) -> List[str]:
+    """Read the proxy paths pinned in this run's generated worker submit files."""
+    submit_files = sorted((root / "submit").glob("*.sub"))
+    if not submit_files:
+        raise RuntimeError("run has no worker submit files with a pinned X.509 proxy")
+    paths = set()
+    for submit_file in submit_files:
+        matches = re.findall(r"(?im)^[ \t]*x509userproxy[ \t]*=[ \t]*(\S+)[ \t]*$",
+                             submit_file.read_text(encoding="utf-8"))
+        if len(matches) != 1 or not Path(matches[0]).is_absolute():
+            raise RuntimeError(f"invalid pinned X.509 proxy in {submit_file}")
+        paths.add(matches[0])
+    return sorted(paths)
 
 
 def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path,
@@ -178,6 +194,8 @@ def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     spec_bytes = spec_path.read_bytes()
     spec = _read_json(spec_path)
     _assert_submittable(spec)
+    for proxy_path in _worker_proxy_paths(root):
+        require_initial_proxy_lifetime(proxy_path)
     # Ownership is established before the durable Condor attempt record and
     # before invoking condor_submit_dag.  A failed reservation therefore cannot
     # leave an ambiguous scheduler submission behind.

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List
 
+from full_mc.credentials import require_initial_proxy_lifetime
 from full_mc.io import atomic_json as _atomic_json
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.settings import CORE_ROOT, LOG_LEVELS
@@ -88,7 +89,6 @@ def _write_worker(path, task_path, core_root, proxy):
     text = (
         "#!/bin/bash\nset -euo pipefail\n"
         "proxy_source=" + source + "\n"
-        '[[ -s "$proxy_source" ]] || { echo "missing proxy" >&2; exit 2; }\n'
         "mkdir -p /tmp/chiw\n"
         "job_scratch=$(mktemp -d /tmp/chiw/mcprod-ihep.XXXXXX)\n"
         'cd "$job_scratch"\n'
@@ -208,12 +208,45 @@ def _record_attempt(job, command):
     return attempt
 
 
+def _worker_proxy_paths(manifest: Dict[str, Any]) -> List[str]:
+    """Resolve the proxy sources recorded in prepared worker wrappers."""
+    paths = set()
+    for job in manifest["jobs"]:
+        if job.get("state") != "prepared":
+            continue
+        wrapper = Path(job["wrapper"])
+        assignments = [line.removeprefix("proxy_source=")
+                       for line in wrapper.read_text(encoding="utf-8").splitlines()
+                       if line.startswith("proxy_source=")]
+        if len(assignments) != 1:
+            raise RuntimeError(f"cannot identify X.509 proxy source in {wrapper}")
+        if assignments[0] == '"${X509_USER_PROXY:?missing proxy}"':
+            source = os.environ.get("X509_USER_PROXY", "")
+        else:
+            try:
+                values = shlex.split(assignments[0])
+            except ValueError as exc:
+                raise RuntimeError(f"invalid X.509 proxy source in {wrapper}") from exc
+            source = values[0] if len(values) == 1 else ""
+        if not source or not Path(source).is_absolute():
+            raise RuntimeError(f"X.509 proxy source for {wrapper} must be an absolute path")
+        paths.add(source)
+    return sorted(paths)
+
+
 def submit_batch(manifest_path: str | Path, runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    """Submit prepared jobs serially.  Ambiguous attempts become ``unknown``."""
+    """Check proxy lifetime once, then submit prepared jobs serially."""
     path = Path(manifest_path)
     manifest = _read(path)
     if manifest.get("schema") not in _SCHEMAS:
         raise ValueError("unsupported batch manifest")
+    for proxy_path in _worker_proxy_paths(manifest):
+        require_initial_proxy_lifetime(proxy_path)
+    return _submit_prepared_batch(path, manifest, runner)
+
+
+def _submit_prepared_batch(path: Path, manifest: Dict[str, Any], runner) -> Dict[str, Any]:
+    """Submit prepared jobs without rechecking credentials during recovery."""
     for job in manifest["jobs"]:
         if job.get("state") != "prepared":
             continue
@@ -354,4 +387,4 @@ def resume_batch(manifest_path: str | Path,
             job.update(state="prepared", recovery_of=previous, job_id=None,
                        recovery_eligible=False, reconciliation_required=False)
     _atomic_json(path, manifest)
-    return submit_batch(path, runner=runner)
+    return _submit_prepared_batch(path, manifest, runner)

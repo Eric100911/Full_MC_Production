@@ -262,6 +262,12 @@ worker's result and does not remotely re-stat the HepMC.
 
 ### 6.3 PRE proxy validation
 
+This section records the behavior verified on 2026-09-20. Current `mcprod`
+checks proxy lifetime only at the initial `run submit` and `batch submit`
+commands, with a strict greater-than-48-hour requirement; generated PRE scripts
+no longer validate the proxy. See `docs/README.md` for the current command
+contract.
+
 **[PROVEN]** Generated PRE scripts establish per-wave logging first, check the
 local `.complete` sentinel before touching credentials, and return 99 for a
 completed run. An incomplete run requires the pinned proxy to be readable and

@@ -27,22 +27,6 @@ REMOTE_METHODS = ("size", "mkdir_parent", "mkdir", "read_json_if_exists",
 SAMPLE = sample_key("C", "run3_2022_legacy_premix_v1")
 
 
-def install_voms_stub(root, output="7200"):
-    path_root = root / "voms-bin"
-    path_root.mkdir()
-    shim = path_root / "voms-proxy-info"
-    shim.write_text("#!/bin/bash\nprintf '%s\\n' '" + output + "'\n", encoding="utf-8")
-    shim.chmod(0o755)
-    script = root / "advance.sh"
-    script.write_text(
-        script.read_text(encoding="utf-8").replace(
-            "export PATH=/usr/bin:/bin",
-            "export PATH=" + str(path_root) + ":/usr/bin:/bin",
-        ),
-        encoding="utf-8",
-    )
-
-
 def sidecar(ref, *, events=None, count_source=None):
     path = Path(ref["url"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,7 +173,7 @@ class ProductionLifecycle(unittest.TestCase):
                           advance_script)
             self.assertIn("export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates",
                           advance_script)
-            self.assertIn("proxy-validity", advance_script)
+            self.assertNotIn('[[ ! -s "$X509_USER_PROXY"', advance_script)
             self.assertIn(f"exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} ", advance_script)
             subprocess.run(["bash", "-n", str(run / "advance.sh")], check=True)
             state = read_json(run / "state.json")
@@ -321,8 +305,6 @@ class ProductionLifecycle(unittest.TestCase):
             with patch("full_mc.planning.graph.PRE_SCRIPT_TIMEOUT_SECONDS", 0.01):
                 write_root_dag(root, {"core_root": str(core)}, 1,
                                str(proxy))
-            install_voms_stub(root)
-
             pre = root / "advance.sh"
             subprocess.run(["bash", "-n", str(pre)], check=True)
             timed_out = subprocess.run([str(pre), "0"], check=False)
@@ -350,8 +332,6 @@ class ProductionLifecycle(unittest.TestCase):
             )
             cli.chmod(0o755)
             write_root_dag(root, {"core_root": str(core)}, 1, str(proxy))
-            install_voms_stub(root)
-
             outcome = subprocess.run([str(root / "advance.sh"), "0"], check=False)
 
             self.assertEqual(outcome.returncode, 0)

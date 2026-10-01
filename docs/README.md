@@ -57,6 +57,11 @@ Freeze and prepare a bounded CERN run without submitting it:
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
+Before `run submit`, `mcprod` checks the X.509 proxy paths pinned in the worker
+submit files with `voms-proxy-info --timeleft`. Every proxy must have more than
+48 hours remaining. A failed check stops before storage reservation or Condor
+submission; `run resume` does not repeat this check. Refresh the pinned proxy
+path before the first submission.
 
 The operational command map is:
 
@@ -85,6 +90,12 @@ Inspect or reconcile a prepared batch using its manifest:
 ./mcprod batch submit --manifest /path/to/batch/batch_manifest.json
 ./mcprod batch resume --manifest /path/to/batch/batch_manifest.json
 ```
+
+`batch submit` checks the proxy source recorded in each prepared worker wrapper
+before submitting any HepJob jobs. Each distinct proxy must have more than
+48 hours remaining; `batch resume` does not repeat this check. When a wrapper
+uses `X509_USER_PROXY`, set that variable to the intended proxy before the
+initial `batch submit`.
 
 An ambiguous HepJob submission is retained as an unresolved attempt. Reconcile
 the exact recorded job before resubmitting.

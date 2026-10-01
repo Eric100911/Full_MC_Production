@@ -1,4 +1,5 @@
 """Offline IHEP preparation and exact-attempt submission tests."""
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -50,6 +51,15 @@ def hep_q_output(job_id=None, state="I"):
 
 
 class IhepContracts(unittest.TestCase):
+    def setUp(self):
+        proxy_env = patch.dict(os.environ, {"X509_USER_PROXY": "/tmp/test-proxy"})
+        proxy_env.start()
+        self.addCleanup(proxy_env.stop)
+        proxy_check = patch("full_mc.backends.hepjob.require_initial_proxy_lifetime",
+                            return_value=172801)
+        proxy_check.start()
+        self.addCleanup(proxy_check.stop)
+
     def test_prepared_wrappers_are_private_and_nodes_round_robin(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

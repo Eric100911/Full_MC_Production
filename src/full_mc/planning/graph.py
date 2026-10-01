@@ -12,8 +12,6 @@ CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
               "reclaim": "lhe_coordination"}
 PRE_SCRIPT_TIMEOUT_SECONDS = 3600
 PRE_SKIP_EXIT_CODE = 99
-PRE_PROXY_ABORT_EXIT_CODE = 98
-PRE_PROXY_MIN_TIMELEFT_SECONDS = 3600
 
 
 def token(value):
@@ -107,7 +105,7 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
 
 def write_root_dag(root, spec, steps, proxy_path):
     root = Path(root)
-    # Worker submit files carry the exact proxy and CA settings.  Avoid root
+    # Worker submit files carry the exact proxy.  Avoid root
     # ENV SET propagation: recursive external-SubDAG generation turns these
     # values into command-line insertion flags and can stall on submit hosts.
     lines = [f"CONFIG {path_text(root / 'dagman.config')}"]
@@ -140,31 +138,6 @@ def write_root_dag(root, spec, steps, proxy_path):
         + f"if [[ -f {path_text(root / '.complete')} ]]; then exit {PRE_SKIP_EXIT_CODE}; fi\n"
         + f"export X509_USER_PROXY={proxy}\n"
         + f"export X509_CERT_DIR={ca_dir}\n"
-        + 'if [[ ! -s "$X509_USER_PROXY" || ! -r "$X509_USER_PROXY" ]]; then\n'
-        + '    echo "FATAL [proxy-validity]: pinned proxy is unavailable: $X509_USER_PROXY" >&2\n'
-        + f"    exit {PRE_PROXY_ABORT_EXIT_CODE}\n"
-        + "fi\n"
-        + 'if ! command -v voms-proxy-info >/dev/null 2>&1; then\n'
-        + '    echo "FATAL [proxy-validity]: voms-proxy-info is unavailable on the submit host" >&2\n'
-        + f"    exit {PRE_PROXY_ABORT_EXIT_CODE}\n"
-        + "fi\n"
-        + 'if ! proxy_timeleft="$(voms-proxy-info --file "$X509_USER_PROXY" --timeleft)"; then\n'
-        + '    echo "FATAL [proxy-validity]: unable to read pinned proxy validity: $X509_USER_PROXY" >&2\n'
-        + f"    exit {PRE_PROXY_ABORT_EXIT_CODE}\n"
-        + "fi\n"
-        + 'if [[ ! "$proxy_timeleft" =~ ^[0-9]+$ ]]; then\n'
-        + '    echo "FATAL [proxy-validity]: invalid voms-proxy-info --timeleft output: '
-        + '$proxy_timeleft" >&2\n'
-        + f"    exit {PRE_PROXY_ABORT_EXIT_CODE}\n"
-        + "fi\n"
-        + f'if (( proxy_timeleft < {PRE_PROXY_MIN_TIMELEFT_SECONDS} )); then\n'
-        + '    echo "FATAL [proxy-validity]: proxy has ${proxy_timeleft}s remaining; at least '
-        + f'{PRE_PROXY_MIN_TIMELEFT_SECONDS}s is required" >&2\n'
-        + '    echo "Pinned proxy: $X509_USER_PROXY" >&2\n'
-        + '    echo "Refresh this proxy in place before resuming the DAG." >&2\n'
-        + f"    exit {PRE_PROXY_ABORT_EXIT_CODE}\n"
-        + "fi\n"
-        + 'printf \'proxy-validity: %ss remaining\\n\' "$proxy_timeleft"\n'
         + f'exec timeout {PRE_SCRIPT_TIMEOUT_SECONDS} {cli} internal advance-wave '
         + f'--run-dir {path_text(root)} --step "$1"\n')
     pre.chmod(0o755)
@@ -172,8 +145,7 @@ def write_root_dag(root, spec, steps, proxy_path):
         name = f"WAVE_{index:06d}"
         lines += [f"SUBDAG EXTERNAL {name} {path_text(root / 'steps' / f'{index:06d}.dag')}",
                   f"SCRIPT PRE {name} {path_text(pre)} {index}",
-                  f"PRE_SKIP {name} {PRE_SKIP_EXIT_CODE}",
-                  f"ABORT-DAG-ON {name} {PRE_PROXY_ABORT_EXIT_CODE} RETURN 1"]
+                  f"PRE_SKIP {name} {PRE_SKIP_EXIT_CODE}"]
         if index:
             lines.append(f"PARENT WAVE_{index-1:06d} CHILD {name}")
     (root / "run.dag").write_text("\n".join(lines) + "\n")

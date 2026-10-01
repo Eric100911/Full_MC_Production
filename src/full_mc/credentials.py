@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Mapping
 
 
 AFS_ROOT = Path("/afs")
+MIN_INITIAL_PROXY_TIME_LEFT_SECONDS = 48 * 60 * 60
 
 
 def _persistent_afs_path(path: Path) -> bool:
@@ -69,3 +71,25 @@ def resolve_proxy_path(*, environ: Mapping[str, str] | None = None,
     detail = "; ".join(failures) if failures else "no X509_USER_PROXY or voms-proxy-info proxy"
     raise RuntimeError("CERN DAGMan requires an existing readable nonempty persistent AFS X.509 proxy: "
                        + detail)
+
+
+def require_initial_proxy_lifetime(proxy_path: str | Path, *, runner=subprocess.run) -> int:
+    """Require more than 48 hours on the exact proxy used for initial submission."""
+    path = str(proxy_path)
+    try:
+        result = runner(["voms-proxy-info", "--file", path, "--timeleft"],
+                        check=False, text=True, capture_output=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"cannot check X.509 proxy lifetime at {path}: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot check X.509 proxy lifetime at {path}: "
+                           "voms-proxy-info failed")
+    value = result.stdout.strip()
+    if re.fullmatch(r"[0-9]+", value) is None:
+        raise RuntimeError(f"invalid X.509 proxy lifetime at {path}: {value!r}")
+    seconds = int(value)
+    if seconds <= MIN_INITIAL_PROXY_TIME_LEFT_SECONDS:
+        raise RuntimeError(f"X.509 proxy at {path} has {seconds}s remaining; "
+                           f"initial submission requires more than "
+                           f"{MIN_INITIAL_PROXY_TIME_LEFT_SECONDS}s (48h)")
+    return seconds

@@ -673,6 +673,11 @@ monitoring. It validates the current attempt, queries only its recorded root,
 and uses matching persisted logs and artifact credentials after the root leaves
 the queue. Optional `--schedd` and `--cluster` values assert that identity.
 
+`mcprod run submit` checks the proxy pinned in the generated worker submit files
+before reserving storage or submitting the root DAG. The proxy certificate must
+have more than 48 hours remaining according to `voms-proxy-info --timeleft`.
+The PRE scripts and `run resume` do not repeat this check.
+
 For an existing legacy DAG, use
 `python3 skills/cms-condor-job-operator/scripts/dag_snapshot.py <root-cluster> --schedd <host>`;
 when the root has left the queue, also pass `--dag-file <root.dag>`. For
@@ -706,6 +711,10 @@ before submission. A ready IHEP cutover requires all of the following:
    checkpoints on persistent IHEP storage, install the proxy into the
    job-private `credentials/x509_user_proxy`, and pin CMSSW15 ntuple tasks to
    the AVX2-safe hosts listed in the HepJob reference.
+
+`mcprod batch submit` checks every distinct proxy source in the prepared worker
+wrappers before submitting the first HepJob job. Each proxy certificate must
+have more than 48 hours remaining. `batch resume` does not repeat this check.
 
 Monitor exact recorded root/job IDs. An empty queue result or an aggregate
 `0 completed`/`0 removed` counter is not a job outcome; retry an empty query

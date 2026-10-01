@@ -20,9 +20,18 @@ def run(root, schedd="schedd.example"):
     (root / "run.dag").write_text("JOB A a.sub\n", encoding="utf-8")
     (root / "run.json").write_text('{"condor":{"schedd":"%s"}}\n' % schedd,
                                     encoding="utf-8")
+    (root / "submit").mkdir()
+    (root / "submit/plan.sub").write_text(
+        "x509userproxy = /afs/cern.ch/user/test/proxy\n", encoding="utf-8")
 
 
 class CondorContracts(unittest.TestCase):
+    def setUp(self):
+        proxy_check = patch("full_mc.backends.condor.require_initial_proxy_lifetime",
+                            return_value=172801)
+        proxy_check.start()
+        self.addCleanup(proxy_check.stop)
+
     def test_submit_persists_exact_pair_before_and_after_submit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
