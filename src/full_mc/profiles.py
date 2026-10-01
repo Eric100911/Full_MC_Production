@@ -19,6 +19,17 @@ _CATALOGUE_FILES = {
     "detector": "detector_profiles.json",
 }
 
+HELAC_SEED_MIN = 11
+HELAC_SEED_MAX = 99999
+
+
+def validate_helac_seed(seed: int) -> None:
+    """Validate the seed range accepted by the HELAC wrapper."""
+    if not HELAC_SEED_MIN <= int(seed) <= HELAC_SEED_MAX:
+        raise ValueError(
+            f"HELAC seed must be between {HELAC_SEED_MIN} and {HELAC_SEED_MAX}"
+        )
+
 
 def _catalogue_path(kind: str) -> Path:
     if kind not in _CATALOGUE_FILES:
@@ -125,6 +136,7 @@ def resolve_source(raw: Mapping[str, Any], generator_profiles: ProfileCatalog) -
         profile = generator_profiles.require_ready(source["generator_profile"])
         if source.get("pool") not in profile.get("compatible_pools", []):
             raise ValueError("generator profile is incompatible with source pool")
+        validate_helac_seed(source.get("seed", 0))
         source["resolved_generator_profile"] = profile
         source.pop("actual_events", None)
         source.pop("size_bytes", None)

@@ -44,7 +44,7 @@ class WorkspaceTests(unittest.TestCase):
                              "helac_2jpsi_cs_v1")
             self.assertEqual(example["sources"][0]["resolved_generator_profile"]["nmc"],
                              500000)
-            self.assertEqual(example["sources"][0]["seed"], 1)
+            self.assertEqual(example["sources"][0]["seed"], 11)
             self.assertEqual(example["runtime_dir"],
                              str((target / "runtimes/production-v2/cern").resolve()))
             self.assertEqual(example["limits"]["source_lhe_bytes"], 2000000000)

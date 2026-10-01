@@ -24,7 +24,7 @@ class SimulationProfileContracts(unittest.TestCase):
                 "ihep_archive": str(root / "archive"),
             },
             "sources": [{
-                "pool": "pool_2jpsi_g", "source_id": "source-1", "seed": 7,
+                "pool": "pool_2jpsi_g", "source_id": "source-1", "seed": 11,
                 "generator_profile": "helac_2jpsi_g_nlostar_v1",
             }],
             "campaigns": [{
@@ -66,9 +66,23 @@ class SimulationProfileContracts(unittest.TestCase):
             catalogues["detector"].require_ready("run3_2022_summer24_mu50_v1")
         with self.assertRaisesRegex(ValueError, "incompatible"):
             from full_mc.profiles import resolve_source
-            resolve_source({"pool": "pool_gg", "source_id": "s", "seed": 1,
+            resolve_source({"pool": "pool_gg", "source_id": "s", "seed": 11,
                             "generator_profile": "helac_2jpsi_g_nlostar_v1"},
                            catalogues["generator"])
+
+    def test_helac_source_seed_range_is_checked_at_settings_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = self.spec(root)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            for seed in (10, 100000):
+                with self.subTest(seed=seed):
+                    payload["sources"][0]["seed"] = seed
+                    atomic_json(path, payload)
+                    with self.assertRaisesRegex(
+                        ValueError, "HELAC seed must be between 11 and 99999"
+                    ):
+                        load_run_spec(path)
 
     def test_ready_generator_profiles_freeze_measured_controls(self):
         profiles = load_catalogues()["generator"]
