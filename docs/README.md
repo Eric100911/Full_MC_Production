@@ -63,6 +63,39 @@ submit files with `voms-proxy-info --timeleft`. Every proxy must have more than
 submission; `run resume` does not repeat this check. Refresh the pinned proxy
 path before the first submission.
 
+### Resuming a stopped CERN run
+
+Use `run resume` only for a run that already has a recorded submission, a
+known terminal root DAGMan state, and a root rescue file. It reads the
+recorded scheduler from `submission.json`, selects the latest
+`run.dag.rescueNNN`, creates a new submission attempt, and preserves nodes
+already recorded as successful. It does not migrate the run to the current
+`myschedd` selection and it does not replace an ambiguous submission.
+
+The `--run` value can be the actual run directory or a wrapper run ID. For an
+AFS run directory, use the directory itself so the CLI does not append the
+site path a second time:
+
+```bash
+RUN=/path/to/production-wrapper/work/example/cern
+LOGDIR=/path/to/production-wrapper/operator-logs
+mkdir -p "$LOGDIR"
+
+# Refresh and check the proxy pinned in the generated submit files first.
+voms-proxy-info --file /path/to/x509_proxy --timeleft
+./mcprod run status --run "$RUN"
+ls -l "$RUN"/run.dag.rescue*
+
+./mcprod run resume --run "$RUN" \
+  | tee "$LOGDIR/resume-$(date -u +%Y%m%dT%H%M%SZ).json"
+python3 -m json.tool "$RUN/submission.json"
+```
+
+After recovery, take a fresh exact-root snapshot using the scheduler and root
+cluster from the new `current_attempt` in `submission.json`. Do not call
+`condor_submit_dag` directly, retry `run resume` after an ambiguous result, or
+use `myschedd bump` to move an existing run.
+
 The operational command map is:
 
 - `runtime prepare` pins a clean site-specific runtime release.

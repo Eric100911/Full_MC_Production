@@ -296,6 +296,47 @@ def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
     }
 
 
+def _local_failed_terminal_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
+    """Confirm an exact failed root when queue/history no longer retain it.
+
+    DAGMan writes metrics and a rescue file before leaving the queue.  Together
+    they are sufficient to authorize a rescue of this exact root, but never
+    count as successful completion evidence.
+    """
+    try:
+        metrics = _read_json(root / "run.dag.metrics")
+        metrics_cluster = str(metrics["dagman_id"])
+        dag_nodes = int(metrics["dag_nodes"])
+        succeeded = int(metrics["dag_nodes_succeeded"])
+        failed = int(metrics["dag_nodes_failed"])
+        exit_code = int(metrics["exitcode"])
+        dag_status = int(metrics["DagStatus"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    rescue = _latest_rescue(root)
+    if not (
+        metrics_cluster == cluster
+        and rescue is not None
+        and (exit_code != 0 or dag_status != 0 or failed != 0)
+    ):
+        return None
+    return {
+        "state": "terminal",
+        "terminal": True,
+        "successful": False,
+        "query": "local-evidence",
+        "local_evidence": {
+            "metrics_cluster": metrics_cluster,
+            "dag_status": dag_status,
+            "root_exit_code": exit_code,
+            "dag_nodes": dag_nodes,
+            "dag_nodes_succeeded": succeeded,
+            "dag_nodes_failed": failed,
+            "rescue_file": str(rescue),
+        },
+    }
+
+
 def status_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
     """Report the state of the recorded root DAGMan job, never a queue window."""
     root, _dag, _spec = _run_paths(run_dir)
@@ -314,6 +355,8 @@ def status_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
         source = "history"
     if states is None or not states:
         result = _local_success_evidence(root, cluster)
+        if result is None:
+            result = _local_failed_terminal_evidence(root, cluster)
         if result is None:
             result = {"state": "unknown", "terminal": False, "scheduler": scheduler,
                       "root_cluster_id": cluster, "query": source}
@@ -355,9 +398,13 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     rescue = _latest_rescue(root)
     if rescue is None:
         raise FileNotFoundError("rescue resume requires an explicit run.dag.rescueNNN file")
+    rescue_match = _RESCUE.match(rescue.name)
+    if rescue_match is None:
+        raise ValueError("invalid rescue filename: %s" % rescue.name)
+    rescue_number = str(int(rescue_match.group(1)))
     scheduler = str(observed["scheduler"])
     command = ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
-               "-RescueFile", rescue.name, "run.dag"]
+               "-DoRescueFrom", rescue_number, "run.dag"]
     attempt = _begin_attempt(record, kind="rescue", scheduler=scheduler, command=command,
                              rescue_file=str(rescue))
     _write(root, record)

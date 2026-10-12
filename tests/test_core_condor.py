@@ -145,6 +145,25 @@ class CondorContracts(unittest.TestCase):
         self.assertEqual(status["state"], "unknown")
         self.assertFalse(status["terminal"])
 
+    def test_empty_queue_and_history_use_exact_local_failed_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            (root / "run.dag.rescue001").write_text("DONE A\n", encoding="utf-8")
+            (root / "run.dag.metrics").write_text(json.dumps({
+                "dagman_id": "42", "exitcode": 1, "DagStatus": 2,
+                "dag_nodes": 28, "dag_nodes_succeeded": 27,
+                "dag_nodes_failed": 1,
+            }), encoding="utf-8")
+
+            status = status_run(root, runner=Mock(return_value=response(stdout="")))
+
+        self.assertEqual(status["state"], "terminal")
+        self.assertTrue(status["terminal"])
+        self.assertFalse(status["successful"])
+        self.assertEqual(status["query"], "local-evidence")
+        self.assertEqual(status["local_evidence"]["dag_nodes_failed"], 1)
+
     def test_resume_requires_terminal_state_and_a_concrete_rescue_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
@@ -158,7 +177,7 @@ class CondorContracts(unittest.TestCase):
                 if command[0] == "condor_history":
                     return response(stdout="42 0 4\n")
                 self.assertEqual(command, ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
-                                           "-RescueFile", "run.dag.rescue002", "run.dag"])
+                                           "-DoRescueFrom", "2", "run.dag"])
                 self.assertEqual(_kwargs["env"]["_CONDOR_SCHEDD_HOST"], "schedd.example")
                 return response(stdout="submitted to cluster 43")
             result = resume_run(root, runner=runner)
