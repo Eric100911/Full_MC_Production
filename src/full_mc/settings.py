@@ -200,7 +200,13 @@ def load_run_spec(path):
                        ("source_files_per_step", 4),
                        ("processing_nodes_per_wave", 10)):
         limits.setdefault(key, value)
+    limits.setdefault("source_selection_mode", "demand")
+    if limits["source_selection_mode"] not in ("demand", "prefetch"):
+        raise ValueError("limits.source_selection_mode must be demand or prefetch")
     _validate_scheduler_and_resources(spec)
+    if (limits["source_selection_mode"] == "prefetch"
+            and "disk_bytes" not in spec["resources"].get("archive", {})):
+        raise ValueError("prefetch requires resources.archive.disk_bytes")
     for key in ("runtime_dir", "analyzer_path", "inventory_path"):
         if spec.get(key):
             spec[key] = _path(spec[key], path.parent)

@@ -766,6 +766,81 @@ def collect_artifacts(run_dir: Path, state: dict) -> dict:
     }
 
 
+def completion_audit(run_dir: Path, state: dict, run_record: dict) -> dict:
+    """Check committed processing products using local receipts, not remote I/O."""
+    totals = {"processing_waves": 0, "products": 0,
+              "hepmc_events": 0, "miniaod_events": 0}
+
+    def problem(status: str, reason: str) -> dict:
+        return {"status": status, "reason": reason, **totals}
+
+    for path in sorted((run_dir / "ledger" / "waves").glob("*.json")):
+        wave = read_json(path)
+        step = wave.get("step")
+        if (not isinstance(step, int) or isinstance(step, bool)
+                or step >= int(state["next_step"]) or wave.get("phase") != "processing"):
+            continue
+        totals["processing_waves"] += 1
+        results = wave.get("results", {})
+        pending = wave.get("pending", {})
+        archives = [(task_id, result) for task_id, result in results.items()
+                    if result.get("stage") == "archive"]
+        if len(archives) != 1:
+            return problem("missing", f"wave {step} has no unique archive result")
+        archive_id, archive_result = archives[0]
+        if (pending.get("archive_task") != archive_id
+                or not isinstance(pending.get("miniaods"), list)):
+            return problem("mismatch", f"wave {step} does not identify its archive and products")
+        receipt = read_json(run_dir / "ledger" / "archives" / f"{step:06d}.json",
+                            required=False)
+        task = read_json(run_dir / "tasks" / f"{archive_id}.json", required=False)
+        if receipt is None or task is None:
+            return problem("missing", f"wave {step} lacks an archive receipt or task")
+        members = archive_result.get("members", [])
+        member_ids = [item.get("artifact_id") for item in members]
+        if (archive_result.get("status") != "ok"
+                or receipt.get("task_id") != archive_id or receipt.get("step") != step
+                or receipt.get("outputs") != archive_result.get("outputs")
+                or receipt.get("members") != members
+                or len(member_ids) != len(set(member_ids))
+                or set(member_ids) != {item["artifact_id"] for item in task["inputs"]}):
+            return problem("mismatch", f"wave {step} archive receipt disagrees with its task")
+        archived = {item["artifact_id"]: item for item in members}
+        minis = [(task_id, result) for task_id, result in results.items()
+                 if result.get("stage") == "miniaod"]
+        declared_minis = {item.get("task_id") for item in pending["miniaods"]}
+        if not minis or {task_id for task_id, _ in minis} != declared_minis:
+            return problem("missing", f"wave {step} lacks declared MiniAOD results")
+        for task_id, result in minis:
+            if result.get("status") != "ok":
+                return problem("mismatch", f"{task_id} is not a successful result")
+            mini_task = read_json(run_dir / "tasks" / f"{task_id}.json", required=False)
+            if mini_task is None or len(mini_task.get("inputs", [])) != 1:
+                return problem("missing", f"{task_id} has no frozen HepMC input")
+            upstream = archived.get(mini_task["inputs"][0].get("artifact_id"))
+            outputs = result.get("outputs", [])
+            if upstream is None or len(outputs) != 1:
+                return problem("mismatch", f"{task_id} has no matching archived HepMC")
+            output = outputs[0]
+            mixed, actual = upstream.get("events"), output.get("events")
+            partial = output.get("partial")
+            if (not isinstance(mixed, int) or isinstance(mixed, bool) or mixed <= 0
+                    or not isinstance(actual, int) or isinstance(actual, bool)
+                    or not 0 < actual <= mixed
+                    or output.get("expected_events") != mixed
+                    or type(partial) is not bool or partial != (actual < mixed)
+                    or result.get("partial") != partial
+                    or (partial and run_record.get("normal_shortfall_policy")
+                        != "report-and-truncate")):
+                return problem("mismatch", f"{task_id} event count disagrees with HepMC")
+            totals["products"] += 1
+            totals["hepmc_events"] += mixed
+            totals["miniaod_events"] += actual
+    if not totals["processing_waves"]:
+        return problem("missing", "no committed processing wave")
+    return problem("ok", "")
+
+
 def count_fields(counts: dict) -> dict:
     return {status: int(counts.get(status, 0)) for status in STATUSES}
 
@@ -998,11 +1073,14 @@ def build_snapshot(
     metrics_conflict = (
         metrics_exit is not None
         and metrics_dag_status is not None
-        and metrics_exit != metrics_dag_status
+        and ((metrics_exit == 0) != (metrics_dag_status == 0))
     )
     known_exit_codes = {code for _, code in exit_evidence if code is not None}
+    failed_exit = bool(known_exit_codes) and 0 not in known_exit_codes
     state_complete = identity["state"].get("status") == "complete"
     complete_file = (run_dir / ".complete").is_file()
+    audit = (completion_audit(run_dir, identity["state"], identity["run_record"])
+             if state_complete else {"status": "not_applicable", "reason": ""})
     root_terminal = all(
         root_summary_internal["resolved"][item.name]["status"] in TERMINAL_STATUSES
         for item in root_nodes
@@ -1039,16 +1117,18 @@ def build_snapshot(
         or metrics_conflict
         or state_complete != complete_file
         or (known_exit_codes == {0} and not state_complete)
-        or (known_exit_codes == {1} and state_complete)
+        or (failed_exit and state_complete)
         or (known_exit_codes == {0} and has_failed)
+        or audit["status"] == "mismatch"
     ):
         overall = "inconsistent"
-    elif has_failed or (known_exit_codes == {1}):
+    elif has_failed or failed_exit:
         overall = "failed"
     elif (known_exit_codes == {0} and state_complete and complete_file
-          and root_terminal and children_terminal and not evidence_missing):
+          and root_terminal and children_terminal and not evidence_missing
+          and audit["status"] == "ok"):
         overall = "complete"
-    elif state_complete and (known_exit_codes == {0}) and evidence_missing:
+    elif state_complete and known_exit_codes == {0}:
         overall = "unknown"
     elif not root_segment:
         overall = "unknown"
@@ -1056,6 +1136,12 @@ def build_snapshot(
         overall = "unknown"
 
     artifacts = collect_artifacts(run_dir, identity["state"])
+    rescues = [(int(match.group(1)), str(path))
+               for path in run_dir.glob("run.dag.rescue*")
+               if path.is_file()
+               for match in [re.fullmatch(r"run\.dag\.rescue(\d{3})", path.name)]
+               if match]
+    pending = identity["state"].get("pending") or {}
     root_log_evidence = {
         "dagman_out_segment": root_segment is not None,
         "dagman_log_exit": userlog_exit is not None,
@@ -1088,6 +1174,11 @@ def build_snapshot(
         "waves": wave_data,
         "stages": public_stages,
         "artifacts": artifacts,
+        "completion_audit": audit,
+        "recovery": {"root_rescue": max(rescues)[1] if rescues else "",
+                     "pending_step": pending.get("step", ""),
+                     "pending_phase": pending.get("phase", ""),
+                     "pending_dag": pending.get("dag", "")},
         "remote_stat_checked": False,
         "evidence": root_log_evidence,
     }
@@ -1127,6 +1218,17 @@ def render_text(snapshot: dict) -> str:
         f"{live_counts('controllers')}; payload: {live_counts('payload')})",
         f"Root DAG: {format_counts(snapshot['root'])}",
     ]
+    recovery = snapshot["recovery"]
+    if recovery["root_rescue"] or recovery["pending_dag"]:
+        lines.append("Recovery evidence: root rescue=" + (recovery["root_rescue"] or "none")
+                     + ", pending step=" + str(recovery["pending_step"])
+                     + ", phase=" + str(recovery["pending_phase"])
+                     + ", DAG=" + str(recovery["pending_dag"]))
+    audit = snapshot["completion_audit"]
+    if audit["status"] != "not_applicable":
+        lines.append("Local completion audit: " + audit["status"]
+                     + (" (" + audit["reason"] + ")" if audit["reason"] else "")
+                     + f"; HepMC={audit['hepmc_events']}, MiniAOD={audit['miniaod_events']}")
     for node in snapshot["root"]["key_nodes"]:
         observed = " [last observed]" if node.get("last_observed") else ""
         reason = f"; {node['hold_reason']}" if node.get("hold_reason") else ""

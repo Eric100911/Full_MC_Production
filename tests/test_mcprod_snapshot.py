@@ -87,9 +87,14 @@ class McprodSnapshotTest(unittest.TestCase):
             ("ARCHIVE_000001", "archive"),
             ("RECLAIM_000001", "reclaim"),
         ):
+            task = {"task_id": name, "stage": stage}
+            if stage == "miniaod":
+                task["inputs"] = [{"artifact_id": "HEPMC_JOB000000"}]
+            elif stage == "archive":
+                task["inputs"] = [{"artifact_id": "HEPMC_JOB000000"}]
             write_json(
                 run / "tasks" / f"{name}.json",
-                {"task_id": name, "stage": stage},
+                task,
             )
 
         root_lines = [
@@ -180,6 +185,8 @@ class McprodSnapshotTest(unittest.TestCase):
             "artifact_id": "MINIAOD_JOB000000_BLOCK000000",
             "kind": "miniaod",
             "events": 5,
+            "expected_events": 5,
+            "partial": False,
             "size_bytes": 2048,
             "url": "root://products/run/miniaod.root",
             "sidecar_url": "root://products/run/miniaod.root.json",
@@ -219,12 +226,15 @@ class McprodSnapshotTest(unittest.TestCase):
             {
                 "step": 1,
                 "phase": "processing",
+                "pending": {"archive_task": "ARCHIVE_000001",
+                            "miniaods": [{"task_id": "MINIAOD_JOB000000_BLOCK000000"}]},
                 "results": {
                     "MINIAOD_JOB000000_BLOCK000000": {
                         "task_id": "MINIAOD_JOB000000_BLOCK000000",
                         "stage": "miniaod",
                         "status": "ok",
                         "outputs": [miniaod],
+                        "partial": False,
                     },
                     "ARCHIVE_000001": {
                         "task_id": "ARCHIVE_000001",
@@ -272,7 +282,8 @@ class McprodSnapshotTest(unittest.TestCase):
                           "member": "000001_mix.hepmc.gz"}]},
         )
 
-        write_json(run / "run.json", {"run_id": "sample"})
+        write_json(run / "run.json", {"run_id": "sample",
+                                      "normal_shortfall_policy": "report-and-truncate"})
         write_json(
             run / "state.json",
             {"status": "complete", "next_step": 2, "pending": {}},
@@ -332,6 +343,8 @@ class McprodSnapshotTest(unittest.TestCase):
         self.assertIn("archive", snapshot["stages"])
         self.assertIn("reclaim", snapshot["stages"])
         self.assertFalse(snapshot["remote_stat_checked"])
+        self.assertEqual(snapshot["completion_audit"]["status"], "ok")
+        self.assertEqual(snapshot["completion_audit"]["miniaod_events"], 5)
 
         artifacts = snapshot["artifacts"]["committed"]
         archive_outputs = [
@@ -361,6 +374,71 @@ class McprodSnapshotTest(unittest.TestCase):
             if item["artifact_id"].startswith("BLOCK:")
         )
         self.assertTrue(block["reclaimed_staging"])
+
+    def test_failed_root_with_pending_child_is_recoverable_not_inconsistent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(Path(tmp))
+            root_out = run / "run.dag.dagman.out"
+            root_out.write_text(root_out.read_text().replace(
+                "(condor_DAGMAN) EXITING WITH STATUS 0",
+                "(condor_DAGMAN) EXITING WITH STATUS 1"), encoding="utf-8")
+            user_log = run / "run.dag.dagman.log"
+            user_log.write_text(user_log.read_text().replace(
+                "Normal termination (return value 0)",
+                "Normal termination (return value 1)"), encoding="utf-8")
+            write_json(run / "run.dag.metrics", {
+                "dagman_id": "200", "exitcode": 1, "DagStatus": 2,
+                "dag_nodes": 5, "dag_nodes_succeeded": 2, "dag_nodes_failed": 1})
+            write_json(run / "state.json", {
+                "status": "running", "next_step": 2,
+                "pending": {"step": 2, "phase": "sources",
+                            "dag": str(run / "steps" / "000002.dag")}})
+            (run / ".complete").unlink()
+            (run / "run.dag.rescue002").write_text("DONE WAVE_000000\n", encoding="utf-8")
+            snapshot = build_snapshot(run, queue_query=lambda _schedd, _cluster: [])
+
+        self.assertEqual(snapshot["overall"], "failed")
+        self.assertEqual(snapshot["recovery"]["pending_step"], 2)
+        self.assertTrue(snapshot["recovery"]["root_rescue"].endswith("rescue002"))
+
+    def test_completion_requires_archive_receipt_and_consistent_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(Path(tmp))
+            archive_path = run / "ledger" / "archives" / "000001.json"
+            archive = json.loads(archive_path.read_text())
+            archive_path.unlink()
+            missing = build_snapshot(run, queue_query=lambda _schedd, _cluster: [])
+            self.assertEqual(missing["overall"], "unknown")
+            self.assertEqual(missing["completion_audit"]["status"], "missing")
+
+            write_json(archive_path, archive)
+            wave_path = run / "ledger" / "waves" / "000001.json"
+            wave = json.loads(wave_path.read_text())
+            mini = wave["results"]["MINIAOD_JOB000000_BLOCK000000"]
+            mini["outputs"][0]["events"] = 6
+            write_json(wave_path, wave)
+            mismatch = build_snapshot(run, queue_query=lambda _schedd, _cluster: [])
+            self.assertEqual(mismatch["overall"], "inconsistent")
+            self.assertEqual(mismatch["completion_audit"]["status"], "mismatch")
+
+    def test_mixed_shortfall_is_not_a_miniaod_partial_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(Path(tmp))
+            wave_path = run / "ledger" / "waves" / "000001.json"
+            archive_path = run / "ledger" / "archives" / "000001.json"
+            wave = json.loads(wave_path.read_text())
+            archive = json.loads(archive_path.read_text())
+            wave["results"]["ARCHIVE_000001"]["members"][0]["events"] = 3
+            archive["members"][0]["events"] = 3
+            mini = wave["results"]["MINIAOD_JOB000000_BLOCK000000"]
+            mini["outputs"][0].update(events=3, expected_events=3, partial=False)
+            write_json(wave_path, wave)
+            write_json(archive_path, archive)
+            snapshot = build_snapshot(run, queue_query=lambda _schedd, _cluster: [])
+
+        self.assertEqual(snapshot["overall"], "complete")
+        self.assertEqual(snapshot["completion_audit"]["hepmc_events"], 3)
+        self.assertEqual(snapshot["completion_audit"]["miniaod_events"], 3)
 
     def test_htcondor_25_workflow_batch_id_restores_completed_stage_states(self):
         with tempfile.TemporaryDirectory() as tmp:

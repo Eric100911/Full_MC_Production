@@ -386,25 +386,25 @@ def _latest_rescue(root: Path) -> Path | None:
 
 
 def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    """Submit an explicitly selected rescue DAG after exact terminal confirmation."""
+    """Resume each DAG from its own latest rescue after exact root confirmation."""
     root, _dag, _spec = _run_paths(run_dir)
     _assert_submittable(_read_json(_spec))
     record = _load_submission(root)
     if record.get("state") in {"submitting", "unknown"}:
         raise RuntimeError("a submission attempt is still ambiguous; reconcile it before resuming")
     observed = status_run(root, runner=runner)
-    if not observed.get("terminal"):
-        raise RuntimeError("rescue resume requires a known terminal root DAGMan state")
+    if not observed.get("terminal") or observed.get("successful") is not False:
+        raise RuntimeError("rescue resume requires a confirmed failed root DAGMan state")
     rescue = _latest_rescue(root)
     if rescue is None:
         raise FileNotFoundError("rescue resume requires an explicit run.dag.rescueNNN file")
     rescue_match = _RESCUE.match(rescue.name)
     if rescue_match is None:
         raise ValueError("invalid rescue filename: %s" % rescue.name)
-    rescue_number = str(int(rescue_match.group(1)))
     scheduler = str(observed["scheduler"])
-    command = ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
-               "-DoRescueFrom", rescue_number, "run.dag"]
+    # DAGMan passes -DoRescueFrom to every SUBDAG.  A newly prepared child has
+    # no rescue file, so each DAG must instead select its own latest rescue.
+    command = ["condor_submit_dag", "-no_recurse", "-AutoRescue", "1", "run.dag"]
     attempt = _begin_attempt(record, kind="rescue", scheduler=scheduler, command=command,
                              rescue_file=str(rescue))
     _write(root, record)

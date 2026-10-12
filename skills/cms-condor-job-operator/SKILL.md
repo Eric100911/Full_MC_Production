@@ -21,6 +21,13 @@ IDs as schedd-local and distinguish queue visibility from DAG topology.
 Read [`references/condor-operations.md`](references/condor-operations.md) for
 commands, state interpretation, and mutation safeguards.
 
+Before any live Condor read from a restricted Codex sandbox, request approved
+unsandboxed network execution. This includes `myschedd`, queue/history
+commands, and snapshot or progress scripts that call them. Do not first run the
+same command inside the sandbox to demonstrate an expected DNS/configuration
+failure. Offline file inspection does not require escalation; queue mutations
+still require explicit user authorization.
+
 ## Resolve identity first
 
 Collect:

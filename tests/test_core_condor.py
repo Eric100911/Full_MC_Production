@@ -1,6 +1,9 @@
 """Offline contracts for exact, durable DAGMan submission attempts."""
 from pathlib import Path
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -176,13 +179,57 @@ class CondorContracts(unittest.TestCase):
                     return response(stdout="")
                 if command[0] == "condor_history":
                     return response(stdout="42 0 4\n")
-                self.assertEqual(command, ["condor_submit_dag", "-no_recurse", "-AutoRescue", "0",
-                                           "-DoRescueFrom", "2", "run.dag"])
+                self.assertEqual(command, ["condor_submit_dag", "-no_recurse",
+                                           "-AutoRescue", "1", "run.dag"])
                 self.assertEqual(_kwargs["env"]["_CONDOR_SCHEDD_HOST"], "schedd.example")
+                self.assertEqual(read_json(root / "submission.json")["attempts"][-1]
+                                 ["rescue_file"], str(rescue))
                 return response(stdout="submitted to cluster 43")
             result = resume_run(root, runner=runner)
             self.assertEqual(result["root_cluster_id"], "43")
             self.assertEqual(result["attempts"][-1]["kind"], "rescue")
+
+    def test_completed_root_cannot_be_resumed_from_a_stale_rescue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            (root / "run.dag.rescue001").write_text("DONE A\n", encoding="utf-8")
+            runner = Mock(return_value=response(stdout="42 0 4 0\n"))
+            with self.assertRaisesRegex(RuntimeError, "confirmed failed"):
+                resume_run(root, runner=runner)
+            self.assertEqual(len(read_json(root / "submission.json")["attempts"]), 1)
+
+    @unittest.skipUnless(shutil.which("condor_submit_dag"), "HTCondor is unavailable")
+    def test_offline_nested_submit_files_do_not_inherit_a_root_rescue_number(self):
+        Path("/tmp/chiw").mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+            root = Path(temporary)
+            (root / "steps").mkdir()
+            (root / "run.dag").write_text(
+                "SUBDAG EXTERNAL OLD steps/old.dag\n"
+                "SUBDAG EXTERNAL NEW steps/new.dag\n"
+                "PARENT OLD CHILD NEW\n", encoding="utf-8")
+            (root / "steps/old.dag").write_text("JOB A task.sub\n", encoding="utf-8")
+            (root / "steps/new.dag").write_text("JOB B task.sub\n", encoding="utf-8")
+            (root / "task.sub").write_text(
+                "executable = /bin/true\noutput = task.out\nerror = task.err\n"
+                "log = task.log\nqueue\n", encoding="utf-8")
+            (root / "run.dag.rescue001").write_text("# failed root\n", encoding="utf-8")
+            (root / "steps/old.dag.rescue001").write_text("# failed child\n",
+                                                            encoding="utf-8")
+            generated = subprocess.run(
+                ["condor_submit_dag", "-no_submit", "-do_recurse", "-AutoRescue", "1",
+                 "run.dag"], cwd=root, env={**os.environ, "CONDOR_CONFIG": "/dev/null"},
+                capture_output=True, text=True, check=False)
+            self.assertEqual(generated.returncode, 0, generated.stdout + generated.stderr)
+            for dag in ("run.dag", "steps/old.dag", "steps/new.dag"):
+                submit = (root / (dag + ".condor.sub")).read_text(encoding="utf-8")
+                arguments = next(line for line in submit.splitlines()
+                                 if line.lower().startswith("arguments ="))
+                self.assertIn("-AutoRescue 1", arguments)
+                self.assertIn("-DoRescueFrom 0", arguments)
+                self.assertNotIn("-DoRescueFrom 1", arguments)
+            self.assertFalse((root / "steps/new.dag.rescue001").exists())
 
 
 if __name__ == "__main__":

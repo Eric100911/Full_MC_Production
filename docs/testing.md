@@ -673,6 +673,20 @@ monitoring. It validates the current attempt, queries only its recorded root,
 and uses matching persisted logs and artifact credentials after the root leaves
 the queue. Optional `--schedd` and `--cluster` values assert that identity.
 
+Live Condor reads need network access. In a restricted Codex sandbox, request
+approved unsandboxed execution *before the first attempt* at `myschedd show`,
+`condor_q`, `condor_history`, `mcprod_snapshot.py`, `dag_snapshot.py`,
+`dag_progress.py`, or `./mcprod run status`. These commands can load the CERN
+Condor configuration and contact a schedd even when they do not change jobs;
+the sandbox may fail during DNS/configuration lookup (for example, through
+`myschedd.sh`). An error or empty result from that environment does not prove
+the queue is empty. If approved network execution is unavailable, inspect
+local DAGMan logs and rescue files but report live queue status as unknown.
+Offline DAG generation, local log inspection, and tests using an isolated
+`CONDOR_CONFIG=/dev/null` do not need this escalation. A submission or rescue
+still requires separate operator authorization; network access alone is not
+authorization to change the queue.
+
 `mcprod run status` can confirm success after the exact root leaves both queue
 and bounded history when `.complete`, controller state, and root DAGMan metrics
 agree on completion and cluster ID. The snapshot reader also recognizes the

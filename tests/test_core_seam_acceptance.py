@@ -250,10 +250,11 @@ class AcceptanceFixture(unittest.TestCase):
         archive = read_json(run / "tasks" / (pending["archive_task"] + ".json"))
         for item in pending["miniaods"]:
             task = read_json(run / "tasks" / (item["task_id"] + ".json"))
-            output = dict(task["outputs"][0], events=1, count_source="edmFileUtil")
+            output = dict(task["outputs"][0], events=1, expected_events=1,
+                          partial=False, count_source="edmFileUtil")
             atomic_json(run / "results" / (item["task_id"] + ".json"), {
                 "task_id": item["task_id"], "stage": "miniaod", "status": "ok",
-                "runtime_release": RELEASE, "outputs": [output]})
+                "runtime_release": RELEASE, "outputs": [output], "partial": False})
         members = []
         for index, ref in enumerate(archive["inputs"]):
             member = {"artifact_id": ref["artifact_id"],
@@ -262,6 +263,8 @@ class AcceptanceFixture(unittest.TestCase):
                       "size_bytes": int(ref.get("size_bytes") or 900)}
             if "events" in ref:
                 member["events"] = int(ref["events"])
+            elif ref["kind"] == "hepmc":
+                member["events"] = 1
             members.append(member)
         atomic_json(run / "results" / (pending["archive_task"] + ".json"), {
             "task_id": pending["archive_task"], "stage": "archive", "status": "ok",

@@ -54,6 +54,17 @@ Freeze and prepare a bounded CERN run without submitting it:
   --log-level info
 ```
 
+Source selection defaults to `limits.source_selection_mode: "demand"`: each
+source wave prepares only the files needed for the next allocation. Set it to
+`"prefetch"` to prepare up to `source_files_per_step` unprepared files from
+active pools, subject to the staging byte ceiling. Prefetch requires an
+explicit `resources.archive.disk_bytes`; processing waves are capped so the
+archive worker's estimated scratch fits that request. The generated root DAG
+uses fewer predeclared wave positions only when the configured byte ceilings
+prove that all sources fit in one source wave. Existing run specifications and
+their default demand-driven source selection remain unchanged; already planned
+run directories are not rewritten.
+
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
@@ -66,11 +77,13 @@ path before the first submission.
 ### Resuming a stopped CERN run
 
 Use `run resume` only for a run that already has a recorded submission, a
-known terminal root DAGMan state, and a root rescue file. It reads the
-recorded scheduler from `submission.json`, selects the latest
-`run.dag.rescueNNN`, creates a new submission attempt, and preserves nodes
-already recorded as successful. It does not migrate the run to the current
-`myschedd` selection and it does not replace an ambiguous submission.
+confirmed failed root DAGMan state, and a root rescue file. It reads the
+recorded scheduler from `submission.json`, checks the latest
+`run.dag.rescueNNN`, and creates a new submission attempt. DAGMan then selects
+the newest rescue independently for the root and each previously failed child
+DAG; a new child without a rescue starts normally. Completed nodes are not
+rerun. It does not migrate the run to the current `myschedd` selection and it
+does not replace an ambiguous submission.
 
 The `--run` value can be the actual run directory or a wrapper run ID. For an
 AFS run directory, use the directory itself so the CLI does not append the

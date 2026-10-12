@@ -172,6 +172,12 @@ the changed workflow. If touching:
 - Record the schedd and top DAGMan cluster ID together. Query progress from
   that root ID on the recorded schedd rather than using a recent time window;
   completed jobs normally leave the live `condor_q` total.
+- Live Condor status and queue/history commands require network access, even
+  when the operation is read-only. From a restricted Codex sandbox, request
+  approved unsandboxed execution before the first `myschedd`, `condor_q`,
+  `condor_history`, DAG snapshot/progress, or `mcprod` live-status call. Do not
+  treat sandbox DNS/configuration failures or an unavailable queue as zero jobs;
+  local log inspection and offline DAG checks may stay sandboxed.
 - For `condor_history`, always pass the recorded schedd with `-name` and use
   exact `cluster.proc` IDs or a narrowly bounded `-constraint`. Keep both the
   returned rows (`-limit`) and scanned ads (`-scanlimit`) bounded; never use a

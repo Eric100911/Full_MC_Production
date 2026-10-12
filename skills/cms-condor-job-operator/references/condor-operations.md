@@ -1,5 +1,18 @@
 # Condor operations reference
 
+## Network boundary for agents
+
+Live `myschedd`, `condor_q`, `condor_history`, `condor_ssh_to_job`, and the
+snapshot/progress wrappers below contact CERN services or load site Condor
+configuration. In a restricted Codex sandbox, request approved unsandboxed
+network execution before the first live call, including read-only status
+checks. Do not spend a first attempt on a predictable sandbox DNS or
+`myschedd.sh` configuration failure. Keep the recorded schedd and exact root
+cluster ID in that approved call. If access is unavailable, use persisted logs
+for an offline assessment and label the live queue state unknown, not empty.
+Offline DAG generation and local log parsing can remain sandboxed. Network
+approval does not authorize submission, release, removal, or rescue.
+
 ## Schedd selection
 
 For a new submission:

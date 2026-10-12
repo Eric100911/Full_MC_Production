@@ -143,7 +143,7 @@ def plan_run(spec_path, output_dir, log_level=None):
     # needs that successor in turn.  One slot short of this and the root DAG
     # runs every wave it declares, reports success, and never writes .complete.
     # Unused slots are not wasted: their PRE sees .complete and skips.
-    steps = len(spec["sources"]) + sum(c.max_processing_nodes for c in campaigns) + 2
+    steps = _root_step_count(spec, campaigns)
     atomic_json(root / "state.json", {
         "state_schema": STATE_SCHEMA, "status": "planned", "next_step": 0,
         "pending": {}, "pool_cursors": {}, "job_offsets": {},
@@ -155,6 +155,30 @@ def plan_run(spec_path, output_dir, log_level=None):
             "runtime_release": spec["runtime_release"], "source_files": len(spec["sources"]),
             "max_processing_nodes": sum(c.max_processing_nodes for c in campaigns),
             "lazy_steps": steps, "first_phase": prepared["phase"], "submitted": False}
+
+
+def _root_step_count(spec, campaigns):
+    """Use a compact bound only when explicit byte ceilings prove it safe."""
+    sources = len(spec["sources"])
+    nodes = sum(c.max_processing_nodes for c in campaigns)
+    fallback = sources + nodes + 2
+    limits = spec["limits"]
+    if (limits["source_selection_mode"] != "prefetch"
+            or sources > limits["source_files_per_step"]):
+        return fallback
+    usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
+    source_upper = sources * (limits["source_lhe_bytes"] + limits["source_block_bytes"])
+    mixed_upper = nodes * limits["mixed_hepmc_bytes"]
+    if source_upper + mixed_upper > usable:
+        return fallback
+    archive_disk = int(spec["resources"]["archive"]["disk_bytes"])
+    archive_cap = (archive_disk - 3 * sources * limits["source_lhe_bytes"]) // (
+        3 * limits["mixed_hepmc_bytes"])
+    if archive_cap <= 0:
+        return fallback
+    per_wave = min(limits["processing_nodes_per_wave"], archive_cap)
+    # One source wave, enough processing waves, then two fold/reclaim slots.
+    return 1 + (nodes + per_wave - 1) // per_wave + 2
 
 
 def _committed(root, spec, state):
@@ -206,10 +230,19 @@ def _blocks(view):
 
 def _allocation(spec, state, view):
     usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
-    fitting = (usable - _used_bytes(view)) // spec["limits"]["mixed_hepmc_bytes"]
-    limit = min(spec["limits"]["processing_nodes_per_wave"], max(1, fitting))
+    mixed_bytes = spec["limits"]["mixed_hepmc_bytes"]
+    fitting = (usable - _used_bytes(view)) // mixed_bytes
+    limit = min(spec["limits"]["processing_nodes_per_wave"], fitting)
+    archive_resource = spec.get("resources", {}).get("archive", {})
+    if "disk_bytes" in archive_resource:
+        originals = sum(int(view["resident"][key]["size_bytes"])
+                        for key in view["originals"])
+        archive_fit = (int(archive_resource["disk_bytes"]) - 3 * originals) // (3 * mixed_bytes)
+        limit = min(limit, archive_fit)
+    if limit <= 0 and any(view["blocks"].values()):
+        raise RuntimeError("no processing node fits the staging and archive disk budgets")
     return allocate_wave(_campaigns(spec), _blocks(view), state["pool_cursors"],
-                         limit, state["job_offsets"])
+                         max(0, limit), state["job_offsets"])
 
 
 def _used_bytes(view):
@@ -262,28 +295,40 @@ def _reclaim_task(spec, step, refs):
 
 
 def _source_phase(root, step, spec, state, view):
+    mode = spec["limits"].get("source_selection_mode", "demand")
     needed = defaultdict(int)
-    blocks = _blocks(view)
-    from full_mc.domain.allocation import _take_budget
-    for campaign in _campaigns(spec):
-        if state["job_offsets"].get(campaign.name, 0) >= campaign.max_processing_nodes:
-            continue
-        cursors = dict(state["pool_cursors"])
-        for slot in campaign.sources:
-            picked = _take_budget(blocks.get(slot.pool, []), cursors.get(slot.pool, 0), slot.lhe_budget)
-            if picked is None:
-                needed[slot.pool] += slot.lhe_budget
-            else:
-                cursors[slot.pool] = picked[0]
+    if mode == "demand":
+        blocks = _blocks(view)
+        from full_mc.domain.allocation import _take_budget
+        for campaign in _campaigns(spec):
+            if state["job_offsets"].get(campaign.name, 0) >= campaign.max_processing_nodes:
+                continue
+            cursors = dict(state["pool_cursors"])
+            for slot in campaign.sources:
+                picked = _take_budget(blocks.get(slot.pool, []), cursors.get(slot.pool, 0),
+                                      slot.lhe_budget)
+                if picked is None:
+                    needed[slot.pool] += slot.lhe_budget
+                else:
+                    cursors[slot.pool] = picked[0]
+    active_pools = {slot.pool for campaign in _campaigns(spec)
+                    if state["job_offsets"].get(campaign.name, 0) < campaign.max_processing_nodes
+                    for slot in campaign.sources}
     selected = []
     for index, source in enumerate(spec["sources"]):
-        if index in view["prepared"] or needed[source["pool"]] <= 0:
+        if index in view["prepared"]:
+            continue
+        if mode == "prefetch":
+            if source["pool"] not in active_pools:
+                continue
+        elif needed[source["pool"]] <= 0:
             continue
         selected.append(index)
-        profile = source.get("resolved_generator_profile", {})
-        hint = source.get("actual_events", profile.get("planning_events_hint", 0))
-        # Only a preparation hint; allocation later uses the splitter's actual count.
-        needed[source["pool"]] -= int(hint)
+        if mode == "demand":
+            profile = source.get("resolved_generator_profile", {})
+            hint = source.get("actual_events", profile.get("planning_events_hint", 0))
+            # Only a preparation hint; allocation uses the splitter's actual count.
+            needed[source["pool"]] -= int(hint)
         if len(selected) == spec["limits"]["source_files_per_step"]:
             break
     if not selected:
@@ -394,11 +439,17 @@ def _process_phase(root, step, spec, view, allocation):
                                      "task_id": mini["task_id"]})
             mixed.append(hepmc)
     archive_inputs = [view["resident"][key] for key in view["originals"]] + mixed
+    original_bytes = sum(int(view["resident"][key]["size_bytes"])
+                         for key in view["originals"])
+    archive_scratch = 3 * (original_bytes + count * spec["limits"]["mixed_hepmc_bytes"])
+    archive_disk = spec.get("resources", {}).get("archive", {}).get("disk_bytes")
+    if archive_disk is not None and archive_scratch > int(archive_disk):
+        raise RuntimeError("archive scratch exceeds its requested disk budget")
     archive_ref = _ref(f"ARCHIVE_{step:06d}", spec["storage"]["ihep_archive"].rstrip("/")
                        + "/" + spec["run_id"] + f"/wave_{step:06d}.tar", "upstream-archive")
     archive = _task(spec, f"ARCHIVE_{step:06d}", "archive", archive_inputs, [archive_ref], {
         "component_miniaods": [task["outputs"][0] for task in tasks if task["stage"] == "miniaod"],
-        "scratch_bytes": 3 * (_used_bytes(view) + count * spec["limits"]["mixed_hepmc_bytes"])})
+        "scratch_bytes": archive_scratch})
     tasks.append(archive)
     dependencies.append(([r["task_id"] for r in mini_records], archive["task_id"]))
     # Deleting these is a separate worker task; recording them here keeps the
@@ -524,7 +575,8 @@ def _validate_archive_result(root, spec, pending, outcome):
             raise RuntimeError("archive output does not match its frozen task")
     members = outcome.get("members")
     expected = {ref["artifact_id"]: ref for ref in task["inputs"]}
-    if not isinstance(members, list) or {item.get("artifact_id") for item in members} != set(expected):
+    if (not isinstance(members, list) or len(members) != len(expected)
+            or {item.get("artifact_id") for item in members} != set(expected)):
         raise RuntimeError("archive membership does not match its frozen task")
     seen_names = set()
     for item in members:
@@ -590,14 +642,26 @@ def _validate_pending_results(root, spec, pending, results):
         _validate_reclaim_result(root, spec, pending, results[pending["reclaim_task"]])
         return
     _validate_archive_result(root, spec, pending, results[pending["archive_task"]])
+    archived = {member["artifact_id"]: member
+                for member in results[pending["archive_task"]]["members"]}
     for item in pending["miniaods"]:
         task = read_json(root / "tasks" / (item["task_id"] + ".json"))
         outcome = results[item["task_id"]]
         validate_result_envelope(task, outcome, spec["runtime_release"])
         output = outcome["outputs"][0]
         expected_profile = item["detector_profile_id"]
-        if int(output.get("events", 0)) <= 0:
-            raise RuntimeError("component MiniAOD has no verified event count")
+        hepmc = archived.get(task["inputs"][0]["artifact_id"])
+        expected = hepmc.get("events") if hepmc else None
+        actual = output.get("events")
+        partial = output.get("partial")
+        if (not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0
+                or not isinstance(actual, int) or isinstance(actual, bool)
+                or not 0 < actual <= expected
+                or output.get("expected_events") != expected
+                or type(partial) is not bool or partial != (actual < expected)
+                or outcome.get("partial") != partial
+                or (partial and spec["normal_shortfall_policy"] != "report-and-truncate")):
+            raise RuntimeError("MiniAOD event count disagrees with archived HepMC")
         if (task["parameters"].get("detector_profile_id") != expected_profile
                 or output.get("detector_profile_id") != expected_profile):
             raise RuntimeError("MiniAOD provenance does not match its detector task")
