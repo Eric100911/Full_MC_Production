@@ -126,6 +126,10 @@ reservation must include its original LHE, split blocks, and enforced mixed-HepM
 output ceilings. File sizes may inform byte reservations, never event counts.
 Already resident sources are not reserved again. Replayed reclamation cannot
 subtract its reservation twice.
+The measured capacity baseline and its scope are recorded in
+`docs/mcprod_capacity_baseline_2026-10-13.md`; the current baseline supports a
+1,000-node planning wave for `pool_2jpsi_cs` and uses a 200 GB archive-worker
+disk request. Other pools require their own size check.
 
 Exact storage roots remain in `common/node_config_defaults.json`. CERN EOS is
 the short-term storage through mixed HepMC; large MiniAOD products and upstream

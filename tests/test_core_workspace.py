@@ -47,8 +47,10 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(example["sources"][0]["seed"], 11)
             self.assertEqual(example["runtime_dir"],
                              str((target / "runtimes/production-v2/cern").resolve()))
-            self.assertEqual(example["limits"]["source_lhe_bytes"], 2000000000)
-            self.assertEqual(example["limits"]["processing_nodes_per_wave"], 1)
+            self.assertEqual(example["limits"]["source_lhe_bytes"], 100000000)
+            self.assertEqual(example["limits"]["mixed_hepmc_bytes"], 64000000)
+            self.assertEqual(example["limits"]["source_files_per_step"], 1000)
+            self.assertEqual(example["limits"]["processing_nodes_per_wave"], 1000)
             self.assertTrue((target / "history" / "README.md").is_file())
             self.assertIn("work/", (target / ".gitignore").read_text(encoding="utf-8"))
             self.assertIn("core", git("status", "--short", cwd=target))

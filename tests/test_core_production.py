@@ -566,8 +566,10 @@ class ProductionLifecycle(unittest.TestCase):
             spec["resources"] = {}
             spec["limits"]["source_selection_mode"] = "prefetch"
             atomic_json(spec_path, spec)
-            with self.assertRaisesRegex(ValueError, "resources.archive.disk_bytes"):
-                plan_run(spec_path, run)
+            plan_run(spec_path, run)
+            planned_spec = read_json(run / "run.json")
+            self.assertEqual(planned_spec["resources"]["archive"]["disk_bytes"],
+                             200_000_000_000)
 
             spec["limits"]["source_selection_mode"] = "unknown"
             atomic_json(spec_path, spec)

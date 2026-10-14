@@ -58,12 +58,21 @@ Source selection defaults to `limits.source_selection_mode: "demand"`: each
 source wave prepares only the files needed for the next allocation. Set it to
 `"prefetch"` to prepare up to `source_files_per_step` unprepared files from
 active pools, subject to the staging byte ceiling. Prefetch requires an
-explicit `resources.archive.disk_bytes`; processing waves are capped so the
-archive worker's estimated scratch fits that request. The generated root DAG
+explicit or default `resources.archive.disk_bytes`; processing waves are capped
+so the archive worker's estimated scratch fits that request. The generated root DAG
 uses fewer predeclared wave positions only when the configured byte ceilings
 prove that all sources fit in one source wave. Existing run specifications and
 their default demand-driven source selection remain unchanged; already planned
 run directories are not rewritten.
+
+The default capacity baseline is recorded in
+[`docs/mcprod_capacity_baseline_2026-10-13.md`](mcprod_capacity_baseline_2026-10-13.md)
+and in `production_capacity` in the node defaults. It is based on measured
+`JJP_SPS_CS` / `pool_2jpsi_cs` files: 90 GB of usable CERN staging, a 200 GB
+archive-worker disk request, and a planning baseline of 1,000 processing
+nodes and 1,000 source files per source-selection step. Treat those values as a planning
+baseline for the measured pool; validate other pools when their first results
+are available. Explicit values in a run specification always win.
 
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records

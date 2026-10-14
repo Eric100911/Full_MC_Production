@@ -194,15 +194,24 @@ def load_run_spec(path):
     spec.setdefault("unused_hepmc_warning_fraction", 0.15)
     spec.setdefault("processing_environment", defaults()["processing_environment"])
     limits = spec.setdefault("limits", {})
+    capacity_defaults = defaults().get("production_capacity", {}).get(
+        "planning_defaults", {})
     for key, value in (("source_lhe_bytes", 2_000_000_000),
                        ("source_block_bytes", 2_000_000_000),
                        ("mixed_hepmc_bytes", 2_000_000_000),
                        ("source_files_per_step", 4),
                        ("processing_nodes_per_wave", 10)):
-        limits.setdefault(key, value)
+        limits.setdefault(key, capacity_defaults.get(key, value))
     limits.setdefault("source_selection_mode", "demand")
     if limits["source_selection_mode"] not in ("demand", "prefetch"):
         raise ValueError("limits.source_selection_mode must be demand or prefetch")
+    if limits["source_selection_mode"] == "prefetch":
+        archive_disk = capacity_defaults.get("archive_disk_bytes")
+        resources = spec.setdefault("resources", {})
+        if isinstance(resources, dict) and archive_disk is not None:
+            archive = resources.setdefault("archive", {})
+            if isinstance(archive, dict):
+                archive.setdefault("disk_bytes", archive_disk)
     _validate_scheduler_and_resources(spec)
     if (limits["source_selection_mode"] == "prefetch"
             and "disk_bytes" not in spec["resources"].get("archive", {})):

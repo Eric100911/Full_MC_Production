@@ -6,6 +6,50 @@
     "staging_bytes": 100000000000,
     "reserve_bytes": 10000000000
   },
+  "production_capacity": {
+    "schema_version": 1,
+    "observed_at": "2026-10-13",
+    "observed_run": "jjp6x1m_600wave_lhegen_20261012T115241Z",
+    "observed_scope": {
+      "campaign": "JJP_SPS_CS",
+      "pool": "pool_2jpsi_cs",
+      "block_events": 1000,
+      "target_mixed_events": 1000,
+      "note": "Measured baseline; do not treat it as a guarantee for other subprocesses or pools."
+    },
+    "observed_counts": {
+      "lhe_originals": 400,
+      "lhe_blocks": 800,
+      "mixed_hepmc": 200,
+      "miniaod": 127
+    },
+    "observed_bytes": {
+      "committed_resident_staging": 83187828,
+      "active_wave_staging": 3404084862,
+      "source_and_blocks_per_node_mean": 415951,
+      "source_and_blocks_per_node_max": 417071,
+      "mixed_hepmc_per_node_mean": 16604485,
+      "mixed_hepmc_per_node_max": 16975384,
+      "archive_scratch_per_200_node_wave_max": 10098932769,
+      "archive_scratch_per_node_max": 50494664
+    },
+    "capacity_estimates": {
+      "staging_usable_bytes": 90000000000,
+      "archive_disk_bytes": 200000000000,
+      "additional_nodes_by_staging_max": 5169,
+      "additional_nodes_by_archive_max": 3877,
+      "additional_nodes_bottleneck": 3877,
+      "basis": "Observed maximum file sizes, current resident originals, and the configured 10 GB staging reserve."
+    },
+    "planning_defaults": {
+      "source_lhe_bytes": 100000000,
+      "source_block_bytes": 100000000,
+      "mixed_hepmc_bytes": 64000000,
+      "source_files_per_step": 1000,
+      "processing_nodes_per_wave": 1000,
+      "archive_disk_bytes": 200000000000
+    }
+  },
   "storage": {
     "eos_redirector": "cceos.ihep.ac.cn:1094",
     "eos_lfn_base": "/store/user/chiw/MC_Production_v3",

@@ -43,6 +43,8 @@ Every run uses an explicit runtime release and exact counted inputs. Existing
 LHE sources require their URL, event count, and seed; generated sources require
 a finite event cap. Storage roots and processing defaults are centralized in
 `common/node_config_defaults.json`.
+The measured staging/archive baseline and its scope are recorded in
+[docs/mcprod_capacity_baseline_2026-10-13.md](docs/mcprod_capacity_baseline_2026-10-13.md).
 
 The full CLI lifecycle, configuration fields, handoff, IHEP batch, aggregation,
 recovery, and worker commands are documented in

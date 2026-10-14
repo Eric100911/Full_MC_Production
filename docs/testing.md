@@ -305,6 +305,16 @@ should a full v2 spec be created with the measured efficiencies.
 
 ## Pilot Submission and Monitoring
 
+Before preparing a new inventory-driven `mcprod` run, check the measured
+capacity baseline in
+[`docs/mcprod_capacity_baseline_2026-10-13.md`](mcprod_capacity_baseline_2026-10-13.md)
+and inspect the generated `run.json` values for `staging_bytes`,
+`reserve_bytes`, `limits.mixed_hepmc_bytes`,
+`limits.processing_nodes_per_wave`, and `resources.archive.disk_bytes`.
+The baseline defaults are applied only to new specs that omit these values;
+existing run directories remain frozen. A different source pool or generator
+profile needs a fresh size sample before its capacity is treated as verified.
+
 Record the schedd before submission because cluster IDs are schedd-local:
 
 ```bash
