@@ -90,7 +90,10 @@ def _assert_submittable(spec: Dict[str, Any]) -> None:
 
 def _worker_proxy_paths(root: Path) -> List[str]:
     """Read the proxy paths pinned in this run's generated worker submit files."""
-    submit_files = sorted((root / "submit").glob("*.sub"))
+    # The shard finalizer is a DAGMan NOOP, so its generated descriptor is
+    # never submitted as a worker and does not transfer a proxy.
+    submit_files = sorted(path for path in (root / "submit").glob("*.sub")
+                          if path.name != "noop.sub")
     if not submit_files:
         raise RuntimeError("run has no worker submit files with a pinned X.509 proxy")
     paths = set()

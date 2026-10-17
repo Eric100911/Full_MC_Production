@@ -35,6 +35,26 @@ class CondorContracts(unittest.TestCase):
         proxy_check.start()
         self.addCleanup(proxy_check.stop)
 
+    def test_submit_ignores_generated_noop_but_checks_worker_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            (root / "submit/noop.sub").write_text(
+                "universe = local\nexecutable = /bin/true\nqueue\n")
+            runner = Mock(return_value=response(
+                stdout="1 job(s) submitted to cluster 91234.\n"))
+            result = submit_run(root, runner=runner)
+            self.assertEqual(result["state"], "submitted")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); run(root)
+            (root / "submit/noop.sub").write_text(
+                "universe = local\nexecutable = /bin/true\nqueue\n")
+            (root / "submit/plan.sub").write_text("executable = worker.sh\nqueue\n")
+            runner = Mock(side_effect=AssertionError("must not submit"))
+            with self.assertRaisesRegex(RuntimeError, "invalid pinned X.509 proxy"):
+                submit_run(root, runner=runner)
+            self.assertFalse((root / "submission.json").exists())
+
     def test_submit_persists_exact_pair_before_and_after_submit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
