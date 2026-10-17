@@ -41,9 +41,12 @@ def export_handoff(run_dir, ready_only=True):
     # Fail closed like the seam does.  A pre-refactor state has no
     # merge_group_counts, so exporting one would silently yield zero tasks and
     # overwrite the operator's merge_groups.json snapshot with an empty index.
-    if state.get("state_schema") != STATE_SCHEMA:
+    if state.get("state_schema") not in (STATE_SCHEMA, "mcprod-shard-state-v1"):
         raise RuntimeError("handoff export requires a " + STATE_SCHEMA + " run; "
                            "existing runs keep their frozen runtime and are not migrated")
+    if (state.get("state_schema") == "mcprod-shard-state-v1"
+            and state.get("status") != "complete"):
+        raise RuntimeError("campaign-shard handoff requires a completed run")
     run_id, runtime_release = spec.get("run_id"), spec.get("runtime_release")
     if not run_id or not runtime_release:
         raise ValueError("merge group index must identify the run and runtime release")

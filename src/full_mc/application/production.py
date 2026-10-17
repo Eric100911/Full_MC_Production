@@ -87,6 +87,9 @@ def _authority(spec):
 
 def plan_run(spec_path, output_dir, log_level=None):
     spec = load_run_spec(spec_path)
+    if spec.get("orchestration") == "campaign_shards":
+        from full_mc.application.shards import plan_run as plan_shards
+        return plan_shards(spec_path, output_dir, log_level=log_level)
     if log_level:
         spec["log_level"] = log_level
     proxy_path = resolve_proxy_path()
@@ -730,7 +733,12 @@ def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None
     root = Path(run_dir).resolve()
     spec = read_json(root / "run.json")
     state = read_json(root / "state.json")
-    archive = next((item for item in load_archives(root, spec, state["next_step"])
+    if state.get("state_schema") == "mcprod-shard-state-v1":
+        from full_mc.application.shards import committed_archives
+        archives = committed_archives(root, state)
+    else:
+        archives = load_archives(root, spec, state["next_step"])
+    archive = next((item for item in archives
                     if any(ref.get("artifact_id") == archive_id for ref in item.get("outputs", []))), None)
     if archive is None:
         raise ValueError("unknown verified archive artifact")

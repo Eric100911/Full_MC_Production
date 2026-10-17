@@ -66,6 +66,16 @@ def run(task, runtime, command, work_dir, extra_env=None):
     launch(runtime, list(map(str,command)), Path(work_dir), env=env)
 
 def result(task, outputs, runtime=None, **extra):
+    if "staging_claim_bytes" in parameters(task) and "staged_objects" not in extra:
+        objects = []
+        for ref in outputs:
+            objects.append({key: ref[key] for key in
+                            ("artifact_id", "url", "size_bytes", "kind")})
+            if "sidecar_url" in ref:
+                objects.append({"artifact_id": ref["artifact_id"] + ":sidecar",
+                                "url": ref["sidecar_url"], "kind": "sidecar",
+                                "size_bytes": ref["sidecar_size_bytes"]})
+        extra["staged_objects"] = objects
     return dict(task_id=task_id(task), stage=task["stage"], status="ok",
                 runtime_release=task["runtime_release"], outputs=outputs, **extra)
 
@@ -79,7 +89,9 @@ def publish(path, task, artifact_id=None, kind=None, events=None, metadata=None)
     if limit and path.stat().st_size > limit:
         raise RuntimeError(f"{task_id(task)} output exceeds reserved staging bytes")
     client = TransferClient()
-    client.copy_out(path, output["url"])
+    staged = "staging_claim_bytes" in parameters(task)
+    if not staged:
+        client.copy_out(path, output["url"])
     ref = artifact_ref(path, output["artifact_id"], kind or output["kind"], events, output["url"])
     ref["runtime_release"] = task["runtime_release"]
     for key, value in output.items():
@@ -94,6 +106,14 @@ def publish(path, task, artifact_id=None, kind=None, events=None, metadata=None)
     sidecar = path.with_name(path.name+".json")
     atomic_json(sidecar, record)
     ref["sidecar_url"] = output["url"]+".json"
+    if staged:
+        ceiling = parameters(task)["staging_claim_bytes"]
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+            raise ValueError("staging_claim_bytes must be a nonnegative integer")
+        ref["sidecar_size_bytes"] = sidecar.stat().st_size
+        if path.stat().st_size + ref["sidecar_size_bytes"] > ceiling:
+            raise RuntimeError(f"{task_id(task)} output and sidecar exceed reserved staging bytes")
+        client.copy_out(path, output["url"])
     client.copy_out(sidecar, ref["sidecar_url"])
     ref["local_path"] = str(path.resolve())
     return ref

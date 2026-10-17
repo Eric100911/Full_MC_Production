@@ -84,6 +84,8 @@ def _configured_schedd(spec: Dict[str, Any]) -> str | None:
 def _assert_submittable(spec: Dict[str, Any]) -> None:
     if spec.get("runtime_source_dirty"):
         raise RuntimeError("refusing scheduler submission from a dirty runtime source")
+    from full_mc.application.site_validation import validate_site
+    validate_site(spec)
 
 
 def _worker_proxy_paths(root: Path) -> List[str]:

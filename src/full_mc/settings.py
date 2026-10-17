@@ -299,5 +299,28 @@ def load_run_spec(path):
     if unknown_pools:
         raise ValueError("campaign references undeclared source pool(s): "
                          + ", ".join(sorted(unknown_pools)))
+    orchestration = spec.get("orchestration", "waves")
+    if orchestration not in ("waves", "campaign_shards"):
+        raise ValueError("orchestration must be waves or campaign_shards")
+    if orchestration == "campaign_shards":
+        from .domain.streams import build_streams
+        limits["shard_nodes"] = _integer(
+            limits.get("shard_nodes", 10), "limits.shard_nodes", minimum=1)
+        limits["target_window_nodes"] = _integer(
+            limits.get("target_window_nodes", 2 * limits["shard_nodes"]),
+            "limits.target_window_nodes", minimum=1)
+        if limits["target_window_nodes"] < limits["shard_nodes"]:
+            raise ValueError("target_window_nodes must cover at least one shard")
+        for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes"):
+            limits[key] = _integer(limits[key], "limits." + key, minimum=1)
+        if spec["normal_shortfall_policy"] != "report-and-truncate":
+            raise ValueError("campaign_shards requires report-and-truncate")
+        build_streams(spec)
+        validation = spec.get("site_validation", {})
+        if not isinstance(validation, dict):
+            raise ValueError("site_validation must be an object")
+        if validation.get("proof_path"):
+            validation["proof_path"] = _path(validation["proof_path"], path.parent)
+        spec["site_validation"] = validation
     _validate_generated_staging(spec)
     return spec

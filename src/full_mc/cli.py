@@ -78,6 +78,23 @@ def build_parser():
     p = _leaf(internal, "advance-wave", "Advance one serialized production wave")
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--step", type=int)
+    for action in ("prepare-source", "prepare-shard", "admit-producer",
+                   "accept-result", "complete-source", "complete-shard",
+                   "prepare-cleanup", "finalize-shards"):
+        p = _leaf(internal, action, "Run one local campaign-shard control operation")
+        p.add_argument("--run-dir", type=Path, required=True)
+        if action in ("prepare-source", "complete-source"):
+            p.add_argument("--source-index", type=int, required=True)
+        if action in ("prepare-shard", "complete-shard"):
+            p.add_argument("--campaign", required=True)
+            p.add_argument("--shard-index", type=int, required=True)
+        if action in ("admit-producer", "accept-result"):
+            p.add_argument("--task-id", required=True)
+        if action in ("accept-result", "complete-source", "complete-shard"):
+            p.add_argument("--return-code", type=int, required=True)
+        if action == "prepare-cleanup":
+            p.add_argument("--pool", required=True)
+            p.add_argument("--slot", required=True)
     p = _leaf(commands, "worker", "Execute a single staged worker task")
     p.add_argument("--task", type=Path, required=True)
     p.add_argument("--work-dir", type=Path)
@@ -125,8 +142,25 @@ def dispatch(args):
         return {"submit": condor.submit_run, "status": condor.status_run,
                 "resume": condor.resume_run}[args.action](_run_dir(args))
     if args.command == "internal":
-        from .application.production import advance_wave
-        return advance_wave(args.run_dir, args.step)
+        if args.action == "advance-wave":
+            from .application.production import advance_wave
+            return advance_wave(args.run_dir, args.step)
+        from .application import shards
+        operation = (shards.finalize_run if args.action == "finalize-shards"
+                     else getattr(shards, args.action.replace("-", "_")))
+        if args.action in ("prepare-source", "complete-source"):
+            arguments = [args.run_dir, args.source_index]
+        elif args.action in ("prepare-shard", "complete-shard"):
+            arguments = [args.run_dir, args.campaign, args.shard_index]
+        elif args.action in ("admit-producer", "accept-result"):
+            arguments = [args.run_dir, args.task_id]
+        elif args.action == "prepare-cleanup":
+            arguments = [args.run_dir, args.pool, args.slot]
+        else:
+            arguments = [args.run_dir]
+        if hasattr(args, "return_code"):
+            arguments.append(args.return_code)
+        return operation(*arguments)
     if args.command == "handoff":
         from .application.handoff import export_handoff, transfer_handoff
         root = _run_dir(args)
@@ -191,4 +225,6 @@ def main(argv=None):
     print(json.dumps(result, indent=2, default=str))
     if args.command == "internal" and result.get("skip"):
         return 99
+    if args.command == "internal" and "exit_code" in result:
+        return int(result["exit_code"])
     return 0
