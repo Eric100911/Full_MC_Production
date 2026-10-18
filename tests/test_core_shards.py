@@ -9,6 +9,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.application import shards, staging
 from full_mc.io import atomic_json, read_json
+from full_mc.local_paths import record_path
+from full_mc.planning.shards import child_path
 from full_mc.planning.shards import shard_name, source_name, source_order
 from tests import test_core_production as legacy_tests
 from tests.test_core_production import remote_io_blocked
@@ -34,14 +36,14 @@ class ShardFixture(unittest.TestCase):
         return run
 
     def task(self, run, identity):
-        return read_json(run / "tasks" / (identity + ".json"))
+        return read_json(record_path(run, "tasks", identity))
 
     def accepted(self, run, identity, **extra):
         task = self.task(run, identity)
         outcome = dict(task_id=identity, stage=task["stage"], status="ok",
                        runtime_release="test-release", outputs=[])
         outcome.update(extra)
-        atomic_json(run / "results" / (identity + ".json"), outcome)
+        atomic_json(record_path(run, "results", identity), outcome)
         result = shards.accept_result(run, identity)
         self.assertEqual(result["exit_code"], 0)
         return outcome
@@ -144,10 +146,10 @@ class ShardGraphTests(ShardFixture):
             state = read_json(run / "state.json")
             self.assertEqual(state["planner"]["sources"]["0"], "admitted")
             self.assertNotIn("SOURCE_ARCHIVE_000000", state["accepted"])
-            source_dag = (run / "subdags" / "SOURCE_000000.dag").read_text()
+            source_dag = child_path(run, "SOURCE_000000").read_text()
             self.assertIn("PARENT PLAN_000000 CHILD SOURCE_ARCHIVE_000000", source_dag)
             self.assertIn("PARENT SOURCE_ARCHIVE_000000 CHILD SOURCE_RECLAIM_000000", source_dag)
-            child = (run / "subdags" / "SHARD_C_000000.dag").read_text()
+            child = child_path(run, "SHARD_C_000000").read_text()
             self.assertIn("CONFIG " + str(run / "dagman.config"), child)
             self.assertIn("SCRIPT DEFER 75 60 PRE MIX_C_", child)
             self.assertNotIn("SCRIPT DEFER 75 60 PRE MINIAOD_", child)
@@ -159,7 +161,7 @@ class ShardGraphTests(ShardFixture):
             shards.prepare_source(run, 0)
             self.source_plan(run)
             shards.prepare_shard(run, "C", 0)
-            path = run / "subdags" / "SHARD_C_000000.dag"
+            path = child_path(run, "SHARD_C_000000")
             before = path.read_bytes()
             manifest = shards._manifest_path(run, "SHARD_C_000000")
             frozen = manifest.read_bytes()
@@ -191,7 +193,7 @@ class ShardGraphTests(ShardFixture):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
             run = self.fixture(directory)
             shards.prepare_source(run, 0)
-            self.assertFalse((run / "tasks" / "SOURCE_ARCHIVE_000000.json").exists())
+            self.assertFalse((record_path(run, "tasks", "SOURCE_ARCHIVE_000000")).exists())
             self.source_plan(run)
             self.assertEqual(shards.admit_producer(run, "SOURCE_ARCHIVE_000000")["exit_code"], 0)
             task = self.task(run, "SOURCE_ARCHIVE_000000")
@@ -278,13 +280,13 @@ class ShardAcceptanceTests(ShardFixture):
             outcome = dict(task_id="PLAN_000000", stage="plan", runtime_release="test-release", status="ok",
                            outputs=blocks, originals=[retained], actual_input_events=41, planned_events=40,
                            staged_objects=[{k: r[k] for k in ("artifact_id", "url", "kind", "size_bytes")} for r in blocks])
-            atomic_json(run / "results" / "PLAN_000000.json", outcome)
+            atomic_json(record_path(run, "results", "PLAN_000000"), outcome)
             before = read_json(run / "state.json")["staging"]
             with self.assertRaisesRegex(RuntimeError, "accepted LHE"):
                 shards.accept_result(run, "PLAN_000000")
             self.assertEqual(read_json(run / "state.json")["staging"], before)
             outcome.update(originals=[original], actual_input_events=40)
-            atomic_json(run / "results" / "PLAN_000000.json", outcome)
+            atomic_json(record_path(run, "results", "PLAN_000000"), outcome)
             self.assertEqual(shards.accept_result(run, "PLAN_000000")["exit_code"], 0)
             self.assertEqual(read_json(run / "state.json")["staging"]["resident_bytes"], 277)
 
@@ -298,7 +300,7 @@ class ShardAcceptanceTests(ShardFixture):
             shards.admit_producer(run, identity)
             output = dict(self.task(run, identity)["outputs"][0], size_bytes=64, events=1,
                           sidecar_url="root://unowned.example///other.json", sidecar_size_bytes=17)
-            atomic_json(run / "results" / (identity + ".json"), dict(
+            atomic_json(record_path(run, "results", identity), dict(
                 task_id=identity, stage="mix", runtime_release="test-release", status="ok", outputs=[output], staged_objects=[]))
             with self.assertRaisesRegex(RuntimeError, "sidecar URL"):
                 shards.accept_result(run, identity)
@@ -317,7 +319,7 @@ class ShardAcceptanceTests(ShardFixture):
                           count_source="filename")
             outcome = dict(task_id=task["task_id"], stage="miniaod", runtime_release="test-release", status="ok",
                            outputs=[output], partial=False)
-            path = run / "results" / (task["task_id"] + ".json")
+            path = record_path(run, "results", task["task_id"])
             atomic_json(path, outcome)
             with self.assertRaisesRegex(RuntimeError, "count or provenance"):
                 shards.accept_result(run, task["task_id"])

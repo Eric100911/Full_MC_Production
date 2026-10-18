@@ -147,6 +147,12 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
     if (root / "batch_manifest.json").exists():
         raise FileExistsError("batch already exists; use its existing manifest")
     root.mkdir(parents=True, exist_ok=True)
+    safe_nodes = tuple(handoff.get("ihep_safe_nodes", SAFE_NTUPLE_NODES))
+    if not safe_nodes or any(not isinstance(node, str) or not node for node in safe_nodes):
+        raise ValueError("ihep_safe_nodes must be a nonempty list of hostnames")
+    request_cpus = int(handoff.get("ihep_request_cpus", 1))
+    if request_cpus <= 0:
+        raise ValueError("ihep_request_cpus must be positive")
     jobs: List[Dict[str, Any]] = []
     for index, combined in enumerate(_combined_tasks(handoff)):
         task_path = root / "tasks" / ("%04d.json" % index)
@@ -165,11 +171,12 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
         _write_worker(wrapper, task_path, effective_core, proxy)
         jobs.append({"job_id": None, "index": index, "state": "prepared", "task_path": str(task_path),
                      "wrapper": str(wrapper), "task_ids": combined.get("task_membership", [combined["task_id"]]),
-                     "node": SAFE_NTUPLE_NODES[index % len(SAFE_NTUPLE_NODES)] + ".ihep.ac.cn"})
+                     "node": safe_nodes[index % len(safe_nodes)] + ".ihep.ac.cn"})
     run_id = str(handoff.get("run_id") or Path(handoff_path).resolve().parent.name)
     manifest = {"schema": SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                 "handoff": str(Path(handoff_path).resolve()), "workspace": str(root), "group": group,
-                "walltime": walltime, "memory_mb": int(memory_mb), "safe_nodes": list(SAFE_NTUPLE_NODES),
+                "walltime": walltime, "memory_mb": int(memory_mb), "safe_nodes": list(safe_nodes),
+                "request_cpus": request_cpus,
                 "runtime_dir": str(Path(runtime_dir).resolve()) if pinned_core else None,
                 "core_revision": handoff.get("core_revision"), "jobs": jobs}
     manifest_path = root / "batch_manifest.json"
@@ -180,7 +187,7 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
 
 def _submit_command(manifest: Dict[str, Any], job: Dict[str, Any]) -> List[str]:
     command = ["hep_sub", str(job["wrapper"]), "-g", str(manifest["group"]), "-gwn", "CMS", "-wt", str(manifest["walltime"]),
-               "-n", "1", "-wn", str(job["node"])]
+               "-n", str(int(manifest.get("request_cpus", 1))), "-wn", str(job["node"])]
     if int(manifest.get("memory_mb", 0)) > 0:
         command.extend(["-mem", str(manifest["memory_mb"])])
     logs = Path(manifest["workspace"]) / "logs"

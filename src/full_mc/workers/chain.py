@@ -86,7 +86,8 @@ def execute_chain(task, work_dir):
     # Only task-local source slots, never a complete production inventory.
     for key in ("target_mixed_events", "normal_shortfall_policy",
                 "unused_hepmc_warning_fraction", "mixing_rng_seed",
-                "phi_consumption_mode", "edm_event_id", "processing_environment"):
+                "phi_consumption_mode", "edm_event_id", "processing_environment",
+                "campaign", "global_job_index"):
         if key in p:
             config[key] = p[key]
     if isinstance(p.get("detector_profile"), dict):

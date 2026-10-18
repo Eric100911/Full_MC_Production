@@ -24,6 +24,7 @@ from full_mc.domain.models import Campaign, CampaignSource
 from full_mc.domain.identity import shuffle_seed
 from full_mc.credentials import resolve_proxy_path
 from full_mc.io import atomic_json, read_json
+from full_mc.local_paths import record_path
 from full_mc.planning.graph import write_root_dag, write_submit_files, write_tasks_dag, token
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
@@ -402,6 +403,7 @@ def _process_phase(root, step, spec, view, allocation):
                         "max_hadronization_retries", 5000))})
             parameters = {"campaign": campaign["name"], "analysis": campaign["analysis"],
                 "job_id": node["job_id"], "target_mixed_events": node["target_mixed_events"],
+                "global_job_index": node.get("global_job_index", node["job_index"]),
                 "edm_event_id": node["edm_event_id"],
                 "normal_shortfall_policy": spec["normal_shortfall_policy"],
                 "unused_hepmc_warning_fraction": spec["unused_hepmc_warning_fraction"],
@@ -516,7 +518,7 @@ def validate_planner_ref(ref, source, parameters, index):
 
 def _validate_planner_result(root, spec, item, outcome):
     """Verify a planner result against the immutable task written for its source."""
-    task = read_json(root / "tasks" / (item["plan_task"] + ".json"))
+    task = read_json(record_path(root, "tasks", item["plan_task"]))
     source = spec["sources"][item["source_index"]]
     parameters = task["parameters"]
     validate_result_envelope(task, outcome, spec["runtime_release"])
@@ -568,7 +570,7 @@ def _validate_archive_result(root, spec, pending, outcome):
     declared size still have to match the frozen archive inputs. PRE does not
     remotely re-stat the HepMC.
     """
-    task = read_json(root / "tasks" / (pending["archive_task"] + ".json"))
+    task = read_json(record_path(root, "tasks", pending["archive_task"]))
     validate_result_envelope(task, outcome, spec["runtime_release"])
     outputs = outcome.get("outputs")
     if not isinstance(outputs, list) or len(outputs) != 1 or len(task["outputs"]) != 1:
@@ -602,7 +604,7 @@ def _validate_reclaim_result(root, spec, pending, outcome):
     whose staged deletions are unconfirmed is not a consumed wave, so a retry
     after a partial deletion replays it instead of moving on.
     """
-    task = read_json(root / "tasks" / (pending["reclaim_task"] + ".json"))
+    task = read_json(record_path(root, "tasks", pending["reclaim_task"]))
     validate_result_envelope(task, outcome, spec["runtime_release"])
     entries = outcome.get("reclaimed")
     if not isinstance(entries, list):
@@ -648,7 +650,7 @@ def _validate_pending_results(root, spec, pending, results):
     archived = {member["artifact_id"]: member
                 for member in results[pending["archive_task"]]["members"]}
     for item in pending["miniaods"]:
-        task = read_json(root / "tasks" / (item["task_id"] + ".json"))
+        task = read_json(record_path(root, "tasks", item["task_id"]))
         outcome = results[item["task_id"]]
         validate_result_envelope(task, outcome, spec["runtime_release"])
         output = outcome["outputs"][0]
@@ -758,7 +760,8 @@ def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None
 def _combined(spec, campaign, detector_profile, refs, ordinal):
     name = campaign["name"]
     variant = detector_profile["profile_id"]
-    identity = f"{name}_{variant}_MERGE{ordinal:06d}"
+    external_ordinal = int(campaign.get("merge_group_index_start", 0)) + int(ordinal)
+    identity = f"{name}_{variant}_MERGE{external_ordinal:06d}"
     base = (spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"]
             + "/" + name + "/" + variant)
     parameters = {"campaign": name, "analysis": campaign["analysis"],

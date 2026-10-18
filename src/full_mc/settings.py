@@ -257,6 +257,10 @@ def load_run_spec(path):
             slot["efficiency"] = efficiency
         for field in ("target_mixed_events", "max_processing_nodes", "merge_events"):
             campaign[field] = _integer(campaign.get(field, 0), f"{name}: {field}", minimum=1)
+        campaign["global_job_index_start"] = _integer(
+            campaign.get("global_job_index_start", 0), f"{name}: global_job_index_start")
+        campaign["merge_group_index_start"] = _integer(
+            campaign.get("merge_group_index_start", 0), f"{name}: merge_group_index_start")
         resolved = resolve_detector_variants(campaign, profile_catalog["detector"])
         campaign["resolved_detector_variants"] = resolved
     if not isinstance(spec.get("sources"), list) or not spec["sources"]:

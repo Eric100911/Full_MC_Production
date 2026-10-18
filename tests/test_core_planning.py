@@ -47,6 +47,21 @@ class AllocationContracts(unittest.TestCase):
         done = allocate_campaign_wave(campaign(), blocks, {"pool": 2}, 10, 2)
         self.assertEqual(done["nodes"], [])
 
+    def test_global_job_offset_separates_edm_ids_across_campaign_runs(self):
+        blocks = source_blocks([Source("pool", "s", 1, "/s.lhe", 200, 1)], 10)
+        phase2 = campaign(max_nodes=10)
+        phase3 = Campaign(phase2.name, phase2.analysis, phase2.sources, 5, 990, 100,
+                          phase2.detector_variants, phase2.resolved_detector_variants,
+                          global_job_index_start=10, merge_group_index_start=1)
+        first = allocate_campaign_wave(phase2, blocks, {}, 10)
+        third = allocate_campaign_wave(phase3, blocks, {}, 10)
+        ids2 = {node["edm_event_id"]["first_luminosity_block"] for node in first["nodes"]}
+        ids3 = {node["edm_event_id"]["first_luminosity_block"] for node in third["nodes"]}
+        self.assertEqual(len(ids2), 10)
+        self.assertEqual(len(ids3), 10)
+        self.assertTrue(ids2.isdisjoint(ids3))
+        self.assertEqual(third["nodes"][0]["global_job_index"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

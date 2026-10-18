@@ -5,6 +5,7 @@ import re
 import shlex
 
 from full_mc.io import atomic_json
+from full_mc.local_paths import bucketed, record_path, task_variables
 from full_mc.runtime.profiles import GRID_CA_DIR, STAGE_RUNTIME
 
 CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
@@ -35,6 +36,8 @@ def write_submit_files(run_dir, core_root, runtime_dir, proxy_path):
     submit.mkdir(parents=True, exist_ok=True)
     for directory in ("tasks", "results", "logs", "steps"):
         (root / directory).mkdir(exist_ok=True)
+    task_macro = "$(task_path)" if bucketed(root) else "$(task)"
+    log_macro = "$(log_path)" if bucketed(root) else "$(task)"
     bootstrap = core / "src/full_mc/runtime/bootstrap.py"
     for stage, category in CATEGORIES.items():
         profile = STAGE_RUNTIME[stage]
@@ -51,18 +54,18 @@ def write_submit_files(run_dir, core_root, runtime_dir, proxy_path):
             "should_transfer_files = YES", "when_to_transfer_output = ON_EXIT",
             "transfer_executable = False",
             "transfer_input_files = " + ",".join(map(path_text, assets))
-                + "," + path_text(root / "tasks") + "/$(task).json",
+                + "," + path_text(root / "tasks") + "/" + task_macro + ".json",
             "transfer_output_files = result.json,diagnostics.tar.gz",
             'transfer_output_remaps = "result.json=' + path_text(root / "results")
-                + '/$(task).json;diagnostics.tar.gz=' + path_text(root / "logs")
-                + '/$(task).tar.gz"',
+                + '/' + task_macro + '.json;diagnostics.tar.gz=' + path_text(root / "logs")
+                + '/' + log_macro + '.tar.gz"',
             "use_x509userproxy = True", "x509userproxy = " + path_text(proxy_path),
             "getenv = False",
             f"request_cpus = {cpus}", "request_memory = $(memory)",
             "request_disk = $(disk)",
             '+JobFlavour = "$(flavour)"',
-            "output = " + path_text(root / "logs") + "/$(task).out",
-            "error = " + path_text(root / "logs") + "/$(task).err",
+            "output = " + path_text(root / "logs") + "/" + log_macro + ".out",
+            "error = " + path_text(root / "logs") + "/" + log_macro + ".err",
             "log = " + path_text(root / "logs") + "/events.log", "queue",
         ]
         (submit / (stage + ".sub")).write_text("\n".join(lines) + "\n")
@@ -81,7 +84,7 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
     for task in tasks:
         name = token(task["task_id"])
         stage = task["stage"]
-        atomic_json(root / "tasks" / (name + ".json"), task)
+        atomic_json(record_path(root, "tasks", name), task)
         resource = spec.get("resources", {}).get(stage, {})
         # Explicit byte ceilings drive scratch needs; never event-count inference.
         default_disk = max(4_000_000_000, int(task.get("parameters", {}).get("scratch_bytes", 0)))
@@ -91,7 +94,7 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
         flavour = token(resource.get("flavour", "workday"))
         lines += [f"JOB {name} {path_text(root / 'submit' / (stage + '.sub'))}",
                   f"CATEGORY {name} {CATEGORIES[stage]}",
-                  f'VARS {name} task="{name}" disk="{disk_kb}" memory="{memory_mb}" flavour="{flavour}"',
+                  f'VARS {name} task="{name}" disk="{disk_kb}" memory="{memory_mb}" flavour="{flavour}"{task_variables(root, name)}',
                   f"RETRY {name} 1"]
     for parents, child in dependencies:
         if parents:

@@ -227,13 +227,28 @@ run_logged() {
     LAST_STDERR_LOG="${stderr_log}"
 
     msg_info "执行 ${label}，完整日志写入 ${log_prefix}.[stdout|stderr]"
-    if "$@" >"${stdout_log}" 2>"${stderr_log}"; then
+    if [[ "${HELAC_RETAIN_DIAGNOSTICS:-0}" == "1" ]]; then
+        # Bash time includes the command's waited-for children. Keep timing
+        # separate from native warnings/stopping messages, including on failure.
+        local TIMEFORMAT=$'wall_seconds=%R\ncpu_user_seconds=%U\ncpu_system_seconds=%S'
+        local timing_log="${log_prefix}.timing.log"
+        if { time "$@" >"${stdout_log}" 2>"${stderr_log}"; } 2>"${timing_log}"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf 'exit_code=%s\n' "${rc}" >> "${timing_log}"
+    elif "$@" >"${stdout_log}" 2>"${stderr_log}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if [[ "${rc}" -eq 0 ]]; then
         stdout_size=$(wc -c < "${stdout_log}" 2>/dev/null || echo 0)
         stderr_size=$(wc -c < "${stderr_log}" 2>/dev/null || echo 0)
         msg_info "${label} 完成 (stdout=${stdout_size} B, stderr=${stderr_size} B)"
         return 0
-    else
-        rc=$?
     fi
 
     msg_error "${label} 失败 (rc=${rc})"
@@ -896,6 +911,12 @@ prepare_runtime_user_inp() {
     set_user_inp_value "${runtime_user_inp}" "useMCFMrun" "T"
     set_user_inp_value "${runtime_user_inp}" "itmax" "1"
     set_user_inp_value "${runtime_user_inp}" "muF_over_ref" "1d0"
+    if [[ "$(basename "${helac_dir}")" == "HELAC-Onia-2.7.6" ]]; then
+        set_user_inp_value "${runtime_user_inp}" "Scale" "0"
+        set_user_inp_value "${runtime_user_inp}" "FScaleValue" "12.8d0"
+        set_user_inp_value "${runtime_user_inp}" "ScaleFactor" "1d0"
+        set_user_inp_value "${runtime_user_inp}" "muR_over_ref" "1d0"
+    fi
     set_user_inp_value "${runtime_user_inp}" "PDF_Hessian2MC" "F"
     set_user_inp_value "${runtime_user_inp}" "N_MCPDFs" "100"
     set_user_inp_value "${runtime_user_inp}" "Way_Hessian2MC" "1"

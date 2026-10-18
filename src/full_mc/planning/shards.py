@@ -5,6 +5,7 @@ import os
 import tempfile
 
 from full_mc.io import write_immutable_json
+from full_mc.local_paths import dag_path, record_path, task_variables
 from full_mc.planning.graph import CATEGORIES, path_text, token
 
 DEFER = 75
@@ -46,7 +47,7 @@ def cleanup_name(pool, slot):
 
 
 def child_path(root, name):
-    return Path(root) / "subdags" / (token(name) + ".dag")
+    return dag_path(root, token(name))
 
 
 def shard_ranges(spec):
@@ -127,7 +128,7 @@ def write_root_dag(root, spec):
         flavour = token(resource.get("flavour", "workday"))
         return [f"JOB {name} {path_text(root / 'submit' / 'reclaim.sub')}",
                 f"CATEGORY {name} lhe_coordination",
-                f'VARS {name} task="{name}" disk="{disk}" memory="{memory}" flavour="{flavour}"',
+                f'VARS {name} task="{name}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, name)}',
                 f"RETRY {name} 1",
                 _script(root, "prepare-cleanup", name, f"--pool {pool} --slot {slot}"),
                 f"PRE_SKIP {name} 99",
@@ -167,7 +168,7 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
         identity = token(task["task_id"])
         stage = task["stage"]
         if not task.get("parameters", {}).get("source_plan_task"):
-            write_immutable_json(root / "tasks" / (identity + ".json"), task)
+            write_immutable_json(record_path(root, "tasks", identity), task)
         resource = spec.get("resources", {}).get(stage, {})
         disk = max(4_000_000_000, int(task.get("parameters", {}).get("scratch_bytes", 0)))
         disk = (int(resource.get("disk_bytes", disk)) + 1023) // 1024
@@ -175,7 +176,7 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
         flavour = token(resource.get("flavour", "workday"))
         lines += [f"JOB {identity} {path_text(root / 'submit' / (stage + '.sub'))}",
                   f"CATEGORY {identity} {CATEGORIES[stage]}",
-                  f'VARS {identity} task="{identity}" disk="{disk}" memory="{memory}" flavour="{flavour}"',
+                  f'VARS {identity} task="{identity}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, identity)}',
                   f"RETRY {identity} 1"]
         if identity in claims:
             lines.append(_script(root, "admit-producer", identity, f"--task-id {identity}"))
@@ -187,6 +188,6 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
     if not tasks:
         raise ValueError("a prepared child must contain worker tasks")
     path = child_path(root, name)
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_text(path, "\n".join(lines) + "\n")
     return path

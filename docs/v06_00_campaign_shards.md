@@ -14,6 +14,29 @@ Each `(campaign, pool)` stream has immutable `stride` and `offset`, plus separat
 
 Each source/shard completion trigger runs an ordinary pool-cleanup `JOB`. That job checks possible future or unfinished demand, durable archive prerequisites, accepted consumer completion, run ownership, and exact artifact URLs. If nothing is eligible at that trigger, PRE returns `PRE_SKIP=99` immediately; it does not wait for later refs. With DPS1 `safe_cursor=80` and TPS `safe_cursor=40`, `[40,80)` retains indices `40,45,50,55,60,65,70,75` for TPS. This arithmetic alone does not prove a file is safe to delete. Reclaim tasks name explicit accepted refs; no broad path deletion or EOS lookup runs from PRE.
 
+## AFS 本地文件分桶
+
+新建 `campaign_shards` run 会冻结空文件标记 `.bucketed-v1`，读写双方据此
+选择相同布局。没有标记的已有 run 继续使用原来的扁平路径；不迁移已有
+文件，也不为恢复操作重写旧 DAG。
+
+任务、结果、已接受结果的完成凭据，以及 source/shard/cleanup 清单按
+`<namespace>/<index // 1000>/` 分桶，每个桶最多 1000 个 JSON 文件。
+`namespace` 保留阶段、campaign 和 detector profile 等身份前缀，`index`
+取既有任务 ID 的末尾数字。例如 `PLAN_001000` 的任务文件是
+`tasks/PLAN_/000001/PLAN_001000.json`。桶号使用整除，随索引增加产生新桶。
+
+每个 worker 通常有 `.out`、`.err`、`.tar.gz` 三个日志文件，因此日志使用
+`index // 333`，每桶最多 999 个文件。共享的 `logs/events.log` 和
+`logs/controller.log` 保持原位置和写入方式。
+
+SubDAG 使用 `subdags/<namespace>/<index // 1000>/<identity>/<identity>.dag`。
+例如 `subdags/SOURCE_/000001/SOURCE_001000/SOURCE_001000.dag`；每个 DAG
+单独占一个目录，DAGMan 的原生日志、lock 和 rescue 文件留在该目录内，
+每个上层桶最多 1000 个子目录。根 DAG 仍为 `run.dag`，公共 submit 文件
+仍放在 `submit/`。分桶只改变提交端本地路径，不改变远端产物 URL、任务
+ID、随机数种子、物理参数或暂存容量的记账方式。
+
 ## Frozen pilot and planning configuration
 
 The initial pilot uses **one isolated staging-budget scope and one authoritative ledger**. Its capacity proof cannot be combined with another run's budget. A future shared budget would require every participating run to use the same ledger and stable lock; it is outside this pilot.
@@ -157,24 +180,24 @@ The root DAG is a finite skeleton. It declares source SubDAGs, finite campaign-s
 
 ```dag
 # One source-owned LHE → PLAN SubDAG per frozen source.
-SUBDAG EXTERNAL SOURCE_000 /run/subdags/sources/000.dag
+SUBDAG EXTERNAL SOURCE_000000 /run/subdags/SOURCE_/000000/SOURCE_000000/SOURCE_000000.dag
 
 # Finite slots; each PRE commits one immutable allocation before rendering DAG.
-SUBDAG EXTERNAL SHARD_DPS1_000 /run/subdags/DPS1/000.dag
-SCRIPT DEFER 75 60 PRE SHARD_DPS1_000 /run/bin/prepare_shard.py DPS1 0
-SUBDAG EXTERNAL SHARD_TPS_000 /run/subdags/TPS/000.dag
-SCRIPT DEFER 75 60 PRE SHARD_TPS_000 /run/bin/prepare_shard.py TPS 0
+SUBDAG EXTERNAL SHARD_DPS1_000000 /run/subdags/SHARD_DPS1_/000000/SHARD_DPS1_000000/SHARD_DPS1_000000.dag
+SCRIPT DEFER 75 60 PRE SHARD_DPS1_000000 /run/bin/prepare_shard.py DPS1 0
+SUBDAG EXTERNAL SHARD_TPS_000000 /run/subdags/SHARD_TPS_/000000/SHARD_TPS_000000/SHARD_TPS_000000.dag
+SCRIPT DEFER 75 60 PRE SHARD_TPS_000000 /run/bin/prepare_shard.py TPS 0
 # No shard-completion edge between these independent children.
 
 # One ordinary cleanup job per declared source/shard completion trigger.
 JOB CLEANUP_JPSI_000 /run/submit/reclaim.sub
 SCRIPT DEFER 75 60 PRE CLEANUP_JPSI_000 /run/bin/prepare_cleanup.py jpsi 0
 PRE_SKIP CLEANUP_JPSI_000 99
-PARENT SHARD_DPS1_000 CHILD CLEANUP_JPSI_000
+PARENT SHARD_DPS1_000000 CHILD CLEANUP_JPSI_000
 
 JOB FINALIZE /run/submit/finalize.sub
 SCRIPT PRE FINALIZE /run/bin/finalize_local.py
-PARENT SOURCE_000 SHARD_DPS1_000 SHARD_TPS_000 CLEANUP_JPSI_000 CHILD FINALIZE
+PARENT SOURCE_000000 SHARD_DPS1_000000 SHARD_TPS_000000 CLEANUP_JPSI_000 CHILD FINALIZE
 ```
 
 The real generator must declare every referenced node and use valid DAGMan syntax. Source readiness is tracked by the frozen accepted inventory prefix; do not make every shard depend on completion of every source. A shard that lacks enough prefix defers, while other campaigns or ready shards proceed. For one campaign, shard **allocation** order is deterministic so job indices, task IDs, seeds, and event IDs do not depend on which PRE wins a race. Across campaigns, allocation may reuse BLOCK refs.

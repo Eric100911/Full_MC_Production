@@ -35,6 +35,7 @@ def allocate_campaign_wave(campaign: Campaign, blocks_by_pool: Mapping[str, Sequ
     max_nodes = min(node_limit, max(0, campaign.max_processing_nodes - global_job_offset))
     for node_index in range(max_nodes):
         index = global_job_offset + node_index
+        global_index = campaign.global_job_index_start + index
         job_id = f"JOB000000_BLOCK{index:06d}"
         trial = dict(cursors)
         slot_records = []
@@ -50,16 +51,17 @@ def allocate_campaign_wave(campaign: Campaign, blocks_by_pool: Mapping[str, Sequ
                                  "lhe_budget": slot.lhe_budget, "block_refs": refs,
                                  "lhe_events": sum(item.events for item in chosen),
                                  "source_rng_seed": deterministic_seed(
-                                     f"{campaign.name}|{job_id}|source={slot_index}|"
+                                     f"{campaign.name}|{global_index}|source={slot_index}|"
                                      f"{';'.join(refs)}|{slot.mode}")})
         inputs = [ref for slot in slot_records for ref in slot["block_refs"]]
         modes = [slot.mode for slot in campaign.sources]
         nodes.append({"job_index": global_job_offset + node_index,
+                      "global_job_index": global_index,
                       "job_id": job_id,
                       "sources": slot_records, "target_mixed_events": campaign.target_mixed_events,
-                      "edm_event_id": edm_event_id(0, index, campaign.target_mixed_events),
+                      "edm_event_id": edm_event_id(0, global_index, campaign.target_mixed_events),
                       "mixing_rng_seed": deterministic_seed(
-                          f"{campaign.name}|{job_id}|shuffle|"
+                          f"{campaign.name}|{global_index}|shuffle|"
                           f"{','.join(inputs)}|{','.join(modes)}")})
         cursors = trial
     return {"campaign": campaign.name, "start_cursors": dict(starting_cursors),

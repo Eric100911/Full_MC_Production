@@ -110,6 +110,8 @@ class Campaign:
     merge_events: int
     detector_variants: List[str] = field(default_factory=list)
     resolved_detector_variants: List[Dict[str, Any]] = field(default_factory=list)
+    global_job_index_start: int = 0
+    merge_group_index_start: int = 0
 
     def __post_init__(self) -> None:
         if not self.name or self.analysis not in {"JJP", "JUP"}:
@@ -119,6 +121,8 @@ class Campaign:
         _positive(self.target_mixed_events, "campaign.target_mixed_events")
         _positive(self.max_processing_nodes, "campaign.max_processing_nodes")
         _positive(self.merge_events, "campaign.merge_events")
+        _positive(self.global_job_index_start, "campaign.global_job_index_start", allow_zero=True)
+        _positive(self.merge_group_index_start, "campaign.merge_group_index_start", allow_zero=True)
         if not self.detector_variants or len(self.detector_variants) != len(set(self.detector_variants)):
             raise ValueError("campaign requires distinct detector_variants")
         if len(self.resolved_detector_variants) != len(self.detector_variants):
@@ -134,6 +138,8 @@ class Campaign:
             merge_events=raw.get("merge_events"),
             detector_variants=list(raw.get("detector_variants", [])),
             resolved_detector_variants=list(raw.get("resolved_detector_variants", [])),
+            global_job_index_start=int(raw.get("global_job_index_start", 0)),
+            merge_group_index_start=int(raw.get("merge_group_index_start", 0)),
         )
 
     def to_dict(self) -> Dict[str, Any]:

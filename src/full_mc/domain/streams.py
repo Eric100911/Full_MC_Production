@@ -49,7 +49,9 @@ def _as_campaign(value: Campaign | Mapping[str, Any]) -> Campaign:
     names = [item["profile_id"] for item in variants]
     return Campaign(value["name"], value["analysis"], sources,
                     value["target_mixed_events"], value["max_processing_nodes"],
-                    value["merge_events"], names, variants)
+                    value["merge_events"], names, variants,
+                    int(value.get("global_job_index_start", 0)),
+                    int(value.get("merge_group_index_start", 0)))
 
 
 def build_streams(spec: Any) -> dict[str, dict[str, Any]]:
@@ -118,7 +120,8 @@ def _stream_block(blocks: Sequence[SourceBlock], stream: Mapping[str, Any], curs
 
 def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mapping[str, Sequence[SourceBlock]],
                    streams: Mapping[str, Mapping[str, Any]], start_job_index: int,
-                   node_limit: int, exhausted_pools: set[str]) -> dict[str, Any] | None:
+                   node_limit: int, exhausted_pools: set[str],
+                   global_job_index_start: int | None = None) -> dict[str, Any] | None:
     """Allocate a deterministic shard without changing caller-owned state.
 
     A temporary shortage in any requested slot rejects the whole shard. A
@@ -127,6 +130,9 @@ def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mappi
     """
     campaign = _as_campaign(campaign)
     start_job_index = _strict_int(start_job_index, "start_job_index")
+    if global_job_index_start is None:
+        global_job_index_start = campaign.global_job_index_start
+    global_job_index_start = _strict_int(global_job_index_start, "global_job_index_start")
     node_limit = _strict_int(node_limit, "node_limit", minimum=1)
     if not isinstance(exhausted_pools, set):
         raise ValueError("exhausted_pools must be a set")
@@ -150,6 +156,7 @@ def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mappi
     shortfalls: list[dict[str, Any]] = []
     for node_offset in range(max_nodes):
         job_index = start_job_index + node_offset
+        global_job_index = global_job_index_start + job_index
         job_id = f"JOB000000_BLOCK{job_index:06d}"
         trial = dict(cursors)
         slot_records = []
@@ -183,15 +190,16 @@ def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mappi
                                  "lhe_budget": slot.lhe_budget, "block_refs": refs,
                                  "lhe_events": total,
                                  "source_rng_seed": deterministic_seed(
-                                     f"{campaign.name}|{job_id}|source={slot_index}|"
+                                     f"{campaign.name}|{global_job_index}|source={slot_index}|"
                                      f"{';'.join(refs)}|{slot.mode}")})
         inputs = [ref for record in slot_records for ref in record["block_refs"]]
         modes = [slot.mode for slot in campaign.sources]
         nodes.append({"job_index": job_index, "job_id": job_id, "sources": slot_records,
                       "target_mixed_events": campaign.target_mixed_events,
-                      "edm_event_id": edm_event_id(0, job_index, campaign.target_mixed_events),
+                      "global_job_index": global_job_index,
+                      "edm_event_id": edm_event_id(0, global_job_index, campaign.target_mixed_events),
                       "mixing_rng_seed": deterministic_seed(
-                          f"{campaign.name}|{job_id}|shuffle|"
+                          f"{campaign.name}|{global_job_index}|shuffle|"
                           f"{','.join(inputs)}|{','.join(modes)}")})
         for entry in node_shortfalls:
             shortfalls.append({"job_index": job_index, **entry})

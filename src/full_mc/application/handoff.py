@@ -9,6 +9,7 @@ from full_mc.storage.transfer import TransferClient, artifact_ready
 HANDOFF_SCHEMA = "full-mc-handoff-v1"
 REF_KEYS = ("artifact_id", "url", "kind", "events", "size_bytes",
             "sidecar_url", "runtime_release", "count_source",
+            "global_job_index", "edm_event_id",
             "generator_profile",
             "detector_profile_id", "detector_profile", "mc_global_tag", "era",
             "simulation_runtime", "merge_runtime", "ntuple_runtime")

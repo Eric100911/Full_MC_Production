@@ -19,5 +19,7 @@ def execute(task, work_dir):
         raise RuntimeError("MiniAOD shortfall is not permitted by this task")
     output = publish(path, task, events=events,
                      metadata={"count_source": "edmFileUtil",
-                               "expected_events": expected, "partial": partial})
+                               "expected_events": expected, "partial": partial,
+                               "global_job_index": parameters(task).get("global_job_index"),
+                               "edm_event_id": parameters(task).get("edm_event_id")})
     return result(task, [output], partial=partial)

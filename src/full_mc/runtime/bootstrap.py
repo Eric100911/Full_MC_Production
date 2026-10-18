@@ -75,6 +75,44 @@ def unpack_runtime(release_dir, destination, profile, release):
     return core
 
 
+def write_diagnostics(task, stage_work, destination):
+    """Keep native HELAC evidence only for tasks explicitly requesting it.
+
+    Preserve paths so helac_inspector.py can parse the extracted HELAC root.
+    Native streams/results contain warning and stopping evidence; do not infer
+    missing physics measurements or bundle LHE, executable trees or full traces.
+    """
+    stage_work, destination = Path(stage_work), Path(destination)
+    paths = set(stage_work.rglob("*.log"))
+    if (task.get("stage") == "lhe"
+            and task.get("parameters", {}).get("retain_helac_diagnostics") is True):
+        patterns = (
+            "command_logs/*.stdout", "command_logs/*.stderr",
+            "py8_onia_user.inp", "helac_forbidden_*.txt",
+            "HELAC-Onia-2.7.6/run_config.ho",
+            "HELAC-Onia-2.7.6/input/*.inp",
+            "HELAC-Onia-2.7.6/input/seed.input",
+            "HELAC-Onia-2.7.6/PROC_HO_*/input/*.inp",
+            "HELAC-Onia-2.7.6/PROC_HO_*/input/seed.input",
+            "HELAC-Onia-2.7.6/PROC_HO_*/P[0-9]*_calc_*/input/*.inp",
+            "HELAC-Onia-2.7.6/PROC_HO_*/P[0-9]*_calc_*/input/seed.input",
+            "HELAC-Onia-2.7.6/PROC_HO_*/P[0-9]*_calc_*/output/RESULT_*.out",
+            "HELAC-Onia-2.7.6/PROC_HO_*/P[0-9]*_calc_*/output/screen_output.txt",
+            "HELAC-Onia-2.7.6/PROC_HO_*/P[0-9]*_calc_*/output/screen_error.txt",
+            "HELAC-Onia-2.7.6/PROC_HO_*/results/*.out",
+        )
+        for pattern in patterns:
+            paths.update(stage_work.glob(pattern))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
+        for path in sorted(paths):
+            relative = path.relative_to(stage_work)
+            if (path.is_file() and not path.is_symlink()
+                    and not any((stage_work / parent).is_symlink()
+                                for parent in relative.parents)):
+                archive.add(path, arcname=str(relative), recursive=False)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", type=Path, required=True)
@@ -108,11 +146,7 @@ def main(argv=None):
         return outcome.returncode
     finally:
         # Return diagnostics, not scratch LHE/HepMC/ROOT payloads or package trees.
-        args.diagnostics.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(args.diagnostics, "w:gz", compresslevel=1) as archive:
-            for path in sorted(stage_work.rglob("*.log")):
-                if path.is_file() and not path.is_symlink():
-                    archive.add(path, arcname=str(path.relative_to(stage_work)), recursive=False)
+        write_diagnostics(task, stage_work, args.diagnostics)
 
 
 if __name__ == "__main__":

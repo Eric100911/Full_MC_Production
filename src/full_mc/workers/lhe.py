@@ -1,4 +1,8 @@
-"""Finite HELAC generation with local native output and one explicit stageout."""
+"""Finite HELAC generation with local native output and one explicit stageout.
+
+Set task parameters.retain_helac_diagnostics to true to retain cards, native
+results and command streams/timings in bootstrap's diagnostics.tar.gz.
+"""
 from __future__ import annotations
 
 import shutil
@@ -18,7 +22,9 @@ def build_command(task, work_dir):
                "--pool", str(p["pool_name"]), "--seed", str(p["seed"]),
                "--nmc", str(nmc), "--unwevt", str(unwevt),
                "--output-dir", "lhe", "--compress-lhe",
-               "--helac-diagnostics", "none", "--log-level",
+               "--helac-diagnostics",
+               "slim" if p.get("retain_helac_diagnostics") is True else "none",
+               "--log-level",
                "info" if task.get("log_level") == "debug" else "slim"]
     process = profile.get("process") or "\n".join(profile.get("process_lines", []))
     if process:
@@ -39,7 +45,9 @@ def execute(task, work_dir):
     source = core_path(task, "common/packages/helac_package.tar.gz")
     shutil.copy2(source, work_dir / "helac_package.tar.gz")
     run(task, "helac-el7", build_command(task, work_dir), work_dir,
-        {"LOCAL_OUTPUT_BASE": str(work_dir / "products"), "SKIP_STAGEOUT": "1"})
+        {"LOCAL_OUTPUT_BASE": str(work_dir / "products"), "SKIP_STAGEOUT": "1",
+         "HELAC_RETAIN_DIAGNOSTICS":
+             "1" if parameters(task).get("retain_helac_diagnostics") is True else "0"})
     p = parameters(task)
     output = work_dir / "products/lhe" / f"sample_{p['pool_name']}_{p['seed']}.lhe.gz"
     events = count_lhe_events(output)

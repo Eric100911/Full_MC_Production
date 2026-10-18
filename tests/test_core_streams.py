@@ -92,6 +92,20 @@ class StreamContracts(unittest.TestCase):
         self.assertEqual([s["source_rng_seed"] for s in node["sources"]],
                          [s["source_rng_seed"] for s in again["nodes"][0]["sources"]])
 
+    def test_global_job_start_changes_edm_and_shower_seeds(self):
+        base = campaign(max_nodes=1)
+        later = Campaign(base.name, base.analysis, base.sources, base.target_mixed_events,
+                         base.max_processing_nodes, base.merge_events,
+                         base.detector_variants, base.resolved_detector_variants,
+                         global_job_index_start=10)
+        inventory = {"pool": blocks(count=2)}
+        first = allocate_shard(base, inventory, build_streams({"campaigns": [base]}), 0, 1, set())
+        next_stage = allocate_shard(later, inventory, build_streams({"campaigns": [later]}), 0, 1, set())
+        self.assertEqual(next_stage["nodes"][0]["global_job_index"], 10)
+        self.assertNotEqual(first["nodes"][0]["edm_event_id"], next_stage["nodes"][0]["edm_event_id"])
+        self.assertNotEqual(first["nodes"][0]["sources"][0]["source_rng_seed"],
+                            next_stage["nodes"][0]["sources"][0]["source_rng_seed"])
+
     def test_temporary_shortage_rolls_back_the_entire_requested_shard(self):
         spec = campaign(max_nodes=3)
         stream_map = build_streams({"campaigns": [spec]})

@@ -102,6 +102,30 @@ class ProductionLifecycle(unittest.TestCase):
         atomic_json(spec_path, spec)
         return spec_path, root / "run"
 
+    def test_merge_group_external_identity_uses_run_offset(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
+            spec_path, run = self.fixture(Path(directory))
+            plan_run(spec_path, run)
+            spec = read_json(run / "run.json")
+            campaign = spec["campaigns"][0]
+            profile = campaign["resolved_detector_variants"][0]
+            phase2 = production._combined(spec, campaign, profile, [], 0)
+            campaign["merge_group_index_start"] = 1
+            phase3 = production._combined(spec, campaign, profile, [], 0)
+            p2 = phase2["subtasks"]["efficiency"]["parameters"]
+            p3 = phase3["subtasks"]["efficiency"]["parameters"]
+            u2 = phase2["subtasks"]["efficiency"]["outputs"][0]["url"]
+            u3 = phase3["subtasks"]["efficiency"]["outputs"][0]["url"]
+            self.assertNotEqual(p2["merge_group"], p3["merge_group"])
+            self.assertNotEqual(u2, u3)
+            self.assertTrue(p2["merge_group"].endswith("MERGE000000"))
+            self.assertTrue(p3["merge_group"].endswith("MERGE000001"))
+            member2 = "shard_" + p2["merge_group"]
+            member3 = "shard_" + p3["merge_group"]
+            self.assertNotEqual(member2, member3)
+            self.assertNotEqual(phase2["subtasks"]["efficiency"]["outputs"][0]["artifact_id"],
+                                phase3["subtasks"]["efficiency"]["outputs"][0]["artifact_id"])
+
     def planner_results(self, run, staged=True):
         pending = read_json(run / "state.json")["pending"]
         plan_id = pending["records"][0]["plan_task"]

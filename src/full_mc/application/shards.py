@@ -17,6 +17,7 @@ from full_mc.domain.identity import shuffle_seed
 from full_mc.domain.inventory import SourceBlock
 from full_mc.domain.streams import allocate_shard, build_streams, may_still_need, next_matching, stream_key
 from full_mc.io import atomic_json, read_json, write_immutable_json
+from full_mc.local_paths import LAYOUT_MARKER, record_path
 from full_mc.planning.graph import token, write_submit_files
 from full_mc.planning.shards import (cleanup_name, shard_name, shard_ranges,
                                      source_name, write_child_dag, write_root_dag)
@@ -45,11 +46,11 @@ def _paths(run_dir):
 
 
 def _manifest_path(root, name):
-    return Path(root) / "ledger" / "shards" / (token(name) + ".json")
+    return record_path(root, "ledger/shards", token(name))
 
 
 def _receipt_path(root, task_id):
-    return Path(root) / "ledger" / "accepted" / (token(task_id) + ".json")
+    return record_path(root, "ledger/accepted", token(task_id))
 
 
 def _receipt(root, state, task_id):
@@ -141,6 +142,7 @@ def plan_run(spec_path, output_dir, log_level=None):
     if root.exists() and any(root.iterdir()):
         raise FileExistsError("run directory is not empty; use existing run for recovery")
     root.mkdir(parents=True, exist_ok=True)
+    (root / LAYOUT_MARKER).touch()
     atomic_json(root / "run.json", spec)
     staging.initialize(root, usable, {"streams": streams, "sources": {},
         "assigned_progress": {c["name"]: 0 for c in spec["campaigns"]},
@@ -381,6 +383,7 @@ def _processing_tasks(spec, allocation, refs, name):
                 "max_hadronization_retries": int(campaign["sources"][slot["slot"]].get("max_hadronization_retries", 5000))})
         parameters = {"campaign": campaign["name"], "analysis": campaign["analysis"],
             "job_id": node["job_id"], "target_mixed_events": node["target_mixed_events"],
+            "global_job_index": node.get("global_job_index", node["job_index"]),
             "edm_event_id": node["edm_event_id"], "normal_shortfall_policy": spec["normal_shortfall_policy"],
             "unused_hepmc_warning_fraction": spec["unused_hepmc_warning_fraction"],
             "processing_environment": spec["processing_environment"]}
@@ -432,7 +435,8 @@ def prepare_shard(run_dir, campaign, shard_index):
                 return _answer(75, reason="waiting for earlier assignments in this campaign")
             blocks, refs, exhausted = _inventory(root, spec, state)
             config = next(c for c in spec["campaigns"] if c["name"] == campaign)
-            allocation = allocate_shard(config, blocks, state["planner"]["streams"], start, width, exhausted)
+            allocation = allocate_shard(config, blocks, state["planner"]["streams"], start, width,
+                                        exhausted, int(config.get("global_job_index_start", 0)))
             if allocation is None:
                 return _answer(75, reason="waiting for a complete shard input range")
             descriptor = _processing_tasks(spec, allocation, refs, name)
@@ -462,9 +466,9 @@ def admit_producer(run_dir, task_id):
             if plan not in state["accepted"]:
                 return _answer(75, reason="source original has no accepted PLAN result")
             task["inputs"] = deepcopy(_receipt(root, state, plan)["originals"])
-        write_immutable_json(root / "tasks" / (identity + ".json"), task)
+        write_immutable_json(record_path(root, "tasks", identity), task)
         return _answer()
-    task = read_json(root / "tasks" / (identity + ".json"))
+    task = read_json(record_path(root, "tasks", identity))
     ceiling = task["parameters"].get("staging_claim_bytes")
     if ceiling is None:
         raise ValueError("producer PRE requires an explicit frozen staging claim")
@@ -560,11 +564,11 @@ def accept_result(run_dir, task_id, return_code=0):
                        reason="worker failed", worker_return_code=int(return_code))
     root, spec = _paths(run_dir)
     identity = token(task_id)
-    task = read_json(root / "tasks" / (identity + ".json"))
+    task = read_json(record_path(root, "tasks", identity))
     with staging.transaction(root) as state:
         if identity in state["accepted"]:
             return _answer(status="accepted")
-        outcome = read_json(root / "results" / (identity + ".json"))
+        outcome = read_json(record_path(root, "results", identity))
         legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
         stage = task["stage"]
         if stage == "plan":
@@ -715,7 +719,7 @@ def prepare_cleanup(run_dir, pool, slot):
                 "urls": [r["url"] for r in _physical_refs(state, task["inputs"])]}
     descriptor = read_json(_manifest_path(root, name))
     task = descriptor["tasks"][0]
-    write_immutable_json(root / "tasks" / (name + ".json"), task)
+    write_immutable_json(record_path(root, "tasks", name), task)
     return _answer(status="prepared", task_id=name)
 
 
@@ -752,7 +756,7 @@ def finalize_run(run_dir):
             for identity, marker in state["accepted"].items():
                 if marker["stage"] != "miniaod":
                     continue
-                task = read_json(root / "tasks" / (identity + ".json"))
+                task = read_json(record_path(root, "tasks", identity))
                 p = task["parameters"]
                 ordered.append((p["campaign"], p["detector_profile_id"],
                                 int(p["job_id"].rsplit("BLOCK", 1)[1]),

@@ -4,10 +4,14 @@
     "helac_2jpsi_g_nlostar_v1": {
       "profile_id": "helac_2jpsi_g_nlostar_v1",
       "availability": "ready",
-      "compatible_pools": ["pool_2jpsi_g"],
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
       "generator_path": "main",
       "process": "generate g g > cc~(3S11) cc~(3S11) g",
-      "process_lines": ["generate g g > cc~(3S11) cc~(3S11) g"],
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
       "nmc": 500000,
       "unwevt": 2000,
       "unwevt_semantics": "main-path-stop-target",
@@ -23,10 +27,14 @@
     "helac_gg_v1": {
       "profile_id": "helac_gg_v1",
       "availability": "ready",
-      "compatible_pools": ["pool_gg"],
+      "compatible_pools": [
+        "pool_gg"
+      ],
       "generator_path": "main",
       "process": "generate g g > g g",
-      "process_lines": ["generate g g > g g"],
+      "process_lines": [
+        "generate g g > g g"
+      ],
       "nmc": 500000,
       "unwevt": 2000,
       "unwevt_semantics": "main-path-stop-target",
@@ -42,10 +50,14 @@
     "helac_2jpsi_cs_v1": {
       "profile_id": "helac_2jpsi_cs_v1",
       "availability": "ready",
-      "compatible_pools": ["pool_2jpsi_cs"],
+      "compatible_pools": [
+        "pool_2jpsi_cs"
+      ],
       "generator_path": "main",
       "process": "generate g g > cc~(3S11) cc~(3S11)",
-      "process_lines": ["generate g g > cc~(3S11) cc~(3S11)"],
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11)"
+      ],
       "nmc": 500000,
       "unwevt": 2000,
       "unwevt_semantics": "main-path-stop-target",
@@ -61,10 +73,14 @@
     "helac_jpsi_csco_g_v1": {
       "profile_id": "helac_jpsi_csco_g_v1",
       "availability": "ready",
-      "compatible_pools": ["pool_jpsi_CSCO_g"],
+      "compatible_pools": [
+        "pool_jpsi_CSCO_g"
+      ],
       "generator_path": "crystalball-addon",
       "process": "addon/pp_psiX_CrystalBall state=J/psi",
-      "process_lines": ["addon/pp_psiX_CrystalBall state=J/psi"],
+      "process_lines": [
+        "addon/pp_psiX_CrystalBall state=J/psi"
+      ],
       "nmc": 500000,
       "unwevt": 2000,
       "unwevt_semantics": "addon-input-not-output-cap",
@@ -80,14 +96,137 @@
     "helac_upsilon_csco_g_v1": {
       "profile_id": "helac_upsilon_csco_g_v1",
       "availability": "unavailable",
-      "blocked_reasons": ["measured HELAC profile is missing"],
-      "compatible_pools": ["pool_upsilon_CSCO_g"]
+      "blocked_reasons": [
+        "measured HELAC profile is missing"
+      ],
+      "compatible_pools": [
+        "pool_upsilon_CSCO_g"
+      ]
     },
     "helac_jpsi_upsilon_csco_v1": {
       "profile_id": "helac_jpsi_upsilon_csco_v1",
       "availability": "unavailable",
-      "blocked_reasons": ["measured HELAC profile is missing"],
-      "compatible_pools": ["pool_jpsi_upsilon_CSCO"]
+      "blocked_reasons": [
+        "measured HELAC profile is missing"
+      ],
+      "compatible_pools": [
+        "pool_jpsi_upsilon_CSCO"
+      ]
+    },
+    "helac_2jpsi_g_nlostar_v06_00_three_stage_a": {
+      "profile_id": "helac_2jpsi_g_nlostar_v06_00_three_stage_a",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > cc~(3S11) cc~(3S11) g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "nmc": 1000000,
+      "unwevt": 100000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1,
+      "cuts": {
+        "min_pt_conia": 6.0,
+        "min_pt_bonia": 4.0,
+        "min_pt_q": 0.0,
+        "min_m_qqp": 3.0969,
+        "min_m_q_beam": 3.0969
+      }
+    },
+    "helac_2jpsi_g_nlostar_v06_00_three_stage_b": {
+      "profile_id": "helac_2jpsi_g_nlostar_v06_00_three_stage_b",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > cc~(3S11) cc~(3S11) g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "nmc": 1000000,
+      "unwevt": 10000000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1,
+      "cuts": {
+        "min_pt_conia": 6.0,
+        "min_pt_bonia": 4.0,
+        "min_pt_q": 0.0,
+        "min_m_qqp": 3.0969,
+        "min_m_q_beam": 3.0969
+      }
+    },
+    "helac_2jpsi_g_nlostar_v06_00_three_stage_c": {
+      "profile_id": "helac_2jpsi_g_nlostar_v06_00_three_stage_c",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > cc~(3S11) cc~(3S11) g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "nmc": 2000000,
+      "unwevt": 100000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1,
+      "cuts": {
+        "min_pt_conia": 6.0,
+        "min_pt_bonia": 4.0,
+        "min_pt_q": 0.0,
+        "min_m_qqp": 3.0969,
+        "min_m_q_beam": 3.0969
+      }
+    },
+    "helac_2jpsi_g_nlostar_v06_00_three_stage_d": {
+      "profile_id": "helac_2jpsi_g_nlostar_v06_00_three_stage_d",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > cc~(3S11) cc~(3S11) g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "nmc": 2000000,
+      "unwevt": 10000000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1,
+      "cuts": {
+        "min_pt_conia": 6.0,
+        "min_pt_bonia": 4.0,
+        "min_pt_q": 0.0,
+        "min_m_qqp": 3.0969,
+        "min_m_q_beam": 3.0969
+      }
+    },
+    "helac_gg_v06_00_three_stage": {
+      "profile_id": "helac_gg_v06_00_three_stage",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_gg"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > g g",
+      "process_lines": [
+        "generate g g > g g"
+      ],
+      "nmc": 500000,
+      "unwevt": 10000000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1,
+      "cuts": {
+        "min_pt_conia": 0.0,
+        "min_pt_bonia": 0.0,
+        "min_pt_q": 4.0,
+        "min_m_qqp": 0.0,
+        "min_m_q_beam": 0.0
+      }
     }
   }
 }
