@@ -381,6 +381,86 @@ PY
 check_pass "Test 13: capped manifest records full input and selected output"
 
 # ---------------------------------------------------------------------------
+# Test 14: Long planner group IDs keep every block filename and event
+# ---------------------------------------------------------------------------
+msg_info "Test 14: Long group ID survives 75 blocks and planner staging"
+GROUP_ID="three_stage_20261018T022046Z_pilot9k_pool_gg_seed96000"
+mkdir -p "${TMP_DIR}/test14"
+python3 "${GEN_PY}" --n-events 149 --output "${TMP_DIR}/test14/input.lhe"
+shuffle_split --input "${TMP_DIR}/test14/input.lhe" \
+    --output-dir "${TMP_DIR}/test14/split" --events-per-block 2 \
+    --seed 42 --mode original-order --filename-prefix "${GROUP_ID}_"
+python3 - "${TMP_DIR}/test14" "${GROUP_ID}" <<'PYTEST14_SPLIT'
+import collections
+import json
+import pathlib
+import re
+import sys
+
+base, group = pathlib.Path(sys.argv[1]), sys.argv[2]
+manifest = json.loads((base / "split/shuffle_split_manifest.json").read_text())
+expected = [f"{group}_block_{index:06d}.lhe" for index in range(75)]
+actual = sorted(path.name for path in (base / "split").glob("*.lhe"))
+assert len(expected[0]) > 63
+assert actual == expected, (len(actual), actual[:2], actual[-2:])
+assert manifest["n_blocks"] == 75
+assert [block["filename"] for block in manifest["blocks"]] == expected
+assert [block["n_events"] for block in manifest["blocks"]] == [2] * 74 + [1]
+assert manifest["event_conservation"]["output_total"] == 149
+
+def event_weights(text):
+    return re.findall(r"<event>\s*\n\s*2 1 (\S+)", text)
+
+source = event_weights((base / "input.lhe").read_text())
+output = []
+for name, block in zip(expected, manifest["blocks"]):
+    weights = event_weights((base / "split" / name).read_text())
+    assert len(weights) == block["n_events"], name
+    output.extend(weights)
+assert len(source) == 149
+assert collections.Counter(output) == collections.Counter(source)
+PYTEST14_SPLIT
+check_pass "Test 14: all 75 full filenames and 149 events match the splitter manifest"
+
+python3 "${BASE_DIR}/tools/plan_lhe_blocks.py" \
+    --pool-name pool_gg --primary-seed 96000 --group-id "${GROUP_ID}" \
+    --lhe-path "${TMP_DIR}/test14/input.lhe" --lhe-event-counts 149 \
+    --output-dir "${TMP_DIR}/test14/manifests" \
+    --block-output-dir "${TMP_DIR}/test14/staged" \
+    --events-per-block 2 --shuffle-seed 42 --shuffle-mode original-order \
+    --lhe-shuffle-split-bin "${TOOL}" --log-level slim
+python3 - "${TMP_DIR}/test14" "${GROUP_ID}" <<'PYTEST14_PLAN'
+import collections
+import gzip
+import json
+import pathlib
+import re
+import sys
+
+base, group = pathlib.Path(sys.argv[1]), sys.argv[2]
+manifest = json.loads(
+    (base / "manifests" / f"plan_manifest_pool_gg_{group}.json").read_text()
+)
+staged = base / "staged" / group
+expected = [f"block_{group}_{index:06d}.lhe.gz" for index in range(75)]
+assert sorted(path.name for path in staged.glob("*.lhe.gz")) == expected
+assert manifest["n_blocks"] == 75
+assert manifest["total_input_events"] == manifest["planned_events"] == 149
+assert [block["filename"] for block in manifest["blocks"]] == expected
+assert [block["n_events"] for block in manifest["blocks"]] == [2] * 74 + [1]
+source = re.findall(r"<event>\s*\n\s*2 1 (\S+)", (base / "input.lhe").read_text())
+output = []
+for name, block in zip(expected, manifest["blocks"]):
+    assert pathlib.Path(block["path"]) == staged / name
+    with gzip.open(staged / name, "rt") as handle:
+        weights = re.findall(r"<event>\s*\n\s*2 1 (\S+)", handle.read())
+    assert len(weights) == block["n_events"], name
+    output.extend(weights)
+assert collections.Counter(output) == collections.Counter(source)
+PYTEST14_PLAN
+check_pass "Test 14: planner stages 75 unique compressed blocks with 149 events"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

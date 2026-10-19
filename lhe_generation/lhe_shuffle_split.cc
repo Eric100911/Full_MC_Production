@@ -17,6 +17,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -25,6 +26,12 @@
 #include <vector>
 
 using namespace std;
+
+static string block_filename(const string &prefix, size_t index) {
+    ostringstream name;
+    name << prefix << "block_" << setw(6) << setfill('0') << index << ".lhe";
+    return name.str();
+}
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -672,9 +679,7 @@ static bool write_lhe_block(
     int n_strata,
     const string &filename_prefix)
 {
-    char fname[64];
-    snprintf(fname, sizeof(fname), "%sblock_%06d.lhe", filename_prefix.c_str(), block_index);
-    string path = output_dir + "/" + fname;
+    string path = output_dir + "/" + block_filename(filename_prefix, block_index);
     string tmp = path + ".tmp";
 
     ofstream ofs(tmp);
@@ -805,8 +810,7 @@ static void write_manifest(
     ofs << "  \"n_blocks\": " << blocks.size() << "," << endl;
     ofs << "  \"blocks\": [" << endl;
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
-        char fname[64];
-        snprintf(fname, sizeof(fname), "%sblock_%06zu.lhe", cfg.filename_prefix.c_str(), bi);
+        string fname = block_filename(cfg.filename_prefix, bi);
         ofs << "    {" << endl;
         ofs << "      \"index\": " << bi << "," << endl;
         ofs << "      \"filename\": \"" << fname << "\"," << endl;
