@@ -87,6 +87,7 @@ def write_root_dag(root, spec):
     (root / "subdags").mkdir(exist_ok=True)
     (root / "logs").mkdir(exist_ok=True)
     write_config(root, spec)
+    limits = spec.get("scheduler", {}).get("maxjobs", {})
     cli = shlex.quote(path_text(Path(spec["core_root"]) / "mcprod"))
     launcher = root / "controller.sh"
     launcher.write_text(
@@ -96,8 +97,9 @@ def write_root_dag(root, spec):
         + f'exec {cli} internal "$phase" --run-dir {shlex.quote(path_text(root))} "$@"\n')
     launcher.chmod(0o755)
     lines = [f"CONFIG {path_text(root / 'dagman.config')}",
-             "MAXJOBS lhe_planning 2", "MAXJOBS block_processing 6",
-             "MAXJOBS lhe_coordination 20"]
+             f"MAXJOBS lhe_planning {int(limits.get('lhe_planning', 2))}",
+             f"MAXJOBS block_processing {int(limits.get('block_processing', 6))}",
+             f"MAXJOBS lhe_coordination {int(limits.get('lhe_coordination', 20))}"]
     pool_parents = {s["pool"]: [] for s in spec["sources"]}
     work = []
     for index in source_order(spec):

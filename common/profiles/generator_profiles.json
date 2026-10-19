@@ -227,6 +227,52 @@
         "min_m_qqp": 0.0,
         "min_m_q_beam": 0.0
       }
+    },
+    "helac_2jpsi_g_nlostar_v06_00_three_stage_pilot_a": {
+      "profile_id": "helac_2jpsi_g_nlostar_v06_00_three_stage_pilot_a",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_2jpsi_g"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > cc~(3S11) cc~(3S11) g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "nmc": 1000000,
+      "unwevt": 100000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 1000,
+      "cuts": {
+        "min_pt_conia": 6.0,
+        "min_pt_bonia": 4.0,
+        "min_pt_q": 0.0,
+        "min_m_qqp": 3.0969,
+        "min_m_q_beam": 3.0969
+      }
+    },
+    "helac_gg_v06_00_three_stage_pilot": {
+      "profile_id": "helac_gg_v06_00_three_stage_pilot",
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_gg"
+      ],
+      "generator_path": "main",
+      "process": "generate g g > g g",
+      "process_lines": [
+        "generate g g > g g"
+      ],
+      "nmc": 500000,
+      "unwevt": 10000000,
+      "unwevt_semantics": "main-path-stop-target",
+      "planning_events_hint": 7000,
+      "cuts": {
+        "min_pt_conia": 0.0,
+        "min_pt_bonia": 0.0,
+        "min_pt_q": 4.0,
+        "min_m_qqp": 0.0,
+        "min_m_q_beam": 0.0
+      }
     }
   }
 }
