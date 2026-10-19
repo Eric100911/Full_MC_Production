@@ -40,9 +40,10 @@ efficiency、最终 handoff。DPS2 同时覆盖 `pool_2jpsi_g:normal` 和
 `pool_gg:phi_mpi_off`；SPS 覆盖 `pool_2jpsi_g:phi_mpi_off`。
 
 Pilot 的 `global_job_index_start` 为 SPS=10、DPS2=10；完成后剩余阶段三
-分别从 SPS=50、DPS2=60 继续。pilot 的 `merge_group_index_start` 为 0；
-剩余阶段三分别从 SPS=4、DPS2=5 继续。EDM event identity 仅由这些全局
-job index 派生；不覆盖 CMSSW RNG seed，随机性来自 HELAC 输入硬散射事件。
+分别从 SPS=50、DPS2=60 继续。阶段二占用 merge group 0，因此 pilot 的
+`merge_group_index_start` 为 1；剩余阶段三分别从 SPS=5、DPS2=6 继续。
+EDM event identity 仅由这些全局 job index 派生；不覆盖 CMSSW RNG seed，
+随机性来自 HELAC 输入硬散射事件。
 
 ## 并发与资源
 
