@@ -200,3 +200,11 @@ and operational lessons are recorded in
 `docs/mcprod_ihep_cutover_pilot_lessons_2026-09-29.md`. The earlier
 `docs/mcprod_dps1_reclaimfix_monitor_prompt_2026-09-24.md` describes a
 historical attempt and must not supply job IDs or runtime paths for a new run.
+
+## Progress history
+
+- [物理研究与生产链路进展](progress_history.md)
+
+## LHE kinematics audit
+
+- [LHE 运动学审计指南](lhe_kinematics_audit.md)
