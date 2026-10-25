@@ -180,7 +180,7 @@ IHEP shell：
 python3 "$IHEP_CORE/mcprod" batch status --manifest "$BATCH/batch_manifest.json"
 ```
 
-该命令按 manifest 的精确 HepJob ID 查询。hep_q 或 xrdfs 空返回在 fork exhaustion 情况只重试一次，再看持久日志、checkpoint和准确产物；空队列不等于失败。**所有任务四阶段 checkpoint identity/status=ok、完整实际输出有效、计数/provenance 正确即可 DONE**；即使 hep_q/history 不再保留作业也停止监控，不继续 reconciliation 循环或补提。
+该命令按 manifest 的精确 HepJob ID 查询。hep_q 或 xrdfs 空返回在 fork exhaustion 情况只重试一次，再看持久日志、checkpoint和准确产物；空队列不等于失败。**所有任务四阶段 checkpoint identity/status=ok、完整实际输出及 sidecar/大小/计数/provenance 均有效即可 DONE**。manifest 的 `scheduler_state=unknown` 只表示精确作业行不可见，不构成未完成或阻塞；达到上述产物条件后停止查询和 reconciliation，不补提。
 
 只有确认失败、需要恢复原运行且未成功完成时，先检查原 outputs/checkpoints/rescue，才可执行下列既有恢复命令；不是补产，不能增加目标或新 source：
 
@@ -212,3 +212,5 @@ analysis_output 应在独立 handoff 中显式设置到本实验 stage2 analysis
 写 `$EXP/stage2/handoff.json`，schema=`three-stage-stage2-v1`，包含 status、experiment_id、stage1_handoff_path、code/runtime/analyzer身份、run_dir/submission与精确 IDs、IHEP batch_manifest/IDs、每 campaign expected=1000 和 actual mixed/component/merged计数、accepted groups及完整四阶段产物/凭据路径、used_source_ids、逐 campaign used_block_refs、local/global_job_indices、实际 EDM 三元组范围及唯一性证据、全部已冻结 HELAC source/shower/MIX seeds、有效线程设置、每slot attempted_lhe/accepted_hepmc/used/unused/retries/wall、phase3_capacity_inputs（选中profile的逐replica实际LHE、stage2实测shower产率）、storage/retained bytes、anchor/deadline及 evidence_paths。0.15 unused-HepMC 只是 warning，不是硬目标或停机条件。
 
 实际每 campaign 恰好1000、10节点100 each、一个1000 merge group、四阶段成功且编号/seed验证通过才写 complete。若任何 shortfall 则写真实不足，禁止承诺阶段三替阶段二补齐。最终只向协调者回结论、退出码和交接/证据路径；完成即停止。
+
+本阶段实际 IHEP cutover 结果见 [`mcprod_three_stage_stage2_1k_pilot_summary_2026-10-25_zh.md`](../mcprod_three_stage_stage2_1k_pilot_summary_2026-10-25_zh.md)。

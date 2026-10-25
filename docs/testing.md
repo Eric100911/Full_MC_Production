@@ -750,8 +750,14 @@ Monitor exact recorded root/job IDs. An empty queue result or an aggregate
 `0 completed`/`0 removed` counter is not a job outcome; retry an empty query
 once, then reconcile against persistent logs, task results, checkpoints, and
 EOS outputs. `batch status` reads only a row matching the recorded HepJob ID;
-an absent or ambiguous row remains unknown. Never remove or resume a DAG/batch
-merely because it looks idle. For a completed small DPS1 cutover example, see
+an absent or ambiguous row may remain `unknown` in the scheduler field. That
+field alone does not keep a task open: when every task has matching
+four-phase checkpoint identities with `status=ok`, and every declared output
+has a valid sidecar and expected size, with applicable count and provenance
+fields matching, mark the batch complete and stop querying. Do not repeat
+scheduler checks or resubmit solely because the scheduler field remains
+`unknown`. Never remove or resume a DAG/batch merely because it looks idle.
+For a completed small DPS1 cutover example, see
 `docs/mcprod_ihep_cutover_pilot_lessons_2026-09-29.md`. The 2026-09-24 DPS1
 monitor prompts are historical and their IDs must not be reused.
 
