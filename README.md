@@ -49,6 +49,8 @@ Two analysis types are supported: **JJP** (`J/psi + J/psi + phi`) and **JUP** (`
 - **`processing/templates/`** — HTCondor submit description files (`.sub`) per machine environment and DAG node type (including `plan_lhe_blocks.sub`, `coordinate_lhe_blocks.sub`, `compress.sub`, `transfer_compress.sub`).
 - **`tests/`** — Shell-based test harness: `run_all_tests.sh` (main entry), `mock_test_worker.sh` (local worker-bundle/config mock), `submit_tests.sh` (per-campaign smoke DAGs), `submit_lhe_matrix.sh` (LHE pool matrix), `test_lhe_shuffle_split.sh` (shuffle-split unit tests), `test_octet_pdg_tool.sh` (PDG mapping self-check), plus `generate_synthetic_lhe.py` and `check_y_symmetry.py`.
 - **`docs/testing.md`** — Canonical static, mock, component, pilot, output-verification, and cleanup procedures.
+- **[`docs/progress_history.md`](docs/progress_history.md)** — 按日期整理的物理问题、样本证据与生产链路演进。
+- **[`docs/lhe_kinematics_audit.md`](docs/lhe_kinematics_audit.md)** — LHE 运动学与重复样本审计工具的配置、运行方式和报告边界。
 - **`docs/`** — Design notes, investigation reports, and review documents.
 
 ## Environment setup
