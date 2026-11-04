@@ -273,6 +273,29 @@
         "min_m_qqp": 0.0,
         "min_m_q_beam": 0.0
       }
+    },
+    "helac_gg_v1_unwevt100k_20261014": {
+      "availability": "ready",
+      "compatible_pools": [
+        "pool_gg"
+      ],
+      "cuts": {
+        "min_m_q_beam": 0.0,
+        "min_m_qqp": 0.0,
+        "min_pt_bonia": 0.0,
+        "min_pt_conia": 0.0,
+        "min_pt_q": 4.0
+      },
+      "generator_path": "main",
+      "nmc": 500000,
+      "planning_events_hint": 2000,
+      "process": "generate g g > g g",
+      "process_lines": [
+        "generate g g > g g"
+      ],
+      "profile_id": "helac_gg_v1_unwevt100k_20261014",
+      "unwevt": 100000,
+      "unwevt_semantics": "main-path-stop-target"
     }
   }
 }

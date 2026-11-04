@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from .profiles import load_catalogues, resolve_detector_variants, resolve_source
+from .planning.script_defer import resolve_script_defer
 from .storage.layout import (
     canonical_storage_location,
     storage_location_is_within,
@@ -95,6 +96,7 @@ def _validate_scheduler_and_resources(spec):
             scheduler[key] = _integer(scheduler[key], f"scheduler.{key}", minimum=1)
     if "submit_delay" in scheduler:
         scheduler["submit_delay"] = _integer(scheduler["submit_delay"], "scheduler.submit_delay")
+    resolve_script_defer(scheduler)
     spec["scheduler"] = scheduler
 
     resources = spec.get("resources", {})

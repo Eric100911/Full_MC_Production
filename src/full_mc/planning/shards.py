@@ -7,6 +7,8 @@ import tempfile
 from full_mc.io import write_immutable_json
 from full_mc.local_paths import dag_path, record_path, task_variables
 from full_mc.planning.graph import CATEGORIES, path_text, token
+from full_mc.planning.script_defer import (resolve_script_defer,
+                                           validate_script_defer_seconds)
 
 DEFER = 75
 SKIP = 99
@@ -59,8 +61,9 @@ def shard_ranges(spec):
             for i, start in enumerate(range(0, int(c["max_processing_nodes"]), width))]
 
 
-def _script(root, phase, name, arguments, post=False):
-    command = "SCRIPT DEFER 75 60 " + ("POST" if post else "PRE")
+def _script(root, phase, name, arguments, interval, post=False):
+    interval = validate_script_defer_seconds(interval)
+    command = f"SCRIPT DEFER 75 {interval} " + ("POST" if post else "PRE")
     return f"{command} {name} {path_text(Path(root) / 'controller.sh')} {phase} {arguments}"
 
 
@@ -87,6 +90,7 @@ def write_root_dag(root, spec):
     (root / "subdags").mkdir(exist_ok=True)
     (root / "logs").mkdir(exist_ok=True)
     write_config(root, spec)
+    defer_seconds = resolve_script_defer(spec.get("scheduler", {}))["default_seconds"]
     limits = spec.get("scheduler", {}).get("maxjobs", {})
     cli = shlex.quote(path_text(Path(spec["core_root"]) / "mcprod"))
     launcher = root / "controller.sh"
@@ -110,8 +114,9 @@ def write_root_dag(root, spec):
         args = f"--source-index {index}"
         lines += [f"SUBDAG EXTERNAL {name} {path_text(child_path(root, name))}",
                   f"CATEGORY {name} lhe_planning",
-                  _script(root, "prepare-source", name, args), f"PRE_SKIP {name} 99",
-                  _script(root, "complete-source", name, args + " --return-code $RETURN", True)]
+                  _script(root, "prepare-source", name, args, defer_seconds), f"PRE_SKIP {name} 99",
+                  _script(root, "complete-source", name, args + " --return-code $RETURN",
+                          defer_seconds, True)]
     campaigns = {c["name"]: c for c in spec["campaigns"]}
     for campaign, index, _, _ in shard_ranges(spec):
         name = shard_name(campaign, index)
@@ -121,8 +126,9 @@ def write_root_dag(root, spec):
         args = f"--campaign {campaign} --shard-index {index}"
         lines += [f"SUBDAG EXTERNAL {name} {path_text(child_path(root, name))}",
                   f"CATEGORY {name} block_processing",
-                  _script(root, "prepare-shard", name, args), f"PRE_SKIP {name} 99",
-                  _script(root, "complete-shard", name, args + " --return-code $RETURN", True)]
+                  _script(root, "prepare-shard", name, args, defer_seconds), f"PRE_SKIP {name} 99",
+                  _script(root, "complete-shard", name, args + " --return-code $RETURN",
+                          defer_seconds, True)]
     def cleanup_job(name, pool, slot):
         resource = spec.get("resources", {}).get("reclaim", {})
         disk = (int(resource.get("disk_bytes", 4_000_000_000)) + 1023) // 1024
@@ -132,9 +138,11 @@ def write_root_dag(root, spec):
                 f"CATEGORY {name} lhe_coordination",
                 f'VARS {name} task="{name}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, name)}',
                 f"RETRY {name} 1",
-                _script(root, "prepare-cleanup", name, f"--pool {pool} --slot {slot}"),
+                _script(root, "prepare-cleanup", name, f"--pool {pool} --slot {slot}",
+                        defer_seconds),
                 f"PRE_SKIP {name} 99",
-                _script(root, "accept-result", name, f"--task-id {name} --return-code $RETURN", True)]
+                _script(root, "accept-result", name, f"--task-id {name} --return-code $RETURN",
+                        defer_seconds, True)]
 
     final_cleanups = []
     for pool, parents in sorted(pool_parents.items()):
@@ -151,7 +159,7 @@ def write_root_dag(root, spec):
             lines.append("PARENT " + " ".join(work + earlier) + " CHILD " + name)
     (root / "submit" / "noop.sub").write_text("universe = local\nexecutable = /bin/true\nqueue\n")
     lines += [f"JOB FINALIZE {path_text(root / 'submit' / 'noop.sub')} NOOP",
-              _script(root, "finalize-shards", "FINALIZE", "")]
+              _script(root, "finalize-shards", "FINALIZE", "", defer_seconds)]
     if final_cleanups:
         lines.append("PARENT " + " ".join(final_cleanups) + " CHILD FINALIZE")
     path = root / "run.dag"
@@ -162,6 +170,7 @@ def write_root_dag(root, spec):
 def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
     """Render after allocation commit; retries repair missing DAG/task files."""
     root = Path(root)
+    defer = resolve_script_defer(spec.get("scheduler", {}))
     lines = [f"CONFIG {path_text(root / 'dagman.config')}"]
     limits = spec.get("scheduler", {}).get("maxjobs", {})
     for category in sorted(set(CATEGORIES.values())):
@@ -181,9 +190,12 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
                   f'VARS {identity} task="{identity}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, identity)}',
                   f"RETRY {identity} 1"]
         if identity in claims:
-            lines.append(_script(root, "admit-producer", identity, f"--task-id {identity}"))
+            lines.append(_script(root, "admit-producer", identity,
+                                 f"--task-id {identity}", defer["default_seconds"]))
         lines.append(_script(root, "accept-result", identity,
-                             f"--task-id {identity} --return-code $RETURN", True))
+                             f"--task-id {identity} --return-code $RETURN",
+                             defer["plan_accept_post_seconds"] if stage == "plan"
+                             else defer["default_seconds"], True))
     for parents, child in dependencies:
         if parents:
             lines.append("PARENT " + " ".join(map(token, parents)) + " CHILD " + token(child))

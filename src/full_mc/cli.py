@@ -33,6 +33,47 @@ def build_parser():
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--profile", action="append")
     p.add_argument("--core", type=Path, default=CORE_ROOT)
+    controller = commands.add_parser("controller").add_subparsers(dest="action", required=True)
+    p = _leaf(controller, "prepare", "Prepare a separate immutable submit-host controller build")
+    p.add_argument("--core", type=Path, default=CORE_ROOT)
+    p.add_argument("--release", required=True, help="fixed controller build ID")
+    p.add_argument("--output-dir", type=Path, required=True,
+                   help="new, absent controller build directory")
+    p = _leaf(controller, "status", "Inspect the run's controller launcher without contacting Condor")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p = _leaf(controller, "activate", "Atomically switch a run to a prepared controller build")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--build-dir", type=Path, required=True)
+    p.add_argument("--control-events", action="store_true",
+                   help="enable append-only controller control event logging")
+    p.add_argument("--admission-hints", action="store_true",
+                   help="enable the optional first-wave admission hint")
+    p.add_argument("--producer-index", action="store_true",
+                   help="enable the optional accepted-producer lookup index")
+    p.add_argument("--plan-accept-post-seconds", type=int,
+                   help="override PLAN accept-result POST interval for future child DAG renders")
+    p.add_argument("--maintenance-pause", action="store_true",
+                   help="make DAG controller PRE/POST launcher calls return temporary hold 75")
+    p = _leaf(controller, "rollback", "Restore the exact launcher saved before activation")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--expect-build", help="require this build ID to be active before rollback")
+    p = _leaf(controller, "sync", "Rebuild the optional producer index under the state lock")
+    p.add_argument("--run-dir", type=Path, required=True)
+    inventory = commands.add_parser("inventory").add_subparsers(dest="action", required=True)
+    p = _leaf(inventory, "migrate-v2", "Checkpoint and migrate a run ledger to PLAN inventory v2")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, required=True,
+                   help="new immutable checkpoint path inside the run directory")
+    p = _leaf(inventory, "rollback-v2", "Restore an unchanged ledger from its migration checkpoint")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, required=True)
+    recovery = commands.add_parser("recovery").add_subparsers(dest="action", required=True)
+    p = _leaf(recovery, "accept-archive-orphan",
+              "Accept one archive task with an orphan receipt and only a local_path difference")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--task-id", required=True)
+    p.add_argument("--confirm-no-active-writer", action="store_true", required=True,
+                   help="assert the matching archive task has no running or restartable writer")
     runs = commands.add_parser("run").add_subparsers(dest="action", required=True)
     p = _leaf(runs, "plan", "Freeze a run and prepare its DAG without submitting")
     p.add_argument("--spec", type=Path, required=True)
@@ -132,6 +173,34 @@ def dispatch(args):
         from .runtime.packages import prepare_runtime
         destination = args.output_dir or args.workspace / "runtimes" / args.release / args.site
         return prepare_runtime(args.core, destination, args.release, args.site, profiles=args.profile)
+    if args.command == "controller":
+        from .runtime import controllers
+        if args.action == "prepare":
+            return controllers.prepare_controller(args.core, args.output_dir, args.release)
+        if args.action == "status":
+            return controllers.controller_status(args.run_dir)
+        if args.action == "activate":
+            return controllers.activate_controller(
+                args.run_dir, args.build_dir, control_events=args.control_events,
+                admission_hints=args.admission_hints,
+                producer_index=args.producer_index,
+                plan_accept_post_seconds=args.plan_accept_post_seconds,
+                maintenance_pause=args.maintenance_pause,
+            )
+        if args.action == "sync":
+            return controllers.sync_producer_index(args.run_dir)
+        return controllers.rollback_controller(args.run_dir, expect_build=args.expect_build)
+    if args.command == "inventory":
+        from .application import shards
+        if args.action == "migrate-v2":
+            return shards.migrate_inventory_v2(
+                args.run_dir, checkpoint_path=args.checkpoint)
+        return shards.rollback_inventory_v2_from_checkpoint(
+            args.run_dir, args.checkpoint)
+    if args.command == "recovery":
+        from .application.shards import recover_archive_orphan
+        return recover_archive_orphan(args.run_dir, args.task_id,
+                                      confirm_no_active_writer=args.confirm_no_active_writer)
     if args.command == "run":
         from .application import production
         if args.action == "plan":

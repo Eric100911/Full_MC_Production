@@ -4,13 +4,16 @@ DAGMan remains the execution authority. This controller accepts immutable worker
 results, allocates finite inputs and maintains the shared staging byte ledger.
 No function in the scheduling seams contacts remote storage.
 """
+import hashlib
+import json
+import time
 from collections import defaultdict
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 
-from full_mc.application import production as legacy
-from full_mc.application import staging
+from full_mc.application import (admission_hints, control_events, producer_index,
+                                 production as legacy, staging)
 from full_mc.application.ledger import load_groups, sample_key, write_group
 from full_mc.credentials import resolve_proxy_path
 from full_mc.domain.identity import shuffle_seed
@@ -19,19 +22,84 @@ from full_mc.domain.streams import allocate_shard, build_streams, may_still_need
 from full_mc.io import atomic_json, read_json, write_immutable_json
 from full_mc.local_paths import LAYOUT_MARKER, record_path
 from full_mc.planning.graph import token, write_submit_files
-from full_mc.planning.shards import (cleanup_name, shard_name, shard_ranges,
-                                     source_name, write_child_dag, write_root_dag)
+from full_mc.planning.script_defer import (controller_render_override,
+                                           resolve_script_defer)
+from full_mc.planning.shards import (child_path, cleanup_name, shard_name,
+                                     shard_ranges, source_name, write_child_dag,
+                                     write_root_dag)
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.settings import load_run_spec
 
+_INVENTORY_CHECKPOINT_SCHEMA = "mcprod-inventory-v2-checkpoint-v1"
+
 
 def _entry(function):
+    def argument(args, kwargs, name, position):
+        if name in kwargs:
+            return kwargs[name]
+        return args[position] if len(args) > position else None
+
     @wraps(function)
     def call(*args, **kwargs):
         try:
-            return function(*args, **kwargs)
-        except BlockingIOError:
+            if not control_events.enabled():
+                try:
+                    return function(*args, **kwargs)
+                except staging.Deferred as exc:
+                    return _answer(exc.code, reason=exc.reason)
+                except staging.LockBusy:
+                    return {"exit_code": 75, "reason": "local state lock busy"}
+            run_dir = kwargs.get("run_dir", args[0] if args else None)
+            task_id = kwargs.get("task_id")
+            if task_id is None:
+                if function.__name__ in {"admit_producer", "accept_result",
+                                         "recover_archive_orphan"}:
+                    task_id = argument(args, kwargs, "task_id", 1)
+                elif function.__name__ == "prepare_source":
+                    index = argument(args, kwargs, "source_index", 1)
+                    task_id = source_name(int(index)) if index is not None else None
+                elif function.__name__ == "prepare_shard":
+                    campaign = argument(args, kwargs, "campaign", 1)
+                    shard_index = argument(args, kwargs, "shard_index", 2)
+                    task_id = (shard_name(campaign, int(shard_index))
+                               if campaign is not None and shard_index is not None
+                               else None)
+                elif function.__name__ == "complete_source":
+                    index = argument(args, kwargs, "source_index", 1)
+                    task_id = source_name(int(index)) if index is not None else None
+                elif function.__name__ == "complete_shard":
+                    campaign = argument(args, kwargs, "campaign", 1)
+                    shard_index = argument(args, kwargs, "shard_index", 2)
+                    task_id = (shard_name(campaign, int(shard_index))
+                               if campaign is not None and shard_index is not None
+                               else None)
+                elif function.__name__ == "prepare_cleanup":
+                    pool = argument(args, kwargs, "pool", 1)
+                    slot = argument(args, kwargs, "slot", 2)
+                    task_id = (cleanup_name(pool, int(slot))
+                               if pool is not None and slot is not None else None)
+                elif len(args) > 1:
+                    task_id = ":".join(str(value) for value in args[1:])
+            metadata = {"run_dir": str(run_dir) if run_dir is not None else None,
+                        "task": str(task_id) if task_id is not None else None}
+            with control_events.operation(function.__name__, metadata) as event:
+                try:
+                    result = function(*args, **kwargs)
+                except staging.Deferred as exc:
+                    result = _answer(exc.code, reason=exc.reason)
+                except staging.LockBusy:
+                    result = {"exit_code": 75, "reason": "local state lock busy"}
+                if event is not None:
+                    event["outcome"] = str(
+                        result.get("status", result.get("exit_code", "ok")))
+                    if "exit_code" in result:
+                        event["exit_code"] = result["exit_code"]
+                    if "reason" in result:
+                        event["reason"] = result["reason"]
+                    event["admission_hint"] = bool(result.get("admission_hint", False))
+                return result
+        except staging.LockBusy:
             return {"exit_code": 75, "reason": "local state lock busy"}
     return call
 
@@ -42,7 +110,10 @@ def _answer(code=0, **extra):
 
 def _paths(run_dir):
     root = Path(run_dir).resolve()
-    return root, read_json(root / "run.json")
+    spec = read_json(root / "run.json")
+    control_events.update_metadata(run_id=spec.get("run_id"),
+                                  runtime_release=spec.get("runtime_release"))
+    return root, spec
 
 
 def _manifest_path(root, name):
@@ -56,13 +127,33 @@ def _receipt_path(root, task_id):
 def _receipt(root, state, task_id):
     if task_id not in state["accepted"]:
         raise RuntimeError("task has no accepted result: " + task_id)
-    return read_json(_receipt_path(root, task_id))
+    timed = control_events.active()
+    started = time.perf_counter() if timed else None
+    try:
+        return read_json(_receipt_path(root, task_id))
+    finally:
+        if timed:
+            control_events.record_io("receipt_read", time.perf_counter() - started)
 
 
-def _render(root, name, spec):
+def _render(root, name, spec, *, allow_plan_accept_post_override=False):
+    path = child_path(root, name)
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"existing child DAG is not a regular file: {path}")
+        return _answer(dag=str(path), status="prepared", preserved_existing=True)
     manifest = read_json(_manifest_path(root, name))
+    render_spec = deepcopy(spec)
+    if allow_plan_accept_post_override:
+        override = controller_render_override(root)
+        if override is not None:
+            scheduler = render_spec.setdefault("scheduler", {})
+            defer = resolve_script_defer(scheduler)
+            script_defer = scheduler.setdefault("script_defer", {})
+            script_defer["default_seconds"] = defer["default_seconds"]
+            script_defer["plan_accept_post_seconds"] = override
     path = write_child_dag(root, name, manifest["tasks"], manifest["dependencies"],
-                           spec, manifest.get("pre_tasks", manifest.get("claims", {})))
+                           render_spec, manifest.get("pre_tasks", manifest.get("claims", {})))
     return _answer(dag=str(path), status="prepared")
 
 
@@ -156,9 +247,30 @@ def plan_run(spec_path, output_dir, log_level=None):
 
 
 def _inventory(root, spec, state):
-    """Pool indexes expose only their own frozen, contiguous accepted prefix."""
+    """Build pool indexes using the run's selected inventory ordering model."""
     refs, blocks, exhausted = {}, defaultdict(list), set()
     pools = {source["pool"] for source in spec["sources"]}
+    if state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
+        segments = state["planner"]["inventory_segments"]["pools"]
+        if set(segments) != pools:
+            raise RuntimeError("PLAN inventory pools disagree with the frozen source spec")
+        for pool in pools:
+            for identity in segments[pool]:
+                index = int(identity.removeprefix("PLAN_"))
+                if index >= len(spec["sources"]) or spec["sources"][index]["pool"] != pool:
+                    raise RuntimeError("PLAN inventory segment disagrees with its frozen source")
+                source = spec["sources"][index]
+                for ref in _receipt(root, state, identity)["outputs"]:
+                    refs[ref["artifact_id"]] = ref
+                    blocks[pool].append(SourceBlock(ref["artifact_id"], pool,
+                        source["source_id"], len(blocks[pool]), int(ref["events"]), ref["url"]))
+            if all(state["planner"]["sources"].get(str(index)) == "skipped"
+                   or f"PLAN_{index:06d}" in state["accepted"]
+                   for index, source in enumerate(spec["sources"])
+                   if source["pool"] == pool):
+                exhausted.add(pool)
+        return dict(blocks), refs, exhausted
+
     for pool in pools:
         complete = True
         for index, source in enumerate(spec["sources"]):
@@ -178,6 +290,268 @@ def _inventory(root, spec, state):
         if complete:
             exhausted.add(pool)
     return dict(blocks), refs, exhausted
+
+
+def _canonical_digest(value):
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_path(root, path):
+    path = Path(path).expanduser().resolve(strict=False)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("inventory checkpoint must be inside its run directory") from exc
+    if (path.parent != root / ".controller-switch"
+            or not path.parent.is_dir()
+            or path == root / "state.json"
+            or path.is_symlink()
+            or (path.exists() and not path.is_file())):
+        raise ValueError("invalid inventory checkpoint path")
+    return path
+
+
+def _checkpoint_expected_state(checkpoint, root, spec):
+    required = {"schema", "run_dir", "run_id", "run_spec_sha256",
+                "original_v1_state", "original_v1_sha256",
+                "inventory_segments", "expected_v2_sha256"}
+    if not isinstance(checkpoint, dict) or set(checkpoint) != required:
+        raise ValueError("invalid inventory migration checkpoint")
+    if (checkpoint["schema"] != _INVENTORY_CHECKPOINT_SCHEMA
+            or checkpoint["run_dir"] != str(root)
+            or checkpoint["run_id"] != spec.get("run_id")
+            or checkpoint["run_spec_sha256"] != _canonical_digest(spec)):
+        raise ValueError("inventory checkpoint belongs to a different run or spec")
+    original = checkpoint["original_v1_state"]
+    if (not isinstance(original, dict)
+            or original.get("state_schema") != staging.STATE_SCHEMA
+            or checkpoint["original_v1_sha256"] != _canonical_digest(original)):
+        raise ValueError("inventory checkpoint v1 state checksum is invalid")
+    expected = deepcopy(original)
+    expected["state_schema"] = staging.INVENTORY_STATE_SCHEMA
+    expected.setdefault("planner", {})["inventory_segments"] = deepcopy(
+        checkpoint["inventory_segments"])
+    if checkpoint["expected_v2_sha256"] != _canonical_digest(expected):
+        raise ValueError("inventory checkpoint v2 state checksum is invalid")
+    staging._check(original)
+    staging._check(expected)
+    return original, expected
+
+
+def _write_inventory_checkpoint(path, root, spec, original, expected):
+    checkpoint = {
+        "schema": _INVENTORY_CHECKPOINT_SCHEMA,
+        "run_dir": str(root),
+        "run_id": spec.get("run_id"),
+        "run_spec_sha256": _canonical_digest(spec),
+        # Store the original state once; expected v2 is reconstructed from its
+        # schema field and the small append-only pool index.
+        "original_v1_state": deepcopy(original),
+        "original_v1_sha256": _canonical_digest(original),
+        "inventory_segments": deepcopy(
+            expected["planner"]["inventory_segments"]),
+        "expected_v2_sha256": _canonical_digest(expected),
+    }
+    write_immutable_json(path, checkpoint)
+    return checkpoint
+
+
+def migrate_inventory_v2(run_dir, *, checkpoint_path=None):
+    """Migrate an independent v1 ledger to append-ordered PLAN segments.
+
+    The currently visible v1 prefix keeps its exact order. Accepted PLAN
+    results hidden behind a missing source are appended afterward in source
+    order, so no block index already present in an allocation can move.
+    """
+    root, spec = _paths(run_dir)
+    checkpoint = (_checkpoint_path(root, checkpoint_path)
+                  if checkpoint_path is not None else None)
+    with staging.transaction(root) as state:
+        if state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
+            checkpoint_record = None
+            if checkpoint is not None:
+                checkpoint_record = read_json(checkpoint)
+                _, expected = _checkpoint_expected_state(checkpoint_record, root, spec)
+                if state != expected:
+                    raise RuntimeError("ledger differs from the migration checkpoint")
+            _inventory(root, spec, state)
+            result = {"status": "already migrated"}
+            if checkpoint_record is not None:
+                result.update({"run_id": spec.get("run_id"),
+                    "checkpoint": str(checkpoint),
+                    "run_spec_sha256": checkpoint_record["run_spec_sha256"],
+                    "v1_state_sha256": checkpoint_record["original_v1_sha256"],
+                    "v2_state_sha256": checkpoint_record["expected_v2_sha256"],
+                    "state_schema": staging.INVENTORY_STATE_SCHEMA})
+            return result
+
+        old_blocks, _, _ = _inventory(root, spec, state)
+        old_indices = {pool: {block.artifact_id: block.index for block in blocks}
+                       for pool, blocks in old_blocks.items()}
+        pools = {source["pool"] for source in spec["sources"]}
+        segments = {pool: [] for pool in pools}
+        exposed = set()
+        for pool in pools:
+            for index, source in enumerate(spec["sources"]):
+                if source["pool"] != pool:
+                    continue
+                status = state["planner"]["sources"].get(str(index))
+                if status == "skipped":
+                    continue
+                identity = f"PLAN_{index:06d}"
+                if identity not in state["accepted"]:
+                    break
+                segments[pool].append(identity)
+                exposed.add(identity)
+
+        accepted_plans = sorted((identity for identity, marker in state["accepted"].items()
+                                 if isinstance(marker, dict) and marker.get("stage") == "plan"),
+                                key=lambda identity: int(identity[5:])
+                                if identity.startswith("PLAN_") and identity[5:].isascii()
+                                and identity[5:].isdigit()
+                                else -1)
+        for identity in accepted_plans:
+            if (not identity.startswith("PLAN_") or not identity[5:].isascii()
+                    or not identity[5:].isdigit()
+                    or f"PLAN_{int(identity[5:]):06d}" != identity):
+                raise RuntimeError("accepted PLAN marker has an invalid identity")
+            index = int(identity[5:])
+            if index >= len(spec["sources"]):
+                raise RuntimeError("accepted PLAN result is outside the frozen source list")
+            source = spec["sources"][index]
+            if state["planner"]["sources"].get(str(index)) not in {"admitted", "completed"}:
+                raise RuntimeError("accepted PLAN source has an inconsistent planner state")
+            task = read_json(record_path(root, "tasks", identity))
+            outcome = _receipt(root, state, identity)
+            legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
+            legacy._validate_planner_result(root, spec,
+                {"plan_task": identity, "source_index": index}, outcome)
+            if identity not in exposed:
+                # Hidden results have never been safe to reclaim through
+                # v1 inventory cleanup. Verify that migration will not make
+                # an already absent block allocatable.
+                for ref in outcome["outputs"]:
+                    physical = state["staging"]["objects"].get(ref["url"])
+                    if (not physical or not physical.get("resident")
+                            or any(physical.get(key) != ref.get(key)
+                                   for key in ("artifact_id", "url", "kind", "size_bytes"))):
+                        raise RuntimeError("hidden accepted PLAN block is not resident")
+                segments[source["pool"]].append(identity)
+
+        candidate = deepcopy(state)
+        candidate["state_schema"] = staging.INVENTORY_STATE_SCHEMA
+        candidate["planner"]["inventory_segments"] = {
+            "schema": staging.INVENTORY_SEGMENT_SCHEMA,
+            "pools": segments,
+        }
+        new_blocks, _, _ = _inventory(root, spec, candidate)
+        new_indices = {pool: {block.artifact_id: block.index for block in blocks}
+                       for pool, blocks in new_blocks.items()}
+        for pool, index_by_id in old_indices.items():
+            for artifact_id, index in index_by_id.items():
+                if new_indices.get(pool, {}).get(artifact_id) != index:
+                    raise RuntimeError("migration would renumber a legacy inventory block")
+
+        # Frozen allocation manifests are the durable record of which pool
+        # ordinals workers consumed. Prove every stored reference retains that
+        # exact ordinal before switching the state schema.
+        campaigns = {campaign["name"]: campaign for campaign in spec["campaigns"]}
+        for name, allocation_state in state["allocations"].items():
+            manifest = read_json(_manifest_path(root, name))
+            allocation = manifest.get("allocation")
+            if not isinstance(allocation, dict) or allocation.get("campaign") not in campaigns:
+                raise RuntimeError("existing allocation manifest has no valid allocation")
+            if (allocation.get("campaign") != allocation_state.get("campaign")
+                    or allocation.get("start_job_index") != allocation_state.get("start_job_index")
+                    or not isinstance(allocation.get("nodes"), list)
+                    or len(allocation["nodes"]) != allocation_state.get("node_count")):
+                raise RuntimeError("existing allocation manifest disagrees with its state marker")
+            campaign = campaigns[allocation["campaign"]]
+            for node in allocation.get("nodes", []):
+                slots = node.get("sources")
+                if not isinstance(slots, list) or len(slots) != len(campaign["sources"]):
+                    raise RuntimeError("existing allocation manifest has incomplete source slots")
+                if [slot.get("slot") for slot in slots] != list(range(len(campaign["sources"]))):
+                    raise RuntimeError("existing allocation manifest source slots are reordered")
+                for slot in slots:
+                    slot_index = slot.get("slot")
+                    if type(slot_index) is not int or not 0 <= slot_index < len(campaign["sources"]):
+                        raise RuntimeError("existing allocation manifest has an invalid source slot")
+                    pool = campaign["sources"][slot_index]["pool"]
+                    if slot.get("pool") != pool:
+                        raise RuntimeError("existing allocation manifest pool disagrees with its slot")
+                    block_refs = slot.get("block_refs")
+                    if not isinstance(block_refs, list) or not block_refs:
+                        raise RuntimeError("existing allocation manifest has no block references")
+                    for artifact_id in block_refs:
+                        old_index = old_indices.get(pool, {}).get(artifact_id)
+                        if (old_index is None
+                                or new_indices.get(pool, {}).get(artifact_id) != old_index):
+                            raise RuntimeError("existing allocation reference is absent or renumbered")
+
+        checkpoint_record = None
+        if checkpoint is not None:
+            checkpoint_record = _write_inventory_checkpoint(
+                checkpoint, root, spec, state, candidate)
+
+        state["planner"]["inventory_segments"] = candidate["planner"]["inventory_segments"]
+        state["state_schema"] = staging.INVENTORY_STATE_SCHEMA
+        result = {"status": "migrated", "segments": sum(map(len, segments.values())),
+                  "hidden_segments": len(accepted_plans) - len(exposed)}
+        if checkpoint_record is not None:
+            result.update({"run_id": spec.get("run_id"),
+                "checkpoint": str(checkpoint),
+                "run_spec_sha256": checkpoint_record["run_spec_sha256"],
+                "v1_state_sha256": checkpoint_record["original_v1_sha256"],
+                "v2_state_sha256": checkpoint_record["expected_v2_sha256"],
+                "state_schema": staging.INVENTORY_STATE_SCHEMA})
+        return result
+
+
+def rollback_inventory_v2_from_checkpoint(run_dir, checkpoint_path):
+    """Restore the exact checkpointed v1 ledger if no post-migration write occurred."""
+    root, spec = _paths(run_dir)
+    checkpoint_file = _checkpoint_path(root, checkpoint_path)
+    checkpoint = read_json(checkpoint_file)
+    original, expected = _checkpoint_expected_state(checkpoint, root, spec)
+    result = rollback_inventory_v2(root, original_v1_state=original,
+                                   expected_v2_state=expected)
+    result.update({"run_id": spec.get("run_id"), "checkpoint": str(checkpoint_file),
+                   "run_spec_sha256": checkpoint["run_spec_sha256"],
+                   "v1_state_sha256": checkpoint["original_v1_sha256"],
+                   "v2_state_sha256": checkpoint["expected_v2_sha256"],
+                   "state_schema": staging.STATE_SCHEMA})
+    return result
+
+
+def rollback_inventory_v2(run_dir, *, original_v1_state, expected_v2_state):
+    """Restore a caller-held v1 snapshot only while the ledger is unchanged.
+
+    This offline rehearsal hook deliberately creates no checkpoint file. The
+    caller must retain both snapshots. Any accepted work or state mutation
+    after migration makes the equality check fail and requires forward repair.
+    """
+    root, _ = _paths(run_dir)
+    original = deepcopy(original_v1_state)
+    expected = deepcopy(expected_v2_state)
+    if original.get("state_schema") != staging.STATE_SCHEMA:
+        raise ValueError("rollback snapshot is not a v1 staging state")
+    if expected.get("state_schema") != staging.INVENTORY_STATE_SCHEMA:
+        raise ValueError("expected rollback state is not a v2 staging state")
+    baseline = deepcopy(original)
+    baseline["state_schema"] = staging.INVENTORY_STATE_SCHEMA
+    baseline.setdefault("planner", {})["inventory_segments"] = deepcopy(
+        expected.get("planner", {}).get("inventory_segments"))
+    if baseline != expected:
+        raise ValueError("v2 snapshot contains changes beyond inventory migration")
+
+    with staging.transaction(root) as state:
+        if state != expected:
+            raise RuntimeError("ledger changed after migration; rollback is unsafe")
+        state.clear()
+        state.update(original)
+    return {"status": "rolled back"}
 
 
 def _targets(spec, state):
@@ -317,6 +691,13 @@ def prepare_source(run_dir, source_index):
     if not 0 <= index < len(spec["sources"]):
         raise ValueError("unknown source slot")
     name = source_name(index)
+    if admission_hints.enabled() and not _manifest_path(root, name).exists():
+        hint_started = time.perf_counter() if control_events.active() else None
+        reason = admission_hints.reject_source(root, spec, index)
+        if hint_started is not None:
+            control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
+        if reason:
+            return _answer(75, reason=reason, admission_hint=True)
     with staging.transaction(root) as state:
         current = state["planner"]["sources"].get(str(index))
         if current == "skipped":
@@ -329,7 +710,7 @@ def prepare_source(run_dir, source_index):
                 return _answer(99, status="unneeded")
             if any(previous["pool"] == source["pool"] and str(j) not in state["planner"]["sources"]
                    for j, previous in enumerate(spec["sources"][:index])):
-                return _answer(75, reason="waiting for earlier source admission in this pool")
+                raise staging.Deferred("waiting for earlier source admission in this pool")
             deficits, by_campaign = _deficits(root, spec, state)
             if deficits[source["pool"]] <= 0:
                 return _answer(75, reason="pool already supplies the soft planning window")
@@ -366,7 +747,7 @@ def prepare_source(run_dir, source_index):
             _freeze(root, name, descriptor)
             state["planner"]["sources"][str(index)] = "admitted"
             state["status"] = "running"
-    return _render(root, name, spec)
+    return _render(root, name, spec, allow_plan_accept_post_override=True)
 
 
 def _processing_tasks(spec, allocation, refs, name):
@@ -429,16 +810,23 @@ def prepare_shard(run_dir, campaign, shard_index):
     if len(matches) != 1:
         raise ValueError("unknown campaign shard")
     _, _, start, width = matches[0]
+    if admission_hints.enabled() and not _manifest_path(root, name).exists():
+        hint_started = time.perf_counter() if control_events.active() else None
+        reason = admission_hints.reject_shard(root, spec, campaign, start)
+        if hint_started is not None:
+            control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
+        if reason:
+            return _answer(75, reason=reason, admission_hint=True)
     with staging.transaction(root) as state:
         if name not in state["allocations"]:
             if state["planner"]["assigned_progress"][campaign] != start:
-                return _answer(75, reason="waiting for earlier assignments in this campaign")
+                raise staging.Deferred("waiting for earlier assignments in this campaign")
             blocks, refs, exhausted = _inventory(root, spec, state)
             config = next(c for c in spec["campaigns"] if c["name"] == campaign)
             allocation = allocate_shard(config, blocks, state["planner"]["streams"], start, width,
                                         exhausted, int(config.get("global_job_index_start", 0)))
             if allocation is None:
-                return _answer(75, reason="waiting for a complete shard input range")
+                raise staging.Deferred("waiting for a complete shard input range")
             descriptor = _processing_tasks(spec, allocation, refs, name)
             # The first MIX PRE atomically admits this complete archive group.
             # A half-produced shard must never pin bytes needed by its own siblings.
@@ -464,7 +852,7 @@ def admit_producer(run_dir, task_id):
         with staging.transaction(root) as state:
             plan = f"PLAN_{index:06d}"
             if plan not in state["accepted"]:
-                return _answer(75, reason="source original has no accepted PLAN result")
+                raise staging.Deferred("source original has no accepted PLAN result")
             task["inputs"] = deepcopy(_receipt(root, state, plan)["originals"])
         write_immutable_json(record_path(root, "tasks", identity), task)
         return _answer()
@@ -478,6 +866,8 @@ def admit_producer(run_dir, task_id):
         bundle = task["parameters"].get("staging_bundle")
         claims = read_json(_manifest_path(root, bundle))["claims"] if bundle else {identity: ceiling}
         code = staging.reserve_bundle(state, claims)
+        if code == 75:
+            raise staging.Deferred("staging capacity")
     return _answer(code, reason="staging capacity" if code else "admitted")
 
 
@@ -521,6 +911,8 @@ def _validate_staged(spec, task, outcome):
 
 
 def _find_producer(root, state, artifact_id):
+    if producer_index.enabled():
+        return producer_index.find(root, state, artifact_id, _receipt)
     for identity, marker in state["accepted"].items():
         if marker["stage"] in {"lhe", "plan", "mix"}:
             result = _receipt(root, state, identity)
@@ -557,6 +949,55 @@ def _physical_refs(state, refs):
     return result
 
 
+def _accept_validated_outcome(root, spec, state, identity, task, outcome):
+    """Settle a previously validated task outcome in the caller's transaction."""
+    stage = task["stage"]
+    if stage == "plan":
+        legacy._validate_planner_result(root, spec, {"plan_task": identity,
+            "source_index": int(identity.removeprefix("PLAN_"))}, outcome)
+        source_index = int(identity.removeprefix("PLAN_"))
+        if spec["sources"][source_index].get("resolved_generator_profile"):
+            produced = _receipt(root, state, f"LHE_{source_index:06d}")["outputs"][0]
+            retained = outcome["originals"][0]
+            if (outcome["actual_input_events"] != produced["events"]
+                    or any(retained.get(k) != produced.get(k) for k in
+                           ("artifact_id", "url", "kind", "size_bytes", "events", "sidecar_url"))):
+                raise RuntimeError("generated PLAN original differs from accepted LHE producer")
+    elif stage == "archive":
+        legacy._validate_archive_result(root, spec, {"archive_task": identity}, outcome)
+        for member in outcome["members"]:
+            accepted = _find_producer(root, state, member["artifact_id"])
+            if any(member.get(k) != accepted.get(k) for k in ("url", "kind", "size_bytes", "events")):
+                raise RuntimeError("archive member differs from its accepted producer")
+    elif stage == "reclaim":
+        legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, outcome)
+        staging.settle_reclaim(state, identity, _physical_refs(state, task["inputs"]), outcome["reclaimed"])
+        if identity in state["cleanup_claims"]:
+            state["cleanup_claims"][identity]["completed"] = True
+    else:
+        _validate_outputs(task, outcome)
+        if stage in {"lhe", "mix"}:
+            for output in outcome["outputs"]:
+                if type(output.get("events")) is not int or output["events"] <= 0:
+                    raise RuntimeError("staging producer has no valid event count")
+            if stage == "mix" and outcome["outputs"][0]["events"] > task["parameters"]["target_mixed_events"]:
+                raise RuntimeError("mixed event count exceeds frozen target")
+        elif stage == "miniaod":
+            _validate_miniaod(root, spec, state, task, outcome)
+    if "staging_claim_bytes" in task["parameters"]:
+        staging.settle_publication(state, identity, _validate_staged(spec, task, outcome))
+    write_immutable_json(_receipt_path(root, identity), outcome)
+    state["accepted"][identity] = {"stage": stage}
+    if stage == "plan" and state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
+        source_index = int(identity.removeprefix("PLAN_"))
+        pool = spec["sources"][source_index]["pool"]
+        pool_segments = state["planner"]["inventory_segments"]["pools"].get(pool)
+        if pool_segments is None:
+            raise RuntimeError("PLAN inventory has no segment list for source pool")
+        pool_segments.append(identity)
+    producer_index.record(root, state, identity, outcome, _receipt)
+
+
 @_entry
 def accept_result(run_dir, task_id, return_code=0):
     if int(return_code) != 0:
@@ -570,44 +1011,52 @@ def accept_result(run_dir, task_id, return_code=0):
             return _answer(status="accepted")
         outcome = read_json(record_path(root, "results", identity))
         legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
-        stage = task["stage"]
-        if stage == "plan":
-            legacy._validate_planner_result(root, spec, {"plan_task": identity,
-                "source_index": int(identity.removeprefix("PLAN_"))}, outcome)
-            source_index = int(identity.removeprefix("PLAN_"))
-            if spec["sources"][source_index].get("resolved_generator_profile"):
-                produced = _receipt(root, state, f"LHE_{source_index:06d}")["outputs"][0]
-                retained = outcome["originals"][0]
-                if (outcome["actual_input_events"] != produced["events"]
-                        or any(retained.get(k) != produced.get(k) for k in
-                               ("artifact_id", "url", "kind", "size_bytes", "events", "sidecar_url"))):
-                    raise RuntimeError("generated PLAN original differs from accepted LHE producer")
-        elif stage == "archive":
-            legacy._validate_archive_result(root, spec, {"archive_task": identity}, outcome)
-            for member in outcome["members"]:
-                accepted = _find_producer(root, state, member["artifact_id"])
-                if any(member.get(k) != accepted.get(k) for k in ("url", "kind", "size_bytes", "events")):
-                    raise RuntimeError("archive member differs from its accepted producer")
-        elif stage == "reclaim":
-            legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, outcome)
-            staging.settle_reclaim(state, identity, _physical_refs(state, task["inputs"]), outcome["reclaimed"])
-            if identity in state["cleanup_claims"]:
-                state["cleanup_claims"][identity]["completed"] = True
-        else:
-            _validate_outputs(task, outcome)
-            if stage in {"lhe", "mix"}:
-                for output in outcome["outputs"]:
-                    if type(output.get("events")) is not int or output["events"] <= 0:
-                        raise RuntimeError("staging producer has no valid event count")
-                if stage == "mix" and outcome["outputs"][0]["events"] > task["parameters"]["target_mixed_events"]:
-                    raise RuntimeError("mixed event count exceeds frozen target")
-            elif stage == "miniaod":
-                _validate_miniaod(root, spec, state, task, outcome)
-        if "staging_claim_bytes" in task["parameters"]:
-            staging.settle_publication(state, identity, _validate_staged(spec, task, outcome))
-        write_immutable_json(_receipt_path(root, identity), outcome)
-        state["accepted"][identity] = {"stage": stage}
+        _accept_validated_outcome(root, spec, state, identity, task, outcome)
     return _answer(status="accepted")
+
+
+def _without_archive_local_paths(outcome):
+    value = json.loads(json.dumps(outcome))
+    outputs = value.get("outputs") if isinstance(value, dict) else None
+    if not isinstance(outputs, list):
+        raise ValueError("archive orphan result has no outputs list")
+    for output in outputs:
+        if not isinstance(output, dict):
+            raise ValueError("archive orphan output is malformed")
+        output.pop("local_path", None)
+    return value
+
+
+@_entry
+def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
+    """Accept one archive orphan after allowing only its ephemeral local path to differ."""
+    if confirm_no_active_writer is not True:
+        raise ValueError("archive orphan recovery requires explicit no-active-writer confirmation")
+    root, spec = _paths(run_dir)
+    identity = token(task_id)
+    with staging.transaction(root) as state:
+        if identity in state["accepted"]:
+            raise RuntimeError("archive orphan already has an accepted marker")
+        task = read_json(record_path(root, "tasks", identity))
+        if task.get("stage") != "archive":
+            raise ValueError("archive orphan recovery only accepts archive tasks")
+        outcome = read_json(record_path(root, "results", identity))
+        receipt_path = _receipt_path(root, identity)
+        orphan = read_json(receipt_path)
+        legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
+        legacy.validate_result_envelope(task, orphan, spec["runtime_release"])
+        if _without_archive_local_paths(outcome) != _without_archive_local_paths(orphan):
+            raise RuntimeError("archive orphan differs beyond output local_path")
+        if (identity in state["staging"].get("settled_publications", {})
+                or identity in state["staging"].get("settled_reclaims", {})
+                or identity in state.get("cleanup_claims", {})):
+            raise RuntimeError("archive orphan has contradictory persisted settlement state")
+        index = state.get("producer_index", {})
+        refs = {item.get("artifact_id") for item in orphan.get("outputs", [])}
+        if any(artifact_id in index.get("artifacts", {}) for artifact_id in refs):
+            raise RuntimeError("archive orphan output unexpectedly appears in producer index")
+        _accept_validated_outcome(root, spec, state, identity, task, orphan)
+    return _answer(status="accepted", recovered_orphan=True)
 
 
 def _require_all(root, state, descriptor):
