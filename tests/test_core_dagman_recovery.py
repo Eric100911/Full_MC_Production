@@ -115,7 +115,7 @@ class Preparation(unittest.TestCase):
     def fixture(self, tmp):
         root = Path(tmp)
         atomic_json(root / 'run.json', dict(runtime_release='r1'))
-        atomic_json(root / 'state.json', dict(accepted={}, planner={'sources': {}}, allocations={}, cleanup_claims={}))
+        atomic_json(root / 'state.json', dict(accepted={}, staging={}, planner={'sources': {}}, allocations={}, cleanup_claims={}))
         atomic_json(root / 'submission.json', dict(schema='full-mc-condor-submission-v1', scheduler='schedd', state='submitted', root_cluster_id='42', attempts=[]))
         (root / 'run.dag').write_text('SUBDAG EXTERNAL SOURCE_000000 child.dag\n')
         (root / 'child.dag').write_text('JOB A worker.sub\nSCRIPT POST A controller accept-result\n')
@@ -154,7 +154,7 @@ class Preparation(unittest.TestCase):
             self.assertEqual(preview['state'], 'preview')
             self.assertFalse((root / 'recovery').exists())
             result = prepare_rescue(root, schedd='schedd', root_cluster_id='42', apply=True, runner=runner, client=store)
-            self.assertEqual(result['state'], 'prepared')
+            self.assertEqual(result['state'], 'prepared', result.get('blocked'))
             self.assertFalse((root / 'run.dag.lock').exists())
             self.assertIn('DONE A', Path(result['groups'][1]['rescue']).read_text())
             self.assertNotIn('DONE SOURCE_000000', Path(result['groups'][0]['rescue']).read_text())
@@ -170,6 +170,32 @@ class Preparation(unittest.TestCase):
                 return response('submitted to cluster 99')
             resumed = resume_run(root, runner=submit_runner)
             self.assertEqual(resumed['root_cluster_id'], '99')
+
+    def test_recovery_replaces_orphan_with_new_verified_product(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp)
+            old = dict(task('lhe'), status='ok')
+            old['outputs'][0].update(size_bytes=2, events=2)
+            atomic_json(root / 'ledger/accepted/A.json', old)
+            new = json.loads(json.dumps(old)); new['outputs'][0]['size_bytes'] = 3
+            atomic_json(root / 'results/A.json', new)
+            metadata = dict(new['outputs'][0], task_id='A', complete=True, runtime_release='r1')
+            store = Store({'root://host/out': b'abc', 'root://host/out.json': json.dumps(metadata).encode()})
+            def runner(command, **kwargs):
+                if command[0] == 'condor_q':
+                    return response()
+                self.assertFalse((root / 'ledger/accepted/A.json').exists())
+                atomic_json(root / 'ledger/accepted/A.json', new)
+                state = json.loads((root / 'state.json').read_text())
+                state['accepted']['A'] = {'stage': 'lhe'}
+                atomic_json(root / 'state.json', state)
+                return response()
+            result = prepare_rescue(root, schedd='schedd', root_cluster_id='42', apply=True,
+                                    runner=runner, client=store)
+            self.assertEqual(result['state'], 'prepared', result.get('blocked'))
+            backup = Path(result['replaced_receipts']['A']['backup'])
+            self.assertEqual(json.loads(backup.read_text())['outputs'][0]['size_bytes'], 2)
+            self.assertEqual(json.loads((root / 'ledger/accepted/A.json').read_text())['outputs'][0]['size_bytes'], 3)
 
     def test_interrupted_archive_resumes_without_new_rescue_number(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,7 +222,7 @@ class Preparation(unittest.TestCase):
                 prepared_failure(root, '42')
             result = prepare_rescue(root, schedd='schedd', root_cluster_id='42', apply=True,
                                     runner=lambda *a, **k: response())
-            self.assertEqual(result['state'], 'prepared')
+            self.assertEqual(result['state'], 'prepared', result.get('blocked'))
             self.assertEqual(len(list(root.glob('run.dag.rescue*'))), 1)
 
     def test_missing_successful_product_blocks_preparation(self):

@@ -210,6 +210,7 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                 done.add(identity)
             if identity.startswith('SHARD_') and state['allocations'].get(identity, {}).get('completed'):
                 done.add(identity)
+        consumed_artifacts = None
         remaining = {i for i in tasks if i not in done}
         with tempfile.TemporaryDirectory(dir='/tmp/chiw', prefix='mcprod-rescue-') as scratch:
             while remaining:
@@ -246,8 +247,37 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                                         ref.pop('local_path', None)
                                 return v
                             if comparable(old) != comparable(outcome):
-                                raise ValueError('immutable receipt conflict: ' + identity)
-                            outcome = old
+                                # A recovery retry may have published a new file at the
+                                # same URL. Preserve the orphan, then let the deployed
+                                # controller validate and publish the replacement receipt.
+                                current = read(root / 'state.json')
+                                if (identity in current['accepted']
+                                        or identity in current['staging'].get('settled_publications', {})
+                                        or identity in current['staging'].get('settled_reclaims', {})):
+                                    raise ValueError('replacement receipt already committed: ' + identity)
+                                if consumed_artifacts is None:
+                                    consumed_artifacts = set()
+                                    for consumer in current['accepted']:
+                                        frozen = tasks.get(consumer)
+                                        if frozen is None:
+                                            frozen = read(record_path(root, 'tasks', consumer))
+                                        consumed_artifacts.update(ref['artifact_id'] for ref in frozen['inputs'])
+                                old_ids = {ref['artifact_id'] for ref in old.get('outputs', []) + old.get('originals', [])}
+                                if old_ids & consumed_artifacts:
+                                    raise ValueError('replacement has an accepted downstream consumer: ' + identity)
+                                proof.append('recovery replacement of uncommitted receipt')
+                                if apply:
+                                    backup = base / 'superseded-receipts' / receipt_path.relative_to(root / 'ledger/accepted')
+                                    backup.parent.mkdir(parents=True, exist_ok=True)
+                                    replacements = journal.setdefault('replaced_receipts', {})
+                                    replacements[identity] = dict(backup=str(backup),
+                                        old_outputs=old.get('outputs', []), new_outputs=outcome.get('outputs', []))
+                                    save()
+                                    if backup.exists():
+                                        raise ValueError('replacement backup already exists: ' + identity)
+                                    receipt_path.rename(backup)
+                            else:
+                                outcome = old
                         if apply:
                             recovered = base / 'recovered-results' / (identity + '.json')
                             recovered.parent.mkdir(exist_ok=True)

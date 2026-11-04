@@ -154,7 +154,7 @@ RUN=/afs/cern.ch/user/c/chiw/condor/Full_MC_Production/generated/dps2g-tps-repla
 
 只对尚未入账且有执行证据/结果记录的任务尝试重建，不扫描全 EOS。PLAN block
 不制造 sidecar。网络和认证故障不等同于文件不存在。缺失实物、身份冲突、计数
-不匹配或不可变凭据冲突会被报告，不能绕过校验补账。
+不匹配会被报告，不能绕过校验补账；恢复新产物替换孤立旧凭据的规则见下节。
 
 本地补账按原任务依赖顺序调用部署入口，不添加 SOURCE 连续前缀要求。
 重建结果、旧 result 备份和证据来源保存在恢复目录。归档仅 local_path 不同的
@@ -193,3 +193,33 @@ Held 也会阻止准备；工具不自动移除或释放作业。准备期间不
 
 这是重复可用的绕过流程，不修复上游缺陷。未来发生同类失败时，应在相关作业
 停止后再次按当时状态准备 rescue，而不是不断回放冲突事件日志。
+
+## 恢复重跑产生新产物时替换旧凭据
+
+用户确认：恢复重跑已产生新文件时，允许新结果替换旧凭据，不能仅因文件大小
+变化而永久阻止恢复。`prepare-rescue --apply` 对已验证的新产物执行此规则：
+先把尚未提交的旧凭据移入本次恢复目录的 `superseded-receipts/`，保存新旧
+输出差异，再调用部署控制器正常入账。不会直接修改 accepted 或 staging 数值。
+
+当前入口处理的是未 accepted、未结算且没有已入账下游引用的孤立凭据。
+已提交或已有下游的替换涉及下游状态协调，不能按这个孤立凭据流程处理。
+
+## 实际恢复记录（2026-11-04，UTC）
+
+- 使用本接口恢复 root `6729016` 对应的原 run，未更改输入清单或生产目标。
+- 恢复目录：`recovery/6729016-20261104T155035Z/`，清单为该目录的 `manifest.json`。
+- 共补账 20 个结果：2 LHE、4 PLAN、5 MIX、6 MiniAOD、2 ARCHIVE、1 RECLAIM。
+- 用户确认恢复新文件允许替换旧凭据后，备份并替换 4 份未入账 MIX 凭据：
+  DPS2_G BLOCK132，TPS BLOCK181–183；旧文件在 `superseded-receipts/`，差异在 manifest。
+- 为 root 和 60 个子 DAG 准备 rescue；root 保留 889 个 DONE 节点，子 DAG
+  保留 409 个 DONE worker 节点。归档 425 个控制文件，未移动物理数据。
+- `2026-11-04T16:09:23Z`：`mcprod run resume` 成功提交，新的 root 为
+  `6737764`，schedd 为 `bigbird102.cern.ch`，使用 `run.dag.rescue001`。
+
+本次使用正常入账规则更新 state/staging，未修改 HTCondor 源码。
+
+提交后仅检查一次：`2026-11-04T16:10:32Z`，root `6737764` Running，
+root 节点 DONE=889、Failed=0；树中 15 个 DAGMan Running，97 个 worker Idle，
+worker Running=0、Held=0。root 日志确认加载 rescue001，未见新的 assertion。
+旧 `mcprod_snapshot.py` 因 SHARD state 无 next_step 在联网前退出，本次使用
+精确 root 的 `condor_q -name bigbird102.cern.ch -dag 6737764` 完成检查，未持续轮询。
