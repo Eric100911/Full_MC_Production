@@ -423,5 +423,8 @@ def prepared_failure(root, cluster):
         return None
     if record['state'] != 'prepared':
         raise RuntimeError('recovery preparation is incomplete')
+    migration = Path(record['directory']) / 'post-completion/migration.json'
+    if migration.exists() and read(migration)['state'] != 'complete':
+        raise RuntimeError('POST protocol migration is incomplete')
     failed_root(Path(record['directory']) / 'control-files/run.dag.dagman.log', cluster)
     return dict(state='terminal', terminal=True, successful=False, query='prepared-rescue-evidence')

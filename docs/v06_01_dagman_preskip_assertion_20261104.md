@@ -259,3 +259,40 @@ MCPROD_NATIVE_DAGMAN_TEST=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
 
 本机已验证版本为 HTCondor 25.0.14；这不等于已对生产 schedd 的 25.13.3
 二进制完成相同验证。当前生产 root 未在此次开发中重启或切换。
+
+## 生产切换记录（2026-11-05，UTC）
+
+再次 assertion 的当前 root 是 `6739360`，于 `09:59:07 UTC` 退出；切换前
+精确队列与后代检查为空。恢复接口为该 root 准备 `run.dag.rescue003`，保留
+root 的 1,791 个 DONE 节点和子 DAG 的 362 个 DONE worker；TPS BLOCK237
+确认为计算失败，保留为正常重跑节点，不补造成功结果。
+
+新控制器 `v06_01-control-20261105-post-completion` 以已部署的 v06_01 inventory
+控制器为底座，仅加入 POST 协议相关的 application/shards.py、planning/shards.py、
+CLI 三处变更。干净构建源码 revision 为 `acaa0d269e258ccad917b534cbee8d230dc92b97`，
+产物位于 `generated/controller-releases/v06_01-control-20261105-post-completion/`。
+worker runtime、run.json 和输入规格保持原值。
+
+使用可复用脚本进行停止态切换，默认预览，加 `--apply` 才转换文件并激活控制器：
+
+```bash
+python3 tools/migrate_post_completion.py \
+  --run-dir <run-directory> --build-dir <prepared-controller-build> [--apply]
+```
+
+该脚本要求本次 root 已完成 rescue 准备、队列为空；只删除 PRE_SKIP 行、为相关
+POST 补充 PRE 参数，并将共享配置设置为 TRUE。原 DAG、配置位于本次恢复目录
+`post-completion/original/`，启动器由现有 controller activate 接口备份。
+本次转换 41 个 DAG 和一个配置文件，核对了 5,768 条 POST 命令。
+`migration.json` 完成前，`run resume` 会拒绝提交；脚本本身不提交作业。
+
+恢复入口同时修正缺失远端伴随元数据的判断：实际失败的 worker 没有发布记录时，
+应作为待重跑节点，而不是误报已发布结果损坏；成功记录缺失产物时仍阻断。
+
+`2026-11-05T13:05:33Z` 已通过 `mcprod run resume` 提交新 root **6747397**，
+schedd **bigbird102.cern.ch**，采用 **run.dag.rescue003**。
+
+提交后的单次检查确认 root Running、Failed=0；5 个 DAGMan Running，
+7 个 worker Running、11 个 Idle、Held=0。现场 root 日志确认配置加载为 TRUE，
+并于 `13:06:11–13:06:12 UTC` 记录 `CLEANUP_pool_gg_000214` 的 PRE99→POST 成功，
+证明新协议已经实际执行，而非仅修改生成文件。检查后停止轮询。

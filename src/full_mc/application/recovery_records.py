@@ -19,7 +19,8 @@ def reconstruct(task, accepted, scratch, client=None):
 
     def published(ref):
         # Only producers using publish() have this sidecar convention.
-        record = validated_record(ref, client)
+        metadata = client.read_json(ref.get('sidecar_url', ref['url'] + '.json'))
+        record = validated_record(ref, client, record=metadata)
         if (record is None or record.get('task_id') != task['task_id']
                 or record.get('runtime_release') != task['runtime_release']):
             raise ValueError('invalid published metadata: ' + ref['url'])

@@ -30,6 +30,7 @@ class Store:
         return len(self.objects[url])
 
     def read_json(self, url):
+        self.size(url)
         return json.loads(self.objects[url])
 
     def copy_in(self, url, path):
@@ -233,6 +234,17 @@ class Preparation(unittest.TestCase):
             self.assertEqual(result['state'], 'blocked')
             self.assertTrue((root / 'run.dag.lock').exists())
             self.assertFalse(list(root.glob('run.dag.rescue*')))
+
+    def test_failed_worker_without_published_metadata_remains_for_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp)
+            atomic_json(root / 'results/A.json', dict(task_id='A', stage='lhe', status='failed', outputs=[]))
+            log = root / 'child.dag.nodes.log'
+            log.write_text(log.read_text().replace('return value 0', 'return value 1'))
+            result = prepare_rescue(root, schedd='schedd', root_cluster_id='42',
+                                    runner=lambda *a, **k: response(), client=Store({}))
+            self.assertEqual(result['state'], 'preview')
+            self.assertEqual(result['groups'][1]['remaining'], ['A'])
 
     def test_held_or_failed_query_prevents_all_changes(self):
         for reply in (response('44 0 5'), response(code=1)):
