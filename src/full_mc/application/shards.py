@@ -949,6 +949,21 @@ def _physical_refs(state, refs):
     return result
 
 
+def _post_pre_status(pre_return_code, return_code):
+    """Classify PRE outcome independently of worker exit (including -1004)."""
+    pre = int(pre_return_code)
+    if pre in (0, -1):
+        return "run"
+    if pre == 99 and int(return_code) == -1004:
+        return "skip"
+    return "failed"
+
+
+def _pre_failure(pre_return_code):
+    # Never return PRE's 75 here: POST DEFER is reserved for its own lock/wait.
+    return _answer(1, reason="PRE failed or unsupported skip", pre_return_code=int(pre_return_code))
+
+
 def _accept_validated_outcome(root, spec, state, identity, task, outcome):
     """Settle a previously validated task outcome in the caller's transaction."""
     stage = task["stage"]
@@ -999,7 +1014,19 @@ def _accept_validated_outcome(root, spec, state, identity, task, outcome):
 
 
 @_entry
-def accept_result(run_dir, task_id, return_code=0):
+def accept_result(run_dir, task_id, return_code=0, *, pre_return_code=0):
+    pre_status = _post_pre_status(pre_return_code, return_code)
+    if pre_status == "failed":
+        return _pre_failure(pre_return_code)
+    if pre_status == "skip":
+        root, _ = _paths(run_dir)
+        identity = token(task_id)
+        state = read_json(root / "state.json")
+        cleanup = state["cleanup_claims"].get(identity, {})
+        if (not identity.startswith("CLEANUP_") or cleanup.get("skipped") is not True
+                or cleanup.get("completed") is not True or cleanup.get("urls") != []):
+            return _answer(1, reason="cleanup skip lacks committed empty-cleanup state")
+        return _answer(status="skipped")
     if int(return_code) != 0:
         return _answer(1 if int(return_code) == 75 else int(return_code),
                        reason="worker failed", worker_return_code=int(return_code))
@@ -1071,7 +1098,19 @@ def _require_all(root, state, descriptor):
 
 
 @_entry
-def complete_source(run_dir, source_index, return_code=0):
+def complete_source(run_dir, source_index, return_code=0, *, pre_return_code=0):
+    pre_status = _post_pre_status(pre_return_code, return_code)
+    if pre_status == "failed":
+        return _pre_failure(pre_return_code)
+    if pre_status == "skip":
+        root, spec = _paths(run_dir)
+        index = int(source_index)
+        if not 0 <= index < len(spec["sources"]):
+            raise ValueError("unknown source slot")
+        state = read_json(root / "state.json")
+        if state["planner"]["sources"].get(str(index)) != "skipped":
+            return _answer(1, reason="source skip lacks committed unneeded-source state")
+        return _answer(status="skipped")
     if int(return_code) != 0:
         return _answer(1 if int(return_code) == 75 else int(return_code),
                        reason="source child failed", worker_return_code=int(return_code))
@@ -1085,7 +1124,10 @@ def complete_source(run_dir, source_index, return_code=0):
 
 
 @_entry
-def complete_shard(run_dir, campaign, shard_index, return_code=0):
+def complete_shard(run_dir, campaign, shard_index, return_code=0, *, pre_return_code=0):
+    # prepare_shard currently has no supported skip outcome.
+    if _post_pre_status(pre_return_code, return_code) != "run":
+        return _pre_failure(pre_return_code)
     if int(return_code) != 0:
         return _answer(1 if int(return_code) == 75 else int(return_code),
                        reason="campaign child failed", worker_return_code=int(return_code))

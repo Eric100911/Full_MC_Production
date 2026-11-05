@@ -138,6 +138,8 @@ def build_parser():
             p.add_argument("--task-id", required=True)
         if action in ("accept-result", "complete-source", "complete-shard"):
             p.add_argument("--return-code", type=int, required=True)
+            p.add_argument("--pre-return-code", type=int, default=0,
+                           help="DAGMan PRE exit code; -1 means no PRE script")
         if action == "prepare-cleanup":
             p.add_argument("--pool", required=True)
             p.add_argument("--slot", required=True)
@@ -241,6 +243,8 @@ def dispatch(args):
             arguments = [args.run_dir]
         if hasattr(args, "return_code"):
             arguments.append(args.return_code)
+        if hasattr(args, "pre_return_code"):
+            return operation(*arguments, pre_return_code=args.pre_return_code)
         return operation(*arguments)
     if args.command == "handoff":
         from .application.handoff import export_handoff, transfer_handoff

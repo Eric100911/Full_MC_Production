@@ -223,3 +223,39 @@ root 节点 DONE=889、Failed=0；树中 15 个 DAGMan Running，97 个 worker I
 worker Running=0、Held=0。root 日志确认加载 rescue001，未见新的 assertion。
 旧 `mcprod_snapshot.py` 因 SHARD state 无 next_step 在联网前退出，本次使用
 精确 root 的 `condor_q -name bigbird102.cern.ch -dag 6737764` 完成检查，未持续轮询。
+
+## v06_01 改用 ALWAYS_RUN_POST（2026-11-05）
+
+新生成的 `campaign_shards` root / 子 DAG 统一启用
+`DAGMAN_ALWAYS_RUN_POST = TRUE`，root 不再写出 `PRE_SKIP` 指令。
+PRE 仍使用原有 0 / 75 / 99 约定：0 正常执行，75 按 DEFER 等待，99 表示无需执行。
+99 通过 PRE 非零→不提交 worker→执行 POST 的普通路径完成，避免 PRE_SKIP 虚拟 ID。
+
+所有新生成 POST 传递 `--pre-return-code $PRE_SCRIPT_RETURN` 与
+`--return-code $RETURN`。`complete-source`、`complete-shard`、`accept-result`
+增加可选 `--pre-return-code`，省略时为 0，兼容既有 DAG 和本地恢复入口。
+没有 PRE 的 worker 使用 DAGMan 的 -1，也继续正常入账。
+
+只有 PRE=99、worker return=-1004，并且提交端 state 已持久记录对应的
+source skipped 或 cleanup skipped/completed/urls=[]，POST 才确认成功。
+不创建虚假 worker result 或 accepted 记录，不把已跳过 source 改成 completed。
+SHARD 当前没有无需执行的 PRE 分支，99 仍作为错误；其他 PRE 错误始终失败。
+PRE 的 75 不会被 POST 转成自己的 DEFER，只有 POST 自身的锁忙等等待可返回75。
+正常 worker 失败仍按原规则处理，正常完成仍执行全部入账和子 DAG 完成校验。
+
+本次只修改 v06_01 生成器与控制器，不改 legacy wave 生成器，不改写正在运行的
+生产 DAG/config/launcher。启用需要在明确检查点使用配套控制器及新 DAG/config；
+只热换 controller.sh 或只编辑磁盘 config 不能视为运行中的 DAGMan 已切换。
+旧 DAG 的 PRE_SKIP 规则保持原语义，不能与新规则混用后宣称问题已消除。
+
+验证包含多个节点跳过、PRE75 defer、在第三个 POST 中途终止 DAGMan 后回放恢复、
+此前完成节点不重做，以及真实 PRE42 仍导致失败。离线 native DAGMan 测试在
+`/tmp/chiw/` 中运行，worker submit 文件故意不存在，不提交任何实际作业：
+
+```bash
+MCPROD_NATIVE_DAGMAN_TEST=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  python3 -m unittest tests.test_core_post_completion.NativePostRecovery
+```
+
+本机已验证版本为 HTCondor 25.0.14；这不等于已对生产 schedd 的 25.13.3
+二进制完成相同验证。当前生产 root 未在此次开发中重启或切换。

@@ -63,6 +63,8 @@ def shard_ranges(spec):
 
 def _script(root, phase, name, arguments, interval, post=False):
     interval = validate_script_defer_seconds(interval)
+    if post:
+        arguments += " --pre-return-code $PRE_SCRIPT_RETURN"
     command = f"SCRIPT DEFER 75 {interval} " + ("POST" if post else "PRE")
     return f"{command} {name} {path_text(Path(root) / 'controller.sh')} {phase} {arguments}"
 
@@ -78,7 +80,7 @@ def write_config(root, spec):
         "DAGMAN_MAX_POST_SCRIPTS": options.get("max_post_scripts", 20),
         "DAGMAN_GENERATE_SUBDAG_SUBMITS": True,
         "DAGMAN_AUTO_RESCUE": True,
-        "DAGMAN_ALWAYS_RUN_POST": False,
+        "DAGMAN_ALWAYS_RUN_POST": True,
     }
     path = Path(root) / "dagman.config"
     path.write_text("".join(f"{key} = {str(value).upper() if isinstance(value, bool) else int(value)}\n"
@@ -114,7 +116,7 @@ def write_root_dag(root, spec):
         args = f"--source-index {index}"
         lines += [f"SUBDAG EXTERNAL {name} {path_text(child_path(root, name))}",
                   f"CATEGORY {name} lhe_planning",
-                  _script(root, "prepare-source", name, args, defer_seconds), f"PRE_SKIP {name} 99",
+                  _script(root, "prepare-source", name, args, defer_seconds),
                   _script(root, "complete-source", name, args + " --return-code $RETURN",
                           defer_seconds, True)]
     campaigns = {c["name"]: c for c in spec["campaigns"]}
@@ -126,7 +128,7 @@ def write_root_dag(root, spec):
         args = f"--campaign {campaign} --shard-index {index}"
         lines += [f"SUBDAG EXTERNAL {name} {path_text(child_path(root, name))}",
                   f"CATEGORY {name} block_processing",
-                  _script(root, "prepare-shard", name, args, defer_seconds), f"PRE_SKIP {name} 99",
+                  _script(root, "prepare-shard", name, args, defer_seconds),
                   _script(root, "complete-shard", name, args + " --return-code $RETURN",
                           defer_seconds, True)]
     def cleanup_job(name, pool, slot):
@@ -140,7 +142,6 @@ def write_root_dag(root, spec):
                 f"RETRY {name} 1",
                 _script(root, "prepare-cleanup", name, f"--pool {pool} --slot {slot}",
                         defer_seconds),
-                f"PRE_SKIP {name} 99",
                 _script(root, "accept-result", name, f"--task-id {name} --return-code $RETURN",
                         defer_seconds, True)]
 

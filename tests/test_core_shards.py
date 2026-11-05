@@ -124,15 +124,15 @@ class ShardGraphTests(ShardFixture):
                 if line.startswith("PARENT") and " CHILD SHARD_" in line:
                     self.fail("shard has a root completion dependency")
             self.assertEqual(text.count("JOB CLEANUP_pool_"), 6)
-            self.assertIn("MAXJOBS lhe_planning 2", text)
-            self.assertIn("MAXJOBS block_processing 6", text)
-            self.assertIn("MAXJOBS lhe_coordination 20", text)
+            configured = read_json(run / "run.json")["scheduler"]["maxjobs"]
+            for category in ("lhe_planning", "block_processing", "lhe_coordination"):
+                self.assertIn(f"MAXJOBS {category} {configured[category]}", text)
             self.assertIn("SCRIPT DEFER 75 60 POST SOURCE_000000", text)
             self.assertIn("--return-code $RETURN", text)
             config = (run / "dagman.config").read_text()
             for option in ("DAGMAN_MAX_PRE_SCRIPTS = 20", "DAGMAN_MAX_POST_SCRIPTS = 20",
                            "DAGMAN_GENERATE_SUBDAG_SUBMITS = TRUE", "DAGMAN_AUTO_RESCUE = TRUE",
-                           "DAGMAN_ALWAYS_RUN_POST = FALSE"):
+                           "DAGMAN_ALWAYS_RUN_POST = TRUE"):
                 self.assertIn(option, config)
             self.assertIn("export PATH=/usr/bin:/bin", (run / "controller.sh").read_text())
 
