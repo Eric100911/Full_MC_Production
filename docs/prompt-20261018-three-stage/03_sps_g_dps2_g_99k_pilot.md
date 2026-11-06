@@ -33,11 +33,11 @@ block_events=100；每campaign/池stride=1、offset=0。同campaign物理BLOCK�
 
 HELAC2.7.6 main：pool2过程`generate g g > cc~(3S11) cc~(3S11) g`，min_pt_conia=6、min_pt_bonia=4、min_pt_q=0 GeV；质量cuts最后记录`min_m_qqp=min_m_q_beam=3.0969` GeV，只用阶段一统一冻结的值，不编造更严阈值。gg过程`generate g g > g g`，min_pt_q=4、conia/bonia pT和两个质量cut=0。pp6800+6800 GeV、effectiveScale0、muR=muF12.8、ScaleFactor=muR_over_ref=muF_over_ref1、pdf10000/cteq6m、lhapdfF、cmass1.54845 GeV；其他LDME/积分器/快度参数沿模板。
 
-每池使用阶段一选中的生产profile；所有新非控制源unwevt=10000000，正整数，不能恢复2000。pool2的nmc选自扫描1m/2m证据；gg nmc固定500000，不扫这个轴。若所选pool2生产profile仍是控制unwevt100k，必须回到已有扫描B/D的同nmc放宽结果完成选择，不能无证据更换生产参数。preunw=nopt=nopt_step=nmc/10、noptlim=nmc；nmc是每pass预算，不能当作实际事件数。源行只选generator_profile ID，不允许inline nmc/unwevt/cuts。
+pool2生产参数已冻结为扫描点B：使用profile `helac_2jpsi_g_nlostar_v06_00_three_stage_b`，即 `pool_2jpsi_g` 的 `nmc=1000000`、`unwevt=10000000`；这是用户对后续生产的选择。扫描中该点两个seed分别产出1225、1279个LHE事件，作业墙钟运行时长为5:19:27和4:45:02。gg nmc固定500000，不扫这个轴；所有新非控制源unwevt=10000000，不能恢复2000。preunw=nopt=nopt_step=nmc/10、noptlim=nmc；nmc是每pass预算，不能当作实际事件数。源行只选generator_profile ID，不允许inline nmc/unwevt/cuts。
 
 detector=`run3_2022_legacy_premix_v1`，simulation/merge CMSSW_12_4_14，GT `124X_mcRun3_2022_realistic_v12`、RAW实际2threads/2streams、CERN miniaod请求2CPU；ntuple CMSSW_15_0_15、JJP、efficiency ntuple=true、tree `mkcands/X_data`，优先预构建`common/packages/cmssw15_tpsonia2mumu_runtime.tar.gz`。phi模式ISR/FSR开、MPI关、phi pT>3GeV、repeat5000、J/psi→μμ、phi→KK，不改Pythia物理。
 
-LHE1CPU/3072MB，CERN processing2CPU/6000MB，scratch至少4GB、workday默认。扫描证明高nmc超workday时，在冻结前仅用现有`resources.lhe.flavour`显式指定合适flavour并说明证据。IHEP combined必须实际`hep_sub -n 2`，轮转10主机ams017/018/019+cws047/048/049/051/052/053/054；排除ams020 Start policy和cws050/055 rc132。独立merge-only不绑节点。不得编造`--cpus`、`--job-index-start`等现有CLI没有的选项。
+LHE1CPU/3072MB，CERN processing2CPU/6000MB，scratch至少4GB。pool2的HELAC flavour冻结为`workday`（8小时）；所选1M点已有实测运行时长约4小时45分至5小时20分，留有运行余量。若其他LHE配置超过8小时证据，必须在冻结前用现有`resources.lhe.flavour`单独指定合适flavour并说明依据。IHEP combined必须实际`hep_sub -n 2`，轮转10主机ams017/018/019+cws047/048/049/051/052/053/054；排除ams020 Start policy和cws050/055 rc132。独立merge-only不绑节点。不得编造`--cpus`、`--job-index-start`等现有CLI没有的选项。
 
 ## 从实测产率冻结有限源数
 

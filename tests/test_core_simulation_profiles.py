@@ -124,6 +124,7 @@ class SimulationProfileContracts(unittest.TestCase):
             allocation = {"campaigns": [{
                 "campaign": "C", "nodes": [{
                     "job_id": "JOB000000_BLOCK000000",
+                    "job_index": 0,
                     "target_mixed_events": 10,
                     "edm_event_id": {"first_run": 1},
                     "mixing_rng_seed": 11,
