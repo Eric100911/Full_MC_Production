@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections import Counter, defaultdict
@@ -161,6 +164,16 @@ def node_stage(name: str, directive: str) -> str:
     if directive == "FINAL":
         return "final"
     if directive == "SUBDAG":
+        return "subdag"
+    if name == "FINALIZE" or name.startswith("FINALIZE_"):
+        return "final"
+    if name.startswith("CLEANUP_"):
+        return "reclaim"
+    if re.search(r"(?:^|_)ARCHIVE_", name):
+        return "archive"
+    if re.search(r"(?:^|_)RECLAIM_", name):
+        return "reclaim"
+    if name.startswith(("SOURCE_", "SHARD_")):
         return "subdag"
     if name.startswith("LHE_"):
         return "lhe"
@@ -316,71 +329,301 @@ PRE_FAILURE_PATTERN = re.compile(
 PRESKIP_EVENT_PATTERN = re.compile(
     r"\bEvent: ULOG_PRESKIP for HTCondor Node (?P<name>\S+)\b"
 )
+LOG_CACHE_VERSION = 1
+LOG_CACHE_NAME = ".dag_progress_log_cache_v1.json"
+LOG_CACHE_LOCK_NAME = ".dag_progress_log_cache_v1.lock"
+LOG_CACHE_FINGERPRINT_BYTES = 128
+LOG_CACHE_BULK_READ_LIMIT = 16 * 1024 * 1024
+
+
+def _apply_terminal_log_line(
+    states: dict[str, dict],
+    planned: dict[str, PlannedNode],
+    line: str,
+) -> None:
+    pre_failure = PRE_FAILURE_PATTERN.search(line)
+    if pre_failure:
+        name = pre_failure.group("name")
+        node = planned.get(name)
+        if node and node.pre_skip_code == int(pre_failure.group("code")):
+            # PRE_SKIP failures are transitional. DAGMan records the
+            # successful skipped terminal state in a later ULOG event.
+            return
+        if name in planned:
+            states[name] = {
+                "DAGNodeName": name,
+                "JobStatus": 4,
+                "ExitCode": 1,
+            }
+        return
+
+    preskip = PRESKIP_EVENT_PATTERN.search(line)
+    if preskip:
+        name = preskip.group("name")
+        if name in planned:
+            states[name] = {
+                "DAGNodeName": name,
+                "JobStatus": 4,
+                "ExitCode": 0,
+                "PreSkipped": True,
+            }
+        return
+
+    success = SUCCESS_PATTERN.search(line)
+    if success:
+        name = success.group(1)
+        if name in planned:
+            states[name] = {
+                "DAGNodeName": name,
+                "JobStatus": 4,
+                "ExitCode": 0,
+            }
+        return
+
+    lowered = line.lower()
+    if " failed" not in lowered and "status_error" not in lowered:
+        return
+    failed = NODE_PATTERN.search(line)
+    if failed and failed.group(1) in planned:
+        name = failed.group(1)
+        states[name] = {
+            "DAGNodeName": name,
+            "JobStatus": 4,
+            "ExitCode": 1,
+        }
+
+
+def _planned_node_manifest(
+    planned: dict[str, PlannedNode],
+) -> dict[str, dict]:
+    return {
+        name: {
+            "dag_file": str(node.dag_file),
+            "directive": node.directive,
+            "pre_skip_code": node.pre_skip_code,
+        }
+        for name, node in planned.items()
+    }
+
+
+def _file_fingerprints(handle, size: int, offset: int) -> tuple[str, str]:
+    position = handle.tell()
+    handle.seek(0)
+    head = handle.read(min(LOG_CACHE_FINGERPRINT_BYTES, size))
+    tail_start = max(0, offset - LOG_CACHE_FINGERPRINT_BYTES)
+    handle.seek(tail_start)
+    tail = handle.read(offset - tail_start)
+    handle.seek(position)
+    return (
+        hashlib.sha256(head).hexdigest(),
+        hashlib.sha256(tail).hexdigest(),
+    )
+
+
+def _cache_entry_matches(path: Path, entry: dict) -> bool:
+    try:
+        with path.open("rb") as handle:
+            current = os.fstat(handle.fileno())
+            offset = int(entry["offset"])
+            if (
+                current.st_dev != int(entry["device"])
+                or current.st_ino != int(entry["inode"])
+                or current.st_size < offset
+            ):
+                return False
+            if (
+                current.st_size == int(entry["size"])
+                and current.st_mtime_ns != int(entry["mtime_ns"])
+            ):
+                return False
+            return _file_fingerprints(handle, current.st_size, offset) == (
+                entry["head_sha256"],
+                entry["tail_sha256"],
+            )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _load_log_cache(cache_path: Path, root_dag: Path, manifest: dict) -> dict:
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+
+    if (
+        not isinstance(cache, dict)
+        or cache.get("version") != LOG_CACHE_VERSION
+        or cache.get("root_dag") != str(root_dag)
+        or not isinstance(cache.get("planned_nodes"), dict)
+        or not isinstance(cache.get("files"), dict)
+        or not isinstance(cache.get("states"), dict)
+    ):
+        return {}
+
+    old_manifest = cache["planned_nodes"]
+    # Child DAGs can appear dynamically. Preserve the cache when the previous
+    # plan remains an unchanged subset of the newly discovered plan.
+    if any(manifest.get(name) != node for name, node in old_manifest.items()):
+        return {}
+    if any(name not in manifest for name in cache["states"]):
+        return {}
+    if any(
+        not isinstance(record, dict)
+        or record.get("DAGNodeName") != name
+        or record.get("JobStatus") != 4
+        for name, record in cache["states"].items()
+    ):
+        return {}
+    return cache
+
+
+def _write_log_cache(cache_path: Path, cache: dict) -> None:
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f"{cache_path.name}.", dir=cache_path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, cache_path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def _scan_appended_log_data(
+    planned: dict[str, PlannedNode],
+    log_files: list[Path],
+    cached_files: dict[str, dict],
+    cached_states: dict[str, dict],
+    force_full_scan: bool,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Read appended complete lines; retry once with a full scan on mutation."""
+    for attempt in range(2):
+        full_scan = force_full_scan or attempt > 0
+        files = {} if full_scan else dict(cached_files)
+        states = {} if full_scan else dict(cached_states)
+        invalidated = False
+
+        for path in log_files:
+            key = str(path)
+            previous = None if full_scan else files.get(key)
+            file_full_scan = full_scan or previous is None
+            with path.open("rb") as handle:
+                before = os.fstat(handle.fileno())
+                offset = int(previous["offset"]) if previous else 0
+                if previous and (
+                    before.st_dev != int(previous["device"])
+                    or before.st_ino != int(previous["inode"])
+                    or before.st_size < offset
+                ):
+                    invalidated = True
+                    break
+
+                if file_full_scan and before.st_size <= LOG_CACHE_BULK_READ_LIMIT:
+                    handle.seek(0)
+                    data = handle.read()
+                    complete_offset = data.rfind(b"\n") + 1
+                    text = data[:complete_offset].decode(
+                        "utf-8", errors="replace"
+                    )
+                    for line in text.splitlines():
+                        _apply_terminal_log_line(states, planned, line)
+                else:
+                    handle.seek(offset)
+                    complete_offset = offset
+                    while True:
+                        raw_line = handle.readline()
+                        if not raw_line or not raw_line.endswith(b"\n"):
+                            break
+                        complete_offset = handle.tell()
+                        line = raw_line.decode("utf-8", errors="replace").rstrip(
+                            "\r\n"
+                        )
+                        _apply_terminal_log_line(states, planned, line)
+
+                after = os.fstat(handle.fileno())
+                if after.st_size < complete_offset:
+                    invalidated = True
+                    break
+                head_hash, tail_hash = _file_fingerprints(
+                    handle, after.st_size, complete_offset
+                )
+                files[key] = {
+                    "device": after.st_dev,
+                    "inode": after.st_ino,
+                    "size": after.st_size,
+                    "mtime_ns": after.st_mtime_ns,
+                    "offset": complete_offset,
+                    "head_sha256": head_hash,
+                    "tail_sha256": tail_hash,
+                }
+
+        if not invalidated:
+            return states, files
+
+    raise RuntimeError("DAGMan log changed repeatedly while being scanned")
 
 
 def completed_records_from_logs(
     planned: dict[str, PlannedNode],
+    root_dag: Path | None = None,
 ) -> list[dict]:
-    """Read terminal node states from the DAGMan logs beside each DAG file."""
-    states: dict[str, dict] = {}
+    """Read terminal states, incrementally caching log offsets and node states."""
     dag_files = {node.dag_file for node in planned.values()}
-    for dag_file in sorted(dag_files):
-        dagman_out = Path(f"{dag_file}.dagman.out")
-        if not dagman_out.is_file():
-            continue
-        for line in dagman_out.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines():
-            pre_failure = PRE_FAILURE_PATTERN.search(line)
-            if pre_failure:
-                name = pre_failure.group("name")
-                node = planned.get(name)
-                if node and node.pre_skip_code == int(pre_failure.group("code")):
-                    # PRE_SKIP failures are transitional. DAGMan records the
-                    # successful skipped terminal state in a later ULOG event.
-                    continue
-                if name in planned:
-                    states[name] = {
-                        "DAGNodeName": name,
-                        "JobStatus": 4,
-                        "ExitCode": 1,
-                    }
-                continue
+    log_files = [
+        Path(f"{dag_file}.dagman.out")
+        for dag_file in sorted(dag_files)
+        if Path(f"{dag_file}.dagman.out").is_file()
+    ]
 
-            preskip = PRESKIP_EVENT_PATTERN.search(line)
-            if preskip:
-                name = preskip.group("name")
-                if name in planned:
-                    states[name] = {
-                        "DAGNodeName": name,
-                        "JobStatus": 4,
-                        "ExitCode": 0,
-                        "PreSkipped": True,
-                    }
-                continue
+    if root_dag is None:
+        states: dict[str, dict] = {}
+        for dagman_out in log_files:
+            with dagman_out.open(
+                "r", encoding="utf-8", errors="replace"
+            ) as handle:
+                for line in handle:
+                    _apply_terminal_log_line(states, planned, line.rstrip("\r\n"))
+        return list(states.values())
 
-            success = SUCCESS_PATTERN.search(line)
-            if success:
-                name = success.group(1)
-                if name in planned:
-                    states[name] = {
-                        "DAGNodeName": name,
-                        "JobStatus": 4,
-                        "ExitCode": 0,
-                    }
-                continue
-            lowered = line.lower()
-            if " failed" not in lowered and "status_error" not in lowered:
-                continue
-            failed = NODE_PATTERN.search(line)
-            if failed and failed.group(1) in planned:
-                name = failed.group(1)
-                states[name] = {
-                    "DAGNodeName": name,
-                    "JobStatus": 4,
-                    "ExitCode": 1,
-                }
-    return list(states.values())
+    root_dag = root_dag.resolve()
+    cache_path = root_dag.parent / LOG_CACHE_NAME
+    lock_path = root_dag.parent / LOG_CACHE_LOCK_NAME
+    manifest = _planned_node_manifest(planned)
+    with lock_path.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        cache = _load_log_cache(cache_path, root_dag, manifest)
+        cached_files = cache.get("files", {})
+        cached_states = cache.get("states", {})
+        full_scan = not cache
+
+        if not full_scan:
+            for path in log_files:
+                previous = cached_files.get(str(path))
+                if previous and not _cache_entry_matches(path, previous):
+                    full_scan = True
+                    break
+
+        states, files = _scan_appended_log_data(
+            planned,
+            log_files,
+            cached_files,
+            cached_states,
+            full_scan,
+        )
+        updated_cache = {
+            "version": LOG_CACHE_VERSION,
+            "root_dag": str(root_dag),
+            "planned_nodes": manifest,
+            "files": files,
+            "states": states,
+        }
+        if updated_cache != cache:
+            _write_log_cache(cache_path, updated_cache)
+        return list(states.values())
 
 
 def record_timestamp(record: dict) -> int:
@@ -515,6 +758,12 @@ SUPPORTED_JOB_PREFIXES = (
     "NTUPLE_",
     "ARCHIVE_",
     "RECLAIM_",
+    "CLEANUP_",
+    "FINALIZE",
+    "SOURCE_ARCHIVE_",
+    "SOURCE_RECLAIM_",
+    "SHARD_ARCHIVE_",
+    "SHARD_RECLAIM_",
 )
 
 
@@ -524,7 +773,9 @@ def validate_structure_graph(graph: DagGraph) -> None:
         if node.directive == "FINAL":
             supported = node.name == "SUMMARY" or node.name.startswith("FINAL_")
         elif node.directive == "SUBDAG":
-            supported = node.name.startswith(("MIX_", "WAVE_"))
+            supported = node.name.startswith(
+                ("MIX_", "WAVE_", "SOURCE_", "SHARD_")
+            )
         else:
             supported = node.name.startswith(SUPPORTED_JOB_PREFIXES)
         if not supported:
@@ -707,7 +958,7 @@ def indexed_family(name: str) -> str:
 def campaign_for_root_node(node: PlannedNode) -> str | None:
     prefixes = ("COORD_", "PROC_", "PROCESS_", "NTUPLE_")
     if node.directive == "SUBDAG":
-        prefixes = ("MIX_",)
+        prefixes = ("MIX_", "SHARD_")
     for prefix in prefixes:
         if not node.name.startswith(prefix):
             continue
@@ -774,6 +1025,59 @@ def render_collapsed_structure(
                     )
             suffix = "; ".join(summaries) if summaries else "no child nodes"
             lines.append(f"    {marker} {wave.name}: {suffix}")
+
+    sources = [
+        node for node in graph.nodes.values()
+        if node.directive == "SUBDAG" and node.name.startswith("SOURCE_")
+    ]
+    if sources:
+        counts = Counter(
+            record_status(records[node.name]) if node.name in records else "pending"
+            for node in sources
+        )
+        lines.append(
+            "  Source SubDAGs: "
+            f"×{len(sources)} [{status_counts_text(counts, color_enabled)}]"
+        )
+        stage_counts: dict[str, Counter] = defaultdict(Counter)
+        stage_totals = Counter()
+        unresolved = 0
+        for source in sources:
+            child = graph.children.get(source.name)
+            if child is None:
+                unresolved += 1
+                continue
+            for child_node in collect_graph_nodes(child):
+                record = records.get(child_node.name)
+                status = record_status(record) if record else "pending"
+                stage_counts[child_node.stage][status] += 1
+                stage_totals[child_node.stage] += 1
+        summaries = [
+            f"{STAGE_LABELS[stage]} ×{stage_totals[stage]} "
+            f"[{status_counts_text(stage_counts[stage], color_enabled)}]"
+            for stage, _ in STAGES
+            if stage_totals[stage]
+        ]
+        if summaries:
+            append_wrapped(lines, "    Child work: ", "; ".join(summaries), width)
+        if unresolved:
+            lines.append(f"    Child DAG pending/unavailable: {unresolved} source(s)")
+
+    cleanup_families: dict[str, list[str]] = defaultdict(list)
+    for name, node in graph.nodes.items():
+        if name.startswith("CLEANUP_"):
+            cleanup_families[indexed_family(name)].append(name)
+    if cleanup_families:
+        lines.append("  Cleanup:")
+        for family, names in sorted(cleanup_families.items()):
+            counts = Counter(
+                record_status(records[name]) if name in records else "pending"
+                for name in names
+            )
+            lines.append(
+                f"    {family.removeprefix('CLEANUP_')} ×{len(names)} "
+                f"[{status_counts_text(counts, color_enabled)}]"
+            )
 
     root_campaigns = {
         name: campaign_for_root_node(node)
@@ -866,8 +1170,13 @@ def render_collapsed_structure(
                 for name in root_names
                 if graph.nodes[name].stage in {"coordinate", "ntuple"}
             )
+        unit_label = (
+            "shards"
+            if root_names and all(name.startswith("SHARD_") for name in root_names)
+            else "source jobs"
+        )
         lines.extend(
-            ("", f"  Campaign {shown_campaign} ({source_count} source jobs):")
+            ("", f"  Campaign {shown_campaign} ({source_count} {unit_label}):")
         )
         for stage, label in STAGES:
             total = stage_totals[stage]
@@ -960,7 +1269,7 @@ def render_collapsed_structure(
     finals = [
         node
         for node in graph.nodes.values()
-        if node.directive == "FINAL"
+        if node.directive == "FINAL" or node.stage == "final"
     ]
     for node in finals:
         record = records.get(node.name)
@@ -968,7 +1277,12 @@ def render_collapsed_structure(
         marker = status_marker(status, color_enabled)
         shown = labels.fit(node.name, width - 42)
         lines.append(
-            f"  ⇢ {marker} {shown} [FINAL: after root DAG termination]"
+            f"  ⇢ {marker} {shown}"
+            + (
+                " [FINAL: after root DAG termination]"
+                if node.directive == "FINAL"
+                else " [finalization node]"
+            )
         )
     lines.extend(labels.render_legend())
     return lines
@@ -1002,7 +1316,7 @@ def render(
 ) -> str:
     graph = parse_dag_graph(root_dag)
     planned = flatten_graph(graph)
-    completed = completed_records_from_logs(planned)
+    completed = completed_records_from_logs(planned, root_dag)
     records = latest_node_records(live, completed)
     counts = {stage: Counter() for stage, _ in STAGES}
     exceptional: list[tuple[str, str, dict]] = []

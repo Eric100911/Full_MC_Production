@@ -231,13 +231,39 @@ class DagProgressTest(unittest.TestCase):
                         "PRE Script of Node PLAN_SKIPPED failed with status 99",
                         "Event: ULOG_PRESKIP for HTCondor Node PLAN_SKIPPED (0.1.0)",
                     )
-                ),
+                ) + "\n",
                 encoding="utf-8",
             )
             output = render("schedd", 1, dag, [], False)
 
         self.assertIn("2/2 complete (1 done, 1 skipped)", output)
         self.assertIn("Done/Skip", output)
+
+    def test_cleanup_preskip_uses_generic_terminal_skip_handling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dag = Path(tmp) / "root.dag"
+            dag.write_text(
+                "\n".join((
+                    "JOB CLEANUP_pool_000001 reclaim.sub",
+                    "PRE_SKIP CLEANUP_pool_000001 99",
+                )) + "\n",
+                encoding="utf-8",
+            )
+            Path(f"{dag}.dagman.out").write_text(
+                "\n".join((
+                    "PRE Script of Node CLEANUP_pool_000001 failed with status 99",
+                    "Event: ULOG_PRESKIP for HTCondor Node CLEANUP_pool_000001 (0.1.0)",
+                )) + "\n",
+                encoding="utf-8",
+            )
+            planned = parse_dag_tree(dag)
+            records = completed_records_from_logs(planned)
+            output = render("schedd", 1, dag, [], False)
+
+        self.assertEqual(node_stage("CLEANUP_pool_000001", "JOB"), "reclaim")
+        self.assertEqual(record_status(records[0]), "skipped")
+        self.assertTrue(records[0]["PreSkipped"])
+        self.assertIn("1/1 complete (0 done, 1 skipped)", output)
 
     def test_nonzero_completed_exit_is_failed(self):
         self.assertEqual(
