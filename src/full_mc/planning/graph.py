@@ -89,9 +89,14 @@ def write_tasks_dag(root, step, tasks, dependencies, spec):
         # Explicit byte ceilings drive scratch needs; never event-count inference.
         default_disk = max(4_000_000_000, int(task.get("parameters", {}).get("scratch_bytes", 0)))
         disk_kb = (int(resource.get("disk_bytes", default_disk)) + 1023) // 1024
-        memory_default = 3072 if stage == "lhe" else 6000
+        memory_default = 3072 if stage == "lhe" else 3000 if stage in {"mix", "plan"} else 6000
         memory_mb = int(resource.get("memory_mb", memory_default))
-        flavour = token(resource.get("flavour", "workday"))
+        flavour_default = (
+            "longlunch" if stage == "mix"
+            else "espresso" if stage in {"plan", "archive", "reclaim"}
+            else "workday"
+        )
+        flavour = token(resource.get("flavour", flavour_default))
         lines += [f"JOB {name} {path_text(root / 'submit' / (stage + '.sub'))}",
                   f"CATEGORY {name} {CATEGORIES[stage]}",
                   f'VARS {name} task="{name}" disk="{disk_kb}" memory="{memory_mb}" flavour="{flavour}"{task_variables(root, name)}',

@@ -135,7 +135,7 @@ def write_root_dag(root, spec):
         resource = spec.get("resources", {}).get("reclaim", {})
         disk = (int(resource.get("disk_bytes", 4_000_000_000)) + 1023) // 1024
         memory = int(resource.get("memory_mb", 6000))
-        flavour = token(resource.get("flavour", "workday"))
+        flavour = token(resource.get("flavour", "espresso"))
         return [f"JOB {name} {path_text(root / 'submit' / 'reclaim.sub')}",
                 f"CATEGORY {name} lhe_coordination",
                 f'VARS {name} task="{name}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, name)}',
@@ -184,8 +184,14 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
         resource = spec.get("resources", {}).get(stage, {})
         disk = max(4_000_000_000, int(task.get("parameters", {}).get("scratch_bytes", 0)))
         disk = (int(resource.get("disk_bytes", disk)) + 1023) // 1024
-        memory = int(resource.get("memory_mb", 3072 if stage == "lhe" else 6000))
-        flavour = token(resource.get("flavour", "workday"))
+        memory_default = 3072 if stage == "lhe" else 3000 if stage in {"mix", "plan"} else 6000
+        memory = int(resource.get("memory_mb", memory_default))
+        flavour_default = (
+            "longlunch" if stage == "mix"
+            else "espresso" if stage in {"plan", "archive", "reclaim"}
+            else "workday"
+        )
+        flavour = token(resource.get("flavour", flavour_default))
         lines += [f"JOB {identity} {path_text(root / 'submit' / (stage + '.sub'))}",
                   f"CATEGORY {identity} {CATEGORIES[stage]}",
                   f'VARS {identity} task="{identity}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, identity)}',
