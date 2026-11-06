@@ -208,3 +208,14 @@ historical attempt and must not supply job IDs or runtime paths for a new run.
 ## LHE kinematics audit
 
 - [LHE 运动学审计指南](lhe_kinematics_audit.md)
+
+## DAGMan assertion recovery (v06_01)
+
+`mcprod recovery prepare-rescue --run-dir <run> --schedd <schedd>
+--root-cluster-id <old-root>` previews per-DAG recovery. Add `--apply` to
+reconstruct missing published-product records, accept results through the run's
+deployed controller, write native rescues and archive old control files. It
+never submits jobs. Then use `mcprod run resume --run <run>`.
+
+See [the PRE_SKIP incident and operating procedure](v06_01_dagman_preskip_assertion_20261104.md)
+for evidence requirements, interruption recovery and submission boundaries.

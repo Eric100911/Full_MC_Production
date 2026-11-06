@@ -308,6 +308,10 @@ def _local_failed_terminal_evidence(root: Path, cluster: str) -> Dict[str, Any] 
     they are sufficient to authorize a rescue of this exact root, but never
     count as successful completion evidence.
     """
+    from full_mc.application.dagman_recovery import prepared_failure
+    prepared = prepared_failure(root, cluster)
+    if prepared is not None:
+        return prepared
     try:
         metrics = _read_json(root / "run.dag.metrics")
         metrics_cluster = str(metrics["dagman_id"])
@@ -397,6 +401,12 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     record = _load_submission(root)
     if record.get("state") in {"submitting", "unknown"}:
         raise RuntimeError("a submission attempt is still ambiguous; reconcile it before resuming")
+    from full_mc.application.dagman_recovery import prepared_failure, quiet
+    prepared = prepared_failure(root, record.get("root_cluster_id"))
+    if prepared is not None:
+        recovery = _read_json(root / "recovery/current.json")
+        quiet(root, str(record["scheduler"]),
+              set(recovery["clusters"]), runner)
     observed = status_run(root, runner=runner)
     if not observed.get("terminal") or observed.get("successful") is not False:
         raise RuntimeError("rescue resume requires a confirmed failed root DAGMan state")

@@ -74,6 +74,11 @@ def build_parser():
     p.add_argument("--task-id", required=True)
     p.add_argument("--confirm-no-active-writer", action="store_true", required=True,
                    help="assert the matching archive task has no running or restartable writer")
+    p = _leaf(recovery, "prepare-rescue", "Preview or prepare per-DAG rescue and result acceptance")
+    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--schedd", required=True)
+    p.add_argument("--root-cluster-id", required=True)
+    p.add_argument("--apply", action="store_true")
     runs = commands.add_parser("run").add_subparsers(dest="action", required=True)
     p = _leaf(runs, "plan", "Freeze a run and prepare its DAG without submitting")
     p.add_argument("--spec", type=Path, required=True)
@@ -198,6 +203,13 @@ def dispatch(args):
         return shards.rollback_inventory_v2_from_checkpoint(
             args.run_dir, args.checkpoint)
     if args.command == "recovery":
+        if args.action == "prepare-rescue":
+            from .application.dagman_recovery import prepare_rescue
+            result = prepare_rescue(args.run_dir, schedd=args.schedd,
+                                    root_cluster_id=args.root_cluster_id, apply=args.apply)
+            if result["state"] in {"blocked", "preparing"}:
+                result["exit_code"] = 1
+            return result
         from .application.shards import recover_archive_orphan
         return recover_archive_orphan(args.run_dir, args.task_id,
                                       confirm_no_active_writer=args.confirm_no_active_writer)
@@ -292,6 +304,8 @@ def main(argv=None):
         logging.error("%s", exc)
         return 1
     print(json.dumps(result, indent=2, default=str))
+    if args.command == "recovery" and args.action == "prepare-rescue":
+        return int(result.get("exit_code", 0))
     if args.command == "internal" and result.get("skip"):
         return 99
     if args.command == "internal" and "exit_code" in result:
