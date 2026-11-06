@@ -254,7 +254,7 @@ class ShardAcceptanceTests(ShardFixture):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
             run = self.fixture(directory)
             before = (run / "state.json").read_bytes()
-            with patch.object(staging, "transaction", side_effect=BlockingIOError()):
+            with patch.object(staging, "transaction", side_effect=staging.LockBusy()):
                 self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 75)
                 self.assertEqual(shards.finalize_run(run)["exit_code"], 75)
             self.assertEqual((run / "state.json").read_bytes(), before)

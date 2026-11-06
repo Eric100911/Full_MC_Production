@@ -145,6 +145,54 @@ class StagingContracts(unittest.TestCase):
             self.assertEqual(state['staging']['claims'], {'a': 40})
         self.assertEqual(inode, (self.root / 'staging/ledger.lock').stat().st_ino)
 
+    def identity(self):
+        stat = (self.root / 'state.json').stat()
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+    def test_read_only_transaction_leaves_state_file_untouched(self):
+        """Deferrals dominate a live run; reading state must not rewrite it."""
+        before = self.identity()
+        for _ in range(3):
+            with transaction(self.root) as state:
+                self.assertEqual(state['status'], 'planned')
+        self.assertEqual(before, self.identity())
+
+    def test_mutate_then_revert_leaves_state_file_untouched(self):
+        before = self.identity()
+        with transaction(self.root) as state:
+            state['status'] = 'running'
+            state['status'] = 'planned'
+        self.assertEqual(before, self.identity())
+
+    def test_mutation_replaces_state_file(self):
+        before = self.identity()
+        with transaction(self.root) as state:
+            reserve_bundle(state, {'a': 40})
+        self.assertNotEqual(before[0], self.identity()[0])
+        with transaction(self.root) as state:
+            self.assertEqual(state['staging']['claims'], {'a': 40})
+
+    def test_deferral_paths_leave_state_file_untouched(self):
+        """The two no-op outcomes a live run produces: hold 75 and post-check reject."""
+        with transaction(self.root) as state:
+            state['staging']['usable_bytes'] = 50
+        before = self.identity()
+        with transaction(self.root) as state:
+            self.assertEqual(reserve_bundle(state, {'p': 60}), 75)
+        self.assertEqual(before, self.identity())
+        with self.assertRaisesRegex(ValueError, 'disagrees'):
+            with transaction(self.root) as state:
+                state['staging']['resident_bytes'] = 999
+        self.assertEqual(before, self.identity())
+        with transaction(self.root) as state:
+            self.assertEqual(state['staging']['resident_bytes'], 0)
+
+    def test_written_record_is_canonical_serialization(self):
+        """The no-write comparison is only valid against the exact on-disk bytes."""
+        text = (self.root / 'state.json').read_text(encoding='utf-8')
+        self.assertEqual(text, json.dumps(json.loads(text), sort_keys=True,
+                                          separators=(',', ':')) + '\n')
+
     def test_lock_busy_is_nonblocking_and_missing_lock_is_not_created(self):
         lockpath = self.root / 'staging/ledger.lock'
         with lockpath.open('r+b') as lock:

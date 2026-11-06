@@ -65,6 +65,31 @@ prove that all sources fit in one source wave. Existing run specifications and
 their default demand-driven source selection remain unchanged; already planned
 run directories are not rewritten.
 
+### DAGMan deferred-script intervals
+
+`scheduler.script_defer.default_seconds` sets the retry delay for generated
+DAGMan PRE and POST scripts. It defaults to 60 seconds, including for older
+run specifications. `plan_accept_post_seconds` optionally overrides only the
+POST `accept-result` script for PLAN tasks; it must be a positive integer and
+defaults to `default_seconds`. Both values must be integers in the project-
+supported range 1 through 2,147,483,647 seconds. For example, to retry PLAN result acceptance
+after 10 seconds (15 seconds is also supported):
+
+```json
+{
+  "scheduler": {
+    "script_defer": {
+      "default_seconds": 60,
+      "plan_accept_post_seconds": 10
+    }
+  }
+}
+```
+
+The planner freezes these settings in `run.json`. A generator change affects
+only DAGs rendered afterward; it does not rewrite DAG files already on disk or
+change a live DAGMan process.
+
 The default capacity baseline is recorded in
 [`docs/mcprod_capacity_baseline_2026-10-13.md`](mcprod_capacity_baseline_2026-10-13.md)
 and in `production_capacity` in the node defaults. It is based on measured
