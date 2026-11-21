@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json
 from .profiles import PROFILES
 
@@ -253,6 +254,8 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                       source_dirty=dirty, profiles=selected, bundles=bundles,
                       bundle_bytes={name: (staging / name).stat().st_size
                                     for name in bundles.values()})
+        if site == "cern":
+            record["cern_state_schema"] = FUSED_STATE_SCHEMA
         if "helac-el7" in selected:
             record["helac_package"] = {
                 "source": HELAC_SOURCE_PACKAGE,

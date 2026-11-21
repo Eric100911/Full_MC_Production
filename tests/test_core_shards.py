@@ -9,11 +9,30 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.application import shards, staging
 from full_mc.io import atomic_json, read_json
-from full_mc.local_paths import record_path
-from full_mc.planning.shards import child_path
+from full_mc.domain.streams import build_streams
+from full_mc.local_paths import LAYOUT_MARKER, record_path
+from full_mc.planning.graph import write_submit_files
+from full_mc.settings import load_run_spec
+from full_mc.planning.shards import child_path, write_root_dag
 from full_mc.planning.shards import shard_name, source_name, source_order
 from tests import test_core_production as legacy_tests
 from tests.test_core_production import remote_io_blocked
+
+
+def plan_legacy_fixture(spec_path, run):
+    """Create the frozen v1 layout exercised by the legacy recovery tests."""
+    spec = load_run_spec(spec_path)
+    spec["storage"].update(staging_bytes=100000, reserve_bytes=1000)
+    spec["core_root"] = str(Path(spec["runtime_dir"]) / "controller/core")
+    spec["core_revision"] = "deadbeef"
+    run.mkdir()
+    (run / LAYOUT_MARKER).touch()
+    atomic_json(run / "run.json", spec)
+    progress = {campaign["name"]: 0 for campaign in spec["campaigns"]}
+    staging.initialize(run, 99000, {"streams": build_streams(spec), "sources": {},
+                                    "assigned_progress": progress, "target_progress": dict(progress)})
+    write_submit_files(run, spec["core_root"], spec["runtime_dir"], "/afs/test/proxy")
+    write_root_dag(run, spec)
 
 
 class ShardFixture(unittest.TestCase):
@@ -31,8 +50,7 @@ class ShardFixture(unittest.TestCase):
             for slot in spec["campaigns"][1]["sources"]:
                 slot["pool"] = "q"
         atomic_json(spec_path, spec)
-        with patch("full_mc.application.shards.resolve_proxy_path", return_value="/afs/test/proxy"):
-            shards.plan_run(spec_path, run)
+        plan_legacy_fixture(spec_path, run)
         return run
 
     def task(self, run, identity):
@@ -202,16 +220,6 @@ class ShardGraphTests(ShardFixture):
             self.assertNotIn("staging_claim_bytes", task["parameters"])
             shards.admit_producer(run, "SOURCE_ARCHIVE_000000")
 
-    def test_minimum_capacity_is_a_hard_configuration_error(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            spec_path, run = legacy_tests.ProductionLifecycle().fixture(Path(directory))
-            spec = read_json(spec_path)
-            spec["storage"].update(staging_bytes=2999, reserve_bytes=0)
-            atomic_json(spec_path, spec)
-            with self.assertRaisesRegex(ValueError, "complementary"):
-                shards.plan_run(spec_path, run)
-            self.assertFalse(run.exists())
-
 
 class ShardAcceptanceTests(ShardFixture):
     def test_independent_pool_campaigns_do_not_reserve_each_others_complements(self):
@@ -221,11 +229,6 @@ class ShardAcceptanceTests(ShardFixture):
                 state["staging"]["usable_bytes"] = 3000
             self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
 
-    def test_minimum_capacity_includes_policy_headroom_for_every_complement(self):
-        spec = {"limits": {"source_lhe_bytes": 1000, "source_block_bytes": 1000,
-                           "mixed_hepmc_bytes": 1000, "policy_headroom_bytes": 3000, "shard_nodes": 1},
-                "campaigns": [{"sources": [{"pool": "p"}, {"pool": "q"}], "max_processing_nodes": 1}]}
-        self.assertEqual(shards._minimum_capacity(spec), 7000)
 
     def test_pool_prefix_is_frozen_despite_other_pool_and_source_completion_order(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:

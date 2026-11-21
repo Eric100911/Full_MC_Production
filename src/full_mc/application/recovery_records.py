@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from full_mc.storage.transfer import TransferClient, validated_record
 
 
-def reconstruct(task, accepted, scratch, client=None):
+def reconstruct(task, accepted, scratch, client=None, *, commit_checkpoints=False):
     client = client or TransferClient()
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
@@ -39,7 +39,14 @@ def reconstruct(task, accepted, scratch, client=None):
         proof.append(ref['url'])
         return result
 
+    if stage == 'processing':
+        from full_mc.workers.processing import recover_result
+        outcome = recover_result(task, client, scratch if commit_checkpoints else None)
+        return outcome, [ref['sidecar_url'] for ref in outcome['outputs']]
     if stage == 'reclaim':
+        if task['parameters'].get('source_archive_task') and validated_record(
+                task['parameters']['verified_archive'], client) is None:
+            raise ValueError('source archive cannot be verified before reclamation')
         reclaimed = []
         for ref in task['inputs']:
             objects = []
@@ -86,8 +93,9 @@ def reconstruct(task, accepted, scratch, client=None):
         # Generated source originals were settled by LHE, not PLAN.
         new_original = original['url'] not in {r['url'] for r in task['inputs']}
         refs = outcome['outputs'] + ([original] if new_original else [])
-        outcome['staged_objects'] = [
-            {k: r[k] for k in ('artifact_id', 'url', 'kind', 'size_bytes')} for r in refs]
+        if 'staging_claim_bytes' in p:
+            outcome['staged_objects'] = [
+                {k: r[k] for k in ('artifact_id', 'url', 'kind', 'size_bytes')} for r in refs]
     else:
         if stage not in {'lhe', 'mix', 'miniaod', 'archive'}:
             raise ValueError('unsupported recovery stage: ' + stage)

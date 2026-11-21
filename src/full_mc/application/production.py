@@ -735,7 +735,11 @@ def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None
     root = Path(run_dir).resolve()
     spec = read_json(root / "run.json")
     state = read_json(root / "state.json")
-    if state.get("state_schema") == "mcprod-shard-state-v1":
+    from full_mc.application import staging
+    schema = state.get("state_schema")
+    if (schema == staging.FUSED_STATE_SCHEMA) != (spec.get("state_schema") == staging.FUSED_STATE_SCHEMA):
+        raise ValueError("run and source-archive state schemas disagree")
+    if schema in {staging.STATE_SCHEMA, staging.INVENTORY_STATE_SCHEMA, staging.FUSED_STATE_SCHEMA}:
         from full_mc.application.shards import committed_archives
         archives = committed_archives(root, state)
     else:

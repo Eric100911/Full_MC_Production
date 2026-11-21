@@ -125,7 +125,7 @@ def build_parser():
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--step", type=int)
     for action in ("prepare-source", "prepare-shard", "admit-producer",
-                   "accept-result", "complete-source", "complete-shard",
+                   "prepare-source-product", "accept-result", "complete-source", "complete-shard",
                    "prepare-cleanup", "finalize-shards"):
         p = _leaf(internal, action, "Run one local campaign-shard control operation")
         p.add_argument("--run-dir", type=Path, required=True)
@@ -134,7 +134,7 @@ def build_parser():
         if action in ("prepare-shard", "complete-shard"):
             p.add_argument("--campaign", required=True)
             p.add_argument("--shard-index", type=int, required=True)
-        if action in ("admit-producer", "accept-result"):
+        if action in ("admit-producer", "prepare-source-product", "accept-result"):
             p.add_argument("--task-id", required=True)
         if action in ("accept-result", "complete-source", "complete-shard"):
             p.add_argument("--return-code", type=int, required=True)
@@ -235,7 +235,7 @@ def dispatch(args):
             arguments = [args.run_dir, args.source_index]
         elif args.action in ("prepare-shard", "complete-shard"):
             arguments = [args.run_dir, args.campaign, args.shard_index]
-        elif args.action in ("admit-producer", "accept-result"):
+        elif args.action in ("admit-producer", "prepare-source-product", "accept-result"):
             arguments = [args.run_dir, args.task_id]
         elif args.action == "prepare-cleanup":
             arguments = [args.run_dir, args.pool, args.slot]
@@ -293,7 +293,8 @@ def dispatch(args):
         atomic_json(output, result)
         return {"task_id": result["task_id"], "stage": result["stage"],
                 "status": result["status"], "result_path": str(output),
-                "output_count": len(result.get("outputs", []))}
+                "output_count": len(result.get("outputs", [])),
+                "exit_code": int(result["status"] == "failed")}
     raise ValueError(f"unsupported command: {args.command}")
 
 
@@ -310,6 +311,8 @@ def main(argv=None):
     print(json.dumps(result, indent=2, default=str))
     if args.command == "recovery" and args.action == "prepare-rescue":
         return int(result.get("exit_code", 0))
+    if args.command == "worker":
+        return result["exit_code"]
     if args.command == "internal" and result.get("skip"):
         return 99
     if args.command == "internal" and "exit_code" in result:

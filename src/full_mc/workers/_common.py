@@ -1,11 +1,9 @@
 """Worker input, output, runtime and compact result conventions."""
 from __future__ import annotations
 import gzip
-import json
-import os
 from pathlib import Path
 from full_mc.io import atomic_json, read_json
-from full_mc.runtime.profiles import STAGE_RUNTIME, resolve_profile, runtime_for_profile
+from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.runtime.launch import launch
 from full_mc.storage.transfer import TransferClient, artifact_ref
 from full_mc.settings import CORE_ROOT
@@ -87,7 +85,7 @@ def publish(path, task, artifact_id=None, kind=None, events=None, metadata=None)
         raise ValueError(f"task output not declared: {artifact_id}")
     limit = int(parameters(task).get("max_output_bytes", 0))
     if limit and path.stat().st_size > limit:
-        raise RuntimeError(f"{task_id(task)} output exceeds reserved staging bytes")
+        raise RuntimeError(f"{task_id(task)} output exceeds its byte ceiling")
     client = TransferClient()
     staged = "staging_claim_bytes" in parameters(task)
     if not staged:

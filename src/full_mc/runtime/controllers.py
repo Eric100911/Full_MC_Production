@@ -214,6 +214,9 @@ def _run_metadata(run_dir) -> tuple[Path, dict]:
         raise ValueError(f"cannot read run metadata in {root}: {exc}") from exc
     if not isinstance(metadata, dict) or metadata.get("orchestration") != "campaign_shards":
         raise ValueError("controller switching requires a campaign_shards run.json")
+    from full_mc.application.staging import FUSED_STATE_SCHEMA
+    if metadata.get("state_schema") == FUSED_STATE_SCHEMA:
+        raise ValueError("fused campaign shards use their pinned runtime controller")
     for key in ("runtime_release", "core_revision", "core_root"):
         if not isinstance(metadata.get(key), str) or not metadata[key]:
             raise ValueError(f"campaign_shards run.json lacks {key}")

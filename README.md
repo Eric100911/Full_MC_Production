@@ -5,8 +5,8 @@ heavy-flavor Monte Carlo workflow. The supported entry point for new work is
 `mcprod`; the retained `dag_generator.py` and related scripts support
 existing production workflows and compatibility operations.
 
-The core separates campaign data, deterministic source/block planning, bounded
-CERN DAG waves, IHEP batch execution, runtime packaging, storage transfers, and
+The core separates campaign data, deterministic source/block planning, progressive
+CERN SOURCE and SHARD SubDAGs, IHEP batch execution, runtime packaging, storage transfers, and
 analysis aggregation. The intended operator layout is a separate wrapper
 repository containing this core as a pinned submodule, reviewed campaign
 specifications, production history, ignored work, and reusable runtimes.
@@ -43,8 +43,11 @@ Every run uses an explicit runtime release and exact counted inputs. Existing
 LHE sources require their URL, event count, and seed; generated sources require
 a finite event cap. Storage roots and processing defaults are centralized in
 `common/node_config_defaults.json`.
-The measured staging/archive baseline and its scope are recorded in
-[docs/mcprod_capacity_baseline_2026-10-13.md](docs/mcprod_capacity_baseline_2026-10-13.md).
+Campaign-shard runs keep LHE blocks on CERN EOS until terminal reclamation. Each
+CERN processing job runs MIX and its detector-specific MiniAOD variants,
+committing mixed HepMC directly to IHEP T2 before CMSSW starts. The IHEP handoff
+still starts with `edmCopyPickMerge` and then runs the existing ntuple and
+analysis stages.
 
 The full CLI lifecycle, configuration fields, handoff, IHEP batch, aggregation,
 recovery, and worker commands are documented in

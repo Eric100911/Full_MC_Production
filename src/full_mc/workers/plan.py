@@ -65,7 +65,7 @@ def _original_output(task, inputs, work_dir, deferred_uploads=None):
         raise ValueError("original LHE input must end in .lhe or .lhe.gz")
     cap = int(p.get("original_max_bytes", 0))
     if cap and retained.stat().st_size > cap:
-        raise RuntimeError("original LHE exceeds reserved staging bytes")
+        raise RuntimeError("original LHE exceeds its byte ceiling")
     source_ref = task["inputs"][0]
     url = str(output["url"])
     if url != str(source_ref["url"]):
@@ -103,7 +103,7 @@ def execute(task, work_dir):
     sizes = sum(Path(item["path"]).stat().st_size for item in blocks)
     limit = int(p.get("max_output_bytes", 0))
     if limit and sizes > limit:
-        raise RuntimeError("split blocks exceed reserved staging bytes")
+        raise RuntimeError("split blocks exceed the planner output byte ceiling")
     staged = "staging_claim_bytes" in p
     uploads = [] if staged else None
     original = _original_output(task, inputs, work_dir, uploads)

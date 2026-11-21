@@ -21,7 +21,7 @@ production-core/
   mcprod                            CLI entry point
   src/full_mc/
     domain/                         counts, source identities, deterministic allocation
-    planning/                       capacity and DAG construction
+    planning/                       DAG construction and offline capacity estimates
     application/                    run lifecycle, handoff, recovery, aggregation
     backends/                       scheduler-specific submission and status
     runtime/                        explicit profiles, packaging, worker bootstrap
@@ -38,43 +38,35 @@ operator's production wrapper remain separate activities. Counted inventories
 and selected source IDs remain authoritative. Inventory/job-spec checksums belong at the
 planning boundary, not in repeated worker package validation.
 
-## Target DAG
+## CERN campaign-shard DAG
 
-One CERN DAGMan root owns serialized, bounded waves. A wave contains only the
-sources needed for that allocation, not a barrier over every source in the run.
-
-```text
-source generation/counting -> deterministic block planning -> frozen allocation
-                                                               |
-                                                    processing SubDAG
-                                                    MIX -> MiniAOD
-                                                               |
-                                             validated component products
-                                                               |
-                                            archive LHE + mixed HepMC at IHEP
-                                                               |
-                                             reclaim eligible CERN staging
-                                                               |
-                                                     next bounded wave
-
-validated MiniAOD groups -> explicit operator handoff -> IHEP combined worker
-                                                        merge (EL8)
-                                                             |
-                                                       raw ntuple (EL9)
-                                                         /        \
-                                                   selection    efficiency
-                                                         \        /
-                                                  explicit aggregation batch
+```mermaid
+flowchart TD
+    S["SOURCE · generate or reuse LHE"] --> P["PLAN · deterministic blocks to CERN EOS"]
+    P --> SA["Archive original LHE at IHEP"]
+    SA --> SR["Verify archive and reclaim original"]
+    P --> A["Progressive SHARD allocation"]
+    A --> M["Fused worker · MIX in Pythia"]
+    M --> H["Commit compressed HepMC at IHEP"]
+    H --> C["Produce missing detector MiniAOD variants at IHEP"]
+    C --> T["Terminal reclamation of all run-owned LHE blocks"]
+    SR --> T
+    T --> F["Finalize MiniAOD groups and export handoff"]
+    F --> I["IHEP merge · edmCopyPickMerge"]
+    I --> N["Raw ntuple"]
+    N --> S1["JJP selection"]
+    N --> E["JJP efficiency"]
 ```
 
-Selection and efficiency execute sequentially in one allocation, but both read
-the full raw ntuple. Their checkpoints are independent. An efficiency retry must
-not rerun successful selection or use its filtered output as the denominator.
+Campaign SHARDs allocate progressively from accepted PLAN segments. The
+allocator freezes source/slot block identities, stride and offset, RNG seeds,
+and EDM IDs. A SHARD can start while SOURCE archiving is underway. When all
+SOURCE and SHARD nodes are complete, one terminal reclaim worker per pool
+removes every block named by that run's accepted PLAN receipts. Finalization
+requires an accepted reclaim result for every pool.
 
-Frozen allocation replay does not allocate a new wave. Committed pool cursors
-advance after archive/reclamation is recorded. Exhausted inventory is distinct
-from satisfying the finite campaign node limit. Repeated pool slots consume
-distinct blocks in selected-inventory order, including usable final tails.
+Selection and efficiency each read the full raw ntuple and have independent
+checkpoints. JUP uses merge and ntuple.
 
 ## Runtime and transfer boundaries
 
@@ -82,10 +74,10 @@ distinct blocks in selected-inventory order, including usable final tails.
 | --- | --- | --- |
 | LHE generation | `helac-el7` | compressed LHE |
 | Block planning | `utilities-el9` | compressed blocks; one task result |
-| Shower and mixing | `pythia-el8` | mixed HepMC at CERN EOS |
-| MiniAOD | `cmssw12-el8` | component MiniAOD at IHEP |
-| Merge | `cmssw12-el8` | merged MiniAOD checkpoint |
-| Ntuple | `cmssw15-el9` | full raw ntuple checkpoint |
+| Shower and mixing | `pythia-el8` | compressed HepMC checkpoint at IHEP T2 |
+| MiniAOD | `cmssw12-sim-el8` | component MiniAOD at IHEP |
+| Merge | `cmssw12-sim-el8` | merged MiniAOD checkpoint |
+| Ntuple | `cmssw15-ntuple-el9` | full raw ntuple checkpoint |
 | Selection/efficiency | `analyzer-el9` | selected ROOT / parquet shard archive |
 
 Profiles are declared by stage; host OS detection must not choose physics
@@ -97,7 +89,9 @@ native two-thread CMSSW settings.
 assets. It does not walk the generated directory, inventories, campaign job
 specs, or Git data. Heavy packages are prepared once per runtime release, not
 copied into every node directory. The transfer bootstrap unpacks the selected
-profile's assets and executes the bundled CLI in a new Python process.
+profile assets and executes the bundled CLI in a new Python process. A fused
+job runs the native MIX and simulation commands in their declared profiles
+sequentially and shares one local HepMC across variants.
 
 Each worker gets one task JSON. Source slots contain only that task's block
 references and their exact URLs. For example, a MIX task's slot configuration is:
@@ -121,26 +115,20 @@ products are published by the core transfer layer.
 
 ## Storage and recovery
 
-The default CERN staging budget is 100 decimal GB with a 10 GB reserve. A wave
-reservation must include its original LHE, split blocks, and enforced mixed-HepMC
-output ceilings. File sizes may inform byte reservations, never event counts.
-Already resident sources are not reserved again. Replayed reclamation cannot
-subtract its reservation twice.
-The measured capacity baseline and its scope are recorded in
-`docs/mcprod_capacity_baseline_2026-10-13.md`; the current baseline supports a
-1,000-node planning wave for `pool_2jpsi_cs` and uses a 200 GB archive-worker
-disk request. Other pools require their own size check.
+CERN EOS retains run-owned PLAN blocks and originals awaiting verified source
+archiving. The fused worker publishes mixed HepMC directly to its run-owned
+IHEP archive path and MiniAOD directly to its existing product paths. The v3
+state transaction records accepted receipts, PLAN segments, allocations, and
+completion under a dedicated lock. It has no resident-byte counters, producer
+reservations, or intermediate cleanup state.
 
-Exact storage roots remain in `common/node_config_defaults.json`. CERN EOS is
-the short-term storage through mixed HepMC; large MiniAOD products and upstream
-archives go to IHEP. No worker searches alternate storage layouts.
-
-Compressed upstream members are stored in uncompressed tar archives, without
-recompressing their gzip payloads. The archive worker verifies component MiniAOD
-readiness and creates the archive; it does not itself delete staging. The
-controller records archive verification, reclamation, and continuation as
-separate lifecycle transitions. Live storage validation is still required before
-production use.
+Each fused artifact has checksum-addressed candidate metadata, an exclusive
+persist-on-successful-close payload, and a final JSON record. Validation binds
+those records to the frozen processing task, runtime release and core revision,
+counts, byte size, and Adler-32 checksum. MiniAOD metadata also binds each
+variant to the exact HepMC checkpoint. A retry can finish a payload whose final
+JSON publication was interrupted. A retry with committed outputs can verify and
+return success without invoking native physics commands.
 
 The immutable group ledger plus `state.json`'s committed
 `merge_group_counts` are the authoritative state source. Handoff export reads
@@ -157,9 +145,8 @@ reconciliation and are not automatically duplicated.
 The refactored CLI is the supported interface for new work. Prepared pilots,
 live CERN/IHEP scheduler reconciliation, full analyzer execution, and the
 CMSSW15 fallback still require environment validation before production cutover.
-The old graph scaffold remains a retained compatibility path. The new runtime
-contracts should be checked in an unsubmitted generated DAG before any
-production cutover.
+The wave and v1/v2 SHARD controllers remain available to frozen legacy runs.
+Use the v3 worker, state, and controller together for new campaign-shard runs.
 
 Offline checks for the current contracts:
 

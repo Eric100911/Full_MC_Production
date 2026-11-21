@@ -1,4 +1,4 @@
-"""Authoritative, locked byte accounting for run-owned staging objects.
+"""Locked production-state transactions and legacy staging accounting.
 
 This module performs local control-record I/O only. Remote publication and
 removal happen in workers, before their exact results are accepted here.
@@ -18,6 +18,7 @@ from full_mc.application import admission_hints, control_events
 
 STATE_SCHEMA = "mcprod-shard-state-v1"
 INVENTORY_STATE_SCHEMA = "mcprod-shard-state-v2"
+FUSED_STATE_SCHEMA = "mcprod-shard-state-v3"
 INVENTORY_SEGMENT_SCHEMA = "mcprod-plan-inventory-v1"
 _OBJECT_KEYS = {"artifact_id", "url", "size_bytes", "kind"}
 
@@ -67,6 +68,11 @@ def _objects(records):
 
 def _check(state):
     schema = state.get("state_schema")
+    if schema == FUSED_STATE_SCHEMA:
+        if "staging" in state or "cleanup_claims" in state:
+            raise ValueError("fused run state contains legacy staging accounting")
+        _check_inventory_segments(state)
+        return
     if schema not in {STATE_SCHEMA, INVENTORY_STATE_SCHEMA}:
         raise ValueError("unsupported staging state schema")
     if schema == INVENTORY_STATE_SCHEMA:
@@ -215,15 +221,33 @@ def initialize(root, usable_bytes, planner):
     return state
 
 
+def initialize_fused(root, planner, pools):
+    """Create a durable run state with an acceptance-ordered PLAN inventory."""
+    root = Path(root)
+    (root / "ledger").mkdir()
+    fd = os.open(root / "ledger/state.lock", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    planner = deepcopy(planner)
+    planner["inventory_segments"] = {"schema": INVENTORY_SEGMENT_SCHEMA,
+                                     "pools": {pool: [] for pool in sorted(pools)}}
+    state = {"state_schema": FUSED_STATE_SCHEMA, "status": "planned",
+             "planner": planner, "accepted": {}, "allocations": {}, "merge_group_counts": {}}
+    _check(state)
+    _write_state(root, state)
+    return state
+
+
 @contextmanager
-def transaction(root):
+def transaction(root, *, expected_schema=None):
     """Read, modify and durably replace state under a nonblocking whole-file lock."""
     root = Path(root)
     # No O_CREAT: recovery must never silently replace a missing lock inode.
     timed = control_events.active()
     started = time.perf_counter() if timed else None
     try:
-        lock_file = (root / "staging/ledger.lock").open("r+b")
+        fused_lock = root / "ledger/state.lock"
+        path = fused_lock if fused_lock.is_file() else root / "staging/ledger.lock"
+        lock_file = path.open("r+b")
     except BaseException:
         if timed:
             control_events.record_duration("lock_attempt", time.perf_counter() - started)
@@ -258,6 +282,10 @@ def transaction(root):
             if timed:
                 control_events.record_duration("state_parse", time.perf_counter() - parse_started)
             check_started = time.perf_counter() if timed else None
+            schema = state.get("state_schema")
+            if ((path == fused_lock) != (schema == FUSED_STATE_SCHEMA)
+                    or (expected_schema is not None and schema != expected_schema)):
+                raise ValueError("run state schema does not match its frozen controller/lock")
             _check(state)
             if timed:
                 control_events.record_duration("entry_check", time.perf_counter() - check_started)

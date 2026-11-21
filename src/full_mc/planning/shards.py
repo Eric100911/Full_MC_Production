@@ -1,9 +1,10 @@
-"""Finite, independent source and campaign SubDAGs for shared staging runs."""
+"""Finite, independent source and campaign SubDAGs and terminal cleanup."""
 from pathlib import Path
 import shlex
 import os
 import tempfile
 
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import write_immutable_json
 from full_mc.local_paths import dag_path, record_path, task_variables
 from full_mc.planning.graph import CATEGORIES, path_text, token
@@ -131,11 +132,13 @@ def write_root_dag(root, spec):
                   _script(root, "prepare-shard", name, args, defer_seconds),
                   _script(root, "complete-shard", name, args + " --return-code $RETURN",
                           defer_seconds, True)]
+    fused = spec.get("state_schema") == FUSED_STATE_SCHEMA
+
     def cleanup_job(name, pool, slot):
         resource = spec.get("resources", {}).get("reclaim", {})
         disk = (int(resource.get("disk_bytes", 4_000_000_000)) + 1023) // 1024
         memory = int(resource.get("memory_mb", 6000))
-        flavour = token(resource.get("flavour", "espresso"))
+        flavour = token(resource.get("flavour", "workday" if fused else "espresso"))
         return [f"JOB {name} {path_text(root / 'submit' / 'reclaim.sub')}",
                 f"CATEGORY {name} lhe_coordination",
                 f'VARS {name} task="{name}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, name)}',
@@ -148,14 +151,15 @@ def write_root_dag(root, spec):
     final_cleanups = []
     for pool, parents in sorted(pool_parents.items()):
         earlier = []
-        for slot, parent in enumerate(parents):
+        for slot, parent in enumerate([] if fused else parents):
             name = cleanup_name(pool, slot)
             earlier.append(name)
             lines += cleanup_job(name, pool, slot)
             lines.append(f"PARENT {parent} CHILD {name}")
-        name = cleanup_name(pool, len(parents))
+        slot = 0 if fused else len(parents)
+        name = cleanup_name(pool, slot)
         final_cleanups.append(name)
-        lines += cleanup_job(name, pool, len(parents))
+        lines += cleanup_job(name, pool, slot)
         if work or earlier:
             lines.append("PARENT " + " ".join(work + earlier) + " CHILD " + name)
     (root / "submit" / "noop.sub").write_text("universe = local\nexecutable = /bin/true\nqueue\n")
@@ -179,11 +183,14 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
     for task in tasks:
         identity = token(task["task_id"])
         stage = task["stage"]
-        if not task.get("parameters", {}).get("source_plan_task"):
+        if not {"source_plan_task", "source_archive_task"} & task["parameters"].keys():
             write_immutable_json(record_path(root, "tasks", identity), task)
         resource = spec.get("resources", {}).get(stage, {})
         disk = max(4_000_000_000, int(task.get("parameters", {}).get("scratch_bytes", 0)))
-        disk = (int(resource.get("disk_bytes", disk)) + 1023) // 1024
+        requested_disk = int(resource.get("disk_bytes", disk))
+        if stage == "processing" and requested_disk < task["parameters"]["scratch_bytes"]:
+            raise ValueError("processing scratch exceeds its requested disk budget")
+        disk = (requested_disk + 1023) // 1024
         memory_default = 3072 if stage == "lhe" else 3000 if stage in {"mix", "plan"} else 6000
         memory = int(resource.get("memory_mb", memory_default))
         flavour_default = (
@@ -197,7 +204,9 @@ def write_child_dag(root, name, tasks, dependencies, spec, claims=()):
                   f'VARS {identity} task="{identity}" disk="{disk}" memory="{memory}" flavour="{flavour}"{task_variables(root, identity)}',
                   f"RETRY {identity} 1"]
         if identity in claims:
-            lines.append(_script(root, "admit-producer", identity,
+            phase = ("prepare-source-product" if spec.get("state_schema") == FUSED_STATE_SCHEMA
+                     else "admit-producer")
+            lines.append(_script(root, phase, identity,
                                  f"--task-id {identity}", defer["default_seconds"]))
         lines.append(_script(root, "accept-result", identity,
                              f"--task-id {identity} --return-code $RETURN",

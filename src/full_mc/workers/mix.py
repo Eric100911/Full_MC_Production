@@ -9,7 +9,7 @@ from ._common import prepare, publish, result
 from .chain import execute_chain
 
 
-def execute(task, work_dir):
+def produce(task, work_dir):
     work_dir = prepare(task, work_dir, "pythia-el8")
     execute_chain(task, work_dir)
     manifest = read_json(work_dir / "mixed_manifest.json")
@@ -21,12 +21,18 @@ def execute(task, work_dir):
     if events <= 0 or events != counted:
         raise RuntimeError("mixed HepMC count disagrees with mixer result")
     compressed = work_dir / "mixed.hepmc.gz"
-    with mixed.open("rb") as source, gzip.open(compressed, "wb", compresslevel=1) as target:
-        shutil.copyfileobj(source, target)
-    output = publish(compressed, task, events=events)
+    with mixed.open("rb") as source, compressed.open("wb") as target:
+        with gzip.GzipFile(filename="", fileobj=target, mode="wb", compresslevel=1, mtime=0) as stream:
+            shutil.copyfileobj(source, stream)
     source_counts = [
         {"slot": index,
          "actual_hepmc_events": read_json(work_dir / f"shower_{slot.get('slot', index)}_manifest.json")["actual_hepmc_events"]}
         for index, slot in enumerate(task["parameters"]["sources"])
     ]
+    return compressed, events, source_counts
+
+
+def execute(task, work_dir):
+    compressed, events, source_counts = produce(task, work_dir)
+    output = publish(compressed, task, events=events)
     return result(task, [output], source_counts=source_counts)

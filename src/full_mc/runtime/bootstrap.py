@@ -34,12 +34,16 @@ def _extract(archive_path, destination, prefix):
             target.chmod(member.mode & 0o777)
 
 
-def unpack_runtime(release_dir, destination, profile, release):
+def unpack_runtime(release_dir, destination, profile, release, *, stage_profiles=(), revision=None):
     """Unpack only this stage's payload; do not hash or copy whole run inventories."""
     source, destination = Path(release_dir).resolve(), Path(destination).resolve()
     descriptor = json.loads((source / "runtime.json").read_text())
     if descriptor["runtime_release"] != release or profile not in descriptor["profiles"]:
         raise ValueError("task does not match the transferred runtime release/profile")
+    if not set(stage_profiles) <= set(descriptor["profiles"]):
+        raise ValueError("fused task requires profiles absent from its runtime release")
+    if revision is not None and descriptor.get("git_revision") != revision:
+        raise ValueError("fused task core revision differs from its runtime release")
     if destination.exists():
         raise FileExistsError(destination)
     destination.mkdir(parents=True)
@@ -52,26 +56,33 @@ def unpack_runtime(release_dir, destination, profile, release):
 
     _extract(bundle("core"), destination, "core")
     core = destination / "core"
-    if profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
-        asset = bundle(profile)
-        if not asset.is_file() and profile == "helac-el7":
-            # Some Condor schedds transfer the package under its source
-            # basename even when the release descriptor uses the stable
-            # runtime basename.  Accept that transfer spelling, but always
-            # install the package under the descriptor name expected by the
-            # worker.
-            source_alias = source / "helac_package_cbseed_v1.tar.gz"
-            if source_alias.is_file():
-                asset = source_alias
-        packages = core / "common/packages"
-        packages.mkdir(parents=True, exist_ok=True)
-        target = packages / Path(descriptor["bundles"][profile]).name
-        try:
-            os.link(asset, target)
-        except OSError:
-            shutil.copy2(asset, target)
-    elif profile == "analyzer-el9":
-        _extract(bundle(profile), core / "external", "NtupleAnalyzer")
+    installed = set()
+    for profile in dict.fromkeys((profile, *stage_profiles)):
+        if profile in descriptor["bundles"]:
+            name = descriptor["bundles"][profile]
+            if name in installed:
+                continue
+            installed.add(name)
+        if profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
+            asset = bundle(profile)
+            if not asset.is_file() and profile == "helac-el7":
+                # Some Condor schedds transfer the package under its source
+                # basename even when the release descriptor uses the stable
+                # runtime basename.  Accept that transfer spelling, but always
+                # install the package under the descriptor name expected by the
+                # worker.
+                source_alias = source / "helac_package_cbseed_v1.tar.gz"
+                if source_alias.is_file():
+                    asset = source_alias
+            packages = core / "common/packages"
+            packages.mkdir(parents=True, exist_ok=True)
+            target = packages / Path(descriptor["bundles"][profile]).name
+            try:
+                os.link(asset, target)
+            except OSError:
+                shutil.copy2(asset, target)
+        elif profile == "analyzer-el9":
+            _extract(bundle(profile), core / "external", "NtupleAnalyzer")
     return core
 
 
@@ -133,8 +144,12 @@ def main(argv=None):
     stage_work = work / "stage"
     stage_work.mkdir()
     try:
+        profiles, revision = (), None
+        if task["stage"] == "processing":
+            profiles = [stage["runtime"] for stage in (task["mix"], *task["variants"])]
+            revision = task["core_revision"]
         core = unpack_runtime(args.release_dir, work / "runtime", task["runtime"],
-                              task["runtime_release"])
+                              task["runtime_release"], stage_profiles=profiles, revision=revision)
         task.setdefault("parameters", {})["core_root"] = str(core)
         if task["runtime"] == "analyzer-el9":
             task["parameters"]["analyzer_path"] = str(core / "external/NtupleAnalyzer")

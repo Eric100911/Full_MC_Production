@@ -2,9 +2,11 @@
 from __future__ import annotations
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import zlib
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -128,6 +130,48 @@ class TransferClient:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def checksum(self, url):
+        """Return the Adler-32 checksum of an exact stored object."""
+        if not is_remote(url):
+            return file_checksum(local_path(url))
+        endpoint, lfn = _remote_parts(url)
+        fields = self._run(["xrdfs", endpoint, "query", "checksum", lfn]).stdout.split()
+        if len(fields) < 2 or fields[0].lower() != "adler32":
+            raise RuntimeError(f"remote checksum is not Adler-32: {url}")
+        value = fields[1].lower()
+        if not 0 < len(value) <= 8 or any(c not in "0123456789abcdef" for c in value):
+            raise RuntimeError(f"invalid remote checksum: {url}")
+        return value.zfill(8)
+
+    def copy_out_exclusive(self, source, destination, checksum):
+        """Publish atomically without replacing an existing object."""
+        source = Path(source)
+        if source.stat().st_size <= 0:
+            raise ValueError(f"refusing empty output: {source}")
+        self.mkdir_parent(destination)
+        if is_remote(destination):
+            try:
+                self._run(["xrdcp", "--nopbar", "--posc", "--retry", "0",
+                           "--rm-bad-cksum", "--cksum", "adler32:" + checksum,
+                           str(source), str(destination)])
+            except RuntimeError as exc:
+                if not re.search(r"(?:\balready exists\b|\bfile exists\b|\[3018\])",
+                                 str(exc), flags=re.IGNORECASE):
+                    raise
+                return False
+        else:
+            target = local_path(destination)
+            with tempfile.NamedTemporaryFile(dir=target.parent) as temporary:
+                with source.open("rb") as incoming:
+                    shutil.copyfileobj(incoming, temporary)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                try:
+                    os.link(temporary.name, target)
+                except FileExistsError:
+                    return False
+        return True
+
     def copy_out(self, source, destination):
         source = Path(source)
         if source.stat().st_size <= 0:
@@ -169,6 +213,14 @@ class TransferClient:
             self._run(["xrdfs", endpoint, "rm", lfn])
         else:
             local_path(url).unlink(missing_ok=True)
+
+def file_checksum(path):
+    checksum = 1
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum = zlib.adler32(chunk, checksum)
+    return f"{checksum:08x}"
+
 
 def materialize_input(reference, work_dir, transfer=None):
     url = str(reference["url"])
@@ -212,7 +264,12 @@ def validated_record(ref, client=None, record=None):
             if key in ref and record.get(key) != ref[key]:
                 return None
         size = client.size(ref["url"])
-        return record if size > 0 and size == record.get("size_bytes") else None
+        if size <= 0 or size != record.get("size_bytes"):
+            return None
+        if "adler32" in ref and (record.get("adler32") != ref["adler32"]
+                                 or client.checksum(ref["url"]) != ref["adler32"]):
+            return None
+        return record
     except (FileNotFoundError, ValueError, KeyError):
         return None
 

@@ -140,9 +140,14 @@ def execute_chain(task, work_dir):
         source = materialize_input(task["inputs"][0], work_dir)
         if task["stage"] == "miniaod":
             destination = work_dir / "mixed.hepmc"
-            opener = gzip.open if source.name.endswith(".gz") else open
-            with opener(source, "rb") as incoming, destination.open("wb") as outgoing:
-                shutil.copyfileobj(incoming, outgoing)
+            if source.name.endswith(".gz"):
+                with gzip.open(source, "rb") as incoming, destination.open("wb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing)
+            elif source != destination:
+                if p.get("shared_local_hepmc"):
+                    os.link(source, destination)
+                else:
+                    shutil.copy2(source, destination)
         else:
             destination = work_dir / "input_MINIAOD.root"
             if source.resolve() != destination.resolve():

@@ -54,16 +54,25 @@ Freeze and prepare a bounded CERN run without submitting it:
   --log-level info
 ```
 
-Source selection defaults to `limits.source_selection_mode: "demand"`: each
-source wave prepares only the files needed for the next allocation. Set it to
-`"prefetch"` to prepare up to `source_files_per_step` unprepared files from
-active pools, subject to the staging byte ceiling. Prefetch requires an
-explicit or default `resources.archive.disk_bytes`; processing waves are capped
-so the archive worker's estimated scratch fits that request. The generated root DAG
-uses fewer predeclared wave positions only when the configured byte ceilings
-prove that all sources fit in one source wave. Existing run specifications and
-their default demand-driven source selection remain unchanged; already planned
-run directories are not rewritten.
+For new runs set `"orchestration": "campaign_shards"` as in the workspace
+example. SOURCE SubDAGs publish PLAN blocks to CERN EOS. The controller can
+allocate and start a SHARD as soon as its needed PLAN segments are accepted.
+Original-source reclamation follows verified source archiving. The run reclaims
+all published blocks in a terminal phase after every SOURCE and SHARD finishes.
+
+Each `PROCESS_*` job freezes the MIX inputs and one MiniAOD manifest per detector
+variant. It publishes and verifies `<ihep_archive>/<run_id>/mixed/<identity>.hepmc.gz`
+before starting MiniAOD. Retries recover the HepMC and any individually committed
+MiniAOD outputs. Condor transfers the result JSON and logs back to the submit
+host. Set `resources.processing` for `memory_mb`, `disk_bytes`, and `flavour`.
+The fused job requests two CPUs. The `mixed_hepmc_bytes` and `miniaod_bytes`
+limits cap individual products and inform worker scratch requests. Queue width
+and submission cadence remain configurable through `scheduler`.
+
+New runs freeze `mcprod-shard-state-v3` in both `run.json` and `state.json` and
+require a CERN runtime prepared by this core. Keep legacy wave and v1/v2 SHARD
+runs on their frozen runtimes. Their source inventory and task manifests stay
+with those runs.
 
 ### DAGMan deferred-script intervals
 
@@ -90,21 +99,22 @@ The planner freezes these settings in `run.json`. A generator change affects
 only DAGs rendered afterward; it does not rewrite DAG files already on disk or
 change a live DAGMan process.
 
-The default capacity baseline is recorded in
-[`docs/mcprod_capacity_baseline_2026-10-13.md`](mcprod_capacity_baseline_2026-10-13.md)
-and in `production_capacity` in the node defaults. It is based on measured
-`JJP_SPS_CS` / `pool_2jpsi_cs` files: 90 GB of usable CERN staging, a 200 GB
-archive-worker disk request, and a planning baseline of 1,000 processing
-nodes and 1,000 source files per source-selection step. Treat those values as a planning
-baseline for the measured pool; validate other pools when their first results
-are available. Explicit values in a run specification always win.
+For a storage estimate, sum the planned source event counts per pool and apply
+the measured compressed PLAN block bytes per event for that pool. Include
+unused blocks and transient originals that may coexist during source archiving.
+For a pool without measured block sizes, record the unknown contribution and
+measure a representative PLAN. Use the 10–20 GB CERN LHE footprint as a
+planning allowance for a roughly ten-million-event run. The actual estimate
+depends on source-pool totals, which can differ from the mixed-event target.
+Submission reserves run namespace ownership. Storage bytes do not govern
+SOURCE or SHARD admission in v3.
 
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
 Before `run submit`, `mcprod` checks the X.509 proxy paths pinned in the worker
 submit files with `voms-proxy-info --timeleft`. Every proxy must have more than
-48 hours remaining. A failed check stops before storage reservation or Condor
+48 hours remaining. A failed check stops before namespace ownership checks or Condor
 submission; `run resume` does not repeat this check. Refresh the pinned proxy
 path before the first submission.
 
@@ -205,8 +215,9 @@ The public worker adapter runs a single staged task:
 ./mcprod worker --task task.json --work-dir worker-output
 ```
 
-`internal advance-wave` is used by generated DAGs to commit the next bounded
-controller transition. It is not a replacement for the run lifecycle commands.
+Generated v3 DAGs use `internal` commands for SOURCE and SHARD preparation,
+result acceptance, terminal cleanup, and finalization. Legacy wave DAGs use
+`internal advance-wave`.
 
 ## Validation
 

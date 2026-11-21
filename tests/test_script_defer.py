@@ -68,6 +68,11 @@ class ScriptDeferSettingsTests(unittest.TestCase):
             }
             atomic_json(spec_path, spec)
 
+            from full_mc.application.staging import FUSED_STATE_SCHEMA
+            runtime_path = Path(spec["runtime_dir"]) / "runtime.json"
+            runtime = read_json(runtime_path)
+            runtime["cern_state_schema"] = FUSED_STATE_SCHEMA
+            atomic_json(runtime_path, runtime)
             loaded = load_run_spec(spec_path)
             self.assertEqual(loaded["scheduler"]["script_defer"], spec["scheduler"]["script_defer"])
             with patch.object(shards, "resolve_proxy_path", return_value="/afs/test/proxy"):

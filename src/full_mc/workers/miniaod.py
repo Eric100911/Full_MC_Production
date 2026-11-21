@@ -1,10 +1,10 @@
-"""CMSSW12 processing from an explicitly staged mixed-HepMC checkpoint."""
+"""CMSSW12 processing from an validated mixed-HepMC checkpoint."""
 from ._common import parameters, prepare, publish, result
 from .chain import execute_chain
 from .edm import count_events
 
 
-def execute(task, work_dir):
+def produce(task, work_dir):
     work_dir = prepare(task, work_dir, task["runtime"])
     expected = int(task["inputs"][0]["events"])
     if expected <= 0 or not parameters(task).get("edm_event_id"):
@@ -17,9 +17,13 @@ def execute(task, work_dir):
     partial = events < expected
     if partial and parameters(task).get("normal_shortfall_policy") != "report-and-truncate":
         raise RuntimeError("MiniAOD shortfall is not permitted by this task")
-    output = publish(path, task, events=events,
-                     metadata={"count_source": "edmFileUtil",
-                               "expected_events": expected, "partial": partial,
-                               "global_job_index": parameters(task).get("global_job_index"),
-                               "edm_event_id": parameters(task).get("edm_event_id")})
-    return result(task, [output], partial=partial)
+    return path, events, {"count_source": "edmFileUtil", "expected_events": expected,
+                          "partial": partial,
+                          "global_job_index": parameters(task).get("global_job_index"),
+                          "edm_event_id": parameters(task).get("edm_event_id")}
+
+
+def execute(task, work_dir):
+    path, events, metadata = produce(task, work_dir)
+    output = publish(path, task, events=events, metadata=metadata)
+    return result(task, [output], partial=metadata["partial"])

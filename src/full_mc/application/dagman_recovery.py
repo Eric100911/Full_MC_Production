@@ -14,6 +14,7 @@ from full_mc.io import atomic_json
 from full_mc.local_paths import record_path
 from full_mc.storage.transfer import TransferClient
 from .recovery_records import reconstruct
+from .staging import FUSED_STATE_SCHEMA
 
 SUFFIXES = ('.nodes.log', '.lock', '.dagman.out', '.dagman.log', '.condor.sub',
             '.lib.out', '.lib.err', '.metrics')
@@ -80,6 +81,11 @@ def envelope(task, outcome):
 
 def verify_record(task, outcome, client):
     envelope(task, outcome)
+    if task['stage'] == 'processing':
+        from full_mc.workers.processing import recover_result
+        if recover_result(task, client, None) != outcome:
+            raise ValueError('fused result differs from durable checkpoints')
+        return
     if task['stage'] != 'plan':
         expected = {(r['artifact_id'], r['url'], r['kind']) for r in task['outputs']}
         actual = {(r['artifact_id'], r['url'], r['kind']) for r in outcome['outputs']}
@@ -123,6 +129,9 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
         elif not apply:
             return previous
     spec, state = read(root / 'run.json'), read(root / 'state.json')
+    fused = state.get('state_schema') == FUSED_STATE_SCHEMA
+    if fused != (spec.get('state_schema') == FUSED_STATE_SCHEMA):
+        raise ValueError('run and recovery state schemas disagree')
     submission = read(root / 'submission.json')
     if submission.get('scheduler') != schedd:
         raise ValueError('schedd differs from recorded submission')
@@ -235,7 +244,9 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                             outcome = candidate
                             break
                         if outcome is None:
-                            outcome, proof = reconstruct(task, accepted_refs, Path(scratch) / identity, client)
+                            outcome, proof = reconstruct(
+                                task, accepted_refs, Path(scratch) / identity, client,
+                                commit_checkpoints=apply)
                         else:
                             proof = ['existing local result/receipt']
                         if receipt_path.exists():
@@ -251,9 +262,9 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                                 # same URL. Preserve the orphan, then let the deployed
                                 # controller validate and publish the replacement receipt.
                                 current = read(root / 'state.json')
-                                if (identity in current['accepted']
-                                        or identity in current['staging'].get('settled_publications', {})
-                                        or identity in current['staging'].get('settled_reclaims', {})):
+                                if (task['stage'] == 'processing' or identity in current['accepted']
+                                        or identity in current.get('staging', {}).get('settled_publications', {})
+                                        or identity in current.get('staging', {}).get('settled_reclaims', {})):
                                     raise ValueError('replacement receipt already committed: ' + identity)
                                 if consumed_artifacts is None:
                                     consumed_artifacts = set()
@@ -329,7 +340,8 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                     elif identity.startswith('SHARD_'):
                         complete = state['allocations'].get(identity, {}).get('completed', False)
                     elif identity.startswith('CLEANUP_'):
-                        complete = state['cleanup_claims'].get(identity, {}).get('completed', False)
+                        complete = (identity in done if fused else
+                                    state['cleanup_claims'].get(identity, {}).get('completed', False))
                     else:
                         complete = False  # FINALIZE still repairs its completion marker.
                     if complete:

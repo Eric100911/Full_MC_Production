@@ -9,7 +9,7 @@ from full_mc.local_paths import bucketed, record_path, task_variables
 from full_mc.runtime.profiles import GRID_CA_DIR, STAGE_RUNTIME
 
 CATEGORIES = {"lhe": "lhe", "plan": "lhe_planning", "mix": "block_processing",
-              "miniaod": "processing", "archive": "lhe_coordination",
+              "miniaod": "processing", "processing": "processing", "archive": "lhe_coordination",
               "reclaim": "lhe_coordination"}
 PRE_SCRIPT_TIMEOUT_SECONDS = 3600
 PRE_SKIP_EXIT_CODE = 99
@@ -29,7 +29,7 @@ def path_text(path):
     return value
 
 
-def write_submit_files(run_dir, core_root, runtime_dir, proxy_path):
+def write_submit_files(run_dir, core_root, runtime_dir, proxy_path, *, processing_profiles=()):
     root, core, runtime = map(Path, (run_dir, core_root, runtime_dir))
     descriptor = json.loads((runtime / "runtime.json").read_text())
     submit = root / "submit"
@@ -39,15 +39,20 @@ def write_submit_files(run_dir, core_root, runtime_dir, proxy_path):
     task_macro = "$(task_path)" if bucketed(root) else "$(task)"
     log_macro = "$(log_path)" if bucketed(root) else "$(task)"
     bootstrap = core / "src/full_mc/runtime/bootstrap.py"
-    for stage, category in CATEGORIES.items():
+    for stage in CATEGORIES:
+        if stage == "processing" and not processing_profiles:
+            continue
+        if processing_profiles and stage in {"mix", "miniaod"}:
+            continue
         profile = STAGE_RUNTIME[stage]
         if profile not in descriptor["profiles"]:
             continue
         assets = [runtime / descriptor["bundles"]["core"], runtime / "runtime.json",
                   bootstrap]
-        if profile in descriptor["bundles"]:
-            assets.append(runtime / descriptor["bundles"][profile])
-        cpus = 2 if stage == "miniaod" else 1
+        profiles = {profile, *processing_profiles} if stage == "processing" else {profile}
+        assets.extend(runtime / name for name in sorted({descriptor["bundles"][p]
+                     for p in profiles if p in descriptor["bundles"]}))
+        cpus = 2 if stage in {"miniaod", "processing"} else 1
         lines = [
             "universe = vanilla", "executable = /usr/bin/python3",
             "arguments = bootstrap.py --task $(task).json",

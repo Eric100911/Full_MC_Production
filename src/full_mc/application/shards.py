@@ -1,7 +1,7 @@
 """Local, transaction-bound orchestration of independent campaign shards.
 
 DAGMan remains the execution authority. This controller accepts immutable worker
-results, allocates finite inputs and maintains the shared staging byte ledger.
+results and allocates finite inputs using durable local transactions.
 No function in the scheduling seams contacts remote storage.
 """
 import hashlib
@@ -30,6 +30,7 @@ from full_mc.planning.shards import (child_path, cleanup_name, shard_name,
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.settings import load_run_spec
+from full_mc.workers.processing import validate_outputs as validate_processing_outputs
 
 _INVENTORY_CHECKPOINT_SCHEMA = "mcprod-inventory-v2-checkpoint-v1"
 
@@ -53,7 +54,7 @@ def _entry(function):
             run_dir = kwargs.get("run_dir", args[0] if args else None)
             task_id = kwargs.get("task_id")
             if task_id is None:
-                if function.__name__ in {"admit_producer", "accept_result",
+                if function.__name__ in {"admit_producer", "prepare_source_product", "accept_result",
                                          "recover_archive_orphan"}:
                     task_id = argument(args, kwargs, "task_id", 1)
                 elif function.__name__ == "prepare_source":
@@ -116,6 +117,18 @@ def _paths(run_dir):
     return root, spec
 
 
+def _fused(spec):
+    return spec.get("state_schema") == staging.FUSED_STATE_SCHEMA
+
+
+def _transaction(root, spec):
+    if _fused(spec):
+        return staging.transaction(root, expected_schema=staging.FUSED_STATE_SCHEMA)
+    if (root / "ledger/state.lock").exists():
+        raise ValueError("fused state requires its matching frozen run.json")
+    return staging.transaction(root)
+
+
 def _manifest_path(root, name):
     return record_path(root, "ledger/shards", token(name))
 
@@ -170,16 +183,9 @@ def _claim(task, ceiling):
     return task
 
 
-def _minimum_capacity(spec):
-    """A complementary source tuple and one complete archive group must fit."""
-    limits = spec["limits"]
-    per_source = limits["source_lhe_bytes"] + limits["source_block_bytes"]
-    headroom = int(limits.get("policy_headroom_bytes", 0))
-    return max((len({s["pool"] for s in c["sources"]}) * per_source
-                + max(min(int(limits.get("shard_nodes", 10)), int(c["max_processing_nodes"]))
-                      * limits["mixed_hepmc_bytes"], headroom)
-                for c in spec["campaigns"]), default=0)
-
+def _processing_scratch(limits):
+    hepmc = limits["mixed_hepmc_bytes"]
+    return max(10 * hepmc, 2 * hepmc + 4 * limits["miniaod_bytes"])
 
 
 def plan_run(spec_path, output_dir, log_level=None):
@@ -189,18 +195,23 @@ def plan_run(spec_path, output_dir, log_level=None):
         spec["log_level"] = log_level
     legacy._authority(spec)
     limits = spec.setdefault("limits", {})
-    for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes"):
+    limits.setdefault("miniaod_bytes", 2_000_000_000)
+    for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes", "miniaod_bytes"):
         if type(limits.get(key)) is not int or limits[key] <= 0:
             raise ValueError(f"limits.{key} must be a positive output byte ceiling")
+    scratch = _processing_scratch(limits)
+    disk = spec.get("resources", {}).get("processing", {}).get("disk_bytes", scratch)
+    if disk < scratch:
+        raise ValueError("processing scratch exceeds its requested disk budget")
     limits.setdefault("shard_nodes", 10)
     limits.setdefault("target_window_nodes", 20)
     if limits["target_window_nodes"] <= 0:
         raise ValueError("target_window_nodes must be positive")
     ranges = shard_ranges(spec)
     streams = build_streams(spec)
-    usable = int(spec["storage"]["staging_bytes"]) - int(spec["storage"]["reserve_bytes"])
-    if usable < _minimum_capacity(spec):
-        raise ValueError("staging cannot fit a complementary source tuple plus full shard MIX headroom")
+    for stream in streams.values():
+        # Completion cursors in v1/v2 existed to decide when blocks could be deleted.
+        del stream["safe_cursor"], stream["closed"]
     for source in spec["sources"]:
         token(source["pool"])
         token(source["source_id"])
@@ -216,9 +227,19 @@ def plan_run(spec_path, output_dir, log_level=None):
                                        expected_site="cern")
     if spec.get("core_revision") and spec["core_revision"] != runtime["git_revision"]:
         raise ValueError("supplied core_revision does not match the prepared runtime")
-    required = {STAGE_RUNTIME[s] for s in ("plan", "mix", "archive", "reclaim")}
-    required.update(runtime_for_profile(p, "simulation") for c in spec["campaigns"]
-                    for p in c["resolved_detector_variants"])
+    if runtime.get("cern_state_schema") != staging.FUSED_STATE_SCHEMA:
+        raise ValueError("prepare a new CERN runtime for fused campaign shards")
+    spec["state_schema"] = staging.FUSED_STATE_SCHEMA
+    for key in ("staging_bytes", "reserve_bytes"):
+        spec["storage"].pop(key, None)
+    for key in ("policy_headroom_bytes", "source_selection_mode", "source_files_per_step",
+                "processing_nodes_per_wave"):
+        limits.pop(key, None)
+    spec.get("site_validation", {}).pop("isolated_budget_bytes", None)
+    required = {STAGE_RUNTIME[s] for s in ("plan", "mix", "archive", "reclaim", "processing")}
+    simulations = {runtime_for_profile(p, "simulation") for c in spec["campaigns"]
+                   for p in c["resolved_detector_variants"]}
+    required.update(simulations)
     if any(s.get("generator_profile") for s in spec["sources"]):
         required.add(STAGE_RUNTIME["lhe"])
     if not required <= set(runtime["profiles"]):
@@ -235,10 +256,12 @@ def plan_run(spec_path, output_dir, log_level=None):
     root.mkdir(parents=True, exist_ok=True)
     (root / LAYOUT_MARKER).touch()
     atomic_json(root / "run.json", spec)
-    staging.initialize(root, usable, {"streams": streams, "sources": {},
+    staging.initialize_fused(root, {"streams": streams, "sources": {},
         "assigned_progress": {c["name"]: 0 for c in spec["campaigns"]},
-        "target_progress": {c["name"]: 0 for c in spec["campaigns"]}})
-    write_submit_files(root, spec["core_root"], runtime_dir, proxy_path)
+        "target_progress": {c["name"]: 0 for c in spec["campaigns"]}},
+        {source["pool"] for source in spec["sources"]})
+    write_submit_files(root, spec["core_root"], runtime_dir, proxy_path,
+                       processing_profiles={STAGE_RUNTIME["mix"], *simulations})
     write_root_dag(root, spec)
     return {"run_id": spec["run_id"], "run_dir": str(root), "dag": str(root / "run.dag"),
             "runtime_release": spec["runtime_release"], "source_files": len(spec["sources"]),
@@ -250,7 +273,7 @@ def _inventory(root, spec, state):
     """Build pool indexes using the run's selected inventory ordering model."""
     refs, blocks, exhausted = {}, defaultdict(list), set()
     pools = {source["pool"] for source in spec["sources"]}
-    if state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
+    if state.get("state_schema") in {staging.INVENTORY_STATE_SCHEMA, staging.FUSED_STATE_SCHEMA}:
         segments = state["planner"]["inventory_segments"]["pools"]
         if set(segments) != pools:
             raise RuntimeError("PLAN inventory pools disagree with the frozen source spec")
@@ -625,37 +648,48 @@ def _source_tasks(spec, index):
     tasks, dependencies, claims = [], [], {}
     plan_id = f"PLAN_{index:06d}"
     if generation:
-        lhe = _claim(legacy._task(spec, f"LHE_{index:06d}", "lhe", [], [original], dict(
+        lhe = legacy._task(spec, f"LHE_{index:06d}", "lhe", [], [original], dict(
             generator_profile=generation, pool_name=source["pool"], seed=int(source["seed"]),
-            max_output_bytes=limits["source_lhe_bytes"], scratch_bytes=limits["source_lhe_bytes"] * 4)),
-            limits["source_lhe_bytes"])
+            max_output_bytes=limits["source_lhe_bytes"], scratch_bytes=limits["source_lhe_bytes"] * 4))
+        if not _fused(spec):
+            claims[lhe["task_id"]] = limits["source_lhe_bytes"]
+            _claim(lhe, claims[lhe["task_id"]])
         tasks.append(lhe)
-        claims[lhe["task_id"]] = limits["source_lhe_bytes"]
         inputs = [original]
         dependencies.append(([lhe["task_id"]], plan_id))
         planner_ceiling = limits["source_block_bytes"]
     else:
         inputs = [legacy._ref(f"INPUT_{index:06d}", source["url"], "lhe", events=int(source["actual_events"]))]
         planner_ceiling = limits["source_lhe_bytes"] + limits["source_block_bytes"]
-    planner = _claim(legacy._task(spec, plan_id, "plan", inputs, [], {
+    planner = legacy._task(spec, plan_id, "plan", inputs, [], {
         "pool_name": source["pool"], "primary_seed": int(source["seed"]),
         "group_id": source["source_id"], "events_per_block": spec["block_events"],
         "shuffle_seed": shuffle_seed(int(source["seed"])),
         "max_events_per_plan": int(source.get("planned_events", 0) or 0),
         "block_output_dir": base + "/blocks", "original_output": original,
         "original_max_bytes": limits["source_lhe_bytes"], "max_output_bytes": limits["source_block_bytes"],
-        "scratch_bytes": 4 * (limits["source_lhe_bytes"] + limits["source_block_bytes"])}), planner_ceiling)
+        "scratch_bytes": 4 * (limits["source_lhe_bytes"] + limits["source_block_bytes"])})
+    if not _fused(spec):
+        claims[plan_id] = planner_ceiling
+        _claim(planner, planner_ceiling)
     tasks.append(planner)
-    claims[plan_id] = planner_ceiling
     archive_id = f"SOURCE_ARCHIVE_{index:06d}"
     archive = _archive(spec, archive_id, [original], [], limits["source_lhe_bytes"])
+    if _fused(spec):
+        archive["outputs"][0]["sidecar_url"] = archive["outputs"][0]["url"] + ".json"
     archive["parameters"].update(archive_role="source", source_plan_task=plan_id)
     reclaim = _reclaim(spec, f"SOURCE_RECLAIM_{index:06d}", [original])
     tasks.extend([archive, reclaim])
     dependencies.extend([([plan_id], archive_id), ([archive_id], reclaim["task_id"])])
-    return {"tasks": tasks, "dependencies": dependencies, "claims": claims,
-            "pre_tasks": list(claims) + [archive_id],
-            "source_index": index, "pool": source["pool"]}
+    descriptor = {"tasks": tasks, "dependencies": dependencies,
+                  "pre_tasks": list(claims) + [archive_id],
+                  "source_index": index, "pool": source["pool"]}
+    if _fused(spec):
+        reclaim["parameters"]["source_archive_task"] = archive_id
+        descriptor["pre_tasks"].append(reclaim["task_id"])
+    else:
+        descriptor["claims"] = claims
+    return descriptor
 
 
 def _archive(spec, identity, refs, miniaods, upper_bytes):
@@ -698,7 +732,7 @@ def prepare_source(run_dir, source_index):
             control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
         if reason:
             return _answer(75, reason=reason, admission_hint=True)
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         current = state["planner"]["sources"].get(str(index))
         if current == "skipped":
             return _answer(99, status="unneeded")
@@ -715,35 +749,36 @@ def prepare_source(run_dir, source_index):
             if deficits[source["pool"]] <= 0:
                 return _answer(75, reason="pool already supplies the soft planning window")
             descriptor = _source_tasks(spec, index)
-            # Reserve a real campaign's complementary supply and full next
-            # archive group as a threshold, not a second ledger claim. Unrelated
-            # campaigns must not reserve one another's source headroom.
-            per_source = spec["limits"]["source_lhe_bytes"] + spec["limits"]["source_block_bytes"]
-            pending_pools = {s["pool"] for j, s in enumerate(spec["sources"])
-                             if state["planner"]["sources"].get(str(j)) == "admitted"
-                             and f"PLAN_{j:06d}" not in state["accepted"]}
-            thresholds = []
-            for campaign in relevant:
-                missing = by_campaign[campaign["name"]]
-                remaining = int(campaign["max_processing_nodes"]) - state["planner"]["assigned_progress"][campaign["name"]]
-                if remaining <= 0 or missing.get(source["pool"], 0) <= 0:
-                    continue
-                complement = sum(per_source for pool, deficit in missing.items()
-                                 if pool != source["pool"] and deficit > 0 and pool not in pending_pools)
-                group_nodes = min(int(spec["limits"].get("shard_nodes", 10)), remaining)
-                headroom = max(group_nodes * spec["limits"]["mixed_hepmc_bytes"],
-                               int(spec["limits"].get("policy_headroom_bytes", 0)))
-                thresholds.append(complement + headroom)
-            threshold = min(thresholds)
-            account = state["staging"]
-            demand = account["resident_bytes"] + sum(account["claims"].values()) + sum(descriptor["claims"].values())
-            if demand + threshold > account["usable_bytes"]:
-                if not _work_can_free_bytes(root, spec, state):
-                    raise RuntimeError("insufficient staging capacity for the next complete shard input range; "
-                                       "no admitted source, allocated shard or eligible cleanup can free bytes")
-                return _answer(75, reason="preserving complementary source and MIX headroom")
-            if staging.reserve_bundle(state, descriptor["claims"]) == 75:
-                return _answer(75, reason="staging capacity")
+            if not _fused(spec):
+                # Reserve a real campaign's complementary supply and full next
+                # archive group as a threshold, not a second ledger claim. Unrelated
+                # campaigns must not reserve one another's source headroom.
+                per_source = spec["limits"]["source_lhe_bytes"] + spec["limits"]["source_block_bytes"]
+                pending_pools = {s["pool"] for j, s in enumerate(spec["sources"])
+                                 if state["planner"]["sources"].get(str(j)) == "admitted"
+                                 and f"PLAN_{j:06d}" not in state["accepted"]}
+                thresholds = []
+                for campaign in relevant:
+                    missing = by_campaign[campaign["name"]]
+                    remaining = int(campaign["max_processing_nodes"]) - state["planner"]["assigned_progress"][campaign["name"]]
+                    if remaining <= 0 or missing.get(source["pool"], 0) <= 0:
+                        continue
+                    complement = sum(per_source for pool, deficit in missing.items()
+                                     if pool != source["pool"] and deficit > 0 and pool not in pending_pools)
+                    group_nodes = min(int(spec["limits"].get("shard_nodes", 10)), remaining)
+                    headroom = max(group_nodes * spec["limits"]["mixed_hepmc_bytes"],
+                                   int(spec["limits"].get("policy_headroom_bytes", 0)))
+                    thresholds.append(complement + headroom)
+                threshold = min(thresholds)
+                account = state["staging"]
+                demand = account["resident_bytes"] + sum(account["claims"].values()) + sum(descriptor["claims"].values())
+                if demand + threshold > account["usable_bytes"]:
+                    if not _work_can_free_bytes(root, spec, state):
+                        raise RuntimeError("insufficient staging capacity for the next complete shard input range; "
+                                           "no admitted source, allocated shard or eligible cleanup can free bytes")
+                    return _answer(75, reason="preserving complementary source and MIX headroom")
+                if staging.reserve_bundle(state, descriptor["claims"]) == 75:
+                    return _answer(75, reason="staging capacity")
             _freeze(root, name, descriptor)
             state["planner"]["sources"][str(index)] = "admitted"
             state["status"] = "running"
@@ -768,14 +803,20 @@ def _processing_tasks(spec, allocation, refs, name):
             "edm_event_id": node["edm_event_id"], "normal_shortfall_policy": spec["normal_shortfall_policy"],
             "unused_hepmc_warning_fraction": spec["unused_hepmc_warning_fraction"],
             "processing_environment": spec["processing_environment"]}
-        hepmc = legacy._ref("HEPMC_" + identity, legacy._staging(spec) + "/mixed/" + identity + ".hepmc.gz", "hepmc")
+        fused = _fused(spec)
+        mixed_base = (spec["storage"]["ihep_archive"].rstrip("/") + "/" + spec["run_id"]
+                      if fused else legacy._staging(spec))
+        hepmc = legacy._ref("HEPMC_" + identity, mixed_base + "/mixed/" + identity + ".hepmc.gz", "hepmc")
         hepmc["sidecar_url"] = hepmc["url"] + ".json"
         ceiling = spec["limits"]["mixed_hepmc_bytes"]
-        mix = _claim(legacy._task(spec, "MIX_" + identity, "mix", inputs, [hepmc],
-            dict(parameters, sources=slots, staging_bundle=name, mixing_rng_seed=node["mixing_rng_seed"],
-                 max_output_bytes=ceiling, scratch_bytes=ceiling * 10)), ceiling)
-        tasks.append(mix)
-        claims[mix["task_id"]] = ceiling
+        mix = legacy._task(spec, "MIX_" + identity, "mix", inputs, [hepmc],
+            dict(parameters, sources=slots, mixing_rng_seed=node["mixing_rng_seed"],
+                 max_output_bytes=ceiling, scratch_bytes=ceiling * 10))
+        variants = []
+        if not fused:
+            mix["parameters"]["staging_bundle"] = name
+            tasks.append(_claim(mix, ceiling))
+            claims[mix["task_id"]] = ceiling
         for profile in campaign["resolved_detector_variants"]:
             variant = profile["profile_id"]
             detector_identity = f"{campaign['name']}_{variant}_{node['job_id']}"
@@ -787,10 +828,25 @@ def _processing_tasks(spec, allocation, refs, name):
                 + campaign["name"] + "/" + variant + "/" + node["job_id"] + ".root", "miniaod",
                 detector_profile_id=variant, detector_profile=deepcopy(profile))
             mini = legacy._task(spec, "MINIAOD_" + detector_identity, "miniaod", [hepmc], [product], detector_parameters)
-            tasks.append(mini)
-            dependencies.append(([mix["task_id"]], mini["task_id"]))
-            miniaods.append(mini)
-        mixed.append(hepmc)
+            if fused:
+                product["sidecar_url"] = product["url"] + ".json"
+                mini["parameters"]["max_output_bytes"] = spec["limits"]["miniaod_bytes"]
+                variants.append(mini)
+            else:
+                tasks.append(mini)
+                dependencies.append(([mix["task_id"]], mini["task_id"]))
+                miniaods.append(mini)
+        if fused:
+            outputs = [hepmc] + [mini["outputs"][0] for mini in variants]
+            processing = legacy._task(spec, "PROCESS_" + identity, "processing", inputs,
+                                      outputs, dict(scratch_bytes=_processing_scratch(spec["limits"])))
+            processing.update(mix=mix, variants=variants, core_revision=spec["core_revision"])
+            tasks.append(processing)
+        else:
+            mixed.append(hepmc)
+    if _fused(spec):
+        return {"tasks": tasks, "dependencies": [], "allocation": allocation,
+                "campaign": campaign["name"]}
     archive = _archive(spec, "ARCHIVE_" + name, mixed,
         [m["outputs"][0] for m in miniaods], len(mixed) * spec["limits"]["mixed_hepmc_bytes"])
     reclaim = _reclaim(spec, "RECLAIM_" + name, mixed)
@@ -817,7 +873,7 @@ def prepare_shard(run_dir, campaign, shard_index):
             control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
         if reason:
             return _answer(75, reason=reason, admission_hint=True)
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         if name not in state["allocations"]:
             if state["planner"]["assigned_progress"][campaign] != start:
                 raise staging.Deferred("waiting for earlier assignments in this campaign")
@@ -828,8 +884,6 @@ def prepare_shard(run_dir, campaign, shard_index):
             if allocation is None:
                 raise staging.Deferred("waiting for a complete shard input range")
             descriptor = _processing_tasks(spec, allocation, refs, name)
-            # The first MIX PRE atomically admits this complete archive group.
-            # A half-produced shard must never pin bytes needed by its own siblings.
             _freeze(root, name, descriptor)
             for key, cursor in allocation["end_cursors"].items():
                 state["planner"]["streams"][key]["allocation_cursor"] = cursor
@@ -841,26 +895,50 @@ def prepare_shard(run_dir, campaign, shard_index):
     return _render(root, name, spec)
 
 
+def _prepare_source_product(root, spec, identity):
+    prefix = "SOURCE_ARCHIVE_" if identity.startswith("SOURCE_ARCHIVE_") else "SOURCE_RECLAIM_"
+    index = int(identity.removeprefix(prefix))
+    descriptor = read_json(_manifest_path(root, source_name(index)))
+    task = deepcopy(next(t for t in descriptor["tasks"] if t["task_id"] == identity))
+    with _transaction(root, spec) as state:
+        plan = f"PLAN_{index:06d}"
+        if plan not in state["accepted"]:
+            raise staging.Deferred("source original has no accepted PLAN result")
+        originals = _receipt(root, state, plan)["originals"]
+        if prefix == "SOURCE_ARCHIVE_":
+            task["inputs"] = deepcopy(originals)
+        else:
+            archive_id = task["parameters"]["source_archive_task"]
+            if archive_id not in state["accepted"]:
+                raise staging.Deferred("source original has no accepted archive")
+            task["parameters"]["verified_archive"] = _receipt(root, state, archive_id)["outputs"][0]
+            task["inputs"] = legacy._reclaim_refs(originals)
+    write_immutable_json(record_path(root, "tasks", identity), task)
+    return _answer()
+
+
+@_entry
+def prepare_source_product(run_dir, task_id):
+    root, spec = _paths(run_dir)
+    identity = token(task_id)
+    if not _fused(spec) or not identity.startswith(("SOURCE_ARCHIVE_", "SOURCE_RECLAIM_")):
+        raise ValueError("expected a fused run SOURCE archive or reclaim task")
+    return _prepare_source_product(root, spec, identity)
+
+
 @_entry
 def admit_producer(run_dir, task_id):
     root, spec = _paths(run_dir)
     identity = token(task_id)
+    if _fused(spec):
+        raise ValueError("producer capacity admission is only available to legacy runs")
     if identity.startswith("SOURCE_ARCHIVE_"):
-        index = int(identity.removeprefix("SOURCE_ARCHIVE_"))
-        descriptor = read_json(_manifest_path(root, source_name(index)))
-        task = deepcopy(next(t for t in descriptor["tasks"] if t["task_id"] == identity))
-        with staging.transaction(root) as state:
-            plan = f"PLAN_{index:06d}"
-            if plan not in state["accepted"]:
-                raise staging.Deferred("source original has no accepted PLAN result")
-            task["inputs"] = deepcopy(_receipt(root, state, plan)["originals"])
-        write_immutable_json(record_path(root, "tasks", identity), task)
-        return _answer()
+        return _prepare_source_product(root, spec, identity)
     task = read_json(record_path(root, "tasks", identity))
     ceiling = task["parameters"].get("staging_claim_bytes")
     if ceiling is None:
         raise ValueError("producer PRE requires an explicit frozen staging claim")
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         if identity.startswith(("LHE_", "PLAN_")) and identity not in state["staging"]["ceilings"]:
             raise RuntimeError("source child has no atomic source-bundle admission")
         bundle = task["parameters"].get("staging_bundle")
@@ -967,10 +1045,21 @@ def _pre_failure(pre_return_code):
 def _accept_validated_outcome(root, spec, state, identity, task, outcome):
     """Settle a previously validated task outcome in the caller's transaction."""
     stage = task["stage"]
+    if (_fused(spec) and stage in {"mix", "miniaod"}) or (stage == "processing" and not _fused(spec)):
+        raise ValueError("processing task does not match the run state schema")
     if stage == "plan":
         legacy._validate_planner_result(root, spec, {"plan_task": identity,
             "source_index": int(identity.removeprefix("PLAN_"))}, outcome)
         source_index = int(identity.removeprefix("PLAN_"))
+        if _fused(spec):
+            p = task["parameters"]
+            for index, block in enumerate(outcome["outputs"]):
+                expected = f"{p['block_output_dir']}/block_{p['group_id']}_{index:06d}.lhe.gz"
+                if block["url"] != expected or "sidecar_url" in block:
+                    raise ValueError("PLAN result does not name an exact run-owned LHE block")
+            original = outcome["originals"][0]
+            if original.get("sidecar_url") != p["original_output"].get("sidecar_url"):
+                raise ValueError("PLAN result has an unexpected source-original sidecar")
         if spec["sources"][source_index].get("resolved_generator_profile"):
             produced = _receipt(root, state, f"LHE_{source_index:06d}")["outputs"][0]
             retained = outcome["originals"][0]
@@ -980,15 +1069,20 @@ def _accept_validated_outcome(root, spec, state, identity, task, outcome):
                 raise RuntimeError("generated PLAN original differs from accepted LHE producer")
     elif stage == "archive":
         legacy._validate_archive_result(root, spec, {"archive_task": identity}, outcome)
+        if _fused(spec):
+            _validate_outputs(task, outcome)
         for member in outcome["members"]:
             accepted = _find_producer(root, state, member["artifact_id"])
             if any(member.get(k) != accepted.get(k) for k in ("url", "kind", "size_bytes", "events")):
                 raise RuntimeError("archive member differs from its accepted producer")
     elif stage == "reclaim":
         legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, outcome)
-        staging.settle_reclaim(state, identity, _physical_refs(state, task["inputs"]), outcome["reclaimed"])
-        if identity in state["cleanup_claims"]:
-            state["cleanup_claims"][identity]["completed"] = True
+        if not _fused(spec):
+            staging.settle_reclaim(state, identity, _physical_refs(state, task["inputs"]), outcome["reclaimed"])
+            if identity in state["cleanup_claims"]:
+                state["cleanup_claims"][identity]["completed"] = True
+    elif stage == "processing":
+        validate_processing_outputs(task, outcome["outputs"])
     else:
         _validate_outputs(task, outcome)
         if stage in {"lhe", "mix"}:
@@ -1001,9 +1095,19 @@ def _accept_validated_outcome(root, spec, state, identity, task, outcome):
             _validate_miniaod(root, spec, state, task, outcome)
     if "staging_claim_bytes" in task["parameters"]:
         staging.settle_publication(state, identity, _validate_staged(spec, task, outcome))
-    write_immutable_json(_receipt_path(root, identity), outcome)
+    if _fused(spec):
+        # Worker paths are ephemeral and must not create receipt differences.
+        outcome = dict(outcome, outputs=[{k: v for k, v in ref.items() if k != "local_path"}
+                                         for ref in outcome["outputs"]])
+    receipt = _receipt_path(root, identity)
+    if _fused(spec) and stage == "reclaim" and receipt.is_file():
+        previous = read_json(receipt)
+        legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, previous)
+        outcome = previous
+    write_immutable_json(receipt, outcome)
     state["accepted"][identity] = {"stage": stage}
-    if stage == "plan" and state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
+    if stage == "plan" and state.get("state_schema") in {
+            staging.INVENTORY_STATE_SCHEMA, staging.FUSED_STATE_SCHEMA}:
         source_index = int(identity.removeprefix("PLAN_"))
         pool = spec["sources"][source_index]["pool"]
         pool_segments = state["planner"]["inventory_segments"]["pools"].get(pool)
@@ -1022,7 +1126,7 @@ def accept_result(run_dir, task_id, return_code=0, *, pre_return_code=0):
         root, _ = _paths(run_dir)
         identity = token(task_id)
         state = read_json(root / "state.json")
-        cleanup = state["cleanup_claims"].get(identity, {})
+        cleanup = state.get("cleanup_claims", {}).get(identity, {})
         if (not identity.startswith("CLEANUP_") or cleanup.get("skipped") is not True
                 or cleanup.get("completed") is not True or cleanup.get("urls") != []):
             return _answer(1, reason="cleanup skip lacks committed empty-cleanup state")
@@ -1033,7 +1137,7 @@ def accept_result(run_dir, task_id, return_code=0, *, pre_return_code=0):
     root, spec = _paths(run_dir)
     identity = token(task_id)
     task = read_json(record_path(root, "tasks", identity))
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         if identity in state["accepted"]:
             return _answer(status="accepted")
         outcome = read_json(record_path(root, "results", identity))
@@ -1061,7 +1165,7 @@ def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
         raise ValueError("archive orphan recovery requires explicit no-active-writer confirmation")
     root, spec = _paths(run_dir)
     identity = token(task_id)
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         if identity in state["accepted"]:
             raise RuntimeError("archive orphan already has an accepted marker")
         task = read_json(record_path(root, "tasks", identity))
@@ -1074,8 +1178,8 @@ def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
         legacy.validate_result_envelope(task, orphan, spec["runtime_release"])
         if _without_archive_local_paths(outcome) != _without_archive_local_paths(orphan):
             raise RuntimeError("archive orphan differs beyond output local_path")
-        if (identity in state["staging"].get("settled_publications", {})
-                or identity in state["staging"].get("settled_reclaims", {})
+        if (identity in state.get("staging", {}).get("settled_publications", {})
+                or identity in state.get("staging", {}).get("settled_reclaims", {})
                 or identity in state.get("cleanup_claims", {})):
             raise RuntimeError("archive orphan has contradictory persisted settlement state")
         index = state.get("producer_index", {})
@@ -1087,13 +1191,15 @@ def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
 
 
 def _require_all(root, state, descriptor):
-    missing = [t["task_id"] for t in descriptor["tasks"] if t["task_id"] not in state["accepted"]]
+    missing = [task["task_id"] for task in descriptor["tasks"]
+               if state["accepted"].get(task["task_id"], {}).get("stage") != task["stage"]]
     if missing:
         raise RuntimeError("child completion lacks accepted results: " + ", ".join(missing))
-    archives = [t["task_id"] for t in descriptor["tasks"] if t["stage"] == "archive"]
-    if not archives:
-        raise RuntimeError("completed child has no durable archive")
-    for identity in archives:
+    durable = [task["task_id"] for task in descriptor["tasks"]
+               if task["stage"] in {"archive", "processing"}]
+    if not durable:
+        raise RuntimeError("completed child has no durable archive or processing results")
+    for identity in durable:
         _receipt(root, state, identity)
 
 
@@ -1114,10 +1220,10 @@ def complete_source(run_dir, source_index, return_code=0, *, pre_return_code=0):
     if int(return_code) != 0:
         return _answer(1 if int(return_code) == 75 else int(return_code),
                        reason="source child failed", worker_return_code=int(return_code))
-    root, _ = _paths(run_dir)
+    root, spec = _paths(run_dir)
     index = int(source_index)
     descriptor = read_json(_manifest_path(root, source_name(index)))
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         _require_all(root, state, descriptor)
         state["planner"]["sources"][str(index)] = "completed"
     return _answer(status="completed")
@@ -1134,9 +1240,11 @@ def complete_shard(run_dir, campaign, shard_index, return_code=0, *, pre_return_
     root, spec = _paths(run_dir)
     name = shard_name(campaign, shard_index)
     descriptor = read_json(_manifest_path(root, name))
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         _require_all(root, state, descriptor)
         state["allocations"][name]["completed"] = True
+        if _fused(spec):
+            return _answer(status="completed")
         # Completion order is independent of allocation order. Only a contiguous
         # finished prefix may advance the physical safe cursors.
         entries = sorted((value["start_job_index"], key, value)
@@ -1183,17 +1291,46 @@ def _cleanup_refs(root, spec, state, pool):
     return result
 
 
+def _require_finished_work(spec, state):
+    if any(state["planner"]["sources"].get(str(i)) not in {"completed", "skipped"}
+           for i in range(len(spec["sources"]))):
+        raise RuntimeError("requires every finite source slot completed or skipped")
+    expected = {shard_name(c, i) for c, i, _, _ in shard_ranges(spec)}
+    if (set(state["allocations"]) != expected
+            or any(not a["completed"] for a in state["allocations"].values())):
+        raise RuntimeError("requires all campaign shards completed")
+
+
+def _prepare_terminal_cleanup(root, spec, pool, slot):
+    if int(slot) != 0 or pool not in {source["pool"] for source in spec["sources"]}:
+        raise ValueError("unknown terminal cleanup slot")
+    name = cleanup_name(pool, slot)
+    with _transaction(root, spec) as state:
+        _require_finished_work(spec, state)
+        refs = []
+        for index, source in enumerate(spec["sources"]):
+            if source["pool"] != pool or state["planner"]["sources"][str(index)] == "skipped":
+                continue
+            refs.extend(_receipt(root, state, f"PLAN_{index:06d}")["outputs"])
+        task = _reclaim(spec, name, refs)
+        task["parameters"]["terminal_blocks"] = True
+        write_immutable_json(record_path(root, "tasks", name), task)
+    return _answer(status="prepared", task_id=name)
+
+
 @_entry
 def prepare_cleanup(run_dir, pool, slot):
     root, spec = _paths(run_dir)
     name = cleanup_name(pool, slot)
+    if _fused(spec):
+        return _prepare_terminal_cleanup(root, spec, pool, slot)
     # Each slot has one source/shard trigger, plus one terminal slot per pool.
     count = sum(s["pool"] == pool for s in spec["sources"]) + sum(
         any(s["pool"] == pool for s in next(c for c in spec["campaigns"] if c["name"] == campaign)["sources"])
         for campaign, _, _, _ in shard_ranges(spec))
     if pool not in {s["pool"] for s in spec["sources"]} or not 0 <= int(slot) <= count:
         raise ValueError("unknown pool cleanup slot")
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         previous = state["cleanup_claims"].get(name)
         if previous and previous.get("skipped"):
             return _answer(99, status="empty cleanup")
@@ -1230,28 +1367,32 @@ def committed_groups(run_dir, state=None):
 @_entry
 def finalize_run(run_dir):
     root, spec = _paths(run_dir)
-    with staging.transaction(root) as state:
+    with _transaction(root, spec) as state:
         if state["status"] != "complete":
-            if any(state["planner"]["sources"].get(str(i)) not in {"completed", "skipped"}
-                   for i in range(len(spec["sources"]))):
-                raise RuntimeError("finalizer requires every finite source slot completed or skipped")
-            expected = {shard_name(c, i) for c, i, _, _ in shard_ranges(spec)}
-            if (set(state["allocations"]) != expected
-                    or any(not a["completed"] for a in state["allocations"].values())):
-                raise RuntimeError("finalizer requires all campaign shards completed")
-            if any(not value["completed"] for value in state["cleanup_claims"].values()):
-                raise RuntimeError("finalizer requires all frozen cleanup operations completed")
-            if state["staging"]["resident_bytes"] or state["staging"]["claims"]:
-                raise RuntimeError("finalizer requires all run-owned staging reclaimed")
+            _require_finished_work(spec, state)
+            if _fused(spec):
+                for pool in {source["pool"] for source in spec["sources"]}:
+                    identity = cleanup_name(pool, 0)
+                    if state["accepted"].get(identity, {}).get("stage") != "reclaim":
+                        raise RuntimeError("finalizer requires terminal LHE block reclamation: " + identity)
+                    _receipt(root, state, identity)
+            else:
+                if any(not value["completed"] for value in state["cleanup_claims"].values()):
+                    raise RuntimeError("finalizer requires all frozen cleanup operations completed")
+                if state["staging"]["resident_bytes"] or state["staging"]["claims"]:
+                    raise RuntimeError("finalizer requires all run-owned staging reclaimed")
             ordered = []
             for identity, marker in state["accepted"].items():
-                if marker["stage"] != "miniaod":
+                stage = marker["stage"]
+                if stage not in {"miniaod", "processing"}:
                     continue
                 task = read_json(record_path(root, "tasks", identity))
-                p = task["parameters"]
-                ordered.append((p["campaign"], p["detector_profile_id"],
-                                int(p["job_id"].rsplit("BLOCK", 1)[1]),
-                                _receipt(root, state, identity)["outputs"][0]))
+                outputs = _receipt(root, state, identity)["outputs"]
+                variants = task["variants"] if stage == "processing" else [task]
+                for variant, ref in zip(variants, outputs[1:] if stage == "processing" else outputs):
+                    p = variant["parameters"]
+                    ordered.append((p["campaign"], p["detector_profile_id"],
+                                    int(p["job_id"].rsplit("BLOCK", 1)[1]), ref))
             groups_state = {"merge_buffers": {}, "merge_group_counts": {}}
             for campaign, profile, _, ref in sorted(ordered):
                 groups_state["merge_buffers"].setdefault(sample_key(campaign, profile), []).append(ref)

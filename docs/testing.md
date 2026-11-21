@@ -678,10 +678,9 @@ it to build a second controller around a new mcprod run.
 Prepare the site-specific runtime from a clean committed core revision and
 store it, the run directory, and operator logs on CERN AFS. A submitted mcprod
 run records its attempts and current root DAGMan identity in `submission.json`;
-use `python3 tools/mcprod_snapshot.py --run <run-dir>` for one-shot, read-only
-monitoring. It validates the current attempt, queries only its recorded root,
-and uses matching persisted logs and artifact credentials after the root leaves
-the queue. Optional `--schedd` and `--cluster` values assert that identity.
+use `./mcprod run status --run <run-dir>` for that recorded attempt and
+`tools/dag_progress.py` for nested SOURCE and SHARD progress.
+`tools/mcprod_snapshot.py` reads legacy wave runs.
 
 Live Condor reads need network access. In a restricted Codex sandbox, request
 approved unsandboxed execution *before the first attempt* at `myschedd show`,
@@ -704,7 +703,7 @@ agree on completion and cluster ID. The snapshot reader also recognizes the
 PRE-skipped wave without a generated child DAG as skipped rather than pending.
 
 `mcprod run submit` checks the proxy pinned in the generated worker submit files
-before reserving storage or submitting the root DAG. The proxy certificate must
+before reserving namespace ownership or submitting the root DAG. The proxy certificate must
 have more than 48 hours remaining according to `voms-proxy-info --timeleft`.
 The PRE scripts and `run resume` do not repeat this check.
 
@@ -728,9 +727,10 @@ use a positive finite `planned_events`, and state the expected source files,
 block size/count, subprocess modes, processing-node count, and merge target
 before submission. A ready IHEP cutover requires all of the following:
 
-1. `python3 tools/mcprod_snapshot.py --run <run-dir>` reports the CERN run
-   complete and the AFS run contains `.complete` plus its committed archive
-   receipts.
+1. `./mcprod run status --run <run-dir>` reports the CERN run complete and
+   the AFS run contains `.complete`, successful SOURCE and PROCESS receipts,
+   and the accepted terminal reclaim receipts. The IHEP mixed HepMC stays in
+   the run's archive.
 2. `mcprod handoff export` reports no rejected groups; inspect its explicit
    `tasks`, `runtime_release`, and `core_revision` before transfer.
 3. `mcprod handoff transfer` uses the explicit IHEP site configuration.
@@ -760,6 +760,39 @@ scheduler checks or resubmit solely because the scheduler field remains
 For a completed small DPS1 cutover example, see
 `docs/mcprod_ihep_cutover_pilot_lessons_2026-09-29.md`. The 2026-09-24 DPS1
 monitor prompts are historical and their IDs must not be reused.
+
+### Retry and recovery for v3 campaign shards
+
+The `PROCESS_*` stderr, diagnostic archive, and result JSON identify failed
+detector variants. A retry loads the frozen manifest, checks the IHEP HepMC
+payload and sidecar, and runs only missing variants. A payload uploaded before a
+worker or controller crash can be reconciled through its recorded checksum.
+An incomplete POSC transfer can be retried. A committed payload or sidecar
+with conflicting provenance, count, size, or checksum stops the task. Preserve
+its exact URLs and evidence. An operator can restore the verified pair before
+resuming, or authorize a new run when the original cannot be restored. Never
+overwrite a conflicting checkpoint during a retry.
+
+If publication completed and POST failed, use the existing
+`mcprod recovery prepare-rescue` procedure for the recorded failed root. The
+preview reads the durable records. Applying recovery can commit a missing final
+sidecar from its verified candidate and accept an exact reconstructed result.
+If a variant is absent, the worker retry performs that variant. A terminal
+reclaim failure leaves the run incomplete. Its frozen block list can be
+replayed, and a missing exact payload is recorded as `already-missing`.
+
+For a separately authorized pilot with one or two processing jobs:
+
+1. Confirm the frozen source count, event counts, block size and count, merge
+   target, subprocess coverage, and site validation record.
+2. Verify the native profiles, two-thread simulation, IHEP POSC publication
+   and checksum queries, and checkpoint creation before MiniAOD.
+3. Exercise a controlled retry after HepMC publication. Confirm that completed
+   variants are reused. Record peak scratch, memory, and walltime.
+4. Verify that terminal cleanup removes the allocated and unused CERN LHE
+   blocks after all consumers finish. Confirm the IHEP HepMC still validates.
+5. Export the handoff and verify the ordered MiniAOD inputs with the existing
+   IHEP `edmCopyPickMerge` and ntuple stages.
 
 ## Legacy CERN MIX / IHEP MERGE+NTUPLE split
 

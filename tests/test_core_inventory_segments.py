@@ -83,8 +83,7 @@ class InventorySegmentTest(unittest.TestCase):
         spec["sources"].append(dict(spec["sources"][0], source_id="s2", seed=20))
         spec["campaigns"][0]["max_processing_nodes"] = 2
         atomic_json(spec_path, spec)
-        with patch.object(shards, "resolve_proxy_path", return_value="/afs/test/proxy"):
-            shards.plan_run(spec_path, run)
+        test_core_shards.plan_legacy_fixture(spec_path, run)
         return run
 
     def test_post_acceptance_order_does_not_renumber_existing_blocks(self):

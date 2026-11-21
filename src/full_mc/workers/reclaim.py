@@ -1,5 +1,6 @@
 """Reclaim run-owned staged products; no discovery and no alternate paths."""
 from full_mc.storage.reclaim import remove_many
+from full_mc.storage.transfer import artifact_ready
 from ._common import parameters, prepare, result
 
 
@@ -7,12 +8,18 @@ def execute(task, work_dir):
     work_dir = prepare(task, work_dir, "utilities-el9")
     staging_prefix = str(parameters(task)["staging_prefix"]).rstrip("/") + "/"
     references = task.get("inputs", [])
-    if not references:
+    if parameters(task).get("source_archive_task"):
+        archive = parameters(task)["verified_archive"]
+        if not artifact_ready(archive):
+            raise RuntimeError("source archive cannot be verified before reclamation")
+    if not references and not parameters(task).get("terminal_blocks"):
         raise ValueError("reclaim requires explicit artifact references")
     plans = []
     targets = []
     seen = set()
     for ref in references:
+        if parameters(task).get("terminal_blocks") and ref["kind"] != "lhe-block":
+            raise ValueError("terminal cleanup requires exact LHE block references")
         url = str(ref["url"])
         if not url.startswith(staging_prefix):
             raise ValueError("refusing to reclaim outside run staging: " + url)
