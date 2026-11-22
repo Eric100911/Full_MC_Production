@@ -794,6 +794,43 @@ For a separately authorized pilot with one or two processing jobs:
 5. Export the handoff and verify the ordered MiniAOD inputs with the existing
    IHEP `edmCopyPickMerge` and ntuple stages.
 
+### Fused CERN-to-IHEP pilot (2026-11-21)
+
+Run `fused_cern_ihep_20261121T131217Z` validated the fused workflow at
+`9a8fec3bf6f6bb0b5c9a80574d7348acf79500e4` with release
+`fused_cern_ihep_20261121T131217Z-9a8fec3`. CERN DAGMan `13889279` on
+`bigbird18.cern.ch` exited successfully. IHEP HepJob `84070069` ran on
+`ams017.ihep.ac.cn` and committed all four stage checkpoints.
+
+- The JJP_DPS1 pilot selected 25 events from counted source `sps-jpsi-103`
+  (seed 103, 153,293 events). The inventory SHA-256 was
+  `9c393a706aa3ad4368a3ca3c10a822cdd65f7c4daee86950df3e4e9044369e68`.
+  PLAN produced five blocks of five events. Each of two fused jobs used distinct
+  `normal` and `phi_mpi_off` blocks and ran one `run3_2022_legacy_premix_v1`
+  variant. The fifth block was unused.
+- SHARD submitted from accepted PLAN blocks while SOURCE was still active.
+  SOURCE reclaimed the staged CERN original after archive verification.
+  MIX committed five-event HepMC files directly to IHEP before MiniAOD.
+  Live detector logs showed two threads and two streams.
+- Controlled eviction of `13889285.0` after HepMC publication recovered the
+  checkpoint and ran the missing MiniAOD without rerunning MIX. A separate
+  replay of the completed task for `13889284.0` reused both outputs without
+  running either native stage.
+- Terminal cleanup removed all five blocks after SOURCE and SHARD completed.
+  Both IHEP HepMC checkpoints still validated after cleanup. The run wrote
+  `.complete` and exported one handoff group with zero rejections.
+- `edmCopyPickMerge` opened blocks `000000` and `000001` in that order.
+  The merged MiniAOD contained ten events, and NTUPLE wrote ten entries.
+  JJP selection selected zero entries. The efficiency shard contained both
+  expected Parquet inputs for aggregation. All four output payloads matched
+  their verified sizes and Adler-32 checksums.
+
+The IHEP source fallback rejected the pinned TPS-Onia2MuMu `test/crabData`
+gitlink. Runtime preparation succeeded with the prebuilt CMSSW15 bundle.
+The AFS pilot bundle retains the scheduler records, receipts, worker logs,
+checkpoint checksums, and resource samples under
+`generated/fused_cern_ihep_20261121T131217Z/` in the pilot worktree.
+
 ## Legacy CERN MIX / IHEP MERGE+NTUPLE split
 
 The following split-DAG procedure applies only to existing legacy workspaces.
