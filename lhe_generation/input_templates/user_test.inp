@@ -53,6 +53,8 @@ minyrapconia -2.4d0
 maxrapbonia 2.4d0
 maxyrapbonia 2.4d0
 minyrapbonia -2.4d0
+miny1c 0d0
+maxy1c 30d0
 
 # Separation cuts
 mindrll 0.d0
@@ -70,7 +72,7 @@ minmqqp 0.d0
 minmqb 0.d0
 minmbb 0.d0
 minmqbeam 0d0
-absoluterap F
+absoluterap T
 
 # Monte Carlo settings - TEST: only 1000 events
 unwgt T

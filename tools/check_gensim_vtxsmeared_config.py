@@ -48,6 +48,28 @@ _RE_GENPARTICLES = re.compile(
     r"process\.genParticles\.src\s*=\s*cms\.InputTag\([\"']generatorSmeared[\"']\)"
 )
 
+_RE_FIRST_RUN_OPTION = re.compile(r"options\.register\([\"']firstRun[\"']")
+_RE_FIRST_LUMI_OPTION = re.compile(r"options\.register\([\"']firstLuminosityBlock[\"']")
+_RE_FIRST_EVENT_OPTION = re.compile(r"options\.register\([\"']firstEvent[\"']")
+_RE_EVENTS_PER_LUMI_OPTION = re.compile(
+    r"options\.register\([\"']numberEventsInLuminosityBlock[\"']"
+)
+_RE_SOURCE_FIRST_RUN = re.compile(
+    r"firstRun\s*=\s*cms\.untracked\.uint32\(options\.firstRun\)"
+)
+_RE_SOURCE_FIRST_LUMI = re.compile(
+    r"firstLuminosityBlock\s*=\s*cms\.untracked\.uint32"
+    r"\(options\.firstLuminosityBlock\)"
+)
+_RE_SOURCE_FIRST_EVENT = re.compile(
+    r"firstEvent\s*=\s*cms\.untracked\.uint64\(options\.firstEvent\)"
+)
+_RE_SOURCE_EVENTS_PER_LUMI = re.compile(
+    r"numberEventsInLuminosityBlock\s*=\s*cms\.untracked\.uint32"
+    r"\(\s*options\.numberEventsInLuminosityBlock\s*\)",
+    re.DOTALL,
+)
+
 
 def find_repo_root() -> Path:
     """Return the repository root directory (parent of tools/)."""
@@ -88,6 +110,30 @@ def main() -> int:
         (
             "process.genParticles.src = cms.InputTag('generatorSmeared')",
             lambda text: bool(_RE_GENPARTICLES.search(text)),
+        ),
+        (
+            "VarParsing registers EDM EventID controls",
+            lambda text: all(
+                regex.search(text)
+                for regex in (
+                    _RE_FIRST_RUN_OPTION,
+                    _RE_FIRST_LUMI_OPTION,
+                    _RE_FIRST_EVENT_OPTION,
+                    _RE_EVENTS_PER_LUMI_OPTION,
+                )
+            ),
+        ),
+        (
+            "MCFileSource receives explicit EDM EventID controls",
+            lambda text: all(
+                regex.search(text)
+                for regex in (
+                    _RE_SOURCE_FIRST_RUN,
+                    _RE_SOURCE_FIRST_LUMI,
+                    _RE_SOURCE_FIRST_EVENT,
+                    _RE_SOURCE_EVENTS_PER_LUMI,
+                )
+            ),
         ),
     ]
 

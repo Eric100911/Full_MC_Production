@@ -1,0 +1,4 @@
+interface:
+  display_name: "CMS LHE Capacity Planner"
+  short_description: "Plan LHE use, waste, and storage capacity"
+  default_prompt: "Use $cms-lhe-capacity-planner to plan source utilization and production capacity from the LHE inventory."

@@ -11,8 +11,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import gzip
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -20,29 +24,136 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from collections import OrderedDict
+import uuid
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common.compression_util import accepts_lhe_ext  # noqa: E402
+from tools.lhe_inventory_condor import (  # noqa: E402
+    atomic_write_json,
+    canonicalize_lhe_path,
+    load_workspace as load_lhe_inventory_workspace,
+    prepare_workspace as prepare_lhe_inventory_workspace,
+    submit_workspace as submit_lhe_inventory_workspace,
+    summarize_workspace as summarize_lhe_inventory_workspace,
+)
+from tools.split_workflow import (  # noqa: E402
+    audit_stage as audit_split_stage,
+    export_mix_manifest,
+    finalize as finalize_split_workspace,
+    prepare_workspace as prepare_split_workspace,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+NODE_CONFIG_DEFAULTS_PATH = os.path.join(BASE_DIR, "common", "node_config_defaults.json")
+
+
+def load_node_config_defaults() -> Dict[str, object]:
+    try:
+        with open(NODE_CONFIG_DEFAULTS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{NODE_CONFIG_DEFAULTS_PATH} must contain a JSON object")
+    return data
+
+
+NODE_CONFIG_DEFAULTS = load_node_config_defaults()
+STORAGE_CONFIG_DEFAULTS = NODE_CONFIG_DEFAULTS.get("storage", {})
+PROCESSING_ENV_DEFAULTS = NODE_CONFIG_DEFAULTS.get("processing_environment", {})
+INVENTORY_COUNTING_DEFAULTS = NODE_CONFIG_DEFAULTS.get("inventory_counting", {})
+if not isinstance(STORAGE_CONFIG_DEFAULTS, dict):
+    raise ValueError("common/node_config_defaults.json field 'storage' must be an object")
+if not isinstance(PROCESSING_ENV_DEFAULTS, dict):
+    raise ValueError("common/node_config_defaults.json field 'processing_environment' must be an object")
+if not isinstance(INVENTORY_COUNTING_DEFAULTS, dict):
+    raise ValueError("common/node_config_defaults.json field 'inventory_counting' must be an object")
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "generated")
 TEST_OUTPUT_DIR = os.path.join(BASE_DIR, "tests", "generated")
 TPS_ONIA2MUMU_SUBMODULE = os.path.join(BASE_DIR, "external", "TPS-Onia2MuMu")
 
-EOS_HOST = "cceos.ihep.ac.cn"
+EOS_REDIRECTOR = str(STORAGE_CONFIG_DEFAULTS.get("eos_redirector", "cceos.ihep.ac.cn"))
+EOS_LFN_BASE = str(STORAGE_CONFIG_DEFAULTS.get("eos_lfn_base", "/store/user/chiw/MC_Production_v3"))
+EOS_BASE = f"root://{EOS_REDIRECTOR}///{EOS_LFN_BASE.lstrip('/')}"
+EOS_HOST = EOS_REDIRECTOR
 EOS_XRDFS_TARGET = EOS_HOST
-EOS_PATH_BASE = "/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
-EOS_BASE = f"root://{EOS_HOST}/{EOS_PATH_BASE}"
+EOS_PATH_BASE = EOS_LFN_BASE
 EOS_OUTPUT = f"{EOS_BASE}/output"
 STORAGE_SITE = "T2_CN_Beijing"
+HELAC_DIAGNOSTICS_MODES = ("legacy", "none", "slim", "full")
+
+NTUPLE_VERSION = "v01_06"  # Should track the TPS-Onia2MuMu submodule tag (currently v2.0_patch2).
+HELAC_SOURCE_PACKAGE = "helac_package_cbseed_v1.tar.gz"
+HELAC_RUNTIME_PACKAGE = "helac_package.tar.gz"
+
+SUBPROCESS_MAP = OrderedDict(
+    NODE_CONFIG_DEFAULTS.get("subprocess_ids_by_campaign", {})
+)
+SUBPROCESS_MAP.setdefault("JJP_DPS1_MC_v4_1", SUBPROCESS_MAP.get("JJP_DPS1", ""))
+SUBPROCESS_MAP.setdefault("JJP_TPS_MC_v4_1", SUBPROCESS_MAP.get("JJP_TPS", ""))
+
+UNUSED_HEPMC_WARNING_FRACTION = 0.15
+DEFAULT_STORAGE_WARNING_BYTES = 4_000_000_000_000
+DEFAULT_STORAGE_HARD_LIMIT_BYTES = 5_000_000_000_000
+DEFAULT_STORAGE_BYTES_PER_EVENT = 100_000
+DEFAULT_GLOBAL_BLOCK_EVENTS = 1000
+DEFAULT_PROCESSING_SHARD_NODES = 2000
+
+LHE_POOL_DIRECTORY_CONFIG = NODE_CONFIG_DEFAULTS.get("lhe_pool_directories", {})
+if not isinstance(LHE_POOL_DIRECTORY_CONFIG, dict):
+    raise ValueError("common/node_config_defaults.json field 'lhe_pool_directories' must be an object")
+
+EXACT_LHE_POOL_PATH_BY_POOL = {
+    pool: str(info.get("path", "")).rstrip("/")
+    for pool, info in LHE_POOL_DIRECTORY_CONFIG.items()
+    if isinstance(info, dict) and info.get("path")
+}
+
+def parse_jobs_arg(jobs_str: str):
+    """Parse --jobs argument that accepts either a single integer (applied to all
+    campaigns) or comma-separated campaign=count pairs.
+
+    Returns:
+        int if the value is a bare integer.
+        Dict[str, int] if the value contains '=' signs (per-campaign mapping).
+        None if the value is empty.
+    """
+    if not jobs_str or not jobs_str.strip():
+        return None
+    jobs_str = jobs_str.strip()
+    if "=" in jobs_str:
+        result = OrderedDict()
+        for pair in jobs_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"Mixed --jobs format: expected all campaign=count pairs, got '{pair}'")
+            name, count = pair.split("=", 1)
+            result[name.strip()] = int(count.strip())
+        return result
+    try:
+        return int(jobs_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid --jobs value: '{jobs_str}'. "
+            "Use a bare integer (e.g. --jobs 100) or campaign=count pairs "
+            "(e.g. --jobs JJP_SPS_CS=999,JJP_DPS1=996)."
+        )
+
 DEFAULT_TEST_CAMPAIGNS = ("JJP_DPS2_CS", "JJP_DPS2_G", "JUP_DPS1")
 POOL_SCAN_CACHE_ENV = "DAG_GENERATOR_POOL_SCAN_CACHE"
 
 REQUIRED_FILES = (
     "common/octet_pdg.py",
+    "common/node_config_defaults.json",
     "lhe_generation/run_helac.sh",
+    "tools/helac_inspector.py",
     "processing/run_chain.sh",
     "processing/templates/lhe_gen.sub",
     "processing/templates/helac_matrix.sub",
@@ -50,6 +161,13 @@ REQUIRED_FILES = (
     "processing/templates/ntuple.sub",
     "processing/templates/summary.sub",
     "processing/templates/summary.sh",
+    "tools/archive_workflow_logs.py",
+    "processing/templates/allocate_campaign_shards.sub",
+    "processing/condor_wrappers/run_allocate_campaign_shards.sh",
+    "processing/condor_wrappers/run_ihep_split_task.sh",
+    "tools/allocate_campaign_shards.py",
+    "processing/templates/count_lhe_inventory.sub",
+    "tools/lhe_inventory_condor.py",
     "common/cmssw_configs/hepmc_to_GENSIM.py",
 )
 
@@ -70,7 +188,7 @@ PROCESSING_SUBMIT_TEMPLATE_HEPTHU = "processing/templates/processing_hepthu.sub"
 LHE_SUBMIT_TEMPLATE_LOCAL = "processing/templates/lhe_gen_local.sub"
 PROCESSING_SUBMIT_TEMPLATE_LOCAL = "processing/templates/processing_local.sub"
 SUMMARY_SUBMIT_TEMPLATE = "processing/templates/summary.sub"
-DEFAULT_LXPLUS_LOG_DIR = "/afs/cern.ch/user/x/xcheng/condor/MC_Production_DAG/T2_CN_Beijing/log"
+# Log and proxy paths are workspace-relative or user-provided; no hardcoded user paths.
 DEFAULT_HEPTHU_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
 DEFAULT_LOCAL_CONDOR_OUTPUT_BASE = os.path.expanduser("~/MC_Production_result")
 
@@ -133,7 +251,7 @@ MACHINE_ENVS: "OrderedDict[str, MachineEnv]" = OrderedDict(
                 storage_description="IHEP T2_CN_Beijing XRootD storage",
                 storage_mode="t2_xrootd",
                 required_commands=REQUIRED_COMMANDS,
-                log_dir=DEFAULT_LXPLUS_LOG_DIR,
+                log_dir="",
             ),
         ),
         (
@@ -193,13 +311,49 @@ BUNDLE_NAMES = {
     "processing": "processing_runtime_bundle.tar.gz",
     "ntuple": "ntuple_runtime_bundle.tar.gz",
     "summary": "summary_runtime_bundle.tar.gz",
+    "compression": "compression_runtime_bundle.tar.gz",
     "proxy": "proxy_bundle.tar.gz",
+    "plan": "plan_runtime_bundle.tar.gz",
+    "coordinate": "coordinate_runtime_bundle.tar.gz",
 }
 
 NTUPLE_WRAPPER_PATH = os.path.join(
     BASE_DIR, "processing", "condor_wrappers", "run_ntuple_only.sh"
 )
 NTUPLE_WRAPPER_NAME = "run_ntuple_only.sh"
+COMPRESS_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_compress.sh"
+)
+COMPRESS_WRAPPER_NAME = "run_compress.sh"
+TRANSFER_COMPRESS_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_transfer_compress.sh"
+)
+TRANSFER_COMPRESS_WRAPPER_NAME = "run_transfer_compress.sh"
+PLAN_SUBMIT_TEMPLATE = "processing/templates/plan_lhe_blocks.sub"
+PLAN_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_plan_lhe_blocks.sh"
+)
+COORDINATE_SUBMIT_TEMPLATE = "processing/templates/coordinate_lhe_blocks.sub"
+COORDINATE_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_coordinate_lhe_blocks.sh"
+)
+ALLOCATE_SUBMIT_TEMPLATE = "processing/templates/allocate_campaign_shards.sub"
+ALLOCATE_WRAPPER_PATH = os.path.join(
+    BASE_DIR,
+    "processing",
+    "condor_wrappers",
+    "run_allocate_campaign_shards.sh",
+)
+MINIAOD_MERGE_SUBMIT_TEMPLATE = "processing/templates/miniaod_merge.sub"
+MINIAOD_MERGE_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_miniaod_merge.sh"
+)
+MINIAOD_MERGE_WRAPPER_NAME = "run_miniaod_merge.sh"
+SUBDAG_FINAL_SUBMIT_TEMPLATE = "processing/templates/subdag_final.sub"
+SUBDAG_FINAL_WRAPPER_PATH = os.path.join(
+    BASE_DIR, "processing", "condor_wrappers", "run_subdag_final_inventory.sh"
+)
+SUBDAG_FINAL_WRAPPER_NAME = "run_subdag_final_inventory.sh"
 DEFAULT_LOG_ROOT = os.path.join(BASE_DIR, "log")
 CMSSW15_RUNTIME_TARBALL_NAME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 DEFAULT_CMSSW15_RUNTIME_TARBALL = os.path.join(
@@ -213,6 +367,8 @@ CMSSW15_RUNTIME_REQUIRED_MEMBERS = (
     "CMSSW_15_0_15/src",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/test/ConfFile_cfg.py",
+    "CMSSW_15_0_15/lib/el9_amd64_gcc12/pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so",
+    "CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache",
 )
 
 POOL_DAG_LABELS = {
@@ -275,11 +431,14 @@ class LHEPool:
         min_pt_conia: float = 6.0,
         min_pt_bonia: float = 4.0,
         min_pt_q: float = 0.0,
+        min_m_qqp: float = 0.0,
+        min_m_q_beam: float = 0.0,
         notes: str = "",
         seed_offset: int = 0,
         storage_name: Optional[str] = None,
         variants: Sequence[str] = (),
         public: bool = True,
+        longitudinal_symmetry_pdg_ids: Sequence[int] = (),
     ):
         self.name = name
         self.description = description
@@ -287,11 +446,14 @@ class LHEPool:
         self.min_pt_conia = min_pt_conia
         self.min_pt_bonia = min_pt_bonia
         self.min_pt_q = min_pt_q
+        self.min_m_qqp = min_m_qqp
+        self.min_m_q_beam = min_m_q_beam
         self.notes = notes
         self.seed_offset = seed_offset
         self.storage_name = storage_name or name
         self.variants = list(variants)
         self.public = public
+        self.longitudinal_symmetry_pdg_ids = list(longitudinal_symmetry_pdg_ids)
 
     @property
     def process_text(self) -> str:
@@ -311,11 +473,41 @@ class LHEPool:
             "min_pt_conia": self.min_pt_conia,
             "min_pt_bonia": self.min_pt_bonia,
             "min_pt_q": self.min_pt_q,
+            "min_m_qqp": self.min_m_qqp,
+            "min_m_q_beam": self.min_m_q_beam,
             "notes": self.notes,
             "storage_name": self.storage_name,
             "variants": self.variants,
             "public": self.public,
+            "longitudinal_symmetry_pdg_ids": self.longitudinal_symmetry_pdg_ids,
         }
+
+
+@dataclass(frozen=True)
+class LHEInventoryEntry:
+    """One immutable existing-LHE file discovered before DAG generation."""
+
+    path: str
+    seed: Optional[int] = None
+    actual_events: Optional[int] = None
+    status: str = "unknown"
+
+
+@dataclass(frozen=True)
+class LHEGroup:
+    """A reproducible group of immutable raw LHE files."""
+
+    pool: str
+    group_index: int
+    group_id: str
+    primary_seed: int
+    seeds: List[int]
+    paths: List[str]
+    event_counts: List[int]
+
+    @property
+    def total_events(self) -> int:
+        return sum(self.event_counts)
 
 
 class Campaign:
@@ -329,6 +521,8 @@ class Campaign:
         shower_modes: Sequence[str],
         description: str,
         notes: str = "",
+        aggregate: bool = True,
+        physics_campaign: str = "",
     ):
         if len(inputs) != len(shower_modes):
             raise ValueError(f"{name}: inputs 与 shower_modes 数量不一致")
@@ -338,6 +532,8 @@ class Campaign:
         self.shower_modes = [canonical_mode(mode) for mode in shower_modes]
         self.description = description
         self.notes = notes
+        self.aggregate = aggregate
+        self.physics_campaign = physics_campaign or name
 
     @property
     def n_sources(self) -> int:
@@ -351,6 +547,8 @@ class Campaign:
             "shower_modes": self.shower_modes,
             "description": self.description,
             "notes": self.notes,
+            "aggregate": self.aggregate,
+            "physics_campaign": self.physics_campaign,
         }
 
 
@@ -375,12 +573,54 @@ class WorkflowOptions:
         local_log_dir: str = "",
         local_output_base: str = "",
         log_root: str = "",
-        maxjobs_lhe: int = 20,
-        maxjobs_processing: int = 50,
-        maxjobs_ntuple: int = 30,
+        maxjobs_lhe: int = 0,
+        maxjobs_processing: int = 0,
+        maxjobs_ntuple: int = 0,
         cmssw15_runtime_tarball: Optional[str] = None,
         shuffle_mixing: bool = False,
         strict_vtx_smearing_check: bool = False,
+        compress_lhe: bool = False,
+        lhe_compression_level: int = 1,
+        lhe_shuffle_split: bool = False,
+        lhe_events_per_block: int = 1000,
+        lhe_max_events_per_plan: int = 0,
+        lhe_shuffle_mode: str = "stratified",
+        lhe_n_strata: str = "auto",
+        lhe_drop_incomplete_last_block: bool = False,
+        use_subprocess_naming: bool = False,
+        enable_lhe_block_subdags: bool = False,
+        keep_legacy_single_processing_path: bool = False,
+        lhe_shuffle_seed_base: Optional[int] = None,
+        max_block_subdag_jobs: int = 0,
+        target_base_url: str = "",
+        ntuple_version: str = "",
+        skip_lhe_generation: bool = False,
+        existing_lhe_base: str = "",
+        existing_lhe_inventory: str = "",
+        allow_incomplete_lhe_inventory: bool = False,
+        lhe_group_min_events: int = 0,
+        lhe_group_max_events: int = 0,
+        lhe_group_max_files: int = 20,
+        miniaod_merge_events: int = 5000,
+        miniaod_merge_validation: str = "event-count",
+        maxjobs_miniaod_merge: int = 0,
+        target_mixed_events: int = 0,
+        normal_max_lhe_events: int = 110,
+        phi_max_lhe_events: int = 350,
+        phi_max_hadronization_retries: int = 5000,
+        minimum_output_fraction: float = 0.8,
+        phi_consumption_mode: str = "target",
+        normal_shortfall_policy: str = "fail",
+        campaign_job_spec: str = "",
+        archive_subdag_logs: bool = True,
+        output_mode: str = "full",
+        log_level: str = "info",
+        helac_diagnostics: str = "legacy",
+        lhe_nmc: Optional[int] = None,
+        lhe_request_cpus: str = "8",
+        lhe_request_memory: str = "15GB",
+        lhe_request_disk: str = "10GB",
+        lhe_job_flavour: str = "nextweek",
     ):
         self.machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
         self.jobs_per_campaign = jobs_per_campaign
@@ -389,10 +629,63 @@ class WorkflowOptions:
         self.efficiency_ntuple = efficiency_ntuple
         self.cleanup = cleanup
         self.test_mode = test_mode
+        self.compress_lhe = compress_lhe
+        self.lhe_compression_level = lhe_compression_level
+        self.lhe_shuffle_split = lhe_shuffle_split
+        self.lhe_events_per_block = lhe_events_per_block
+        self.lhe_max_events_per_plan = lhe_max_events_per_plan
+        self.lhe_shuffle_mode = lhe_shuffle_mode
+        self.lhe_n_strata = lhe_n_strata
+        self.lhe_drop_incomplete_last_block = lhe_drop_incomplete_last_block
+        self.use_subprocess_naming = use_subprocess_naming
+        self.enable_lhe_block_subdags = enable_lhe_block_subdags
+        self.keep_legacy_single_processing_path = keep_legacy_single_processing_path
+        self.lhe_shuffle_seed_base = lhe_shuffle_seed_base
+        self.max_block_subdag_jobs = max_block_subdag_jobs if max_block_subdag_jobs > 0 else maxjobs_processing
+        self.target_base_url = target_base_url
+        self.ntuple_version = ntuple_version
         self.scan_existing = scan_existing
         self.force_generate_lhe = force_generate_lhe
+        self.skip_lhe_generation = skip_lhe_generation
+        self.existing_lhe_base = existing_lhe_base or ""
+        self.existing_lhe_inventory = existing_lhe_inventory or ""
+        self.allow_incomplete_lhe_inventory = allow_incomplete_lhe_inventory
+        self.lhe_group_min_events = lhe_group_min_events
+        self.lhe_group_max_events = lhe_group_max_events
+        self.lhe_group_max_files = lhe_group_max_files
+        self.miniaod_merge_events = miniaod_merge_events
+        self.miniaod_merge_validation = miniaod_merge_validation
+        self.maxjobs_miniaod_merge = maxjobs_miniaod_merge if maxjobs_miniaod_merge > 0 else maxjobs_ntuple
+        if target_mixed_events > 0:
+            self.target_mixed_events = target_mixed_events
+        elif max_events > 0:
+            self.target_mixed_events = max_events
+        else:
+            self.target_mixed_events = 100
+        self.normal_max_lhe_events = normal_max_lhe_events
+        self.phi_max_lhe_events = phi_max_lhe_events
+        self.phi_max_hadronization_retries = phi_max_hadronization_retries
+        self.minimum_output_fraction = minimum_output_fraction
+        self.phi_consumption_mode = phi_consumption_mode
+        self.normal_shortfall_policy = normal_shortfall_policy
+        self.unused_hepmc_warning_fraction = UNUSED_HEPMC_WARNING_FRACTION
+        self.campaign_job_spec = campaign_job_spec
+        self.archive_subdag_logs = archive_subdag_logs
+        self.output_mode = output_mode
+        self.log_level = log_level
+        if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+            raise ValueError(
+                "helac_diagnostics must be one of "
+                + ", ".join(HELAC_DIAGNOSTICS_MODES)
+            )
+        self.helac_diagnostics = helac_diagnostics
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
+        self.lhe_nmc = lhe_nmc
+        self.lhe_request_cpus = lhe_request_cpus
+        self.lhe_request_memory = lhe_request_memory
+        self.lhe_request_disk = lhe_request_disk
+        self.lhe_job_flavour = lhe_job_flavour
         self.dagman_max_jobs_submitted = dagman_max_jobs_submitted
         self.dagman_max_jobs_idle = dagman_max_jobs_idle
         self.local_log_dir = local_log_dir or self.machine_env.log_dir
@@ -410,6 +703,15 @@ class WorkflowOptions:
             return self.lhe_unwevt
         return 100 if self.test_mode else 100000
 
+    @property
+    def lhe_grouping_enabled(self) -> bool:
+        return self.lhe_group_min_events > 0
+
+    def resolved_lhe_group_max_events(self) -> int:
+        if self.lhe_group_max_events > 0:
+            return self.lhe_group_max_events
+        return 3 * self.lhe_events_per_block
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "machine_env": self.machine_env.to_dict(),
@@ -423,6 +725,13 @@ class WorkflowOptions:
             "force_generate_lhe": self.force_generate_lhe,
             "proxy_path": self.proxy_path,
             "lhe_unwevt": self.resolved_lhe_unwevt(),
+            "lhe_nmc": self.lhe_nmc,
+            "lhe_resource_request": {
+                "cpus": self.lhe_request_cpus,
+                "memory": self.lhe_request_memory,
+                "disk": self.lhe_request_disk,
+                "job_flavour": self.lhe_job_flavour,
+            },
             "dagman_max_jobs_submitted": self.dagman_max_jobs_submitted,
             "dagman_max_jobs_idle": self.dagman_max_jobs_idle,
             "local_log_dir": self.local_log_dir,
@@ -434,8 +743,60 @@ class WorkflowOptions:
             "cmssw15_runtime_tarball": self.cmssw15_runtime_tarball,
             "shuffle_mixing": self.shuffle_mixing,
             "strict_vtx_smearing_check": self.strict_vtx_smearing_check,
+            "compress_lhe": self.compress_lhe,
+            "lhe_compression_level": self.lhe_compression_level,
+            "lhe_shuffle_split": self.lhe_shuffle_split,
+            "lhe_events_per_block": self.lhe_events_per_block,
+            "lhe_shuffle_mode": self.lhe_shuffle_mode,
+            "lhe_n_strata": self.lhe_n_strata,
+            "lhe_drop_incomplete_last_block": self.lhe_drop_incomplete_last_block,
+            "use_subprocess_naming": self.use_subprocess_naming,
+            "target_base_url": self.target_base_url,
+            "ntuple_version": self.ntuple_version,
+            "enable_lhe_block_subdags": self.enable_lhe_block_subdags,
+            "keep_legacy_single_processing_path": self.keep_legacy_single_processing_path,
+            "lhe_shuffle_seed_base": self.lhe_shuffle_seed_base,
+            "max_block_subdag_jobs": self.max_block_subdag_jobs,
+            "lhe_max_events_per_plan": self.lhe_max_events_per_plan,
+            "skip_lhe_generation": self.skip_lhe_generation,
+            "existing_lhe_base": self.existing_lhe_base,
+            "existing_lhe_inventory": self.existing_lhe_inventory,
+            "existing_lhe_inventory_sha256": (
+                sha256_file(self.existing_lhe_inventory)
+                if self.existing_lhe_inventory else ""
+            ),
+            "allow_incomplete_lhe_inventory": self.allow_incomplete_lhe_inventory,
+            "lhe_group_min_events": self.lhe_group_min_events,
+            "lhe_group_max_events": self.lhe_group_max_events,
+            "lhe_group_max_files": self.lhe_group_max_files,
+            "miniaod_merge_events": self.miniaod_merge_events,
+            "miniaod_merge_validation": self.miniaod_merge_validation,
+            "maxjobs_miniaod_merge": self.maxjobs_miniaod_merge,
+            "target_mixed_events": self.target_mixed_events,
+            "normal_max_lhe_events": self.normal_max_lhe_events,
+            "phi_max_lhe_events": self.phi_max_lhe_events,
+            "phi_max_hadronization_retries": self.phi_max_hadronization_retries,
+            "minimum_output_fraction": self.minimum_output_fraction,
+            "phi_consumption_mode": self.phi_consumption_mode,
+            "normal_shortfall_policy": self.normal_shortfall_policy,
+            "unused_hepmc_warning_fraction": self.unused_hepmc_warning_fraction,
+            "campaign_job_spec": self.campaign_job_spec,
+            "campaign_job_spec_sha256": (
+                sha256_file(self.campaign_job_spec)
+                if self.campaign_job_spec else ""
+            ),
+            "archive_subdag_logs": self.archive_subdag_logs,
+            "output_mode": self.output_mode,
+            "helac_diagnostics": self.helac_diagnostics,
         }
 
+
+CHARMONIUM_LONGITUDINAL_QA_PDG_IDS = (
+    443, 9900441, 9900443, 9910441, 9940003, 9941003, 9942003,
+)
+BOTTOMONIUM_LONGITUDINAL_QA_PDG_IDS = (
+    553, 9900551, 9900553, 9910551, 9950003, 9951003, 9952003,
+)
 
 LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
     [
@@ -450,6 +811,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 ),
                 notes="J/psi 基础池使用 HELAC-Onia addon/pp_psiX_CrystalBall，CrystalBall 参数取 addon input 默认。",
                 seed_offset=0,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -463,6 +825,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 ),
                 notes="Upsilon(1S) 基础池使用 HELAC-Onia addon/pp_psiX_CrystalBall，CrystalBall 参数取 addon input 默认。",
                 seed_offset=20000,
+                longitudinal_symmetry_pdg_ids=BOTTOMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -487,6 +850,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 notes="double-J/psi born/color-singlet SPS 基础池。",
                 seed_offset=60000,
                 public=True,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -497,6 +861,9 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > cc~(3S11) cc~(3S11) g",),
                 notes="double-J/psi + g SPS 基础池。",
                 seed_offset=70000,
+                min_m_qqp=3.0969,
+                min_m_q_beam=3.0969,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
         (
@@ -507,6 +874,7 @@ LHE_POOLS: "OrderedDict[str, LHEPool]" = OrderedDict(
                 process_lines=("generate g g > jpsi y(1s)",),
                 notes="J/psi + Upsilon SPS 基础池。",
                 seed_offset=80000,
+                longitudinal_symmetry_pdg_ids=CHARMONIUM_LONGITUDINAL_QA_PDG_IDS,
             ),
         ),
     ]
@@ -573,6 +941,30 @@ CAMPAIGNS: "OrderedDict[str, Campaign]" = OrderedDict(
                 inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g", "pool_gg"),
                 shower_modes=("normal", "normal", "phi_mpi_off"),
                 description="三源混合的 JJP TPS 方案。",
+            ),
+        ),
+        (
+            "JJP_DPS1_MC_v4_1",
+            Campaign(
+                name="JJP_DPS1_MC_v4_1",
+                analysis_type="JJP",
+                inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g"),
+                shower_modes=("normal", "phi_mpi_off"),
+                description="Inventory-driven exhaustive recovery of JJP_DPS1 cap700.",
+                aggregate=False,
+                physics_campaign="JJP_DPS1",
+            ),
+        ),
+        (
+            "JJP_TPS_MC_v4_1",
+            Campaign(
+                name="JJP_TPS_MC_v4_1",
+                analysis_type="JJP",
+                inputs=("pool_jpsi_CSCO_g", "pool_jpsi_CSCO_g", "pool_gg"),
+                shower_modes=("normal", "normal", "phi_mpi_off"),
+                description="Inventory-driven exhaustive recovery of JJP_TPS cap700.",
+                aggregate=False,
+                physics_campaign="JJP_TPS",
             ),
         ),
         (
@@ -648,6 +1040,69 @@ def pool_storage_name(pool_name: str) -> str:
     return LHE_POOLS[pool_name].storage_name
 
 
+def default_existing_lhe_base() -> str:
+    """Base URL for immutable/raw LHE pools."""
+
+    return EOS_BASE.rstrip("/")
+
+
+def existing_lhe_base_url(existing_lhe_base: str = "") -> str:
+    return (existing_lhe_base or default_existing_lhe_base()).rstrip("/")
+
+
+def existing_lhe_pool_dir(pool_name: str, existing_lhe_base: str = "") -> str:
+    """Directory containing raw LHE files for one pool."""
+
+    if existing_lhe_base:
+        return f"{existing_lhe_base.rstrip('/')}/{pool_storage_name(pool_name)}"
+    configured_path = EXACT_LHE_POOL_PATH_BY_POOL.get(pool_name, "")
+    if not configured_path:
+        raise ValueError(
+            f"Missing exact LHE pool path for {pool_name} in common/node_config_defaults.json"
+        )
+    return configured_path
+
+
+def generated_lhe_pool_dir(pool_name: str, target_eos_base: str = "") -> str:
+    """Write-side directory for freshly generated LHE of one pool."""
+    base = str(node_storage_config(target_eos_base)["generated_lhe_base"])
+    return f"{base.rstrip('/')}/{pool_storage_name(pool_name)}"
+
+
+def _xrootd_storage_path(url: str) -> str:
+    """Normalize a legacy IHEP URL/LFN for inventory-overlap comparison."""
+    text = str(url).strip()
+    if text.startswith("root://"):
+        _, _, text = text[len("root://"):].partition("/")
+        text = "/" + text
+    parts: List[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/" + "/".join(parts)
+
+
+def assert_generated_dir_not_inventory(output_dir: str) -> None:
+    """Reject a generated destination equal to or below an immutable pool."""
+    target = _xrootd_storage_path(output_dir)
+    for pool_name, entry in LHE_POOL_DIRECTORY_CONFIG.items():
+        configured = str(entry.get("path", "")).strip()
+        if not configured:
+            continue
+        inventory = _xrootd_storage_path(configured)
+        if target == inventory or target.startswith(inventory + "/"):
+            raise ValueError(
+                "Refusing to generate LHE into the immutable inventory directory for "
+                + pool_name + ": " + str(output_dir)
+                + ". Generated LHE must go under <target-base>/lhe_pools/<pool>."
+            )
+
+
 def machine_env_choices() -> Tuple[str, ...]:
     choices = ["auto"]
     for name, machine_env in MACHINE_ENVS.items():
@@ -669,6 +1124,15 @@ def detect_machine_env_name() -> str:
     if os.environ.get("LOCAL_OUTPUT_BASE"):
         return "local_condor"
     return "lxplus_t2_ihep"
+
+
+def effective_log_level(args: argparse.Namespace) -> str:
+    """Resolve --log-level, defaulting to slim for inventory-driven production."""
+    if getattr(args, "log_level", None):
+        return args.log_level
+    if getattr(args, "campaign_job_spec", ""):
+        return "slim"
+    return "info"
 
 
 def requested_machine_env_name(args: argparse.Namespace) -> str:
@@ -694,12 +1158,20 @@ def resolve_machine_env(name: str) -> MachineEnv:
 def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
     required = [
         "common/octet_pdg.py",
+        "common/node_config_defaults.json",
         "lhe_generation/run_helac.sh",
+        "tools/helac_inspector.py",
         "processing/run_chain.sh",
+        "processing/cmssw_helpers/cmssw12_exec.sh",
+        "processing/cmssw_helpers/cmssw15_exec.sh",
+        "processing/cmssw_helpers/cmssw15_project_create.sh",
+        "processing/cmssw_helpers/cmssw15_project_rename.sh",
         machine_env.lhe_submit_template,
         machine_env.processing_submit_template,
         machine_env.summary_submit_template,
         "processing/templates/summary.sh",
+        "processing/templates/count_lhe_inventory.sub",
+        "tools/lhe_inventory_condor.py",
         "common/cmssw_configs/hepmc_to_GENSIM.py",
     ]
     if machine_env.name == "hepthu":
@@ -717,22 +1189,39 @@ def required_files_for_env(machine_env: MachineEnv) -> Tuple[str, ...]:
 
 
 def proxy_candidates_for_env(machine_env: Optional[MachineEnv] = None) -> List[str]:
+    """Return ordered proxy path candidates for the given machine environment.
+
+    Resolution order:
+      1. $X509_USER_PROXY  environment variable
+      2. voms-proxy-info --path  (system tool)
+
+    Hardcoded user paths are intentionally absent — every collaborator has
+    a different AFS home and directory layout.
+
+    Callers should warn when the resolved proxy lives under /tmp, since
+    Condor worker nodes cannot access a /tmp proxy that belongs to a
+    different host.
+    """
     machine_env = machine_env or resolve_machine_env("auto")
     candidates: List[str] = []
-
-    if machine_env.name == "lxplus_t2_ihep":
-        persistent_proxy = os.path.expanduser(f"~/x509up_u{os.getuid()}")
-        candidates.append(persistent_proxy)
 
     env_proxy = os.environ.get("X509_USER_PROXY")
     if env_proxy:
         candidates.append(env_proxy)
 
-    tmp_proxy = f"/tmp/x509up_u{os.getuid()}"
-    candidates.append(tmp_proxy)
-
-    workfs2_proxy = f"/workfs2/cms/chengxing/Full_MC_Production/x509up_u{os.getuid()}"
-    candidates.append(workfs2_proxy)
+    if command_exists("voms-proxy-info"):
+        try:
+            result = subprocess.run(
+                ["voms-proxy-info", "--path"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=10, check=False,
+            )
+            if result.returncode == 0:
+                voms_path = result.stdout.strip()
+                if voms_path and voms_path not in candidates:
+                    candidates.append(voms_path)
+        except Exception:
+            pass
 
     deduped: List[str] = []
     for candidate in candidates:
@@ -742,7 +1231,13 @@ def proxy_candidates_for_env(machine_env: Optional[MachineEnv] = None) -> List[s
 
 
 def detect_proxy_path(machine_env_name: str = "auto") -> str:
-    """探测当前 profile 可用的代理路径。"""
+    """Resolve an available X509 proxy path for the current environment.
+
+    Candidates are ordered by ``proxy_candidates_for_env``.  Each candidate
+    under ``/tmp`` triggers a warning (Condor worker nodes cannot access a
+    submit-host ``/tmp`` directory).  A fatal error is emitted only when
+    *no* usable non-/tmp proxy is found.
+    """
 
     try:
         machine_env = resolve_machine_env(machine_env_name)
@@ -751,39 +1246,45 @@ def detect_proxy_path(machine_env_name: str = "auto") -> str:
 
     candidates = proxy_candidates_for_env(machine_env)
 
+    found_any = False
+    good: List[str] = []
     for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return candidates[0]
+        if not candidate:
+            continue
+        if os.path.exists(candidate):
+            found_any = True
+            if candidate.startswith("/tmp/"):
+                print(
+                    f"[WARN] 代理 {candidate} 位于 /tmp 下；"
+                    f"HTCondor worker 节点无法访问。",
+                    file=sys.stderr,
+                )
+            else:
+                good.append(candidate)
+
+    if good:
+        return good[0]
+
+    if found_any:
+        print(
+            "[WARN] 所有存在的代理文件都位于 /tmp 下；"
+            "HTCondor worker 节点将无法访问。"
+            "请将 X509_USER_PROXY 设置为持久路径（例如 ~/x509up_u$(id -u)）。",
+            file=sys.stderr,
+        )
+        # Return the first /tmp candidate anyway so the caller can inspect it.
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+    # No proxy found — return first candidate for a clear downstream message.
+    if candidates:
+        return candidates[0]
+    return ""
 
 
 def ensure_local_xrootd_proxy(proxy_path: str) -> str:
-    """给本地 xrdfs/xrdcp 准备一个可直接使用的代理副本。"""
-
-    tmp_proxy = f"/tmp/x509up_u{os.getuid()}"
-    candidates: List[str] = []
-    if tmp_proxy:
-        candidates.append(tmp_proxy)
-    if proxy_path and proxy_path not in candidates:
-        candidates.append(proxy_path)
-
-    for candidate in candidates:
-        if not candidate or not os.path.exists(candidate):
-            continue
-        ok, _, _ = check_proxy_valid(candidate)
-        if ok and candidate == tmp_proxy:
-            return candidate
-
-    if proxy_path and os.path.exists(proxy_path):
-        try:
-            shutil.copyfile(proxy_path, tmp_proxy)
-            os.chmod(tmp_proxy, 0o600)
-            ok, _, _ = check_proxy_valid(tmp_proxy)
-            if ok:
-                return tmp_proxy
-        except OSError:
-            pass
-
+    """Return the caller-selected proxy without copying it to shared /tmp."""
     return proxy_path
 
 
@@ -824,6 +1325,664 @@ def load_pool_scan_cache() -> Dict[str, int]:
     return _POOL_SCAN_CACHE
 
 
+def _inventory_entry_from_raw(item: object, inventory_path: str, pool_name: str) -> LHEInventoryEntry:
+    if isinstance(item, str):
+        return LHEInventoryEntry(path=item, seed=parse_seed_from_lhe_filename(item))
+    if not isinstance(item, dict):
+        raise ValueError(f"Invalid file entry for pool {pool_name} in {inventory_path}")
+    lhe_path = str(item.get("path", "") or "")
+    if not lhe_path:
+        raise ValueError(f"Missing path for pool {pool_name} in {inventory_path}")
+    seed = item.get("seed")
+    if seed is None:
+        seed = parse_seed_from_lhe_filename(lhe_path)
+    else:
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid seed for {lhe_path} in {inventory_path}") from exc
+    actual_events = item.get("actual_events")
+    if actual_events is not None:
+        try:
+            actual_events = int(actual_events)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid actual_events for {lhe_path} in {inventory_path}") from exc
+    status = str(item.get("status", "ok" if actual_events is not None else "unknown"))
+    return LHEInventoryEntry(
+        path=lhe_path,
+        seed=seed,
+        actual_events=actual_events,
+        status=status,
+    )
+
+
+def load_existing_lhe_inventory(
+    path: str,
+    allow_incomplete: bool = False,
+) -> Dict[str, List[LHEInventoryEntry]]:
+    """Load an exact existing-LHE file inventory.
+
+    Supported formats:
+      {"pools": {"pool_name": {"files": [...]}}}
+      {"pool_name": [...]}
+    """
+
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"Cannot read existing LHE inventory {path}: {exc}") from exc
+
+    if isinstance(raw, dict) and raw.get("complete") is False and not allow_incomplete:
+        raise ValueError(
+            f"Existing-LHE inventory {path} is marked incomplete; "
+            "use --allow-incomplete-lhe-inventory only after reviewing its failures."
+        )
+
+    source = raw.get("pools", raw) if isinstance(raw, dict) else {}
+    inventory: Dict[str, List[LHEInventoryEntry]] = {}
+    if not isinstance(source, dict):
+        raise ValueError(f"Invalid existing LHE inventory format: {path}")
+    for pool_name, value in source.items():
+        files = value.get("files", []) if isinstance(value, dict) else value
+        if not isinstance(files, list):
+            raise ValueError(f"Invalid file list for pool {pool_name} in {path}")
+        clean = [
+            _inventory_entry_from_raw(item, path, str(pool_name))
+            for item in files
+            if item
+        ]
+        inventory[str(pool_name)] = sorted(clean, key=lambda entry: entry.path)
+    return inventory
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def deterministic_seed(material: str) -> int:
+    value = int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:4], "big")
+    return value % 900000000 + 1
+
+
+def load_campaign_planning_spec(
+    path: str,
+    campaign_names: Sequence[str],
+    existing_inventory_path: str = "",
+) -> Optional[Dict[str, object]]:
+    """Load and validate the global-pool campaign job-spec v2 format."""
+
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict) or int(raw.get("version", 0)) != 2:
+        return None
+
+    expected_hash = str(raw.get("source_inventory_sha256", ""))
+    if not existing_inventory_path:
+        raise ValueError("campaign job spec v2 requires --existing-lhe-inventory")
+    actual_hash = sha256_file(existing_inventory_path)
+    if expected_hash != actual_hash:
+        raise ValueError(
+            "campaign job spec v2 inventory hash mismatch: "
+            f"expected {expected_hash or '<missing>'}, got {actual_hash}"
+        )
+
+    inventory = load_existing_lhe_inventory(existing_inventory_path)
+    inventory_by_seed = {
+        pool: {
+            int(entry.seed): entry
+            for entry in entries
+            if entry.seed is not None and entry.actual_events is not None
+        }
+        for pool, entries in inventory.items()
+    }
+
+    planning = raw.get("planning")
+    campaigns = raw.get("campaigns")
+    if not isinstance(planning, dict) or not isinstance(campaigns, dict):
+        raise ValueError("campaign job spec v2 requires planning and campaigns objects")
+
+    block_events = int(planning.get("block_events", DEFAULT_GLOBAL_BLOCK_EVENTS))
+    shard_nodes = int(
+        planning.get("shard_processing_nodes", DEFAULT_PROCESSING_SHARD_NODES)
+    )
+    if block_events <= 0 or shard_nodes <= 0:
+        raise ValueError("block_events and shard_processing_nodes must be positive")
+    if bool(planning.get("drop_incomplete_last_block", False)):
+        raise ValueError("campaign job spec v2 must retain incomplete final blocks")
+
+    pool_seeds = planning.get("pool_seeds")
+    if not isinstance(pool_seeds, dict) or not pool_seeds:
+        raise ValueError("campaign job spec v2 requires planning.pool_seeds")
+    max_events_per_file = planning.get("max_events_per_file", {})
+    if not isinstance(max_events_per_file, dict):
+        raise ValueError("planning.max_events_per_file must be an object")
+
+    selected_inventory: Dict[str, List[Dict[str, object]]] = OrderedDict()
+    for pool_name, seeds_raw in pool_seeds.items():
+        if pool_name not in inventory_by_seed:
+            raise ValueError(f"inventory does not contain pool {pool_name}")
+        if not isinstance(seeds_raw, list) or not seeds_raw:
+            raise ValueError(f"planning.pool_seeds.{pool_name} must be a non-empty list")
+        seen: Set[int] = set()
+        records: List[Dict[str, object]] = []
+        for value in seeds_raw:
+            seed = int(value)
+            if seed in seen:
+                raise ValueError(f"duplicate seed {seed} in pool {pool_name}")
+            seen.add(seed)
+            entry = inventory_by_seed[pool_name].get(seed)
+            if entry is None or entry.actual_events is None:
+                raise ValueError(f"uncounted or missing seed {seed} in pool {pool_name}")
+            file_cap = int(max_events_per_file.get(pool_name, 0) or 0)
+            planned_events = min(int(entry.actual_events), file_cap) if file_cap > 0 else int(entry.actual_events)
+            if planned_events <= 0:
+                raise ValueError(f"seed {seed} in pool {pool_name} has no plannable events")
+            records.append({
+                "pool": pool_name,
+                "seed": seed,
+                "path": entry.path,
+                "actual_events": int(entry.actual_events),
+                "planned_events": planned_events,
+                "planned_blocks": (planned_events + block_events - 1) // block_events,
+            })
+        selected_inventory[pool_name] = records
+
+    block_sizes_by_pool: Dict[str, List[int]] = OrderedDict()
+    for pool_name, records in selected_inventory.items():
+        block_sizes: List[int] = []
+        for record in records:
+            planned_events = int(record["planned_events"])
+            full_blocks, remainder = divmod(planned_events, block_events)
+            block_sizes.extend([block_events] * full_blocks)
+            if remainder:
+                block_sizes.append(remainder)
+        block_sizes_by_pool[pool_name] = block_sizes
+
+    def simulate_campaign_allocation(
+        campaign: Campaign,
+        budgets: Sequence[int],
+        start_cursors: Dict[str, int],
+        node_limit: int = 0,
+    ) -> Tuple[int, Dict[str, int], List[int], List[int]]:
+        """Mirror coordinator block consumption, including partial file tails."""
+
+        cursors = dict(start_cursors)
+        nodes = 0
+        attempted_by_slot = [0] * campaign.n_sources
+        blocks_by_slot = [0] * campaign.n_sources
+        while node_limit <= 0 or nodes < node_limit:
+            next_cursors = dict(cursors)
+            node_attempted = [0] * campaign.n_sources
+            node_blocks = [0] * campaign.n_sources
+            can_build = True
+            for slot, (pool_name, budget) in enumerate(
+                zip(campaign.inputs, budgets)
+            ):
+                blocks = block_sizes_by_pool[pool_name]
+                cursor = next_cursors.get(pool_name, 0)
+                accumulated = 0
+                chosen = 0
+                while cursor < len(blocks) and (
+                    chosen == 0 or accumulated < budget
+                ):
+                    accumulated += blocks[cursor]
+                    cursor += 1
+                    chosen += 1
+                if chosen == 0:
+                    can_build = False
+                    break
+                next_cursors[pool_name] = cursor
+                node_attempted[slot] = accumulated
+                node_blocks[slot] = chosen
+            if not can_build:
+                break
+            cursors = next_cursors
+            nodes += 1
+            attempted_by_slot = [
+                total + value
+                for total, value in zip(attempted_by_slot, node_attempted)
+            ]
+            blocks_by_slot = [
+                total + value
+                for total, value in zip(blocks_by_slot, node_blocks)
+            ]
+        return nodes, cursors, attempted_by_slot, blocks_by_slot
+
+    campaign_specs: Dict[str, Dict[str, object]] = OrderedDict()
+    for campaign_name in campaign_names:
+        cfg = campaigns.get(campaign_name)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"campaign job spec v2 has no config for {campaign_name}")
+        campaign = CAMPAIGNS[campaign_name]
+        if str(cfg.get("physics_campaign", "")) != campaign.physics_campaign:
+            raise ValueError(
+                f"{campaign_name}: physics_campaign must be {campaign.physics_campaign}"
+            )
+        budgets = cfg.get("source_lhe_budgets")
+        efficiencies = cfg.get("source_efficiencies")
+        if not isinstance(budgets, list) or len(budgets) != campaign.n_sources:
+            raise ValueError(
+                f"{campaign_name}: source_lhe_budgets must have {campaign.n_sources} entries"
+            )
+        if not isinstance(efficiencies, list) or len(efficiencies) != campaign.n_sources:
+            raise ValueError(
+                f"{campaign_name}: source_efficiencies must have {campaign.n_sources} entries"
+            )
+        budgets = [int(value) for value in budgets]
+        efficiencies = [float(value) for value in efficiencies]
+        if any(value <= 0 for value in budgets):
+            raise ValueError(f"{campaign_name}: source LHE budgets must be positive")
+        if any(not 0.0 < value <= 1.0 for value in efficiencies):
+            raise ValueError(f"{campaign_name}: source efficiencies must be in (0, 1]")
+        missing_pools = sorted(set(campaign.inputs) - set(selected_inventory))
+        if missing_pools:
+            raise ValueError(
+                f"{campaign_name}: planning.pool_seeds misses {', '.join(missing_pools)}"
+            )
+
+        blocks_by_pool = {
+            pool: sum(int(item["planned_blocks"]) for item in records)
+            for pool, records in selected_inventory.items()
+        }
+        required_blocks = Counter()
+        for pool_name, budget in zip(campaign.inputs, budgets):
+            required_blocks[pool_name] += (budget + block_events - 1) // block_events
+        available_nodes = min(
+            blocks_by_pool[pool] // block_count
+            for pool, block_count in required_blocks.items()
+        )
+        configured_cap = int(cfg.get("max_processing_nodes", 0) or 0)
+        processing_nodes = (
+            min(available_nodes, configured_cap)
+            if configured_cap > 0 else available_nodes
+        )
+        if processing_nodes <= 0:
+            raise ValueError(f"{campaign_name}: selected inventory produces no processing nodes")
+        expected_events_per_node = min(
+            budget * efficiency
+            for budget, efficiency in zip(budgets, efficiencies)
+        )
+        campaign_specs[campaign_name] = {
+            **copy.deepcopy(cfg),
+            "source_lhe_budgets": budgets,
+            "source_efficiencies": efficiencies,
+            "available_processing_nodes": available_nodes,
+            "processing_nodes": processing_nodes,
+            "expected_events_per_node": expected_events_per_node,
+            "expected_final_events": expected_events_per_node * processing_nodes,
+            "required_blocks_by_pool": dict(required_blocks),
+        }
+
+    def apply_campaign_allocation(
+        campaign_name: str,
+        start_cursors: Dict[str, int],
+    ) -> Dict[str, int]:
+        campaign = CAMPAIGNS[campaign_name]
+        cfg = campaign_specs[campaign_name]
+        budgets = list(cfg["source_lhe_budgets"])
+        available_nodes, _, _, _ = simulate_campaign_allocation(
+            campaign,
+            budgets,
+            start_cursors,
+        )
+        configured_cap = int(cfg.get("max_processing_nodes", 0) or 0)
+        processing_nodes = (
+            min(available_nodes, configured_cap)
+            if configured_cap > 0 else available_nodes
+        )
+        if processing_nodes <= 0:
+            raise ValueError(
+                f"{campaign_name}: allocation produces no processing nodes"
+            )
+
+        campaign_pools = tuple(dict.fromkeys(campaign.inputs))
+        shard_cursor = dict(start_cursors)
+        estimated_processing_shards: List[Dict[str, object]] = []
+        attempted_by_slot = [0] * campaign.n_sources
+        blocks_by_slot = [0] * campaign.n_sources
+        for start_index in range(0, processing_nodes, shard_nodes):
+            shard_index = start_index // shard_nodes
+            node_count = min(shard_nodes, processing_nodes - start_index)
+            shard_start = dict(shard_cursor)
+            (
+                selected_nodes,
+                shard_cursor,
+                shard_attempted,
+                shard_blocks,
+            ) = simulate_campaign_allocation(
+                campaign,
+                budgets,
+                shard_start,
+                node_count,
+            )
+            if selected_nodes != node_count:
+                raise ValueError(
+                    f"{campaign_name}: shard {shard_index} selected "
+                    f"{selected_nodes} of {node_count} requested nodes"
+                )
+            attempted_by_slot = [
+                total + value
+                for total, value in zip(
+                    attempted_by_slot, shard_attempted
+                )
+            ]
+            blocks_by_slot = [
+                total + value
+                for total, value in zip(blocks_by_slot, shard_blocks)
+            ]
+            estimated_processing_shards.append({
+                "shard_index": shard_index,
+                "processing_start_index": start_index,
+                "node_count": node_count,
+                "pool_start_blocks": {
+                    pool: shard_start[pool]
+                    for pool in campaign_pools
+                },
+                "pool_end_blocks": {
+                    pool: shard_cursor[pool]
+                    for pool in campaign_pools
+                },
+            })
+
+        expected_events_per_node = float(cfg["expected_events_per_node"])
+        cfg.update({
+            "available_processing_nodes": available_nodes,
+            "processing_nodes": processing_nodes,
+            "expected_final_events": (
+                expected_events_per_node * processing_nodes
+            ),
+            "estimated_pool_start_blocks": {
+                pool: start_cursors[pool]
+                for pool in campaign_pools
+            },
+            "estimated_pool_end_blocks": {
+                pool: shard_cursor[pool]
+                for pool in campaign_pools
+            },
+            "estimated_lhe_events_by_slot": attempted_by_slot,
+            "estimated_blocks_by_slot": blocks_by_slot,
+            "estimated_processing_shards": estimated_processing_shards,
+        })
+        return shard_cursor
+
+    allocation_order_raw = planning.get("campaign_allocation_order", [])
+    if allocation_order_raw:
+        if (
+            not isinstance(allocation_order_raw, list)
+            or len(allocation_order_raw) != len(campaign_names)
+            or set(allocation_order_raw) != set(campaign_names)
+            or len(set(allocation_order_raw)) != len(allocation_order_raw)
+        ):
+            raise ValueError(
+                "planning.campaign_allocation_order must contain each requested "
+                "campaign exactly once"
+            )
+        pool_cursors = {pool: 0 for pool in selected_inventory}
+        for campaign_name in allocation_order_raw:
+            pool_cursors = apply_campaign_allocation(
+                campaign_name,
+                dict(pool_cursors),
+            )
+    else:
+        for campaign_name in campaign_names:
+            apply_campaign_allocation(
+                campaign_name,
+                {pool: 0 for pool in selected_inventory},
+            )
+
+    storage = copy.deepcopy(raw.get("storage", {}))
+    if not isinstance(storage, dict):
+        raise ValueError("campaign job spec v2 storage must be an object")
+    storage.setdefault("warning_bytes", DEFAULT_STORAGE_WARNING_BYTES)
+    storage.setdefault("hard_limit_bytes", DEFAULT_STORAGE_HARD_LIMIT_BYTES)
+    storage.setdefault("bytes_per_final_event", DEFAULT_STORAGE_BYTES_PER_EVENT)
+    storage.setdefault("existing_retained_bytes", 0)
+    for key in (
+        "warning_bytes",
+        "hard_limit_bytes",
+        "bytes_per_final_event",
+        "existing_retained_bytes",
+    ):
+        storage[key] = int(storage[key])
+    if not (
+        0 <= storage["existing_retained_bytes"]
+        < storage["hard_limit_bytes"]
+        and 0 < storage["warning_bytes"] < storage["hard_limit_bytes"]
+        and storage["bytes_per_final_event"] > 0
+    ):
+        raise ValueError("campaign job spec v2 has invalid storage limits")
+
+    predicted_new_bytes = int(sum(
+        float(cfg["expected_final_events"]) * storage["bytes_per_final_event"]
+        for cfg in campaign_specs.values()
+    ))
+    predicted_total_bytes = storage["existing_retained_bytes"] + predicted_new_bytes
+    storage["predicted_new_bytes"] = predicted_new_bytes
+    storage["predicted_total_bytes"] = predicted_total_bytes
+    if predicted_total_bytes > storage["hard_limit_bytes"]:
+        details = ", ".join(
+            f"{name}={int(cfg['expected_final_events'])} events"
+            for name, cfg in campaign_specs.items()
+        )
+        raise ValueError(
+            "projected retained output exceeds storage hard limit: "
+            f"{predicted_total_bytes} > {storage['hard_limit_bytes']} bytes "
+            f"({details}); reduce max_processing_nodes in the authoritative spec"
+        )
+    storage["capacity_status"] = (
+        "warning"
+        if predicted_total_bytes > storage["warning_bytes"]
+        else "within_warning_limit"
+    )
+
+    layout_material = json.dumps(
+        {
+            "inventory_sha256": actual_hash,
+            "block_events": block_events,
+            "shuffle_mode": planning.get("shuffle_mode", "stratified"),
+            "n_strata": planning.get("n_strata", "auto"),
+            "pool_seeds": pool_seeds,
+            "max_events_per_file": max_events_per_file,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    layout_id = "poolv2-" + hashlib.sha256(layout_material.encode("utf-8")).hexdigest()[:12]
+
+    return {
+        "version": 2,
+        "path": path,
+        "source_inventory_sha256": actual_hash,
+        "planning": {
+            **copy.deepcopy(planning),
+            "block_events": block_events,
+            "shard_processing_nodes": shard_nodes,
+            "layout_id": layout_id,
+        },
+        "storage": storage,
+        "campaigns": campaign_specs,
+        "selected_inventory": selected_inventory,
+    }
+
+
+def load_campaign_job_spec(
+    path: str,
+    campaign_names: Sequence[str],
+    existing_inventory_path: str = "",
+) -> Dict[str, List[Dict[str, object]]]:
+    """Load exact, nonconsecutive campaign jobs without seed/range inference."""
+
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict) or int(raw.get("version", 0)) != 1:
+        raise ValueError(f"Invalid campaign job spec version in {path}")
+    spec_campaigns = raw.get("campaigns")
+    if not isinstance(spec_campaigns, dict):
+        raise ValueError(f"Campaign job spec {path} requires a campaigns object")
+    if existing_inventory_path:
+        expected_hash = str(raw.get("source_inventory_sha256", ""))
+        actual_hash = sha256_file(existing_inventory_path)
+        if expected_hash and expected_hash != actual_hash:
+            raise ValueError(
+                f"Campaign job spec inventory hash mismatch: expected {expected_hash}, "
+                f"got {actual_hash} for {existing_inventory_path}"
+            )
+    inventory = load_existing_lhe_inventory(existing_inventory_path) if existing_inventory_path else {}
+    inventory_entries = {
+        pool: {entry.path: entry for entry in entries}
+        for pool, entries in inventory.items()
+    }
+    inventory_by_seed = {
+        pool: {entry.seed: entry for entry in entries if entry.seed is not None}
+        for pool, entries in inventory.items()
+    }
+    compact = raw.get("compact_jobs")
+
+    def expand_compact(campaign_name: str) -> List[Dict[str, object]]:
+        if not isinstance(compact, dict):
+            return []
+        job_ids = compact.get("job_ids", [])
+        legacy_indices = compact.get("legacy_outer_indices", [])
+        pool_seeds = compact.get("pool_seeds", {})
+        if not isinstance(job_ids, list) or not isinstance(legacy_indices, list):
+            raise ValueError("compact_jobs requires job_ids and legacy_outer_indices lists")
+        if len(job_ids) != len(legacy_indices) or not isinstance(pool_seeds, dict):
+            raise ValueError("compact_jobs arrays have inconsistent lengths")
+        campaign = CAMPAIGNS[campaign_name]
+        jobs = []
+        for position, (job_id_value, legacy_value) in enumerate(zip(job_ids, legacy_indices)):
+            job_id = int(job_id_value)
+            legacy_index = int(legacy_value)
+            if job_id < 0 or legacy_index < 0:
+                raise ValueError("compact_jobs IDs and legacy indices must be non-negative")
+            pools = {}
+            legacy_groups = {}
+            for pool_name in set(campaign.inputs):
+                seeds = pool_seeds.get(pool_name)
+                if not isinstance(seeds, list) or len(seeds) != len(job_ids):
+                    raise ValueError(f"compact_jobs has no aligned seeds for {pool_name}")
+                seed = int(seeds[position])
+                authoritative = inventory_by_seed.get(pool_name, {}).get(seed)
+                if authoritative is None or authoritative.actual_events is None:
+                    raise ValueError(
+                        f"compact_jobs seed {seed} for {pool_name} is absent or uncounted"
+                    )
+                legacy_seed = 100 + LHE_POOLS[pool_name].seed_offset + legacy_index
+                legacy_groups[pool_name] = str(legacy_seed)
+                pools[pool_name] = {
+                    "path": authoritative.path,
+                    "seed": seed,
+                    "actual_events": int(authoritative.actual_events),
+                    "shuffle_seed": legacy_seed * 1000 + 37,
+                    "legacy_group_id": str(legacy_seed),
+                    "group_id": f"INV{job_id:06d}",
+                }
+            legacy_job = f"JOB{legacy_index:06d}_BLOCK000000"
+            inputs = []
+            rng_seeds = []
+            for slot, (pool_name, mode) in enumerate(zip(campaign.inputs, campaign.shower_modes)):
+                block_index = sum(1 for prior in campaign.inputs[:slot] if prior == pool_name)
+                input_group = f"BLOCK:{pool_name}:{legacy_groups[pool_name]}:{block_index:06d}"
+                inputs.append(input_group)
+                rng_seeds.append(deterministic_seed(
+                    f"{campaign.physics_campaign}|{legacy_job}|source={slot}|{input_group}|{mode}"
+                ))
+            jobs.append({
+                "job_id": job_id,
+                "legacy_outer_index": legacy_index,
+                "pools": pools,
+                "source_rng_seeds": rng_seeds,
+                "mixing_rng_seed": deterministic_seed(
+                    f"{campaign.physics_campaign}|{legacy_job}|shuffle|"
+                    f"{','.join(inputs)}|{','.join(campaign.shower_modes)}"
+                ),
+            })
+        return jobs
+    result: Dict[str, List[Dict[str, object]]] = OrderedDict()
+    for campaign_name in campaign_names:
+        entry = spec_campaigns.get(campaign_name)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Campaign job spec {path} has no jobs for {campaign_name}")
+        raw_jobs = entry.get("jobs")
+        if raw_jobs is None:
+            raw_jobs = expand_compact(campaign_name)
+        if not isinstance(raw_jobs, list) or not raw_jobs:
+            raise ValueError(f"Campaign job spec {path} has no jobs for {campaign_name}")
+        campaign = CAMPAIGNS[campaign_name]
+        if str(entry.get("physics_campaign", "")) != campaign.physics_campaign:
+            raise ValueError(
+                f"{campaign_name}: physics_campaign must be {campaign.physics_campaign}"
+            )
+        required_pools = set(campaign.inputs)
+        jobs: List[Dict[str, object]] = []
+        seen_ids: Set[int] = set()
+        for raw_job in raw_jobs:
+            if not isinstance(raw_job, dict):
+                raise ValueError(f"{campaign_name}: job entries must be objects")
+            job_id = int(raw_job.get("job_id", -1))
+            if job_id < 0 or job_id in seen_ids:
+                raise ValueError(f"{campaign_name}: invalid or duplicate job_id {job_id}")
+            seen_ids.add(job_id)
+            pools = raw_job.get("pools")
+            if not isinstance(pools, dict) or not required_pools.issubset(pools):
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: pools must include {sorted(required_pools)}"
+                )
+            for pool_name in required_pools:
+                source = pools[pool_name]
+                if not isinstance(source, dict):
+                    raise ValueError(f"{campaign_name} job {job_id}: invalid {pool_name} entry")
+                source_path = str(source.get("path", ""))
+                source_seed = int(source.get("seed", -1))
+                source_events = int(source.get("actual_events", 0))
+                if not source_path or source_seed < 0 or source_events <= 0:
+                    raise ValueError(
+                        f"{campaign_name} job {job_id}: incomplete inventory entry for {pool_name}"
+                    )
+                if inventory:
+                    authoritative = inventory_entries.get(pool_name, {}).get(source_path)
+                    if authoritative is None:
+                        raise ValueError(
+                            f"{campaign_name} job {job_id}: {source_path} is absent from inventory"
+                        )
+                    if authoritative.seed != source_seed or authoritative.actual_events != source_events:
+                        raise ValueError(
+                            f"{campaign_name} job {job_id}: seed/count mismatch for {source_path}"
+                        )
+            if (
+                not campaign.aggregate
+                and int(pools["pool_jpsi_CSCO_g"]["seed"]) != job_id
+            ):
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: job_id must equal the authoritative "
+                    "pool_jpsi_CSCO_g inventory seed"
+                )
+            rng_seeds = raw_job.get("source_rng_seeds", [])
+            if not isinstance(rng_seeds, list) or len(rng_seeds) != campaign.n_sources:
+                raise ValueError(
+                    f"{campaign_name} job {job_id}: source_rng_seeds must have "
+                    f"{campaign.n_sources} entries"
+                )
+            if any(int(seed) <= 0 for seed in rng_seeds):
+                raise ValueError(f"{campaign_name} job {job_id}: invalid source RNG seed")
+            if int(raw_job.get("mixing_rng_seed", 0)) <= 0:
+                raise ValueError(f"{campaign_name} job {job_id}: invalid mixing RNG seed")
+            jobs.append(copy.deepcopy(raw_job))
+        result[campaign_name] = jobs
+    return result
+
+
 def check_proxy_valid(proxy_path: str) -> Tuple[bool, Optional[int], Optional[str]]:
     """返回代理是否可用、剩余秒数以及错误信息。"""
 
@@ -856,39 +2015,23 @@ def check_proxy_valid(proxy_path: str) -> Tuple[bool, Optional[int], Optional[st
     return timeleft > 0, timeleft, None
 
 
-def count_lhe_files_on_t2(pool_name: str, proxy_path: str) -> Tuple[int, Optional[str]]:
+def count_lhe_files_on_t2(
+    pool_name: str,
+    proxy_path: str,
+    existing_lhe_base: str = "",
+) -> Tuple[int, Optional[str]]:
     """统计远端 pool 内已有的 .lhe 文件数量。"""
 
     cache = load_pool_scan_cache()
-    if pool_name in cache:
-        return cache[pool_name], None
+    cache_key = f"{existing_lhe_base_url(existing_lhe_base)}::{pool_name}"
+    if cache_key in cache:
+        return cache[cache_key], None
 
-    storage_name = pool_storage_name(pool_name)
-    local_proxy_path = ensure_local_xrootd_proxy(proxy_path)
-    env = os.environ.copy()
-    env["X509_USER_PROXY"] = local_proxy_path
-
-    try:
-        result = subprocess.run(
-            ["xrdfs", EOS_XRDFS_TARGET, "ls", f"{EOS_PATH_BASE}/lhe_pools/{storage_name}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,
-            check=False,
-            env=env,
-        )
-    except Exception as exc:
-        return 0, str(exc)
-
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if "No such file" in stderr or "Unable to locate" in stderr:
-            return 0, None
-        return 0, stderr or "xrdfs ls 返回非零"
-
-    count = sum(1 for line in result.stdout.splitlines() if line.strip().endswith(".lhe"))
-    return count, None
+    files = list_lhe_files_remote(pool_name, proxy_path, existing_lhe_base)
+    if files:
+        cache[cache_key] = len(files)
+        return len(files), None
+    return 0, None
 
 
 def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, Optional[str]]:
@@ -904,22 +2047,171 @@ def count_lhe_files_local(pool_name: str, local_output_base: str) -> Tuple[int, 
     try:
         if not os.path.exists(local_pool_dir):
             return 0, None
-        count = sum(1 for filename in os.listdir(local_pool_dir) if filename.endswith(".lhe"))
+        count = sum(1 for filename in os.listdir(local_pool_dir) if accepts_lhe_ext(filename))
         return count, None
     except Exception as exc:
         return 0, str(exc)
 
 
-def pool_remote_path(pool_name: str, local_output_base: str = "") -> str:
+def _list_remote_dir(
+    eos_path: str,
+    proxy_path: str,
+    host: str = EOS_XRDFS_TARGET,
+) -> Tuple[List[str], Optional[str]]:
+    """Run xrdfs ls on a remote directory.
+
+    Returns (entries, error).  An empty list with None error means the
+    directory is empty or does not exist; an empty list with a non-None
+    error string means the listing attempt failed (network, proxy, etc.).
+    """
+    local_proxy_path = ensure_local_xrootd_proxy(proxy_path)
+    env = os.environ.copy()
+    env["X509_USER_PROXY"] = local_proxy_path
+    xrdfs_host = host if host.startswith("root://") else f"root://{host}"
+    try:
+        result = subprocess.run(
+            ["xrdfs", xrdfs_host, "ls", eos_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=30, check=False, env=env,
+        )
+    except FileNotFoundError:
+        return [], "xrdfs not found on PATH"
+    except subprocess.TimeoutExpired:
+        return [], f"xrdfs ls timed out after 30s: {eos_path}"
+    except Exception as exc:
+        return [], f"xrdfs ls failed: {exc}"
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "No such file" in stderr or "Unable to locate" in stderr:
+            return [], None
+        if not command_exists("gfal-ls"):
+            return [], f"xrdfs ls returned {result.returncode}: {stderr or eos_path}"
+        url = eos_path
+        if eos_path.startswith("/"):
+            url = f"root://{EOS_HOST}//{eos_path}"
+        try:
+            fallback = subprocess.run(
+                ["gfal-ls", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True, timeout=30, check=False, env=env,
+            )
+        except Exception as exc:
+            return [], f"gfal-ls fallback failed: {exc}"
+        if fallback.returncode != 0:
+            return [], f"gfal-ls returned {fallback.returncode}: {fallback.stderr.strip() or url}"
+        entries = [line.strip() for line in fallback.stdout.splitlines() if line.strip()]
+        if eos_path.startswith("/"):
+            return [f"{eos_path.rstrip('/')}/{entry}" for entry in entries], None
+        return entries, None
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()], None
+
+
+def list_lhe_files_remote(pool_name: str, proxy_path: str, existing_lhe_base: str = "") -> List[str]:
+    """Discover existing LHE files for a pool from its exact configured directory."""
+    storage_name = pool_storage_name(pool_name)
+    exact_dir = existing_lhe_pool_dir(pool_name, existing_lhe_base)
+    if not exact_dir.startswith("root://"):
+        return list_lhe_files_local(pool_name, exact_dir)
+
+    rest = exact_dir[len("root://"):]
+    host = rest.split("/", 1)[0]
+    remote_dir = "/" + rest.split("/", 1)[1].lstrip("/")
+    entries, err = _list_remote_dir(remote_dir, proxy_path, host=host)
+    if err:
+        print(f"[WARN] Cannot list exact LHE pool path {exact_dir}: {err}", file=sys.stderr)
+        return []
+    files = []
+    for line in entries:
+        fname = line.rsplit("/", 1)[-1] if "/" in line else line
+        if accepts_lhe_ext(fname) and fname.startswith(f"sample_{storage_name}_"):
+            remote_path = "/" + line.strip().lstrip("/")
+            files.append(f"root://{host}//{remote_path}")
+    return sorted(files)
+
+
+def list_lhe_files_local(pool_name: str, local_output_base: str) -> List[str]:
+    """Discover existing LHE files for a pool in one exact local directory."""
+    storage_name = pool_storage_name(pool_name)
+    prefix = f"sample_{storage_name}_"
+    exact_dir = local_output_base
+    if not os.path.isdir(exact_dir):
+        return []
+    return sorted(
+        os.path.join(exact_dir, f) for f in os.listdir(exact_dir)
+        if accepts_lhe_ext(f) and f.startswith(prefix)
+    )
+
+
+def parse_seed_from_lhe_filename(path: str) -> Optional[int]:
+    """Extract the trailing seed from sample_<pool>_<seed>.lhe[.gz] names."""
+    filename = os.path.basename(path)
+    match = re.search(r"_(\d+)\.lhe(?:\.gz)?$", filename)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def count_lhe_events_strict(path: str) -> int:
+    """Count <event> records in a local LHE file, failing on read errors."""
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return sum(1 for line in handle if line.strip().startswith("<event>"))
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return sum(1 for line in handle if line.strip().startswith("<event>"))
+
+
+def count_existing_lhe_events(path: str, scratch_dir: str, proxy_path: str) -> int:
+    """Count a local or remote existing-LHE file for inventory discovery."""
+    if not path.startswith("root://"):
+        return count_lhe_events_strict(path)
+
+    ensure_dir(scratch_dir)
+    basename = os.path.basename(path)
+    scratch_handle = tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=scratch_dir,
+        prefix="lhe_count_",
+        suffix=f"_{basename}",
+    )
+    local_path = scratch_handle.name
+    scratch_handle.close()
+    env = os.environ.copy()
+    if proxy_path:
+        env["X509_USER_PROXY"] = ensure_local_xrootd_proxy(proxy_path)
+    try:
+        subprocess.run(
+            ["xrdcp", "--nopbar", "--force", path, local_path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1800,
+            env=env,
+        )
+        return count_lhe_events_strict(local_path)
+    finally:
+        try:
+            os.remove(local_path)
+        except FileNotFoundError:
+            pass
+
+
+def pool_remote_path(
+    pool_name: str,
+    local_output_base: str = "",
+    existing_lhe_base: str = "",
+) -> str:
     if local_output_base:
         return os.path.join(local_output_base, "lhe_pools", pool_storage_name(pool_name))
-    return f"{EOS_BASE}/lhe_pools/{pool_storage_name(pool_name)}"
+    return existing_lhe_pool_dir(pool_name, existing_lhe_base)
 
 
 def scan_existing_pools(
     pool_requirements: Dict[str, int],
     proxy_path: str,
     local_output_base: str = "",
+    existing_lhe_base: str = "",
 ) -> Dict[str, Dict[str, object]]:
     """扫描已有 LHE 池，数量不足时视为需要全量重生。"""
 
@@ -928,15 +2220,234 @@ def scan_existing_pools(
         if local_output_base:
             count, error = count_lhe_files_local(pool_name, local_output_base)
         else:
-            count, error = count_lhe_files_on_t2(pool_name, proxy_path)
+            count, error = count_lhe_files_on_t2(pool_name, proxy_path, existing_lhe_base)
         result[pool_name] = {
             "required_count": required_count,
             "remote_count": count,
             "use_existing": error is None and count >= required_count,
             "error": error,
-            "remote_path": pool_remote_path(pool_name, local_output_base),
+            "remote_path": pool_remote_path(pool_name, local_output_base, existing_lhe_base),
         }
     return result
+
+
+def execute_lhe_inventory_scan(
+    campaign_names: Sequence[str],
+    output_path: str,
+    proxy_path: str,
+    local_output_base: str = "",
+    existing_lhe_base: str = "",
+    allow_empty: bool = False,
+    count_events: bool = False,
+    count_scratch_dir: str = "/tmp/chiw/lhe_inventory_counts",
+    max_files_per_pool: int = 0,
+) -> int:
+    """Write an exact existing-LHE inventory for later offline DAG generation."""
+
+    pool_requirements = compute_pool_requirements(campaign_names, 1)
+    payload: Dict[str, object] = OrderedDict()
+    payload["complete"] = True
+    payload["created_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["campaigns"] = list(campaign_names)
+    payload["existing_lhe_base"] = existing_lhe_base
+    payload["local_output_base"] = local_output_base
+    payload["pools"] = OrderedDict()
+
+    missing: List[str] = []
+    pools_payload = payload["pools"]
+    assert isinstance(pools_payload, OrderedDict)
+    for pool_name in pool_requirements:
+        if local_output_base:
+            files = list_lhe_files_local(pool_name, pool_remote_path(pool_name, local_output_base))
+        else:
+            files = list_lhe_files_remote(pool_name, proxy_path, existing_lhe_base)
+        if max_files_per_pool > 0:
+            files = files[:max_files_per_pool]
+        if not files:
+            missing.append(pool_name)
+        pool_payload = OrderedDict()
+        pool_payload["path"] = pool_remote_path(pool_name, local_output_base, existing_lhe_base)
+        pool_payload["count"] = len(files)
+        if count_events:
+            counted_files = []
+            for idx, lhe_path in enumerate(files, start=1):
+                print(f"{pool_name}: counting {idx}/{len(files)} {lhe_path}")
+                try:
+                    actual_events = count_existing_lhe_events(
+                        lhe_path,
+                        count_scratch_dir,
+                        proxy_path,
+                    )
+                except Exception as exc:
+                    print(
+                        f"Error: failed to count events in {lhe_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if actual_events <= 0:
+                    print(
+                        f"Error: counted zero events in {lhe_path}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                counted_files.append(
+                    OrderedDict(
+                        [
+                            ("path", lhe_path),
+                            ("seed", parse_seed_from_lhe_filename(lhe_path)),
+                            ("actual_events", actual_events),
+                            ("status", "ok"),
+                        ]
+                    )
+                )
+            pool_payload["files"] = counted_files
+            pool_payload["counted_events"] = sum(
+                int(item["actual_events"]) for item in counted_files
+            )
+        else:
+            pool_payload["files"] = files
+        pools_payload[pool_name] = pool_payload
+        print(f"{pool_name}: {len(files)} files")
+
+    if missing and not allow_empty:
+        print(
+            "Error: empty LHE inventory for pool(s): " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        print("Use --allow-empty only when an empty pool is intentional.", file=sys.stderr)
+        return 1
+
+    write_json_file(output_path, payload)
+    print(f"Wrote exact LHE inventory: {output_path}")
+    return 0
+
+
+def prepare_condor_lhe_inventory_scan(
+    campaign_names: Sequence[str],
+    output_path: str,
+    workdir: str,
+    proxy_path: str,
+    machine_env: MachineEnv,
+    local_output_base: str = "",
+    existing_lhe_base: str = "",
+    allow_empty: bool = False,
+    max_files_per_pool: int = 0,
+    max_materialize: int = 50,
+) -> int:
+    """Discover exact inputs and create a plain Condor counting workspace."""
+
+    pool_requirements = compute_pool_requirements(campaign_names, 1)
+    pools: Dict[str, object] = OrderedDict()
+    tasks: List[Dict[str, object]] = []
+    missing: List[str] = []
+    needs_proxy = False
+
+    remote_discovery = not local_output_base and any(
+        existing_lhe_pool_dir(pool_name, existing_lhe_base).startswith("root://")
+        for pool_name in pool_requirements
+    )
+    if remote_discovery:
+        valid, _, error = check_proxy_valid(proxy_path)
+        if not valid:
+            raise ValueError(f"A valid X509 proxy is required for remote discovery: {error}")
+
+    for pool_name in pool_requirements:
+        if local_output_base:
+            discovered_files = list_lhe_files_local(
+                pool_name,
+                pool_remote_path(pool_name, local_output_base),
+            )
+        else:
+            discovered_files = list_lhe_files_remote(
+                pool_name,
+                proxy_path,
+                existing_lhe_base,
+            )
+        if max_files_per_pool > 0:
+            discovered_files = discovered_files[:max_files_per_pool]
+        if not discovered_files:
+            missing.append(pool_name)
+
+        discovered_pool_path = pool_remote_path(
+            pool_name,
+            local_output_base,
+            existing_lhe_base,
+        )
+        canonical_pool_path = canonicalize_lhe_path(
+            discovered_pool_path,
+            INVENTORY_COUNTING_DEFAULTS,
+        )
+        pools[pool_name] = OrderedDict(
+            [
+                ("path", canonical_pool_path),
+                ("discovered_path", discovered_pool_path),
+                ("discovered_count", len(discovered_files)),
+            ]
+        )
+        for discovered_path in discovered_files:
+            canonical_path = canonicalize_lhe_path(
+                discovered_path,
+                INVENTORY_COUNTING_DEFAULTS,
+            )
+            needs_proxy = needs_proxy or canonical_path.startswith("root://")
+            tasks.append(
+                OrderedDict(
+                    [
+                        ("task_id", len(tasks)),
+                        ("pool", pool_name),
+                        ("path", canonical_path),
+                        ("discovered_path", discovered_path),
+                        ("seed", parse_seed_from_lhe_filename(canonical_path)),
+                    ]
+                )
+            )
+        print(f"{pool_name}: discovered {len(discovered_files)} files")
+
+    if missing and not allow_empty:
+        raise ValueError(
+            "Empty LHE inventory for pool(s): " + ", ".join(missing) +
+            "; use --allow-empty only when intentional."
+        )
+    if needs_proxy:
+        valid, _, error = check_proxy_valid(proxy_path)
+        if not valid:
+            raise ValueError(f"A valid X509 proxy is required for remote counting: {error}")
+
+    worklist = OrderedDict(
+        [
+            ("schema_version", 1),
+            ("created_at", datetime.now().isoformat(timespec="seconds")),
+            ("campaigns", list(campaign_names)),
+            ("existing_lhe_base", existing_lhe_base),
+            ("local_output_base", local_output_base),
+            ("allow_empty", allow_empty),
+            ("pools", pools),
+            ("tasks", tasks),
+        ]
+    )
+    manifest = prepare_lhe_inventory_workspace(
+        workdir=workdir,
+        worklist=worklist,
+        output_path=output_path,
+        machine_env=machine_env.to_dict(),
+        proxy_path=proxy_path if needs_proxy else "",
+        max_materialize=max_materialize,
+        worker_path=os.path.join(BASE_DIR, "tools", "lhe_inventory_condor.py"),
+        template_path=os.path.join(
+            BASE_DIR,
+            "processing",
+            "templates",
+            "count_lhe_inventory.sub",
+        ),
+    )
+    print(f"Prepared Condor inventory workspace: {os.path.abspath(workdir)}")
+    print(f"Tasks: {manifest['task_count']}")
+    print(f"Submit: condor_submit {os.path.join(os.path.abspath(workdir), 'count_lhe_inventory.sub')}")
+    print(
+        "Summarize: python3 dag_generator.py scan-lhe-inventory "
+        f"--summarize-from {os.path.abspath(workdir)} --output {os.path.abspath(output_path)}"
+    )
+    return 0
 
 
 def expand_campaign_selection(items: Sequence[str]) -> List[str]:
@@ -949,11 +2460,17 @@ def expand_campaign_selection(items: Sequence[str]) -> List[str]:
     for item in items:
         for token in [part.strip() for part in item.split(",") if part.strip()]:
             if token == "ALL":
-                resolved.extend(CAMPAIGNS.keys())
+                resolved.extend(name for name, campaign in CAMPAIGNS.items() if campaign.aggregate)
             elif token == "JJP_ALL":
-                resolved.extend(name for name in CAMPAIGNS if name.startswith("JJP"))
+                resolved.extend(
+                    name for name, campaign in CAMPAIGNS.items()
+                    if name.startswith("JJP") and campaign.aggregate
+                )
             elif token == "JUP_ALL":
-                resolved.extend(name for name in CAMPAIGNS if name.startswith("JUP"))
+                resolved.extend(
+                    name for name, campaign in CAMPAIGNS.items()
+                    if name.startswith("JUP") and campaign.aggregate
+                )
             elif token in CAMPAIGNS:
                 resolved.append(token)
             else:
@@ -1059,7 +2576,7 @@ def display_remote_target(target: str) -> str:
     if target.startswith("/eos/"):
         return f"root://eosuser.cern.ch/{target}"
     if target.startswith("/store/"):
-        return f"root://{EOS_HOST}/{target}"
+        return f"root://{EOS_HOST}//{target}"
     return f"{EOS_BASE}/{target.strip('/')}"
 
 
@@ -1098,6 +2615,62 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def write_json_file(path: str, payload: object) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        ensure_dir(parent)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def node_storage_config(target_eos_base: str = "") -> Dict[str, object]:
+    """Storage roots that wrappers/tools should treat as explicit node config."""
+
+    effective_target = target_eos_base or EOS_BASE
+    storage = {
+        "eos_redirector": EOS_REDIRECTOR,
+        "eos_lfn_base": EOS_LFN_BASE,
+        "eos_base": EOS_BASE,
+        "eos_host": EOS_HOST,
+        "eos_xrdfs_target": EOS_XRDFS_TARGET,
+        "eos_path_base": EOS_PATH_BASE,
+        "existing_lhe_base": default_existing_lhe_base(),
+        "target_eos_base": effective_target,
+        "eos_output": f"{effective_target.rstrip('/')}/output",
+        "generated_lhe_base": f"{effective_target.rstrip('/')}/lhe_pools",
+    }
+    for key in (
+        "output_subdir",
+    ):
+        if key in STORAGE_CONFIG_DEFAULTS:
+            storage[key] = str(STORAGE_CONFIG_DEFAULTS[key])
+    storage["lhe_pool_directories"] = copy.deepcopy(LHE_POOL_DIRECTORY_CONFIG)
+    return storage
+
+
+def processing_environment_config(log_level: str = "info") -> Dict[str, str]:
+    defaults = {
+        "premix_input_mode": "eoscms",
+        "premix_redirector": "root://eoscms.cern.ch",
+        "premix_cache_files": "1",
+        "premix_cache_redirector": "root://eoscms.cern.ch",
+    }
+    if log_level and log_level != "info":
+        defaults["log_level"] = str(log_level)
+    defaults.update({str(k): str(v) for k, v in PROCESSING_ENV_DEFAULTS.items()})
+    overrides = {
+        "premix_input_mode": os.environ.get("PREMIX_INPUT_MODE"),
+        "premix_redirector": os.environ.get("PREMIX_REDIRECTOR"),
+        "premix_cache_files": os.environ.get("PREMIX_CACHE_FILES"),
+        "premix_cache_redirector": os.environ.get("PREMIX_CACHE_REDIRECTOR"),
+    }
+    for key, value in overrides.items():
+        if value:
+            defaults[key] = value
+    return defaults
+
+
 def ensure_submit_visible_output_dir(output_dir: str) -> None:
     """确保输出目录使用持久存储（workfs2 或 AFS），而非临时目录。"""
 
@@ -1134,7 +2707,40 @@ def build_proxy_bundle(output_dir: str, proxy_path: str) -> Tuple[str, str]:
 
     bundle_name = BUNDLE_NAMES["proxy"]
     bundle_path = os.path.join(output_dir, bundle_name)
-    build_bundle(bundle_path, ((proxy_path, os.path.join("credentials", "x509_user_proxy")),))
+    ensure_dir(output_dir)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{bundle_name}.",
+        suffix=".tmp",
+        dir=output_dir,
+    )
+    os.close(descriptor)
+    try:
+        build_bundle(
+            temporary_path,
+            ((proxy_path, os.path.join("credentials", "x509_user_proxy")),),
+        )
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, bundle_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return bundle_path, bundle_name
+
+
+def build_compression_bundle(output_dir: str) -> Tuple[str, str]:
+    """打包压缩工具及其依赖，worker 解压后从 runtime/tools/ 运行。"""
+
+    bundle_name = BUNDLE_NAMES["compression"]
+    bundle_path = os.path.join(output_dir, bundle_name)
+    build_bundle(
+        bundle_path,
+        (
+            (os.path.join(BASE_DIR, "tools", "compress_existing_lhe.py"),
+             "runtime/tools/compress_existing_lhe.py"),
+            (os.path.join(BASE_DIR, "common", "compression_util.py"),
+             "runtime/common/compression_util.py"),
+        ),
+    )
     return bundle_path, bundle_name
 
 
@@ -1235,8 +2841,6 @@ def build_cmssw15_runtime_tarball(output_dir: Optional[str] = None) -> str:
         shutil.copytree(submodule_dir, tps_target, symlinks=True, dirs_exist_ok=True)
         _clean_git_artifacts(tps_target)
 
-        _ensure_openssl_dev_symlinks(project_dir)
-
         print("  [cmssw15-runtime] 编译 HeavyFlavorAnalysis/TPS-Onia2MuMu ...")
         subprocess.run(
             [
@@ -1246,8 +2850,8 @@ def build_cmssw15_runtime_tarball(output_dir: Optional[str] = None) -> str:
                 f"export SCRAM_ARCH=el9_amd64_gcc12 && "
                 f"cd {shlex.quote(src_dir)} && "
                 "eval $(scramv1 runtime -sh) && "
-                f"export LIBRARY_PATH={shlex.quote(project_dir)}:$LIBRARY_PATH && "
-                "scram b -j 8 HeavyFlavorAnalysis/TPS-Onia2MuMu",
+                "scram b clean && "
+                "scram b -j 8",
             ],
             check=True,
             capture_output=True,
@@ -1272,41 +2876,6 @@ def build_cmssw15_runtime_tarball(output_dir: Optional[str] = None) -> str:
         return target_path
     finally:
         shutil.rmtree(build_dir, ignore_errors=True)
-
-
-def _ensure_openssl_dev_symlinks(project_dir: str) -> None:
-    """若无 openssl-devel，在 project_dir 中创建 libssl.so / libcrypto.so 的符号链接。
-
-    部分系统（如 EL9 最小安装）只有带版本号的 .so.3 文件，缺少供 ld 使用的
-    未版本化 .so 符号链接，导致 scram 链接阶段失败。
-    """
-    needed = False
-    for lib in ("libssl.so", "libcrypto.so"):
-        if not os.path.exists(os.path.join(project_dir, lib)):
-            needed = True
-            break
-    if not needed:
-        return
-
-    candidates = (
-        "/usr/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib",
-    )
-    for lib_base in ("libssl", "libcrypto"):
-        link_path = os.path.join(project_dir, lib_base + ".so")
-        if os.path.exists(link_path):
-            continue
-        for candidate_dir in candidates:
-            for variant in (f"{lib_base}.so.3", f"{lib_base}.so"):
-                candidate = os.path.join(candidate_dir, variant)
-                if os.path.exists(candidate) and not os.path.islink(link_path):
-                    os.symlink(candidate, link_path)
-                    break
-            if os.path.exists(link_path):
-                break
 
 
 def _clean_git_artifacts(directory: str) -> None:
@@ -1430,12 +2999,67 @@ def prepare_runtime_assets(
     ensure_dir(output_dir)
     assets: Dict[str, str] = OrderedDict()
 
+    # Build separate shuffle-split binaries for the two execution environments.
+    # HELAC generation runs inside cmssw/el7 with LCG_88b, while the planner
+    # bundle keeps the native EL9 build used by its existing runtime path.
+    shuffle_split_src = os.path.join(BASE_DIR, "lhe_generation", "lhe_shuffle_split.cc")
+    shuffle_split_el9_bin = os.path.join(output_dir, "lhe_shuffle_split_el9")
+    print("  [planner-bundle] Compiling lhe_shuffle_split_el9 natively...")
+    subprocess.run(
+        [
+            "g++", "-std=c++14", "-O2", "-Wall",
+            "-o", shuffle_split_el9_bin, shuffle_split_src,
+        ],
+        check=True,
+        timeout=120,
+    )
+    print(f"  [planner-bundle] Compiled: {shuffle_split_el9_bin}")
+
+    shuffle_split_el7_bin = os.path.join(output_dir, "lhe_shuffle_split_el7")
+    el7_image = (
+        "/cvmfs/unpacked.cern.ch/registry.hub.docker.com/"
+        "cmssw/el7:x86_64"
+    )
+    el7_lcg_setup = (
+        "/cvmfs/sft.cern.ch/lcg/views/LCG_88b/"
+        "x86_64-centos7-gcc62-opt/setup.sh"
+    )
+    print(
+        "  [lhe-bundle] Compiling lhe_shuffle_split_el7 "
+        "in cmssw/el7 + LCG_88b..."
+    )
+    with tempfile.TemporaryDirectory(prefix="lhe_shuffle_split_el7_") as build_dir:
+        container_bin = os.path.join(build_dir, "lhe_shuffle_split_el7")
+        compile_command = (
+            f"source {shlex.quote(el7_lcg_setup)} && "
+            "g++ -std=c++14 -O2 -Wall "
+            f"-o {shlex.quote(container_bin)} {shlex.quote(shuffle_split_src)}"
+        )
+        subprocess.run(
+            [
+                "singularity", "exec",
+                "--bind", f"{BASE_DIR}:{BASE_DIR}:ro",
+                "--bind", f"{build_dir}:{build_dir}",
+                "--bind", "/cvmfs:/cvmfs",
+                el7_image,
+                "bash", "-c", compile_command,
+            ],
+            check=True,
+            timeout=120,
+        )
+        shutil.copy2(container_bin, shuffle_split_el7_bin)
+    print(f"  [lhe-bundle] Compiled: {shuffle_split_el7_bin}")
+
     lhe_bundle_name = BUNDLE_NAMES["lhe"]
     lhe_bundle_path = os.path.join(output_dir, lhe_bundle_name)
     build_bundle(
         lhe_bundle_path,
         (
             (os.path.join(BASE_DIR, "lhe_generation", "run_helac.sh"), "runtime/lhe_generation/run_helac.sh"),
+            (
+                shuffle_split_el7_bin,
+                "runtime/lhe_generation/lhe_shuffle_split_el7",
+            ),
             (
                 os.path.join(BASE_DIR, "lhe_generation", "input_templates", "user.inp"),
                 "runtime/lhe_generation/input_templates/user.inp",
@@ -1445,10 +3069,15 @@ def prepare_runtime_assets(
                 "runtime/lhe_generation/lhe_pythia6_pythia8.f",
             ),
             (
-                os.path.join(BASE_DIR, "common", "packages", "helac_package.tar.gz"),
-                "runtime/lhe_generation/helac_package.tar.gz",
+                os.path.join(BASE_DIR, "common", "packages", HELAC_SOURCE_PACKAGE),
+                f"runtime/lhe_generation/{HELAC_RUNTIME_PACKAGE}",
             ),
             (os.path.join(BASE_DIR, "common", "octet_pdg.py"), "runtime/common/octet_pdg.py"),
+            (os.path.join(BASE_DIR, "tools", "helac_inspector.py"), "runtime/tools/helac_inspector.py"),
+            (
+                os.path.join(BASE_DIR, "common", "compression_helpers.sh"),
+                "runtime/common/compression_helpers.sh",
+            ),
         ),
     )
     assets["lhe_bundle_path"] = lhe_bundle_path
@@ -1456,6 +3085,10 @@ def prepare_runtime_assets(
 
     processing_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
+        (
+            os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+            "runtime/processing/cmssw_helpers",
+        ),
         (
             os.path.join(BASE_DIR, "processing", "pythia_shower"),
             "runtime/processing/pythia_shower",
@@ -1465,6 +3098,10 @@ def prepare_runtime_assets(
             "runtime/common/cmssw_configs",
         ),
         (os.path.join(BASE_DIR, "common", "octet_pdg.py"), "runtime/common/octet_pdg.py"),
+        (
+            os.path.join(BASE_DIR, "common", "compression_helpers.sh"),
+            "runtime/common/compression_helpers.sh",
+        ),
     ]
     processing_bundle_name = BUNDLE_NAMES["processing"]
     processing_bundle_path = os.path.join(output_dir, processing_bundle_name)
@@ -1523,14 +3160,30 @@ def prepare_runtime_assets(
                         os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
                         "runtime/processing/templates/summary.sh",
                     ),
+                    (
+                        os.path.join(BASE_DIR, "tools", "archive_workflow_logs.py"),
+                        "runtime/tools/archive_workflow_logs.py",
+                    ),
                 ),
             )
             return_assets["summary_bundle_path"] = summary_bundle_path
             return_assets["summary_bundle_name"] = summary_bundle_name
+            summary_script_name = "summary_final.sh"
+            summary_script_path = os.path.join(output_dir, summary_script_name)
+            shutil.copy2(
+                os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
+                summary_script_path,
+            )
+            return_assets["summary_script_path"] = summary_script_path
+            return_assets["summary_script_name"] = summary_script_name
             return return_assets
 
         ntuple_items: List[Tuple[str, str]] = [
             (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
+            (
+                os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+                "runtime/processing/cmssw_helpers",
+            ),
             (
                 os.path.join(BASE_DIR, "common", "cmssw_configs"),
                 "runtime/common/cmssw_configs",
@@ -1554,10 +3207,54 @@ def prepare_runtime_assets(
                 os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
                 "runtime/processing/templates/summary.sh",
             ),
+            (
+                os.path.join(BASE_DIR, "tools", "archive_workflow_logs.py"),
+                "runtime/tools/archive_workflow_logs.py",
+            ),
         ),
     )
     assets["summary_bundle_path"] = summary_bundle_path
     assets["summary_bundle_name"] = summary_bundle_name
+    summary_script_name = "summary_final.sh"
+    summary_script_path = os.path.join(output_dir, summary_script_name)
+    shutil.copy2(
+        os.path.join(BASE_DIR, "processing", "templates", "summary.sh"),
+        summary_script_path,
+    )
+    assets["summary_script_path"] = summary_script_path
+    assets["summary_script_name"] = summary_script_name
+
+    # Planner bundle (per-pool block planner)
+    plan_bundle_name = BUNDLE_NAMES["plan"]
+    plan_bundle_path = os.path.join(output_dir, plan_bundle_name)
+    plan_items: List[Tuple[str, str]] = [
+        (os.path.join(BASE_DIR, "tools", "plan_lhe_blocks.py"),
+         "runtime/tools/plan_lhe_blocks.py"),
+        (shuffle_split_el9_bin, "runtime/tools/lhe_shuffle_split_el9"),
+        (os.path.join(BASE_DIR, "common", "compression_util.py"),
+         "runtime/common/compression_util.py"),
+    ]
+    print("  [bundle] Building planner runtime bundle...")
+    build_bundle(plan_bundle_path, plan_items)
+    assets["plan_bundle_path"] = plan_bundle_path
+    assets["plan_bundle_name"] = plan_bundle_name
+
+    # Coordinator bundle (multi-source campaign-level coordinator)
+    coord_bundle_name = BUNDLE_NAMES["coordinate"]
+    coord_bundle_path = os.path.join(output_dir, coord_bundle_name)
+    coord_items: List[Tuple[str, str]] = [
+        (os.path.join(BASE_DIR, "tools", "coordinate_lhe_blocks.py"),
+         "runtime/tools/coordinate_lhe_blocks.py"),
+        (os.path.join(BASE_DIR, "tools", "allocate_campaign_shards.py"),
+         "runtime/tools/allocate_campaign_shards.py"),
+        (os.path.join(BASE_DIR, "common", "compression_util.py"),
+         "runtime/common/compression_util.py"),
+    ]
+    print("  [bundle] Building coordinator runtime bundle...")
+    build_bundle(coord_bundle_path, coord_items)
+    assets["coordinate_bundle_path"] = coord_bundle_path
+    assets["coordinate_bundle_name"] = coord_bundle_name
+
     return assets
 
 
@@ -1607,6 +3304,10 @@ def prepare_ntuple_only_assets(
     ntuple_items: List[Tuple[str, str]] = [
         (os.path.join(BASE_DIR, "processing", "run_chain.sh"), "runtime/processing/run_chain.sh"),
         (
+            os.path.join(BASE_DIR, "processing", "cmssw_helpers"),
+            "runtime/processing/cmssw_helpers",
+        ),
+        (
             os.path.join(BASE_DIR, "common", "cmssw_configs"),
             "runtime/common/cmssw_configs",
         ),
@@ -1641,9 +3342,108 @@ class DAGBuilder:
         self.runtime_assets = runtime_assets
         self.generated_jobs_by_pool: Dict[str, List[str]] = OrderedDict()
         self.generated_specs_by_pool: Dict[str, List[str]] = OrderedDict()
+        self.generated_planners_by_pool: Dict[str, List[str]] = OrderedDict()
+        self.generated_group_planners_by_pool: Dict[str, Dict[str, str]] = OrderedDict()
+        self.generated_spec_planners: Dict[Tuple[str, int], Tuple[str, Dict[str, object]]] = {}
+        self.generated_lhe_groups_by_pool: Dict[str, List[LHEGroup]] = OrderedDict()
         self.allocations_by_pool: Dict[str, int] = OrderedDict()
         self.dag_lines: List[str] = []
         self.metadata: Dict[str, object] = OrderedDict()
+        self._existing_lhe_cache: Dict[str, List[LHEInventoryEntry]] = {}
+        self._existing_lhe_inventory: Dict[str, List[LHEInventoryEntry]] = load_existing_lhe_inventory(
+            self.options.existing_lhe_inventory,
+            allow_incomplete=self.options.allow_incomplete_lhe_inventory,
+        )
+        self.campaign_jobs: Dict[str, List[Dict[str, object]]] = {}
+        self.planning_spec: Optional[Dict[str, object]] = None
+        self.workflow_archive_id = ""
+
+    def write_node_config(
+        self,
+        category: str,
+        filename: str,
+        payload: Dict[str, object],
+    ) -> Tuple[str, str]:
+        config_dir = os.path.join(self.output_dir, "node_configs", category)
+        config_path = os.path.join(config_dir, filename)
+        write_json_file(config_path, payload)
+        return config_path, os.path.basename(config_path)
+
+    def log_directory(self, *parts: object) -> str:
+        """Return and create one deterministic leaf directory for Condor logs."""
+        path = os.path.join(self.options.log_root, *(str(part) for part in parts))
+        ensure_dir(path)
+        return path
+
+    def initialize_workflow_archive_id(self, dag_filename: str) -> str:
+        if not self.workflow_archive_id:
+            stem = os.path.splitext(os.path.basename(dag_filename))[0]
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
+            if not safe_stem:
+                safe_stem = "workflow"
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.workflow_archive_id = (
+                f"{safe_stem}-{timestamp}-{uuid.uuid4().hex[:8]}"
+            )
+        return self.workflow_archive_id
+
+    def append_summary_final(self) -> None:
+        summary_log_root = self.log_directory("_shared", "summary")
+        archive_enabled = bool(
+            self.options.archive_subdag_logs
+            and self.options.enable_lhe_block_subdags
+        )
+        target_base_url = self.options.target_base_url or EOS_BASE
+        subdag_root = os.path.join(self.output_dir, "plan_subdags")
+        self.dag_lines.extend([
+            "# -------- 汇总与日志归档节点 --------",
+            (
+                "FINAL SUMMARY "
+                f"{os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}"
+            ),
+            (
+                "VARS SUMMARY "
+                f'summary_bundle_path="{dag_escape(self.runtime_assets["summary_bundle_path"])}" '
+                f'summary_bundle_name="{dag_escape(self.runtime_assets["summary_bundle_name"])}" '
+                f'summary_script_path="{dag_escape(self.runtime_assets["summary_script_path"])}" '
+                f'summary_script_name="{dag_escape(self.runtime_assets["summary_script_name"])}" '
+                f'proxy_bundle_path="{dag_escape(self.runtime_assets["proxy_bundle_path"])}" '
+                f'proxy_bundle_name="{dag_escape(self.runtime_assets["proxy_bundle_name"])}" '
+                f'log_dir="{dag_escape(self.options.local_log_dir)}" '
+                f'log_root="{dag_escape(summary_log_root)}" '
+                f'log_source_root="{dag_escape(self.options.log_root)}" '
+                f'subdag_root="{dag_escape(subdag_root)}" '
+                f'target_base_url="{dag_escape(target_base_url)}" '
+                f'workflow_archive_id="{dag_escape(self.workflow_archive_id)}" '
+                f'archive_enabled="{dag_escape(bool_string(archive_enabled))}"'
+            ),
+        ])
+
+    def log_archive_metadata(self) -> Dict[str, object]:
+        enabled = bool(
+            self.options.archive_subdag_logs
+            and self.options.enable_lhe_block_subdags
+        )
+        return OrderedDict([
+            ("enabled", enabled),
+            ("mechanism", "top-level-final-worker"),
+            ("workflow_archive_id", self.workflow_archive_id),
+            ("source", "scan-log-root"),
+            ("source_log_root", self.options.log_root),
+            ("subdag_source", os.path.join(self.output_dir, "plan_subdags")),
+            ("proxy_source", "frozen-runtime-bundle"),
+            ("stages", list(("processing", "miniaod_merge", "ntuple", "final"))),
+            (
+                "target_layout",
+                "output/<campaign>/<job_component>_logs/<workflow_archive_id>/",
+            ),
+            (
+                "subdag_target_layout",
+                "output/_workflow_archives/<workflow_archive_id>/plan_subdags.tar.gz",
+            ),
+            ("subdag_source_cleanup", "after-archive-and-manifest-upload"),
+            ("retry_attempts", 3),
+        ])
 
     def seed_for_pool_index(self, pool_name: str, index: int) -> int:
         pool = LHE_POOLS[pool_name]
@@ -1657,25 +3457,33 @@ class DAGBuilder:
         return bool(info.get("use_existing"))
 
     def lhe_resource_request(self) -> Tuple[str, str, str]:
-        if self.options.test_mode:
+        if self.options.test_mode and (
+            self.options.lhe_request_cpus == "8"
+            and self.options.lhe_request_memory == "15GB"
+            and self.options.lhe_request_disk == "10GB"
+        ):
             return "4", "8GB", "8GB"
-        return "8", "15GB", "10GB"
+        return (
+            self.options.lhe_request_cpus,
+            self.options.lhe_request_memory,
+            self.options.lhe_request_disk,
+        )
 
     def processing_resource_request(self) -> Tuple[str, str, str]:
         if os.environ.get("PREMIX_INPUT_MODE") == "localcache":
-            return "4", "12GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
+            return "2", "6GB", os.environ.get("PREMIX_LOCALCACHE_REQUEST_DISK", "80GB")
         if self.options.test_mode:
-            return "4", "12GB", "20GB"
-        return "8", "20GB", "50GB"
+            return "2", "6GB", "4GB"
+        return "2", "6GB", "8GB"
 
     def ntuple_resource_request(self, is_ntuple_only: bool = False) -> Tuple[str, str, str]:
         if self.options.test_mode:
             if is_ntuple_only:
                 return "1", "2GB", "2GB"
-            return "4", "8GB", "10GB"
+            return "2", "6GB", "4GB"
         if is_ntuple_only:
             return "1", "2GB", "2GB"
-        return "4", "12GB", "20GB"
+        return "2", "12GB", "8GB"
 
     def ensure_lhe_jobs(self, pool_name: str, required_count: int) -> None:
         """全局共享同一个 pool 的生成节点，避免跨 campaign 重复生成。"""
@@ -1694,6 +3502,40 @@ class DAGBuilder:
             seed = self.seed_for_pool_index(pool_name, index)
             job_name = f"LHE_{pool_dag_label(pool_name)}_{index}"
             request_cpus, request_memory, request_disk = self.lhe_resource_request()
+            output_dir = self._resolve_generated_lhe_output_dir(pool.name)
+            assert_generated_dir_not_inventory(output_dir)
+            lhe_config = {
+                "pool": pool.name,
+                "seed": seed,
+                "min_pt_conia": pool.min_pt_conia,
+                "min_pt_bonia": pool.min_pt_bonia,
+                "min_pt_q": pool.min_pt_q,
+                "min_m_qqp": pool.min_m_qqp,
+                "min_m_q_beam": pool.min_m_q_beam,
+                "unwevt": self.options.resolved_lhe_unwevt(),
+                "nmc": self.options.lhe_nmc,
+                "log_level": self.options.log_level,
+                "helac_diagnostics": self.options.helac_diagnostics,
+                "test_mode": self.options.test_mode,
+                "local_output_base": self.options.local_output_base,
+                "compress_lhe": self.options.compress_lhe,
+                "lhe_compression_level": self.options.lhe_compression_level,
+                "lhe_shuffle_split": self.options.lhe_shuffle_split,
+                "lhe_events_per_block": self.options.lhe_events_per_block,
+                "lhe_shuffle_mode": self.options.lhe_shuffle_mode,
+                "lhe_n_strata": self.options.lhe_n_strata,
+                "lhe_drop_incomplete_last_block": self.options.lhe_drop_incomplete_last_block,
+                "output_dir": output_dir,
+                "storage": node_storage_config(self.options.target_base_url),
+            }
+            config_path, config_name = self.write_node_config(
+                "lhe_generation",
+                f"{job_name}.json",
+                lhe_config,
+            )
+            log_root = self.log_directory(
+                "_shared", "lhe_generation", pool.name, f"seed_{seed}"
+            )
             jobs.append(job_name)
             specs.append(f"GEN:{pool_name}:{index}:{seed}")
             self.dag_lines.append(
@@ -1702,22 +3544,17 @@ class DAGBuilder:
             self.dag_lines.append(f"CATEGORY {job_name} lhe")
             self.dag_lines.append(
                 "VARS {job} pool=\"{pool}\" seed=\"{seed}\" "
-                "min_pt_conia=\"{min_pt_conia}\" min_pt_bonia=\"{min_pt_bonia}\" "
-                "min_pt_q=\"{min_pt_q}\" unwevt=\"{unwevt}\" test_mode=\"{test_mode}\" "
                 "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" request_disk=\"{request_disk}\" "
                 "lhe_bundle_path=\"{lhe_bundle_path}\" lhe_bundle_name=\"{lhe_bundle_name}\" "
                 "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
                 "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
-                "log_root=\"{log_root}\" "
+                "log_root=\"{log_root}\" config_path=\"{config_path}\" config_name=\"{config_name}\" "
+                "helac_diagnostics=\"{helac_diagnostics}\" "
+                "lhe_job_flavour=\"{lhe_job_flavour}\" "
                 "lhe_wrapper_path=\"{lhe_wrapper_path}\" target_machine=\"{target_machine}\"".format(
                     job=job_name,
                     pool=dag_escape(pool.name),
                     seed=dag_escape(seed),
-                    min_pt_conia=dag_escape(pool.min_pt_conia),
-                    min_pt_bonia=dag_escape(pool.min_pt_bonia),
-                    min_pt_q=dag_escape(pool.min_pt_q),
-                    unwevt=dag_escape(self.options.resolved_lhe_unwevt()),
-                    test_mode=dag_escape(bool_string(self.options.test_mode)),
                     request_cpus=dag_escape(request_cpus),
                     request_memory=dag_escape(request_memory),
                     request_disk=dag_escape(request_disk),
@@ -1727,11 +3564,15 @@ class DAGBuilder:
                     proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                     log_dir=dag_escape(self.options.local_log_dir),
                     local_output_base=dag_escape(self.options.local_output_base),
+                    config_path=dag_escape(config_path),
+                    config_name=dag_escape(config_name),
                     lhe_wrapper_path=dag_escape(
                         os.path.join(BASE_DIR, "lhe_generation", "condor_wrappers", "run_lhe_gen.sh")
                     ),
                     target_machine=dag_escape(self.options.machine_env.target_machine),
-                    log_root=dag_escape(self.options.log_root),
+                    log_root=dag_escape(log_root),
+                    helac_diagnostics=dag_escape(self.options.helac_diagnostics),
+                    lhe_job_flavour=dag_escape(self.options.lhe_job_flavour),
                 )
             )
             self.dag_lines.append(f"RETRY {job_name} 2")
@@ -1767,59 +3608,63 @@ class DAGBuilder:
         processing_enable_ntuple = (
             self.options.enable_ntuple if self.options.machine_env.uses_local_storage else False
         )
+        processing_config = {
+            "inputs": input_specs,
+            "modes": list(campaign.shower_modes),
+            "analysis": campaign.analysis_type,
+            "campaign": campaign.name,
+            "job_id": str(job_index),
+            "max_events": self.options.max_events,
+            "enable_ntuple": processing_enable_ntuple,
+            "efficiency_ntuple": self.options.efficiency_ntuple,
+            "cleanup": self.options.cleanup,
+            "shuffle_mixing": self.options.shuffle_mixing,
+            "local_output_base": self.options.local_output_base,
+            "target_eos_base": self.options.target_base_url,
+            "storage": node_storage_config(self.options.target_base_url),
+            "processing_environment": processing_environment_config(
+                getattr(self.options, "log_level", "info")
+            ),
+            "log_level": getattr(self.options, "log_level", "info"),
+        }
+        config_path, config_name = self.write_node_config(
+            "processing",
+            f"{job_name}.json",
+            processing_config,
+        )
+        log_root = self.log_directory(
+            campaign.name, "processing", f"job_{job_index:06d}"
+        )
         self.dag_lines.append(
             f"JOB {job_name} {os.path.join(BASE_DIR, self.options.machine_env.processing_submit_template)}"
         )
         self.dag_lines.append(f"CATEGORY {job_name} processing")
         self.dag_lines.append(
             "VARS {job} campaign=\"{campaign}\" job_id=\"{job_id}\" "
-            "inputs=\"{inputs}\" modes=\"{modes}\" analysis=\"{analysis}\" "
-            "n_sources=\"{n_sources}\" max_events=\"{max_events}\" "
-            "enable_ntuple=\"{enable_ntuple}\" efficiency_ntuple=\"{efficiency_ntuple}\" cleanup=\"{cleanup}\" "
             "request_cpus=\"{request_cpus}\" request_disk=\"{request_disk}\" request_memory=\"{request_memory}\" "
-            "shuffle_mixing=\"{shuffle_mixing}\" "
             "processing_bundle_path=\"{processing_bundle_path}\" "
             "processing_bundle_name=\"{processing_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
-            "log_dir=\"{log_dir}\" local_output_base=\"{local_output_base}\" "
             "log_root=\"{log_root}\" "
             "processing_wrapper_path=\"{processing_wrapper_path}\" target_machine=\"{target_machine}\" "
-            "premix_input_mode=\"{premix_input_mode}\" "
-            "premix_redirector=\"{premix_redirector}\" "
-            "premix_cache_files=\"{premix_cache_files}\" "
-            "premix_cache_redirector=\"{premix_cache_redirector}\"".format(
+            "config_path=\"{config_path}\" config_name=\"{config_name}\"".format(
                 job=job_name,
                 campaign=dag_escape(campaign.name),
                 job_id=dag_escape(job_index),
-                inputs=dag_escape(",".join(input_specs)),
-                modes=dag_escape(",".join(campaign.shower_modes)),
-                analysis=dag_escape(campaign.analysis_type),
-                n_sources=dag_escape(campaign.n_sources),
-                max_events=dag_escape(self.options.max_events),
-                enable_ntuple=dag_escape(bool_string(processing_enable_ntuple)),
-                efficiency_ntuple=dag_escape(bool_string(self.options.efficiency_ntuple)),
-                cleanup=dag_escape(bool_string(self.options.cleanup)),
                 request_cpus=dag_escape(request_cpus),
                 request_disk=dag_escape(request_disk),
                 request_memory=dag_escape(request_memory),
-                shuffle_mixing=dag_escape(bool_string(self.options.shuffle_mixing)),
                 processing_bundle_path=dag_escape(self.runtime_assets["processing_bundle_path"]),
                 processing_bundle_name=dag_escape(self.runtime_assets["processing_bundle_name"]),
                 proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
-                log_dir=dag_escape(self.options.local_log_dir),
-                log_root=dag_escape(self.options.log_root),
-                local_output_base=dag_escape(self.options.local_output_base),
+                log_root=dag_escape(log_root),
                 processing_wrapper_path=dag_escape(
                     os.path.join(BASE_DIR, "processing", "condor_wrappers", "run_processing.sh")
                 ),
                 target_machine=dag_escape(self.options.machine_env.target_machine),
-                premix_input_mode=dag_escape(os.environ.get("PREMIX_INPUT_MODE", "eoscms")),
-                premix_redirector=dag_escape(os.environ.get("PREMIX_REDIRECTOR", "root://eoscms.cern.ch")),
-                premix_cache_files=dag_escape(os.environ.get("PREMIX_CACHE_FILES", "1")),
-                premix_cache_redirector=dag_escape(
-                    os.environ.get("PREMIX_CACHE_REDIRECTOR", os.environ.get("PREMIX_REDIRECTOR", "root://eoscms.cern.ch"))
-                ),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
             )
         )
         self.dag_lines.append(f"RETRY {job_name} 1")
@@ -1834,6 +3679,9 @@ class DAGBuilder:
         parent_job: Optional[str] = None,
         miniaod_input: Optional[str] = None,
         is_ntuple_only: bool = False,
+        target_eos_base: str = "",
+        custom_output_subpath: str = "",
+        custom_ntuple_basename: str = "",
     ) -> str:
         campaign = CAMPAIGNS[campaign_name]
         job_name = f"NTUPLE_{campaign_name}_{job_index}"
@@ -1843,28 +3691,42 @@ class DAGBuilder:
         if miniaod_input is None:
             miniaod_input = f"{EOS_OUTPUT}/{campaign.name}/{job_index}/output_MINIAOD.root"
         local_output_base = self.options.local_output_base
+        ntuple_config = {
+            "analysis": campaign.analysis_type,
+            "campaign": campaign.name,
+            "job_id": str(job_index),
+            "max_events": self.options.max_events,
+            "efficiency_ntuple": self.options.efficiency_ntuple,
+            "cleanup": self.options.cleanup,
+            "miniaod_input": miniaod_input,
+            "local_output_base": local_output_base,
+            "target_eos_base": target_eos_base,
+            "custom_output_subpath": custom_output_subpath,
+            "custom_ntuple_basename": custom_ntuple_basename,
+            "storage": node_storage_config(target_eos_base or self.options.target_base_url),
+            "log_level": getattr(self.options, "log_level", "info"),
+        }
+        config_path, config_name = self.write_node_config(
+            "ntuple",
+            f"{job_name}.json",
+            ntuple_config,
+        )
+        log_root = self.log_directory(
+            campaign.name, "ntuple", f"job_{job_index:06d}"
+        )
         self.dag_lines.append(f"JOB {job_name} {os.path.join(BASE_DIR, 'processing/templates/ntuple.sub')}")
         self.dag_lines.append(f"CATEGORY {job_name} ntuple")
         self.dag_lines.append(
             "VARS {job} campaign=\"{campaign}\" job_id=\"{job_id}\" "
-            "analysis=\"{analysis}\" max_events=\"{max_events}\" cleanup=\"{cleanup}\" "
-            "efficiency_ntuple=\"{efficiency_ntuple}\" "
-            "miniaod_input=\"{miniaod_input}\" "
-            "local_output_base=\"{local_output_base}\" "
             "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" request_disk=\"{request_disk}\" "
             "ntuple_bundle_path=\"{ntuple_bundle_path}\" ntuple_bundle_name=\"{ntuple_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
             "ntuple_wrapper_path=\"{ntuple_wrapper_path}\" ntuple_wrapper_name=\"{ntuple_wrapper_name}\" "
-            "log_root=\"{log_root}\"".format(
+            "log_root=\"{log_root}\" "
+            "config_path=\"{config_path}\" config_name=\"{config_name}\"".format(
                 job=job_name,
                 campaign=dag_escape(campaign.name),
                 job_id=dag_escape(job_index),
-                analysis=dag_escape(campaign.analysis_type),
-                max_events=dag_escape(self.options.max_events),
-                cleanup=dag_escape(bool_string(self.options.cleanup)),
-                efficiency_ntuple=dag_escape(bool_string(self.options.efficiency_ntuple)),
-                miniaod_input=dag_escape(miniaod_input),
-                local_output_base=dag_escape(local_output_base),
                 request_cpus=dag_escape(request_cpus),
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
@@ -1874,7 +3736,9 @@ class DAGBuilder:
                 proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
                 ntuple_wrapper_path=dag_escape(NTUPLE_WRAPPER_PATH),
                 ntuple_wrapper_name=dag_escape(NTUPLE_WRAPPER_NAME),
-                log_root=dag_escape(self.options.log_root),
+                log_root=dag_escape(log_root),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
             )
         )
         self.dag_lines.append(f"RETRY {job_name} 1")
@@ -1882,16 +3746,933 @@ class DAGBuilder:
             self.dag_lines.append(f"PARENT {parent_job} CHILD {job_name}")
         return job_name
 
+    # ------------------------------------------------------------------
+    # Block SubDAG methods
+    # ------------------------------------------------------------------
+
+    def _resolve_generated_lhe_output_dir(self, pool_name: str) -> str:
+        """Worker-visible write directory for freshly generated LHE."""
+        storage = pool_storage_name(pool_name)
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join("lhe_pools", storage)
+        return generated_lhe_pool_dir(pool_name, self.options.target_base_url)
+
+    def _resolve_lhe_path(self, pool_name: str, seed: int) -> str:
+        """Return the full path (EOS URL or local) to the HELAC LHE output."""
+        storage = pool_storage_name(pool_name)
+        extension = "lhe.gz" if self.options.compress_lhe else "lhe"
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join(
+                self.options.local_output_base,
+                "lhe_pools", storage,
+                f"sample_{storage}_{seed}.{extension}",
+            )
+        return (
+            f"{generated_lhe_pool_dir(pool_name, self.options.target_base_url)}/"
+            f"sample_{storage}_{seed}.{extension}"
+        )
+
+    def _resolve_block_output_dir(self, pool_name: str, seed: int) -> str:
+        """Return the directory where block .lhe.gz files should be stored."""
+        storage = pool_storage_name(pool_name)
+        base = str(node_storage_config(self.options.target_base_url)["generated_lhe_base"])
+        if self.options.machine_env.uses_local_storage and self.options.local_output_base:
+            return os.path.join(
+                self.options.local_output_base, "lhe_pools", storage, "lhe_blocks",
+            )
+        block_output_dir = f"{base.rstrip('/')}/{storage}/lhe_blocks"
+        assert_generated_dir_not_inventory(block_output_dir)
+        return block_output_dir
+
+    def _resolve_plan_manifest_path(self, pool_name: str, seed: int) -> str:
+        """Return the path where the plan manifest JSON will be written."""
+        subdir = os.path.join(
+            self.output_dir, "plan_subdags",
+            pool_dag_label(pool_name),
+            f"seed_{seed}",
+        )
+        return os.path.join(subdir, f"plan_manifest_{pool_name}_{seed}.json")
+
+    def _resolve_group_plan_manifest_path(self, pool_name: str, group_id: str) -> str:
+        """Return the grouped plan manifest path."""
+        subdir = os.path.join(
+            self.output_dir, "plan_subdags",
+            pool_dag_label(pool_name),
+            group_id,
+        )
+        return os.path.join(subdir, f"plan_manifest_{pool_name}_{group_id}.json")
+
+    def _ensure_skip_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
+        """Get or create a planner node for skip-lhe-generation mode.
+
+        Deduplicates across campaigns: the same pool+job_index always maps
+        to the same planner node, even when the pool appears in multiple
+        campaigns.
+        """
+        planners = self.generated_planners_by_pool.setdefault(pool_name, [])
+        while len(planners) <= job_index:
+            planners.append("")
+        if planners[job_index]:
+            return planners[job_index]
+        seed = self.seed_for_pool_index(pool_name, job_index)
+        lhe_path = self._resolve_existing_lhe_path(pool_name, job_index, seed)
+        plan_job = self.add_planning_job(
+            pool_name, job_index, seed, lhe_path_override=lhe_path,
+        )
+        planners[job_index] = plan_job
+        return plan_job
+
+    def _ensure_generated_lhe_planning_job(self, pool_name: str, job_index: int) -> str:
+        """Create one fresh-LHE planner per pool/index and share it across campaigns."""
+        planners = self.generated_planners_by_pool.setdefault(pool_name, [])
+        while len(planners) <= job_index:
+            planners.append("")
+        if planners[job_index]:
+            return planners[job_index]
+        seed = self.seed_for_pool_index(pool_name, job_index)
+        plan_job = self.add_planning_job(pool_name, job_index, seed)
+        lhe_job = self.generated_jobs_by_pool[pool_name][job_index]
+        self.dag_lines.append(f"PARENT {lhe_job} CHILD {plan_job}")
+        planners[job_index] = plan_job
+        return plan_job
+
+    def _ensure_spec_planning_job(
+        self,
+        pool_name: str,
+        job_record: Dict[str, object],
+    ) -> Tuple[str, Dict[str, object]]:
+        """Create one planner from an exact campaign job-spec inventory entry."""
+
+        job_id = int(job_record["job_id"])
+        source = copy.deepcopy(job_record["pools"][pool_name])
+        key = (pool_name, job_id)
+        if key in self.generated_spec_planners:
+            plan_job, previous = self.generated_spec_planners[key]
+            comparable_keys = ("path", "seed", "actual_events", "shuffle_seed")
+            if any(previous.get(name) != source.get(name) for name in comparable_keys):
+                raise ValueError(
+                    f"Conflicting job-spec entries for {pool_name} job_id={job_id}"
+                )
+            return plan_job, copy.deepcopy(previous)
+        seed = int(source["seed"])
+        group_id = str(source.get("group_id") or f"INV{job_id:06d}")
+        shuffle_seed = int(source["shuffle_seed"])
+        plan_job = self.add_planning_job(
+            pool_name,
+            job_id,
+            seed,
+            group_id=group_id,
+            seeds=[seed],
+            lhe_paths=[str(source["path"])],
+            lhe_event_counts=[int(source["actual_events"])],
+            shuffle_seed_override=shuffle_seed,
+        )
+        source["group_id"] = group_id
+        source["manifest_path"] = self._resolve_group_plan_manifest_path(
+            pool_name, group_id
+        )
+        self.generated_spec_planners[key] = (plan_job, source)
+        return plan_job, source
+
+    def _resolve_existing_lhe_path(self, pool_name: str, job_index: int, seed: int) -> str:
+        """Discover and return an LHE file from the exact configured pool directory."""
+        storage = pool_storage_name(pool_name)
+        if self.options.existing_lhe_inventory and pool_name not in self._existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"does not contain pool {pool_name}."
+            )
+        explicit_base = self.options.existing_lhe_base
+        cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
+        if cache_key not in self._existing_lhe_cache:
+            if pool_name in self._existing_lhe_inventory:
+                files = self._existing_lhe_inventory[pool_name]
+            elif self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_local(
+                        pool_name,
+                        existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                    )
+                ]
+            else:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_remote(
+                        pool_name,
+                        self.options.proxy_path,
+                        explicit_base,
+                    )
+                ]
+            self._existing_lhe_cache[cache_key] = files
+        files = self._existing_lhe_cache[cache_key]
+        fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
+        if job_index < len(files):
+            return files[job_index].path
+        if self.options.existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"has only {len(files)} files for pool {pool_name}; "
+                f"job index {job_index} was requested."
+            )
+        return f"{fallback_dir}/sample_{storage}_{seed}.lhe.gz"
+
+    def _discover_existing_lhe_files(self, pool_name: str) -> List[LHEInventoryEntry]:
+        """Return cached existing LHE file paths for grouping and skip-LHE planning."""
+        if self.options.existing_lhe_inventory and pool_name not in self._existing_lhe_inventory:
+            raise ValueError(
+                f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                f"does not contain pool {pool_name}."
+            )
+        explicit_base = self.options.existing_lhe_base
+        cache_key = f"{pool_name}::{explicit_base or '<configured>'}"
+        if cache_key not in self._existing_lhe_cache:
+            if pool_name in self._existing_lhe_inventory:
+                files = self._existing_lhe_inventory[pool_name]
+            elif self.options.machine_env.uses_local_storage and self.options.local_output_base:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_local(
+                        pool_name,
+                        existing_lhe_pool_dir(pool_name, self.options.local_output_base),
+                    )
+                ]
+            else:
+                files = [
+                    LHEInventoryEntry(path=path, seed=parse_seed_from_lhe_filename(path))
+                    for path in list_lhe_files_remote(
+                        pool_name,
+                        self.options.proxy_path,
+                        explicit_base,
+                    )
+                ]
+            self._existing_lhe_cache[cache_key] = files
+        return self._existing_lhe_cache[cache_key]
+
+    def _ensure_lhe_groups(self, pool_name: str) -> List[LHEGroup]:
+        """Build deterministic groups of immutable existing LHE files."""
+        if pool_name in self.generated_lhe_groups_by_pool:
+            return self.generated_lhe_groups_by_pool[pool_name]
+
+        files = self._discover_existing_lhe_files(pool_name)
+        if not files:
+            if self.options.existing_lhe_inventory:
+                raise ValueError(
+                    f"Existing-LHE inventory {self.options.existing_lhe_inventory} "
+                    f"has no files for pool {pool_name}; refusing synthetic fallback."
+                )
+            if self.options.scan_existing:
+                raise ValueError(
+                    f"No existing LHE files discovered for {pool_name}; "
+                    "cannot build LHE groups."
+                )
+            storage = pool_storage_name(pool_name)
+            fallback_dir = existing_lhe_pool_dir(pool_name, self.options.existing_lhe_base)
+            synthetic_count = self.options.jobs_per_campaign * max(1, self.options.lhe_group_max_files)
+            files = [
+                LHEInventoryEntry(
+                    path=f"{fallback_dir}/sample_{storage}_{self.seed_for_pool_index(pool_name, i)}.lhe.gz",
+                    seed=self.seed_for_pool_index(pool_name, i),
+                )
+                for i in range(synthetic_count)
+            ]
+
+        min_events = self.options.lhe_group_min_events
+        max_events = self.options.resolved_lhe_group_max_events()
+        max_files = max(1, self.options.lhe_group_max_files)
+
+        groups: List[LHEGroup] = []
+        current_paths: List[str] = []
+        current_seeds: List[int] = []
+        current_counts: List[int] = []
+        current_has_unknown_counts = False
+
+        def flush_group() -> None:
+            nonlocal current_has_unknown_counts
+            if not current_paths:
+                return
+            group_index = len(groups)
+            groups.append(
+                LHEGroup(
+                    pool=pool_name,
+                    group_index=group_index,
+                    group_id=f"g{group_index:06d}",
+                    primary_seed=current_seeds[0],
+                    seeds=list(current_seeds),
+                    paths=list(current_paths),
+                    event_counts=list(current_counts),
+                )
+            )
+            current_paths.clear()
+            current_seeds.clear()
+            current_counts.clear()
+            current_has_unknown_counts = False
+
+        if self.options.lhe_grouping_enabled and not self.options.existing_lhe_inventory:
+            raise ValueError(
+                "Grouped existing-LHE mode requires --existing-lhe-inventory with "
+                "counted file records; run scan-lhe-inventory --count-events."
+            )
+
+        for job_index, entry in enumerate(files):
+            path = entry.path
+            seed = entry.seed
+            if seed is None:
+                seed = self.seed_for_pool_index(pool_name, job_index)
+            count = entry.actual_events
+            if count is None or count <= 0:
+                if self.options.lhe_grouping_enabled:
+                    raise ValueError(
+                        f"Grouped existing-LHE mode requires positive actual_events for "
+                        f"{path}; run scan-lhe-inventory --count-events."
+                    )
+                current_has_unknown_counts = True
+                count = 0
+            current_paths.append(path)
+            current_seeds.append(seed)
+            current_counts.append(count)
+
+            total_events = sum(current_counts)
+            reached_file_cap = len(current_paths) >= max_files
+            reached_min = not current_has_unknown_counts and total_events >= min_events
+            reached_soft_max = not current_has_unknown_counts and total_events >= max_events
+            if reached_file_cap or reached_min or reached_soft_max:
+                flush_group()
+
+        flush_group()
+        self.generated_lhe_groups_by_pool[pool_name] = groups
+        return groups
+
+    def _ensure_group_planning_job(self, pool_name: str, group_index: int) -> Tuple[str, LHEGroup]:
+        """Get or create one planner node for a grouped existing-LHE input."""
+        groups = self._ensure_lhe_groups(pool_name)
+        if group_index >= len(groups):
+            raise ValueError(
+                f"Pool {pool_name} has only {len(groups)} LHE groups, "
+                f"but group index {group_index} was requested."
+            )
+        group = groups[group_index]
+        planners = self.generated_group_planners_by_pool.setdefault(pool_name, {})
+        if group.group_id in planners:
+            return planners[group.group_id], group
+
+        plan_job = self.add_planning_job(
+            pool_name,
+            group.group_index,
+            group.primary_seed,
+            group_id=group.group_id,
+            seeds=group.seeds,
+            lhe_paths=group.paths,
+            lhe_event_counts=group.event_counts,
+        )
+        planners[group.group_id] = plan_job
+        return plan_job, group
+
+    def add_planning_job(
+        self,
+        pool_name: str,
+        index: int,
+        seed: int,
+        lhe_path_override: str = "",
+        group_id: str = "",
+        seeds: Optional[List[int]] = None,
+        lhe_paths: Optional[List[str]] = None,
+        lhe_event_counts: Optional[List[int]] = None,
+        shuffle_seed_override: Optional[int] = None,
+        events_per_block_override: Optional[int] = None,
+        max_events_per_plan_override: Optional[int] = None,
+    ) -> str:
+        """Emit a per-pool LHE block planner DAG node."""
+        pool = LHE_POOLS[pool_name]
+        pool_label = pool_dag_label(pool_name)
+        job_name = f"PLAN_{pool_label}_{index}"
+        lhe_path = lhe_path_override or self._resolve_lhe_path(pool_name, seed)
+        group_id = group_id or str(seed)
+        seeds = seeds or [seed]
+        lhe_paths = lhe_paths or [lhe_path]
+        lhe_event_counts = lhe_event_counts or []
+        block_output_dir = self._resolve_block_output_dir(pool_name, seed)
+        if group_id == str(seed):
+            plan_manifest_path = self._resolve_plan_manifest_path(pool_name, seed)
+        else:
+            plan_manifest_path = self._resolve_group_plan_manifest_path(pool_name, group_id)
+        output_dir = os.path.dirname(plan_manifest_path)
+        shuffle_seed = (
+            shuffle_seed_override
+            if shuffle_seed_override is not None
+            else self.options.lhe_shuffle_seed_base or (seed * 1000 + 37)
+        )
+        plan_config = {
+            "pool_name": pool_name,
+            "group_id": group_id,
+            "primary_seed": seed,
+            "seeds": seeds,
+            "lhe_paths": lhe_paths,
+            "lhe_event_counts": lhe_event_counts,
+            "output_dir": output_dir,
+            "events_per_block": (
+                events_per_block_override
+                if events_per_block_override is not None
+                else self.options.lhe_events_per_block
+            ),
+            "max_events_per_plan": (
+                max_events_per_plan_override
+                if max_events_per_plan_override is not None
+                else self.options.lhe_max_events_per_plan
+            ),
+            "shuffle_seed": shuffle_seed,
+            "shuffle_mode": self.options.lhe_shuffle_mode,
+            "n_strata": self.options.lhe_n_strata,
+            "drop_incomplete_last_block": self.options.lhe_drop_incomplete_last_block,
+            "longitudinal_symmetry_pdg_ids": pool.longitudinal_symmetry_pdg_ids,
+            "longitudinal_symmetry_policy": (
+                "fail" if pool.longitudinal_symmetry_pdg_ids else "off"
+            ),
+            "longitudinal_symmetry_max_asymmetry": 0.20,
+            "longitudinal_symmetry_min_particles": 500,
+            "block_output_dir": block_output_dir,
+            "local_output_base": self.options.local_output_base,
+            "reuse_existing_blocks": False,
+            "manifest_output_path": plan_manifest_path,
+            "storage": node_storage_config(self.options.target_base_url),
+            "log_level": getattr(self.options, "log_level", "info"),
+        }
+        config_path, config_name = self.write_node_config(
+            "planning",
+            f"{job_name}.json",
+            plan_config,
+        )
+        log_root = self.log_directory(
+            "_shared", "lhe_planning", pool_name, f"group_{group_id}"
+        )
+
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, PLAN_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_planning")
+        self.dag_lines.append(
+            "VARS {job} "
+            "plan_wrapper_path=\"{plan_wrapper_path}\" "
+            "plan_bundle_path=\"{plan_bundle_path}\" plan_bundle_name=\"{plan_bundle_name}\" "
+            "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
+            "pool=\"{pool}\" group_id=\"{group_id}\" "
+            "config_path=\"{config_path}\" config_name=\"{config_name}\" "
+            "log_root=\"{log_root}\"".format(
+                job=job_name,
+                plan_wrapper_path=dag_escape(PLAN_WRAPPER_PATH),
+                plan_bundle_path=dag_escape(self.runtime_assets["plan_bundle_path"]),
+                plan_bundle_name=dag_escape(self.runtime_assets["plan_bundle_name"]),
+                proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
+                proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
+                pool=dag_escape(pool_name),
+                group_id=dag_escape(group_id),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
+                log_root=dag_escape(log_root),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
+    def add_coordinator_job(
+        self,
+        campaign_name: str,
+        job_index: int,
+        source_infos: List[object],
+        campaign_inputs: Tuple[str, ...],
+        job_record: Optional[Dict[str, object]] = None,
+        source_lhe_budgets: Optional[List[int]] = None,
+        pool_start_blocks: Optional[Dict[str, int]] = None,
+        processing_start_index: int = 0,
+        max_processing_nodes: int = 0,
+        shared_source_manifests: bool = False,
+        source_manifests_path_override: str = "",
+        allocation_manifest_path: str = "",
+        allocation_shard_index: int = -1,
+    ) -> str:
+        """Emit a campaign-level LHE block coordinator DAG node (multi-source only)."""
+        campaign = CAMPAIGNS[campaign_name]
+        job_name = f"COORD_{campaign_name}_{job_index}"
+
+        # Build source_manifests JSON: list of {pool, seed, path}
+        source_manifest_entries = []
+        for source in source_infos:
+            if isinstance(source, dict):
+                pool_name = str(source["pool"])
+                group_id = str(source.get("group_id") or source.get("seed"))
+                primary_seed = int(source.get("primary_seed", source.get("seed")))
+                seeds = list(source.get("seeds", [primary_seed]))
+                manifest_path = str(source.get("path") or self._resolve_group_plan_manifest_path(pool_name, group_id))
+                source_manifest_entries.append({
+                    "source_id": source.get("source_id", f"{pool_name}:{group_id}"),
+                    "pool": pool_name,
+                    "group_id": group_id,
+                    "primary_seed": primary_seed,
+                    "seed": primary_seed,
+                    "seeds": seeds,
+                    "path": manifest_path,
+                })
+            else:
+                pool_name, seed = source
+                source_manifest_entries.append({
+                    "source_id": f"{pool_name}:{seed}",
+                    "pool": pool_name,
+                    "group_id": str(seed),
+                    "primary_seed": seed,
+                    "seed": seed,
+                    "seeds": [seed],
+                    "path": self._resolve_plan_manifest_path(pool_name, seed),
+                })
+
+        subdag_dir = os.path.join(
+            self.output_dir, "plan_subdags", campaign_name,
+            f"job_{job_index}",
+        )
+        subdag_output_path = os.path.join(subdag_dir, "blocks_processing.dag")
+        os.makedirs(subdag_dir, exist_ok=True)
+        source_manifests_path = source_manifests_path_override or (
+            os.path.join(
+                self.output_dir,
+                "plan_subdags",
+                campaign_name,
+                "source_manifests.json",
+            )
+            if shared_source_manifests
+            else os.path.join(subdag_dir, "source_manifests.json")
+        )
+        if not source_manifests_path_override:
+            write_json_file(source_manifests_path, source_manifest_entries)
+
+        request_cpus, request_memory, request_disk = self.processing_resource_request()
+
+        ntuple_sub_template = ""
+        ntuple_bundle_path = ""
+        ntuple_bundle_name = ""
+        ntuple_wrapper_path = ""
+        if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
+            ntuple_sub_template = os.path.join(BASE_DIR, "processing/templates/ntuple.sub")
+            ntuple_bundle_path = self.runtime_assets.get("ntuple_bundle_path", "")
+            ntuple_bundle_name = self.runtime_assets.get("ntuple_bundle_name", "")
+            ntuple_wrapper_path = NTUPLE_WRAPPER_PATH
+        coord_config = {
+            "campaign": campaign_name,
+            "job_index": job_index,
+            "source_manifests_path": source_manifests_path,
+            "source_manifests_count": len(source_manifest_entries),
+            "shower_modes": list(campaign.shower_modes),
+            "campaign_inputs": list(campaign_inputs),
+            "analysis_type": campaign.analysis_type,
+            "n_sources": campaign.n_sources,
+            "max_events": self.options.max_events,
+            "target_mixed_events": self.options.target_mixed_events,
+            "normal_max_lhe_events": self.options.normal_max_lhe_events,
+            "phi_max_lhe_events": self.options.phi_max_lhe_events,
+            "phi_max_hadronization_retries": self.options.phi_max_hadronization_retries,
+            "minimum_output_fraction": self.options.minimum_output_fraction,
+            "phi_consumption_mode": self.options.phi_consumption_mode,
+            "normal_shortfall_policy": self.options.normal_shortfall_policy,
+            "unused_hepmc_warning_fraction": (
+                self.options.unused_hepmc_warning_fraction
+            ),
+            "source_lhe_budgets": list(source_lhe_budgets or []),
+            "pool_start_blocks": dict(pool_start_blocks or {}),
+            "processing_start_index": processing_start_index,
+            "max_processing_nodes": max_processing_nodes,
+            "allocation_manifest_path": allocation_manifest_path,
+            "allocation_shard_index": allocation_shard_index,
+            "physics_campaign": campaign.physics_campaign,
+            "source_rng_seeds": list((job_record or {}).get("source_rng_seeds", [])),
+            "mixing_rng_seed": int((job_record or {}).get("mixing_rng_seed", 0) or 0),
+            "output_mode": self.options.output_mode,
+            "enable_ntuple": self.options.enable_ntuple and not self.options.machine_env.uses_local_storage,
+            "efficiency_ntuple": self.options.efficiency_ntuple,
+            "cleanup": self.options.cleanup,
+            "shuffle_mixing": self.options.shuffle_mixing,
+            "log_root": self.options.log_root,
+            "request_cpus": request_cpus,
+            "request_memory": request_memory,
+            "request_disk": request_disk,
+            "target_machine": self.options.machine_env.target_machine,
+            "target_eos_base": self.options.target_base_url,
+            "output_dir": subdag_dir,
+            "processing_sub_template_path": os.path.join(
+                BASE_DIR, self.options.machine_env.processing_submit_template
+            ),
+            "processing_bundle_path": self.runtime_assets["processing_bundle_path"],
+            "processing_bundle_name": self.runtime_assets["processing_bundle_name"],
+            "proxy_bundle_path": self.runtime_assets["proxy_bundle_path"],
+            "proxy_bundle_name": self.runtime_assets["proxy_bundle_name"],
+            "processing_wrapper_path": os.path.join(
+                BASE_DIR, "processing", "condor_wrappers", "run_processing.sh"
+            ),
+            "ntuple_sub_template_path": ntuple_sub_template,
+            "ntuple_bundle_path": ntuple_bundle_path,
+            "ntuple_bundle_name": ntuple_bundle_name,
+            "ntuple_wrapper_path": ntuple_wrapper_path,
+            "miniaod_merge_events": self.options.miniaod_merge_events,
+            "miniaod_merge_validation": self.options.miniaod_merge_validation,
+            "max_miniaod_merge_jobs": self.options.maxjobs_miniaod_merge,
+            "miniaod_merge_sub_template_path": os.path.join(BASE_DIR, MINIAOD_MERGE_SUBMIT_TEMPLATE),
+            "miniaod_merge_wrapper_path": MINIAOD_MERGE_WRAPPER_PATH,
+            "final_sub_template_path": os.path.join(BASE_DIR, SUBDAG_FINAL_SUBMIT_TEMPLATE),
+            "final_wrapper_path": SUBDAG_FINAL_WRAPPER_PATH,
+            "subdag_output_path": subdag_output_path,
+            "max_block_subdag_jobs": self.options.max_block_subdag_jobs,
+            "local_output_base": self.options.local_output_base,
+            "storage": node_storage_config(self.options.target_base_url),
+            "processing_environment": processing_environment_config(
+                getattr(self.options, "log_level", "info")
+            ),
+            "log_level": getattr(self.options, "log_level", "info"),
+        }
+        config_path, config_name = self.write_node_config(
+            "coordination",
+            f"{job_name}.json",
+            coord_config,
+        )
+        log_root = self.log_directory(
+            campaign_name, "lhe_coordination", f"job_{job_index:06d}"
+        )
+
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, COORDINATE_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_coordination")
+        self.dag_lines.append(
+            "VARS {job} "
+            "coord_wrapper_path=\"{coord_wrapper}\" "
+            "coord_bundle_path=\"{coord_bundle_path}\" coord_bundle_name=\"{coord_bundle_name}\" "
+            "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
+            "campaign=\"{campaign}\" job_index=\"{job_index}\" "
+            "log_root=\"{log_root}\" "
+            "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" "
+            "request_disk=\"{request_disk}\" "
+            "target_machine=\"{target_machine}\" "
+            "config_path=\"{config_path}\" config_name=\"{config_name}\"".format(
+                job=job_name,
+                coord_wrapper=dag_escape(COORDINATE_WRAPPER_PATH),
+                coord_bundle_path=dag_escape(self.runtime_assets["coordinate_bundle_path"]),
+                coord_bundle_name=dag_escape(self.runtime_assets["coordinate_bundle_name"]),
+                proxy_bundle_path=dag_escape(self.runtime_assets["proxy_bundle_path"]),
+                proxy_bundle_name=dag_escape(self.runtime_assets["proxy_bundle_name"]),
+                campaign=dag_escape(campaign_name),
+                job_index=dag_escape(job_index),
+                log_root=dag_escape(log_root),
+                request_cpus=dag_escape(request_cpus),
+                request_memory=dag_escape(request_memory),
+                request_disk=dag_escape(request_disk),
+                target_machine=dag_escape(self.options.machine_env.target_machine),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
+    def add_campaign_allocation_job(
+        self,
+        source_manifests_path: str,
+        allocation_manifest_path: str,
+        campaign_names: Sequence[str],
+        shard_processing_nodes: int,
+    ) -> str:
+        """Emit the post-planner node that assigns authoritative shard cursors."""
+
+        job_name = "ALLOCATE_CAMPAIGN_SHARDS"
+        assert self.planning_spec is not None
+        planning = self.planning_spec["planning"]
+        allocation_order = list(
+            planning.get("campaign_allocation_order") or campaign_names
+        )
+        allocation_config = {
+            "source_manifests_path": source_manifests_path,
+            "output_path": allocation_manifest_path,
+            "shard_processing_nodes": shard_processing_nodes,
+            "campaign_allocation_order": allocation_order,
+            "log_level": getattr(self.options, "log_level", "info"),
+            "campaigns": {
+                campaign_name: {
+                    "campaign_inputs": list(CAMPAIGNS[campaign_name].inputs),
+                    "source_lhe_budgets": list(
+                        self.planning_spec["campaigns"][campaign_name][
+                            "source_lhe_budgets"
+                        ]
+                    ),
+                    "max_processing_nodes": int(
+                        self.planning_spec["campaigns"][campaign_name].get(
+                            "max_processing_nodes", 0
+                        ) or 0
+                    ),
+                    "expected_shards": (
+                        int(
+                            self.planning_spec["campaigns"][campaign_name][
+                                "processing_nodes"
+                            ]
+                        )
+                        + shard_processing_nodes
+                        - 1
+                    ) // shard_processing_nodes,
+                }
+                for campaign_name in allocation_order
+            },
+        }
+        config_path, config_name = self.write_node_config(
+            "coordination",
+            f"{job_name}.json",
+            allocation_config,
+        )
+        log_root = self.log_directory(
+            "_shared", "lhe_coordination", "campaign_allocation"
+        )
+        self.dag_lines.append(
+            f"JOB {job_name} {os.path.join(BASE_DIR, ALLOCATE_SUBMIT_TEMPLATE)}"
+        )
+        self.dag_lines.append(f"CATEGORY {job_name} lhe_coordination")
+        self.dag_lines.append(
+            "VARS {job} "
+            "allocation_wrapper_path=\"{wrapper}\" "
+            "coord_bundle_path=\"{bundle_path}\" "
+            "coord_bundle_name=\"{bundle_name}\" "
+            "config_path=\"{config_path}\" config_name=\"{config_name}\" "
+            "log_root=\"{log_root}\"".format(
+                job=job_name,
+                wrapper=dag_escape(ALLOCATE_WRAPPER_PATH),
+                bundle_path=dag_escape(
+                    self.runtime_assets["coordinate_bundle_path"]
+                ),
+                bundle_name=dag_escape(
+                    self.runtime_assets["coordinate_bundle_name"]
+                ),
+                config_path=dag_escape(config_path),
+                config_name=dag_escape(config_name),
+                log_root=dag_escape(log_root),
+            )
+        )
+        self.dag_lines.append(f"RETRY {job_name} 2")
+        return job_name
+
+    def add_block_subdag_node(
+        self,
+        campaign_name: str,
+        job_index: int,
+        is_single_source: bool,
+        pool_name: str = "",
+    ) -> str:
+        """Emit a SUBDAG EXTERNAL node for a block processing SubDAG."""
+        if is_single_source:
+            pool_label = pool_dag_label(pool_name)
+            subdag_name = f"PROC_{campaign_name}_{pool_label}_{job_index}"
+        else:
+            subdag_name = f"MIX_{campaign_name}_{job_index}"
+
+        subdag_path = os.path.join(
+            self.output_dir, "plan_subdags", campaign_name,
+            f"job_{job_index}", "blocks_processing.dag",
+        )
+        # Pre-create the directory as a placeholder so DAGMan can validate the path
+        os.makedirs(os.path.dirname(subdag_path), exist_ok=True)
+
+        self.dag_lines.append(
+            f"SUBDAG EXTERNAL {subdag_name} {subdag_path}"
+        )
+        return subdag_name
+
+    def _build_planning_spec_v2(
+        self,
+        campaign_names: Sequence[str],
+        dag_filename: str,
+        dagman_config_path: str,
+    ) -> str:
+        """Emit planners and deterministic processing shards from a v2 spec."""
+
+        assert self.planning_spec is not None
+        planning = self.planning_spec["planning"]
+        layout_id = str(planning["layout_id"])
+        block_events = int(planning["block_events"])
+        shard_nodes = int(planning["shard_processing_nodes"])
+        source_infos: List[Dict[str, object]] = []
+        planner_nodes: List[Tuple[str, str]] = []
+
+        for pool_name, records in self.planning_spec["selected_inventory"].items():
+            for record_index, record in enumerate(records):
+                seed = int(record["seed"])
+                group_id = f"{layout_id}_{pool_dag_label(pool_name)}_{seed}"
+                shuffle_seed = deterministic_seed(
+                    f"{layout_id}|{pool_name}|{seed}|block-shuffle"
+                )
+                planner = self.add_planning_job(
+                    pool_name,
+                    record_index,
+                    seed,
+                    group_id=group_id,
+                    seeds=[seed],
+                    lhe_paths=[str(record["path"])],
+                    lhe_event_counts=[int(record["actual_events"])],
+                    shuffle_seed_override=shuffle_seed,
+                    events_per_block_override=block_events,
+                    max_events_per_plan_override=int(record["planned_events"]),
+                )
+                planner_nodes.append((pool_name, planner))
+                source_infos.append({
+                    "source_id": f"{pool_name}:{group_id}",
+                    "pool": pool_name,
+                    "group_id": group_id,
+                    "primary_seed": seed,
+                    "seed": seed,
+                    "seeds": [seed],
+                    "path": self._resolve_group_plan_manifest_path(
+                        pool_name, group_id
+                    ),
+                })
+
+        processing_jobs: List[str] = []
+        campaign_build_order = list(
+            planning.get("campaign_allocation_order") or campaign_names
+        )
+        shared_manifest_root = os.path.join(self.output_dir, "plan_subdags")
+        global_source_manifests_path = os.path.join(
+            shared_manifest_root, "source_manifests.json"
+        )
+        write_json_file(global_source_manifests_path, source_infos)
+        allocation_manifest_path = os.path.join(
+            shared_manifest_root, "campaign_shard_allocation.json"
+        )
+        allocation_job = self.add_campaign_allocation_job(
+            global_source_manifests_path,
+            allocation_manifest_path,
+            campaign_build_order,
+            shard_nodes,
+        )
+        for _, planner in planner_nodes:
+            self.dag_lines.append(f"PARENT {planner} CHILD {allocation_job}")
+
+        for campaign_name in campaign_build_order:
+            campaign = CAMPAIGNS[campaign_name]
+            campaign_spec = self.planning_spec["campaigns"][campaign_name]
+            processing_nodes = int(campaign_spec["processing_nodes"])
+            budgets = list(campaign_spec["source_lhe_budgets"])
+            campaign_pools = set(campaign.inputs)
+            campaign_sources = [
+                source for source in source_infos
+                if str(source["pool"]) in campaign_pools
+            ]
+            campaign_source_manifests_path = os.path.join(
+                shared_manifest_root,
+                campaign_name,
+                "source_manifests.json",
+            )
+            write_json_file(
+                campaign_source_manifests_path,
+                campaign_sources,
+            )
+            shard_count = (processing_nodes + shard_nodes - 1) // shard_nodes
+            for shard_index in range(shard_count):
+                node_count = min(
+                    shard_nodes,
+                    processing_nodes - shard_index * shard_nodes,
+                )
+                coord_job = self.add_coordinator_job(
+                    campaign_name,
+                    shard_index,
+                    campaign_sources,
+                    campaign.inputs,
+                    source_lhe_budgets=budgets,
+                    pool_start_blocks={},
+                    processing_start_index=0,
+                    max_processing_nodes=node_count,
+                    source_manifests_path_override=(
+                        campaign_source_manifests_path
+                    ),
+                    allocation_manifest_path=allocation_manifest_path,
+                    allocation_shard_index=shard_index,
+                )
+                self.dag_lines.append(
+                    f"PARENT {allocation_job} CHILD {coord_job}"
+                )
+                subdag_name = self.add_block_subdag_node(
+                    campaign_name,
+                    shard_index,
+                    is_single_source=False,
+                )
+                self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                processing_jobs.append(subdag_name)
+
+        if processing_jobs:
+            self.dag_lines.append("")
+            self.append_summary_final()
+
+        self.metadata = OrderedDict([
+            ("created_at", datetime.now().isoformat()),
+            ("dag_path", os.path.join(self.output_dir, dag_filename)),
+            ("dagman_config_path", dagman_config_path),
+            ("options", self.options.to_dict()),
+            ("runtime_assets", self.runtime_assets),
+            ("log_archive", self.log_archive_metadata()),
+            ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
+            ("campaign_planning_spec", self.planning_spec),
+            ("production_capacity_signals", {
+                "layout_id": layout_id,
+                "block_events": block_events,
+                "selected_source_files": sum(
+                    len(records)
+                    for records in self.planning_spec["selected_inventory"].values()
+                ),
+                "blocks_by_pool": {
+                    pool: sum(int(record["planned_blocks"]) for record in records)
+                    for pool, records in self.planning_spec["selected_inventory"].items()
+                },
+                "campaigns": {
+                    name: {
+                        "available_processing_nodes": cfg["available_processing_nodes"],
+                        "selected_processing_nodes": cfg["processing_nodes"],
+                        "required_blocks_by_pool": cfg["required_blocks_by_pool"],
+                        "estimated_pool_start_blocks": cfg.get(
+                            "estimated_pool_start_blocks", {}
+                        ),
+                        "estimated_pool_end_blocks": cfg.get(
+                            "estimated_pool_end_blocks", {}
+                        ),
+                        "estimated_lhe_events_by_slot": cfg.get(
+                            "estimated_lhe_events_by_slot", []
+                        ),
+                        "estimated_blocks_by_slot": cfg.get(
+                            "estimated_blocks_by_slot", []
+                        ),
+                        "expected_events_per_node": cfg["expected_events_per_node"],
+                        "expected_final_events": cfg["expected_final_events"],
+                    }
+                    for name, cfg in self.planning_spec["campaigns"].items()
+                },
+                "storage": self.planning_spec["storage"],
+            }),
+        ])
+        return "\n".join(self.dag_lines)
+
     def build(self, campaign_names: Sequence[str], dag_filename: str) -> str:
         dagman_config_path = os.path.join(self.output_dir, "dagman.config")
         processing_jobs: List[str] = []
+        self.initialize_workflow_archive_id(dag_filename)
+        self.planning_spec = load_campaign_planning_spec(
+            self.options.campaign_job_spec,
+            campaign_names,
+            self.options.existing_lhe_inventory,
+        )
+        self.campaign_jobs = (
+            {}
+            if self.planning_spec is not None
+            else load_campaign_job_spec(
+                self.options.campaign_job_spec,
+                campaign_names,
+                self.options.existing_lhe_inventory,
+            )
+        )
 
         self.dag_lines = [
             "# ================================================",
             "# workbook_v2 MC 生产 DAG",
             f"# 生成时间: {datetime.now().isoformat()}",
             f"# Campaigns: {', '.join(campaign_names)}",
-            f"# 每个 campaign 作业数: {self.options.jobs_per_campaign}",
+            f"# 每个 campaign 作业数: {'job-spec' if self.campaign_jobs else self.options.jobs_per_campaign}",
             f"# 测试模式: {bool_string(self.options.test_mode)}",
             "# ================================================",
             "",
@@ -1904,10 +4685,38 @@ class DAGBuilder:
             self.dag_lines.append(f"MAXJOBS processing {self.options.maxjobs_processing}")
         if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage and self.options.maxjobs_ntuple > 0:
             self.dag_lines.append(f"MAXJOBS ntuple {self.options.maxjobs_ntuple}")
+        if self.options.enable_lhe_block_subdags:
+            self.dag_lines.append(f"MAXJOBS lhe_planning {self.options.maxjobs_lhe}")
+            self.dag_lines.append(f"MAXJOBS lhe_coordination {self.options.maxjobs_lhe}")
+            if self.options.maxjobs_miniaod_merge > 0:
+                self.dag_lines.append(f"MAXJOBS miniaod_merge {self.options.maxjobs_miniaod_merge}")
         self.dag_lines.append("")
 
-        for pool_name, required_count in self.pool_requirements.items():
-            self.ensure_lhe_jobs(pool_name, required_count)
+        if self.planning_spec is not None:
+            return self._build_planning_spec_v2(
+                campaign_names,
+                dag_filename,
+                dagman_config_path,
+            )
+
+        if (
+            self.options.enable_lhe_block_subdags
+            and not self.options.keep_legacy_single_processing_path
+            and not self.options.skip_lhe_generation
+        ):
+            block_pool_requirements: Dict[str, int] = OrderedDict()
+            for campaign_name in campaign_names:
+                campaign = CAMPAIGNS[campaign_name]
+                for pool_name in dict.fromkeys(campaign.inputs):
+                    block_pool_requirements[pool_name] = max(
+                        block_pool_requirements.get(pool_name, 0),
+                        self.options.jobs_per_campaign,
+                    )
+            for pool_name, required_count in block_pool_requirements.items():
+                self.ensure_lhe_jobs(pool_name, required_count)
+        else:
+            for pool_name, required_count in self.pool_requirements.items():
+                self.ensure_lhe_jobs(pool_name, required_count)
 
         for campaign_name in campaign_names:
             campaign = CAMPAIGNS[campaign_name]
@@ -1915,26 +4724,192 @@ class DAGBuilder:
             self.dag_lines.append(f"# {campaign.description}")
             if campaign.notes:
                 self.dag_lines.append(f"# 备注: {campaign.notes}")
-            for job_index in range(self.options.jobs_per_campaign):
-                processing_job = self.add_processing_job(campaign_name, job_index)
-                processing_jobs.append(processing_job)
-                if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
-                    self.add_ntuple_job(campaign_name, job_index, processing_job)
+
+            use_block_subdags = (
+                self.options.enable_lhe_block_subdags
+                and not self.options.keep_legacy_single_processing_path
+            )
+
+            # Block SubDAGs require freshly generated LHE; existing pools
+            # can't provide block files so fall back to legacy processing.
+            # When --skip-lhe-generation is set, existing files are expected
+            # (planners point at them directly), so skip this guard.
+            if use_block_subdags and not self.options.skip_lhe_generation:
+                any_existing = any(
+                    self.pool_uses_existing(pn) for pn in campaign.inputs
+                )
+                if any_existing:
+                    print(
+                        f"[WARNING] Campaign {campaign_name}: some pools use existing LHE. "
+                        f"Falling back to legacy flat DAG (block SubDAGs require fresh LHE generation).",
+                        file=sys.stderr,
+                    )
+                    use_block_subdags = False
+
+            if use_block_subdags and self.options.skip_lhe_generation:
+                # Short-circuit: skip HELAC generation, use existing LHE files.
+                # Planners are deduplicated across campaigns (same pool+index → one node).
+                if self.campaign_jobs:
+                    for job_record in self.campaign_jobs[campaign_name]:
+                        job_id = int(job_record["job_id"])
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: Set[str] = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            plan_job, source = self._ensure_spec_planning_job(
+                                pool_name, job_record
+                            )
+                            plan_jobs.append(plan_job)
+                            source_infos.append({
+                                "source_id": f"{pool_name}:{source['group_id']}",
+                                "pool": pool_name,
+                                "group_id": source["group_id"],
+                                "primary_seed": int(source["seed"]),
+                                "seed": int(source["seed"]),
+                                "seeds": [int(source["seed"])],
+                                "path": source["manifest_path"],
+                            })
+                        coord_job = self.add_coordinator_job(
+                            campaign_name,
+                            job_id,
+                            source_infos,
+                            campaign.inputs,
+                            job_record=job_record,
+                        )
+                        for plan_job in plan_jobs:
+                            self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_id, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                elif self.options.lhe_grouping_enabled:
+                    for group_index in range(self.options.jobs_per_campaign):
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: set = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            plan_job, group = self._ensure_group_planning_job(pool_name, group_index)
+                            plan_jobs.append(plan_job)
+                            source_infos.append({
+                                "source_id": f"{pool_name}:{group.group_id}",
+                                "pool": pool_name,
+                                "group_id": group.group_id,
+                                "primary_seed": group.primary_seed,
+                                "seed": group.primary_seed,
+                                "seeds": group.seeds,
+                                "path": self._resolve_group_plan_manifest_path(pool_name, group.group_id),
+                            })
+                        coord_job = self.add_coordinator_job(campaign_name, group_index, source_infos, campaign.inputs)
+                        for pj in plan_jobs:
+                            self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, group_index, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                elif campaign.n_sources == 1:
+                    pool_name = campaign.inputs[0]
+                    for job_index in range(self.options.jobs_per_campaign):
+                        plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
+                        seed = self.seed_for_pool_index(pool_name, job_index)
+                        coord_job = self.add_coordinator_job(
+                            campaign_name,
+                            job_index,
+                            [(pool_name, seed)],
+                            campaign.inputs,
+                        )
+                        self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_index, is_single_source=True,
+                            pool_name=pool_name,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+                else:
+                    # Multi-source: planner per unique pool → coordinator → SubDAG
+                    for job_index in range(self.options.jobs_per_campaign):
+                        plan_jobs = []
+                        source_infos = []
+                        seen_pools: set = set()
+                        for pool_name in campaign.inputs:
+                            if pool_name in seen_pools:
+                                continue
+                            seen_pools.add(pool_name)
+                            plan_job = self._ensure_skip_lhe_planning_job(pool_name, job_index)
+                            plan_jobs.append(plan_job)
+                            seed = self.seed_for_pool_index(pool_name, job_index)
+                            source_infos.append((pool_name, seed))
+                        coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
+                        for pj in plan_jobs:
+                            self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                        subdag_name = self.add_block_subdag_node(
+                            campaign_name, job_index, is_single_source=False,
+                        )
+                        self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                        processing_jobs.append(subdag_name)
+
+            elif use_block_subdags and campaign.n_sources == 1:
+                # Single-source: planner writes SubDAG directly
+                pool_name = campaign.inputs[0]
+                for job_index in range(self.options.jobs_per_campaign):
+                    seed = self.seed_for_pool_index(pool_name, job_index)
+                    plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
+                    coord_job = self.add_coordinator_job(
+                        campaign_name,
+                        job_index,
+                        [(pool_name, seed)],
+                        campaign.inputs,
+                    )
+                    self.dag_lines.append(f"PARENT {plan_job} CHILD {coord_job}")
+                    subdag_name = self.add_block_subdag_node(
+                        campaign_name, job_index, is_single_source=True,
+                        pool_name=pool_name,
+                    )
+                    self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                    processing_jobs.append(subdag_name)
+
+            elif use_block_subdags and campaign.n_sources >= 2:
+                # Multi-source: planner per source → coordinator → SubDAG
+                for job_index in range(self.options.jobs_per_campaign):
+                    plan_jobs = []
+                    source_infos = []
+                    seen_pools: set = set()
+                    for pool_name in campaign.inputs:
+                        if pool_name in seen_pools:
+                            continue
+                        seen_pools.add(pool_name)
+                        seed = self.seed_for_pool_index(pool_name, job_index)
+                        plan_job = self._ensure_generated_lhe_planning_job(pool_name, job_index)
+                        plan_jobs.append(plan_job)
+                        source_infos.append((pool_name, seed))
+                    coord_job = self.add_coordinator_job(campaign_name, job_index, source_infos, campaign.inputs)
+                    for pj in plan_jobs:
+                        self.dag_lines.append(f"PARENT {pj} CHILD {coord_job}")
+                    subdag_name = self.add_block_subdag_node(
+                        campaign_name, job_index, is_single_source=False,
+                    )
+                    self.dag_lines.append(f"PARENT {coord_job} CHILD {subdag_name}")
+                    processing_jobs.append(subdag_name)
+
+            else:
+                # Legacy flat DAG (current behavior)
+                for job_index in range(self.options.jobs_per_campaign):
+                    processing_job = self.add_processing_job(campaign_name, job_index)
+                    processing_jobs.append(processing_job)
+                    if self.options.enable_ntuple and not self.options.machine_env.uses_local_storage:
+                        self.add_ntuple_job(campaign_name, job_index, processing_job)
+
             self.dag_lines.append("")
 
         if processing_jobs:
-            self.dag_lines.append("# -------- 汇总节点 --------")
-            self.dag_lines.append(f"FINAL SUMMARY {os.path.join(BASE_DIR, self.options.machine_env.summary_submit_template)}")
-            self.dag_lines.append(
-                "VARS SUMMARY summary_bundle_path=\"{summary_bundle_path}\" "
-                "summary_bundle_name=\"{summary_bundle_name}\" "
-                "log_dir=\"{log_dir}\" log_root=\"{log_root}\"".format(
-                    summary_bundle_path=dag_escape(self.runtime_assets["summary_bundle_path"]),
-                    summary_bundle_name=dag_escape(self.runtime_assets["summary_bundle_name"]),
-                    log_dir=dag_escape(self.options.local_log_dir),
-                    log_root=dag_escape(self.options.log_root),
-                )
-            )
+            self.append_summary_final()
 
         self.metadata = OrderedDict(
             [
@@ -1943,7 +4918,15 @@ class DAGBuilder:
                 ("dagman_config_path", dagman_config_path),
                 ("options", self.options.to_dict()),
                 ("runtime_assets", self.runtime_assets),
+                ("log_archive", self.log_archive_metadata()),
                 ("campaigns", [CAMPAIGNS[name].to_dict() for name in campaign_names]),
+                (
+                    "campaign_job_ids",
+                    OrderedDict(
+                        (name, [int(job["job_id"]) for job in self.campaign_jobs.get(name, [])])
+                        for name in campaign_names
+                    ) if self.campaign_jobs else OrderedDict(),
+                ),
                 (
                     "pool_plan",
                     OrderedDict(
@@ -2006,11 +4989,25 @@ class DAGBuilder:
                 self.dag_lines.append(f"# 备注: {campaign.notes}")
             for job_index in job_indices:
                 miniaod_path = miniaod_input_fn(campaign_name, job_index)
+                target_eos_base = ""
+                custom_output_subpath = ""
+                custom_ntuple_basename = ""
+                if self.options.use_subprocess_naming:
+                    subprocess_id = SUBPROCESS_MAP.get(campaign_name, "")
+                    if subprocess_id:
+                        target_eos_base = self.options.target_base_url or EOS_BASE
+                        version = self.options.ntuple_version or NTUPLE_VERSION
+                        ntuple_dir = f"Ntuple-{version}" if self.options.ntuple_version else "Ntuple"
+                        custom_output_subpath = f"JpsiJpsiPhi/{ntuple_dir}/{subprocess_id}"
+                        custom_ntuple_basename = f"{subprocess_id}-Ntuple-{version}-{job_index}.root"
                 self.add_ntuple_job(
                     campaign_name, job_index,
                     parent_job=None,
                     miniaod_input=miniaod_path,
                     is_ntuple_only=True,
+                    target_eos_base=target_eos_base,
+                    custom_output_subpath=custom_output_subpath,
+                    custom_ntuple_basename=custom_ntuple_basename,
                 )
             self.dag_lines.append("")
 
@@ -2050,8 +5047,8 @@ def render_dagman_config(options: WorkflowOptions) -> str:
     if options.dagman_max_jobs_submitted > 0 or options.dagman_max_jobs_idle > 0:
         lines.extend(
             (
-                "DAGMAN_MAX_SUBMITS_PER_INTERVAL = 20",
-                "DAGMAN_SUBMIT_DELAY = 1",
+                "DAGMAN_MAX_SUBMITS_PER_INTERVAL = 100",
+                "DAGMAN_SUBMIT_DELAY = 0",
             )
         )
     lines.extend(
@@ -2137,6 +5134,7 @@ def validate_environment(
     machine_env: Optional[MachineEnv] = None,
     local_output_base: str = "",
     cmssw15_runtime_tarball: Optional[str] = None,
+    existing_lhe_base: str = "",
 ) -> int:
     machine_env = machine_env or MACHINE_ENVS["lxplus_t2_ihep"]
     if machine_env.uses_local_storage and not local_output_base:
@@ -2151,6 +5149,8 @@ def validate_environment(
     print(f"Storage: {machine_env.storage_description}")
     if local_output_base:
         print(f"Local output base: {local_output_base}")
+    elif existing_lhe_base:
+        print(f"Existing LHE base: {existing_lhe_base}")
     print()
 
     print("命令检查:")
@@ -2171,9 +5171,9 @@ def validate_environment(
             exit_code = 1
 
     print("\n包检查:")
-    helac_package_path = os.path.join(BASE_DIR, "common", "packages", "helac_package.tar.gz")
+    helac_package_path = os.path.join(BASE_DIR, "common", "packages", HELAC_SOURCE_PACKAGE)
     helac_ok, helac_status = inspect_helac_package(helac_package_path)
-    print(f"  - {'common/packages/helac_package.tar.gz':<40} {'OK' if helac_ok else '缺失/无效'} ({helac_status})")
+    print(f"  - {('common/packages/' + HELAC_SOURCE_PACKAGE):<40} {'OK' if helac_ok else '缺失/无效'} ({helac_status})")
     if not helac_ok:
         exit_code = 1
 
@@ -2219,7 +5219,12 @@ def validate_environment(
         if scan_existing and (proxy_ok or local_output_base):
             scan_target = "本地" if local_output_base else "远端"
             print(f"\n{scan_target} pool 扫描:")
-            scan = scan_existing_pools(pool_requirements, proxy_path, local_output_base)
+            scan = scan_existing_pools(
+                pool_requirements,
+                proxy_path,
+                local_output_base,
+                existing_lhe_base,
+            )
             for pool_name, info in scan.items():
                 status = "复用已有文件" if info["use_existing"] else "需要重新生成"
                 error = info.get("error")
@@ -2236,7 +5241,7 @@ def validate_environment(
 def discover_ntuple_jobs(
     miniaod_dir: str,
     campaign_names: Sequence[str],
-    filename: str = "MINIAOD.root",
+    filename: str = "output_MINIAOD.root",
     max_jobs: int = 0,
 ) -> Dict[str, List[int]]:
     """扫描本地目录结构，找到可用的 MiniAOD 文件及其 job index。
@@ -2272,6 +5277,62 @@ def discover_ntuple_jobs(
     return result
 
 
+def discover_ntuple_jobs_remote(
+    miniaod_base_url: str,
+    campaign_names: Sequence[str],
+    filename: str = "output_MINIAOD.root",
+    proxy_path: str = "",
+    max_jobs: int = 0,
+) -> Dict[str, List[int]]:
+    """Scan remote XRootD directory structure for available MiniAOD files.
+
+    Expected structure: {miniaod_base_url}/{campaign_name}/{job_index}/{filename}
+    Returns campaign_name -> sorted job index list mapping.
+    """
+    result: Dict[str, List[int]] = OrderedDict()
+    if not proxy_path:
+        proxy_path = detect_proxy_path()
+    local_proxy = ensure_local_xrootd_proxy(proxy_path)
+    env = os.environ.copy()
+    env["X509_USER_PROXY"] = local_proxy
+    base_path = miniaod_base_url.replace(f"root://{EOS_XRDFS_TARGET}/", "")
+    for campaign_name in campaign_names:
+        campaign_dir = f"{base_path}/{campaign_name}"
+        # Use recursive listing to discover {idx}/{filename} in one shot
+        try:
+            r = subprocess.run(
+                ["xrdfs", EOS_XRDFS_TARGET, "ls", "-R", campaign_dir],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=120, check=False, env=env,
+            )
+        except Exception:
+            print(f"警告: 无法列出远端目录: {campaign_dir}")
+            continue
+        if r.returncode != 0:
+            print(f"警告: 远端 campaign 目录不存在: {miniaod_base_url}/{campaign_name}")
+            continue
+        # Parse lines like: /path/to/campaign/0/output_MINIAOD.root
+        indices: Set[int] = set()
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line.endswith(filename):
+                continue
+            # Extract the index from the path component before the filename
+            parent = line[:-(len(filename) + 1)].rsplit("/", 1)[-1]
+            try:
+                indices.add(int(parent))
+            except ValueError:
+                continue
+        indices_sorted = sorted(indices)
+        if max_jobs > 0:
+            indices_sorted = indices_sorted[:max_jobs]
+        if indices_sorted:
+            result[campaign_name] = indices_sorted
+        else:
+            print(f"警告: campaign {campaign_name} 中没有找到 {filename} 文件")
+    return result
+
+
 def execute_ntuple_only_generation(
     campaign_names: Sequence[str],
     miniaod_dir: str,
@@ -2280,7 +5341,7 @@ def execute_ntuple_only_generation(
     output_dir: str,
     dag_filename: str,
     options: WorkflowOptions,
-    jobs: int,
+    jobs: object,  # int or Dict[str, int] from parse_jobs_arg()
     dry_run: bool,
 ) -> int:
     """生成仅含 ntuple 重跑节点的 DAG（从已有 MiniAOD 出发）。"""
@@ -2317,16 +5378,24 @@ def execute_ntuple_only_generation(
 
     # Resolve job indices
     if use_miniaod_dir:
+        max_jobs_int = jobs if isinstance(jobs, int) else 0
         campaign_jobs_map = discover_ntuple_jobs(
-            miniaod_dir, campaign_names, miniaod_filename, max_jobs=jobs,
+            miniaod_dir, campaign_names, miniaod_filename, max_jobs=max_jobs_int,
         )
     else:
-        if jobs <= 0:
-            print("错误: 使用 --miniaod-base-url 时必须提供 --jobs", file=sys.stderr)
-            return 1
-        campaign_jobs_map = OrderedDict(
-            (name, list(range(jobs))) for name in campaign_names
+        max_jobs_int = jobs if isinstance(jobs, int) else 0
+        per_campaign_caps = {} if isinstance(jobs, int) or jobs is None else jobs
+        campaign_jobs_map = discover_ntuple_jobs_remote(
+            miniaod_base_url, campaign_names, miniaod_filename,
+            proxy_path=options.proxy_path,
+            max_jobs=max_jobs_int,
         )
+        # Apply per-campaign caps if --jobs is a dict
+        if isinstance(per_campaign_caps, dict):
+            for name in list(campaign_jobs_map.keys()):
+                limit = per_campaign_caps.get(name)
+                if limit is not None and limit > 0:
+                    campaign_jobs_map[name] = campaign_jobs_map[name][:limit]
 
     if not campaign_jobs_map:
         print("错误: 没有任何可用的 ntuple job（未找到 MiniAOD 文件）", file=sys.stderr)
@@ -2418,6 +5487,93 @@ def execute_generation(
     options: WorkflowOptions,
     dry_run: bool,
 ) -> int:
+    recovery_campaigns = [name for name in campaign_names if not CAMPAIGNS[name].aggregate]
+    planning_spec = None
+    if options.campaign_job_spec:
+        try:
+            planning_spec = load_campaign_planning_spec(
+                options.campaign_job_spec,
+                campaign_names,
+                options.existing_lhe_inventory,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"Error: invalid campaign planning spec: {exc}", file=sys.stderr)
+            return 1
+    if options.campaign_job_spec and (
+        not options.skip_lhe_generation or not options.enable_lhe_block_subdags
+    ):
+        print(
+            "Error: --campaign-job-spec requires --skip-lhe-generation and "
+            "--enable-lhe-block-subdags",
+            file=sys.stderr,
+        )
+        return 1
+    if recovery_campaigns and not options.campaign_job_spec:
+        print("Error: recovery campaigns require --campaign-job-spec", file=sys.stderr)
+        return 1
+    if recovery_campaigns and options.phi_consumption_mode != "exhaustive":
+        print("Error: recovery campaigns require --phi-consumption-mode exhaustive", file=sys.stderr)
+        return 1
+    if recovery_campaigns and planning_spec is None:
+        recovery_contract = {
+            "--lhe-shuffle-split": options.lhe_shuffle_split is True,
+            "--lhe-events-per-block 350": options.lhe_events_per_block == 350,
+            "--lhe-max-events-per-plan 700": options.lhe_max_events_per_plan == 700,
+            "--lhe-shuffle-mode stratified": options.lhe_shuffle_mode == "stratified",
+            "--lhe-n-strata auto": options.lhe_n_strata == "auto",
+            "keep incomplete final LHE block": (
+                options.lhe_drop_incomplete_last_block is False
+            ),
+            "--normal-max-lhe-events 350": options.normal_max_lhe_events == 350,
+            "--phi-max-lhe-events 350": options.phi_max_lhe_events == 350,
+            "--phi-max-hadronization-retries 5000": (
+                options.phi_max_hadronization_retries == 5000
+            ),
+            "--miniaod-merge-events 5000": options.miniaod_merge_events == 5000,
+            "--miniaod-merge-validation event-count": (
+                options.miniaod_merge_validation == "event-count"
+            ),
+            "--no-shuffle-mixing": options.shuffle_mixing is False,
+            "--normal-shortfall-policy report-and-truncate": (
+                options.normal_shortfall_policy == "report-and-truncate"
+            ),
+            "fixed unused HepMC warning threshold 0.15": (
+                options.unused_hepmc_warning_fraction == 0.15
+            ),
+            "block SubDAG path (no legacy fallback)": (
+                options.keep_legacy_single_processing_path is False
+            ),
+        }
+        invalid_contract = [
+            setting for setting, valid in recovery_contract.items() if not valid
+        ]
+        if invalid_contract:
+            print(
+                "Error: MC_v4_1 recovery contract mismatch: "
+                + ", ".join(invalid_contract),
+                file=sys.stderr,
+            )
+            return 1
+    if options.campaign_job_spec and options.lhe_grouping_enabled:
+        print("Error: --campaign-job-spec is incompatible with LHE grouping", file=sys.stderr)
+        return 1
+    try:
+        if planning_spec is None:
+            load_campaign_job_spec(
+                options.campaign_job_spec,
+                campaign_names,
+                options.existing_lhe_inventory,
+            )
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Error: invalid campaign job spec: {exc}", file=sys.stderr)
+        return 1
+    if options.lhe_grouping_enabled and not options.skip_lhe_generation:
+        print("Error: --lhe-group-min-events requires --skip-lhe-generation in this implementation", file=sys.stderr)
+        return 1
+    if options.lhe_grouping_enabled and not options.enable_lhe_block_subdags:
+        print("Error: --lhe-group-min-events requires --enable-lhe-block-subdags", file=sys.stderr)
+        return 1
+
     if options.strict_vtx_smearing_check:
         result = subprocess.run(
             [sys.executable, os.path.join(BASE_DIR, "tools", "check_gensim_vtxsmeared_config.py")],
@@ -2440,7 +5596,47 @@ def execute_generation(
         if options.log_root != options.local_log_dir:
             ensure_dir(options.log_root)
     pool_requirements = compute_pool_requirements(campaign_names, options.jobs_per_campaign)
-    if options.force_generate_lhe:
+    existing_lhe_inventory = load_existing_lhe_inventory(
+        options.existing_lhe_inventory,
+        allow_incomplete=options.allow_incomplete_lhe_inventory,
+    )
+    if options.skip_lhe_generation:
+        # Short-circuit: mark all pools as "existing" so ensure_lhe_jobs()
+        # is a no-op. In block mode, planners are shared across campaigns and
+        # duplicate campaign inputs consume distinct blocks from one manifest,
+        # so each pool needs one source file per top-level job index rather
+        # than the aggregate flat-DAG occurrence count.
+        existing_pools = OrderedDict()
+        for pool_name, required_count in pool_requirements.items():
+            source_file_requirement = (
+                options.jobs_per_campaign
+                if options.enable_lhe_block_subdags
+                else required_count
+            )
+            count = len(existing_lhe_inventory.get(pool_name, []))
+            error = None
+            if options.existing_lhe_inventory and pool_name not in existing_lhe_inventory:
+                error = f"missing from existing LHE inventory: {options.existing_lhe_inventory}"
+            elif options.scan_existing and not options.existing_lhe_inventory:
+                if local_output_base:
+                    count, error = count_lhe_files_local(pool_name, local_output_base)
+                else:
+                    count, error = count_lhe_files_on_t2(
+                        pool_name,
+                        options.proxy_path,
+                        options.existing_lhe_base,
+                    )
+            existing_pools[pool_name] = {
+                "required_count": source_file_requirement,
+                "remote_count": count,
+                "use_existing": error is None and (
+                    count >= source_file_requirement
+                    or (not options.scan_existing and not options.existing_lhe_inventory)
+                ),
+                "error": error,
+                "remote_path": pool_remote_path(pool_name, local_output_base, options.existing_lhe_base),
+            }
+    elif options.force_generate_lhe:
         existing_pools = OrderedDict(
             (
                 pool_name,
@@ -2449,13 +5645,18 @@ def execute_generation(
                     "remote_count": 0,
                     "use_existing": False,
                     "error": "已禁用远端复用",
-                    "remote_path": pool_remote_path(pool_name, local_output_base),
+                    "remote_path": pool_remote_path(pool_name, local_output_base, options.existing_lhe_base),
                 },
             )
             for pool_name, required_count in pool_requirements.items()
         )
     elif options.scan_existing:
-        existing_pools = scan_existing_pools(pool_requirements, options.proxy_path, local_output_base)
+        existing_pools = scan_existing_pools(
+            pool_requirements,
+            options.proxy_path,
+            local_output_base,
+            options.existing_lhe_base,
+        )
     else:
         existing_pools = OrderedDict(
             (
@@ -2465,7 +5666,7 @@ def execute_generation(
                     "remote_count": 0,
                     "use_existing": False,
                     "error": None,
-                    "remote_path": pool_remote_path(pool_name, local_output_base),
+                    "remote_path": pool_remote_path(pool_name, local_output_base, options.existing_lhe_base),
                 },
             )
             for pool_name, required_count in pool_requirements.items()
@@ -2480,8 +5681,14 @@ def execute_generation(
             "processing_bundle_name": BUNDLE_NAMES["processing"],
             "summary_bundle_path": "<dry-run>/summary_runtime_bundle.tar.gz",
             "summary_bundle_name": BUNDLE_NAMES["summary"],
+            "summary_script_path": "<dry-run>/summary_final.sh",
+            "summary_script_name": "summary_final.sh",
             "proxy_bundle_path": "<dry-run>/proxy_bundle.tar.gz",
             "proxy_bundle_name": BUNDLE_NAMES["proxy"],
+            "plan_bundle_path": "<dry-run>/plan_runtime_bundle.tar.gz",
+            "plan_bundle_name": BUNDLE_NAMES["plan"],
+            "coordinate_bundle_path": "<dry-run>/coordinate_runtime_bundle.tar.gz",
+            "coordinate_bundle_name": BUNDLE_NAMES["coordinate"],
         }
         if split_ntuple:
             runtime_assets["ntuple_bundle_path"] = "<dry-run>/ntuple_runtime_bundle.tar.gz"
@@ -2547,6 +5754,7 @@ def execute_helac_matrix_generation(
     dagman_max_jobs_idle: int,
     log_root: str,
     maxjobs_lhe: int,
+    helac_diagnostics: str,
     dry_run: bool,
 ) -> int:
     output_dir = os.path.abspath(output_dir)
@@ -2555,13 +5763,18 @@ def execute_helac_matrix_generation(
         raise ValueError("seed-base must leave all 162 HELAC matrix seeds between 11 and 99999")
     if lhe_unwevt <= 0:
         raise ValueError("--lhe-unwevt must be positive")
+    if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "--helac-diagnostics must be one of "
+            + ", ".join(HELAC_DIAGNOSTICS_MODES)
+        )
     if not dry_run:
         ensure_submit_visible_output_dir(output_dir)
-        helac_package_path = os.path.join(BASE_DIR, "common", "packages", "helac_package.tar.gz")
+        helac_package_path = os.path.join(BASE_DIR, "common", "packages", HELAC_SOURCE_PACKAGE)
         helac_ok, helac_status = inspect_helac_package(helac_package_path)
         if not helac_ok:
             raise FileNotFoundError(
-                "common/packages/helac_package.tar.gz is required for HELAC matrix jobs "
+                f"common/packages/{HELAC_SOURCE_PACKAGE} is required for HELAC matrix jobs "
                 f"and is not usable: {helac_status}"
             )
 
@@ -2641,6 +5854,7 @@ def execute_helac_matrix_generation(
             "extra_gluon=\"{extra_gluon}\" job_slug=\"{job_slug}\" seed=\"{seed}\" "
             "stageout_dir=\"{stageout_dir}\" min_pt_conia=\"6.0\" min_pt_bonia=\"4.0\" "
             "min_pt_q=\"0.0\" unwevt=\"{unwevt}\" test_mode=\"{test_mode}\" "
+            "helac_diagnostics=\"{helac_diagnostics}\" "
             "request_cpus=\"{request_cpus}\" request_memory=\"{request_memory}\" request_disk=\"{request_disk}\" "
             "lhe_bundle_path=\"{lhe_bundle_path}\" lhe_bundle_name=\"{lhe_bundle_name}\" "
             "proxy_bundle_path=\"{proxy_bundle_path}\" proxy_bundle_name=\"{proxy_bundle_name}\" "
@@ -2654,6 +5868,7 @@ def execute_helac_matrix_generation(
                 stageout_dir=dag_escape(stageout_dir.rstrip("/")),
                 unwevt=dag_escape(lhe_unwevt),
                 test_mode=dag_escape(bool_string(test_mode)),
+                helac_diagnostics=dag_escape(helac_diagnostics),
                 request_cpus=dag_escape(request_cpus),
                 request_memory=dag_escape(request_memory),
                 request_disk=dag_escape(request_disk),
@@ -2679,6 +5894,7 @@ def execute_helac_matrix_generation(
                         ("seed_base", seed_base),
                         ("stageout_dir", stageout_dir.rstrip("/")),
                         ("lhe_unwevt", lhe_unwevt),
+                        ("helac_diagnostics", helac_diagnostics),
                         ("test_mode", test_mode),
                         ("dagman_max_jobs_submitted", dagman_max_jobs_submitted),
                         ("dagman_max_jobs_idle", dagman_max_jobs_idle),
@@ -2754,6 +5970,8 @@ def execute_hepjob_delegate(args: argparse.Namespace) -> int:
         command.extend(["--max-events", str(args.max_events)])
         command.extend(["--proxy-path", args.proxy_path])
         command.extend(["--group", args.hepjob_group])
+        if args.existing_lhe_inventory:
+            command.extend(["--existing-lhe-inventory", args.existing_lhe_inventory])
 
         if args.enable_ntuple:
             command.append("--enable-ntuple")
@@ -2779,6 +5997,7 @@ def execute_hepjob_delegate(args: argparse.Namespace) -> int:
             command.append("--force-generate-lhe")
         if args.lhe_unwevt is not None:
             command.extend(["--lhe-unwevt", str(args.lhe_unwevt)])
+        command.extend(["--helac-diagnostics", args.helac_diagnostics])
         command.extend(["--walltime", args.hepjob_walltime])
 
     if args.command == "generate-ntuple-only":
@@ -2827,10 +6046,24 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--campaign",
         action="append",
-        required=True,
+        default=None,
         help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
     )
+    parser.add_argument("--output-mode", choices=("full", "mix-only", "merge-ntuple"),
+                        default="full", help="全链、CERN MIX-only 或 IHEP merge/ntuple 工作区。")
+    parser.add_argument("--split-manifest", default="")
+    parser.add_argument("--hepjob-merge-walltime", default="short",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-ntuple-walltime", default="mid",
+                        choices=("test", "short", "mid", "long", "special"))
+    parser.add_argument("--hepjob-merge-memory-mb", type=int, default=0)
+    parser.add_argument("--hepjob-ntuple-memory-mb", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=1, help="每个 campaign 的 job 数。")
+    parser.add_argument(
+        "--campaign-job-spec",
+        default="",
+        help="Authoritative campaign-level job spec; replaces consecutive --jobs generation.",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录。")
     parser.add_argument("--output", default="mc_production.dag", help="输出 DAG 文件名。")
     parser.add_argument(
@@ -2839,7 +6072,207 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="LHE 节点的 unwevt；默认正式模式 100000、测试模式 100。",
     )
-    parser.add_argument("--max-events", type=int, default=-1, help="processing 节点的 max-events。")
+    parser.add_argument(
+        "--lhe-nmc",
+        type=int,
+        default=None,
+        help="Optional HELAC nmc override for every generated LHE node.",
+    )
+    parser.add_argument("--lhe-request-cpus", default="8")
+    parser.add_argument("--lhe-request-memory", default="15GB")
+    parser.add_argument("--lhe-request-disk", default="10GB")
+    parser.add_argument("--lhe-job-flavour", default="nextweek")
+    parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the current compact "
+            "bundle; none, slim, and full select the new modes."
+        ),
+    )
+    parser.add_argument("--max-events", type=int, default=-1, help="兼容旧配置的 processing 事件目标/上限。")
+    parser.add_argument("--target-mixed-events", type=int, default=0, help="每个 block 的目标混合 HepMC 事件数；0 表示正数 --max-events，否则 100。")
+    parser.add_argument("--normal-max-lhe-events", type=int, default=110, help="normal source 的默认 LHE 输入预算。")
+    parser.add_argument("--phi-max-lhe-events", type=int, default=350, help="phi source 的默认 LHE 输入预算。")
+    parser.add_argument("--phi-max-hadronization-retries", type=int, default=5000, help="phi source 每个 LHE 事件的 hadronization retry 上限。")
+    parser.add_argument(
+        "--phi-consumption-mode",
+        choices=("target", "exhaustive"),
+        default="target",
+        help="target keeps the fixed accepted-event target; exhaustive consumes the full phi LHE exposure.",
+    )
+    parser.add_argument(
+        "--normal-shortfall-policy",
+        choices=("fail", "report-and-truncate"),
+        default="fail",
+        help=(
+            "In exhaustive mode, either fail when a normal source misses the "
+            "phi-derived target or report the shortfall and mix the common positive yield."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("info", "slim"),
+        default=None,
+        help=(
+            "Processing node stdout verbosity. slim suppresses per-command "
+            "INFO/OK chatter and step banners (kept in worker-local command_logs); "
+            "warnings/errors and the completion banner always print. info (default) "
+            "keeps the full log for validation. Defaults to 'slim' when "
+            "--campaign-job-spec is set (inventory-driven production), else 'info'."
+        ),
+    )
+    parser.add_argument("--minimum-output-fraction", type=float, default=0.8, help="block 接受的最小完成比例；0 表示任何正输出均可。")
+    parser.add_argument(
+        "--compress-lhe",
+        action="store_true",
+        default=False,
+        help="压缩新生成的 LHE 输出为 .lhe.gz。",
+    )
+    parser.add_argument(
+        "--lhe-compression-level",
+        type=int,
+        default=1,
+        choices=range(1, 10),
+        metavar="[1-9]",
+        help="gzip 压缩级别，默认 1（快速）。",
+    )
+    parser.add_argument(
+        "--lhe-shuffle-split",
+        action="store_true",
+        default=False,
+        help="启用 LHE 分层 shuffle 并按 events-per-block 分块。",
+    )
+    parser.add_argument(
+        "--lhe-events-per-block",
+        type=int,
+        default=1000,
+        help="每个 block 的事件数，默认 1000。",
+    )
+    parser.add_argument(
+        "--lhe-max-events-per-plan",
+        type=int,
+        default=0,
+        help=(
+            "每个 PLAN 节点最多输出的 LHE 事件数；0 表示不限制。"
+            "限制在 shuffle 排序后应用。generate-test + existing-LHE block SubDAG "
+            "默认从正数 --max-events 自动派生。"
+        ),
+    )
+    parser.add_argument(
+        "--lhe-group-min-events",
+        type=int,
+        default=0,
+        help="启用 existing-LHE 分组；每组至少累计的事件数。默认 0 表示关闭。",
+    )
+    parser.add_argument(
+        "--lhe-group-max-events",
+        type=int,
+        default=0,
+        help="existing-LHE 分组的软事件上限；默认 0 表示 3 * --lhe-events-per-block。",
+    )
+    parser.add_argument(
+        "--lhe-group-max-files",
+        type=int,
+        default=20,
+        help="existing-LHE 分组中最多串联的原始 LHE 文件数，默认 20。",
+    )
+    parser.add_argument(
+        "--lhe-shuffle-mode",
+        default="stratified",
+        choices=("stratified", "original-order"),
+        help="LHE shuffle 模式，默认 stratified。",
+    )
+    parser.add_argument(
+        "--lhe-n-strata",
+        default="auto",
+        help="分层数，auto 或正整数。",
+    )
+    parser.add_argument(
+        "--lhe-drop-incomplete-last-block",
+        action="store_true",
+        default=False,
+        help="丢弃不完整的最末 block。",
+    )
+    parser.add_argument(
+        "--enable-lhe-block-subdags",
+        action="store_true",
+        default=False,
+        help="启用 LHE block SubDAG 模式：每个 HELAC 作业生成 block 级处理子 DAG。",
+    )
+    parser.add_argument(
+        "--keep-legacy-single-processing-path",
+        action="store_true",
+        default=False,
+        help="强制使用旧版单文件处理路径（flat DAG），即使 --enable-lhe-block-subdags 已设置。",
+    )
+    parser.add_argument(
+        "--lhe-shuffle-seed-base",
+        type=int,
+        default=None,
+        help="LHE shuffle 种子基值；默认从 HELAC seed 派生 (seed * 1000 + 37)。",
+    )
+    parser.add_argument(
+        "--max-block-subdag-jobs",
+        type=int,
+        default=0,
+        help="block SubDAG 内部 MAXJOBS block_processing 节流值；默认与 --maxjobs-processing 相同。",
+    )
+    parser.add_argument(
+        "--miniaod-merge-events",
+        type=int,
+        default=5000,
+        help="block SubDAG 中每个 merged MiniAOD 的目标事件数；0 表示关闭 merge 并保留 per-block ntuple。",
+    )
+    parser.add_argument(
+        "--miniaod-merge-validation",
+        choices=("none", "event-count"),
+        default="event-count",
+        help="MiniAOD merge 后的轻量验证级别，默认 event-count。",
+    )
+    parser.add_argument(
+        "--maxjobs-miniaod-merge",
+        type=int,
+        default=0,
+        help="DAGMan miniaod_merge category throttle；默认与 --maxjobs-ntuple 相同。",
+    )
+    parser.add_argument(
+        "--archive-subdag-logs",
+        dest="archive_subdag_logs",
+        action="store_true",
+        default=True,
+        help="由顶层 FINAL worker 归档 block workflow 的阶段日志。",
+    )
+    parser.add_argument(
+        "--no-archive-subdag-logs",
+        dest="archive_subdag_logs",
+        action="store_false",
+        help="禁用顶层 FINAL worker 的 block workflow 日志归档。",
+    )
+    parser.add_argument(
+        "--skip-lhe-generation",
+        action="store_true",
+        default=False,
+        help="跳过 HELAC LHE 生成；使用池目录中已有的 LHE 文件，配合 --enable-lhe-block-subdags 使用。",
+    )
+    parser.add_argument(
+        "--existing-lhe-base",
+        type=str,
+        default="",
+        help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。与 --skip-lhe-generation 配合使用。",
+    )
+    parser.add_argument(
+        "--existing-lhe-inventory",
+        type=str,
+        default="",
+        help="精确的已有 LHE 文件清单 JSON；用于跳过远端扫描且避免合成文件名 fallback。",
+    )
+    parser.add_argument(
+        "--allow-incomplete-lhe-inventory",
+        action="store_true",
+        help="显式允许使用标记为 incomplete 的 inventory；默认拒绝。",
+    )
     parser.add_argument(
         "--enable-ntuple",
         dest="enable_ntuple",
@@ -2910,13 +6343,13 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dagman-max-jobs-submitted",
         type=int,
-        default=200,
+        default=2000,
         help="DAGMan 允许同时提交/运行的最大节点数。",
     )
     parser.add_argument(
         "--dagman-max-jobs-idle",
         type=int,
-        default=100,
+        default=2000,
         help="DAGMan 允许同时处于 idle 状态的最大节点数。",
     )
     parser.add_argument(
@@ -2947,19 +6380,19 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--maxjobs-lhe",
         type=int,
-        default=20,
+        default=2000,
         help="DAGMan LHE category throttle。",
     )
     parser.add_argument(
         "--maxjobs-processing",
         type=int,
-        default=50,
+        default=2000,
         help="DAGMan MiniAOD/processing category throttle。",
     )
     parser.add_argument(
         "--maxjobs-ntuple",
         type=int,
-        default=30,
+        default=2000,
         help="DAGMan ntuple category throttle。",
     )
     parser.add_argument(
@@ -2978,6 +6411,17 @@ def add_common_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="machine-env=ihep 时传给 hep_sub 的 walltime 等级。",
     )
     parser.add_argument("--dry-run", action="store_true", help="只打印 DAG，不写文件。")
+    parser.add_argument(
+        "--use-subprocess-naming",
+        action="store_true",
+        default=False,
+        help="使用 SUBPROCESS_MAP 命名的 ntuple 输出目录结构。",
+    )
+    parser.add_argument(
+        "--target-base-url",
+        default="",
+        help="输出目标 EOS 基础 URL。同时控制 block staging 和处理输出的 EOS 区域。",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3036,6 +6480,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="本地输出基础目录；hepthu 默认使用 ~/MC_Production_result。",
     )
     validate_parser.add_argument(
+        "--existing-lhe-base",
+        default="",
+        help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。",
+    )
+    validate_parser.add_argument(
         "--local-condor",
         action="store_true",
         help="快捷方式：等价于 --machine-env local_condor。",
@@ -3073,6 +6522,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="快捷方式：等价于 --machine-env local_condor。",
     )
 
+    inventory_parser = subparsers.add_parser(
+        "scan-lhe-inventory",
+        help="一次性扫描已有 LHE 文件名并写出精确清单 JSON",
+    )
+    inventory_parser.add_argument(
+        "--machine-env",
+        choices=machine_env_choices(),
+        default="auto",
+        help="Condor 计数使用的运行环境。",
+    )
+    inventory_parser.add_argument(
+        "--campaign",
+        action="append",
+        help="可重复指定，也支持 ALL/JJP_ALL/JUP_ALL 或逗号分隔。",
+    )
+    inventory_parser.add_argument("--output", help="输出 inventory JSON 路径。")
+    inventory_mode = inventory_parser.add_mutually_exclusive_group()
+    inventory_mode.add_argument(
+        "--run-on-condor",
+        metavar="WORKDIR",
+        help="准备或提交无 DAG 的 HTCondor 计数 cluster。",
+    )
+    inventory_mode.add_argument(
+        "--summarize-from",
+        metavar="WORKDIR",
+        help="从 Condor workspace 汇总已有结果。",
+    )
+    inventory_parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="立即提交新 workspace，或提交已准备但尚未提交的 workspace。",
+    )
+    inventory_parser.add_argument(
+        "--condor-max-materialize",
+        type=int,
+        default=50,
+        help="Condor cluster 同时 materialize 的最大 job 数，默认 50。",
+    )
+    inventory_parser.add_argument(
+        "--proxy-path",
+        default=detect_proxy_path(),
+        help="X509 代理路径；默认自动探测。",
+    )
+    inventory_parser.add_argument(
+        "--local-output-base",
+        default="",
+        help="本地 LHE 输出基础目录；设置后扫描本地 pool 而不是远端 T2。",
+    )
+    inventory_parser.add_argument(
+        "--existing-lhe-base",
+        default="",
+        help="已有 LHE 文件的基础 URL/路径；设置后会覆盖默认 EOS_BASE。",
+    )
+    inventory_parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="允许某些 pool 扫描结果为空并仍写出清单。",
+    )
+    inventory_parser.add_argument(
+        "--count-events",
+        action="store_true",
+        help="逐个读取已有 LHE 文件并在清单中记录 actual_events。",
+    )
+    inventory_parser.add_argument(
+        "--count-scratch-dir",
+        default="/tmp/chiw/lhe_inventory_counts",
+        help="远端 LHE 计数时使用的本地临时目录。",
+    )
+    inventory_parser.add_argument(
+        "--max-files-per-pool",
+        type=int,
+        default=0,
+        help="每个 pool 最多写入/计数的 LHE 文件数；0 表示不限制。",
+    )
+    inventory_parser.add_argument(
+        "--local-condor",
+        action="store_true",
+        help="快捷方式：等价于 --machine-env local_condor。",
+    )
+
     generate_parser = subparsers.add_parser("generate", help="生成正式 DAG")
     add_common_generation_arguments(generate_parser)
     generate_parser.set_defaults(test_mode=False)
@@ -3096,6 +6625,16 @@ def build_parser() -> argparse.ArgumentParser:
         force_generate_lhe=False,
         test_mode=True,
     )
+    audit_split_parser = subparsers.add_parser("audit-split")
+    audit_split_parser.add_argument("--stage", required=True, choices=("mix", "merge", "ntuple"))
+    audit_split_parser.add_argument("--workspace", required=True)
+    audit_split_parser.add_argument("--output", default="")
+    audit_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser = subparsers.add_parser("finalize-split")
+    finalize_split_parser.add_argument("--workspace", required=True)
+    finalize_split_parser.add_argument("--campaign", action="append", default=None)
+    finalize_split_parser.add_argument("--apply", action="store_true")
+
 
     matrix_parser = subparsers.add_parser(
         "generate-helac-matrix",
@@ -3134,6 +6673,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="把 HELAC matrix job 切到 fast-test 积分设置。",
+    )
+    matrix_parser.add_argument(
+        "--helac-diagnostics",
+        choices=HELAC_DIAGNOSTICS_MODES,
+        default="legacy",
+        help=(
+            "HELAC post-job diagnostics: legacy preserves the compact output "
+            "archive; none, slim, and full select the new modes."
+        ),
     )
     matrix_parser.add_argument(
         "--dagman-max-jobs-submitted",
@@ -3184,18 +6732,18 @@ def build_parser() -> argparse.ArgumentParser:
     ntuple_only_parser.add_argument(
         "--miniaod-base-url",
         default="",
-        help="远端 MiniAOD URL 基础 (e.g. root://cceos.ihep.ac.cn//eos/.../output)，与 --jobs 配合使用。",
+        help="远端 MiniAOD URL 基础 (e.g. root://cceos.ihep.ac.cn:1094///store/.../output)，与 --jobs 配合使用。",
     )
     ntuple_only_parser.add_argument(
         "--miniaod-filename",
-        default="MINIAOD.root",
+        default="output_MINIAOD.root",
         help="MiniAOD 文件名（默认: MINIAOD.root）。",
     )
     ntuple_only_parser.add_argument(
         "--jobs",
-        type=int,
-        default=0,
-        help="每个 campaign 的 job 数；用于 --miniaod-base-url 时必填；用于 --miniaod-dir 时可限制发现数量。",
+        default="",
+        help="每个 campaign 的 job 数；用于 --miniaod-base-url 时必填。可指定单个整数（所有 campaign 统一）"
+             "或逗号分隔的 campaign=count 对（例如 JJP_SPS_CS=999,JJP_DPS1=996）。",
     )
     ntuple_only_parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="输出目录。")
     ntuple_only_parser.add_argument("--output", default="ntuple_only.dag", help="输出 DAG 文件名。")
@@ -3237,7 +6785,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTCondor stdout/stderr/event log 输出目录。",
     )
     ntuple_only_parser.add_argument(
-        "--maxjobs-ntuple", type=int, default=30,
+        "--maxjobs-ntuple", type=int, default=0,
         help="DAGMan ntuple category throttle。",
     )
     ntuple_only_parser.add_argument(
@@ -3248,6 +6796,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-vtx-smearing-check",
         action="store_true",
         help="在生成 DAG 前运行 GEN-SIM vertex smearing 静态校验。",
+    )
+    ntuple_only_parser.add_argument(
+        "--use-subprocess-naming",
+        action="store_true",
+        help="使用 subprocess ID 命名输出目录和文件 (SPS-JpsiJpsiPhi-LO 等)。",
+    )
+    ntuple_only_parser.add_argument(
+        "--target-base-url",
+        default="",
+        help="自定义输出 EOS 基地址 (默认: chiw MC_Production_v3)。",
+    )
+    ntuple_only_parser.add_argument(
+        "--ntuple-version",
+        default="",
+        help="ntuple 文件名中的版本字符串 (默认: v01_06)。",
     )
     ntuple_only_parser.add_argument("--dry-run", action="store_true", help="只打印 DAG，不写文件。")
 
@@ -3269,9 +6832,12 @@ def normalize_args(argv: Sequence[str]) -> Sequence[str]:
         "list",
         "validate",
         "prepare-runtime",
+        "scan-lhe-inventory",
         "generate",
         "generate-test",
         "generate-helac-matrix",
+        "audit-split",
+        "finalize-split",
         "generate-ntuple-only",
     }:
         return argv
@@ -3293,6 +6859,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "audit-split":
+        try:
+            if args.stage == "mix":
+                if not args.output:
+                    parser.error("--stage mix requires --output")
+                result = export_mix_manifest(args.workspace, args.output, args.campaign)
+            else:
+                result = audit_split_stage(args.workspace, args.stage, args.campaign)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("complete", True) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "finalize-split":
+        try:
+            result = finalize_split_workspace(args.workspace, args.campaign, args.apply)
+            print(json.dumps(result, indent=2))
+            return 0 if not any(x["action"] == "failed" for x in result["records"]) else 1
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "list":
         if args.kind in ("all", "campaigns"):
@@ -3316,6 +6904,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env=machine_env,
             local_output_base=local_output_base,
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
+            existing_lhe_base=args.existing_lhe_base,
         )
 
     if args.command == "prepare-runtime":
@@ -3329,6 +6918,108 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env=machine_env,
             include_ntuple=args.include_ntuple,
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
+        )
+
+    if args.command == "scan-lhe-inventory":
+        if args.summarize_from:
+            if args.submit:
+                parser.error("--submit cannot be combined with --summarize-from")
+            if args.campaign:
+                parser.error("--campaign is read from the workspace in --summarize-from mode")
+            if not args.output:
+                parser.error("--summarize-from requires --output")
+            try:
+                payload, complete = summarize_lhe_inventory_workspace(args.summarize_from)
+                atomic_write_json(args.output, payload)
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"Wrote {'complete' if complete else 'partial'} LHE inventory: "
+                f"{os.path.abspath(args.output)}"
+            )
+            return 0 if complete else 1
+
+        if args.run_on_condor:
+            try:
+                machine_env = resolve_machine_env(requested_machine_env_name(args))
+            except ValueError as exc:
+                parser.error(str(exc))
+            if machine_env.is_hepjob:
+                parser.error("--run-on-condor does not support the HepJob-only ihep profile")
+
+            workspace_exists = os.path.isdir(args.run_on_condor)
+            if workspace_exists:
+                if not args.submit:
+                    parser.error(
+                        "Condor workspace already exists; use --submit to submit it, "
+                        "or choose a new directory"
+                    )
+                if args.campaign or args.output:
+                    parser.error(
+                        "Submitting an existing workspace does not accept --campaign or --output"
+                    )
+                try:
+                    manifest, _ = load_lhe_inventory_workspace(args.run_on_condor)
+                    workspace_proxy = str(manifest.get("proxy_path", "") or "")
+                    if workspace_proxy:
+                        valid, _, error = check_proxy_valid(workspace_proxy)
+                        if not valid:
+                            raise ValueError(f"X509 proxy is not valid: {error}")
+                    submit_lhe_inventory_workspace(args.run_on_condor)
+                    return 0
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
+
+            if not args.campaign:
+                parser.error("fresh --run-on-condor preparation requires --campaign")
+            if not args.output:
+                parser.error("fresh --run-on-condor preparation requires --output")
+            try:
+                campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
+                local_output_base = args.local_output_base or (
+                    machine_env.local_output_base if machine_env.uses_local_storage else ""
+                )
+                prepare_condor_lhe_inventory_scan(
+                    campaign_names=campaign_names,
+                    output_path=args.output,
+                    workdir=args.run_on_condor,
+                    proxy_path=args.proxy_path,
+                    machine_env=machine_env,
+                    local_output_base=local_output_base,
+                    existing_lhe_base=args.existing_lhe_base,
+                    allow_empty=args.allow_empty,
+                    max_files_per_pool=args.max_files_per_pool,
+                    max_materialize=args.condor_max_materialize,
+                )
+                if args.submit:
+                    submit_lhe_inventory_workspace(args.run_on_condor)
+                return 0
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        if args.submit:
+            parser.error("--submit requires --run-on-condor")
+        if not args.campaign:
+            parser.error("direct scan-lhe-inventory requires --campaign")
+        if not args.output:
+            parser.error("direct scan-lhe-inventory requires --output")
+        try:
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
+        except ValueError as exc:
+            parser.error(str(exc))
+        return execute_lhe_inventory_scan(
+            campaign_names=campaign_names,
+            output_path=args.output,
+            proxy_path=args.proxy_path,
+            local_output_base=args.local_output_base,
+            existing_lhe_base=args.existing_lhe_base,
+            allow_empty=args.allow_empty,
+            count_events=args.count_events,
+            count_scratch_dir=args.count_scratch_dir,
+            max_files_per_pool=args.max_files_per_pool,
         )
 
     if args.command == "generate-helac-matrix":
@@ -3345,6 +7036,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dagman_max_jobs_idle=args.dagman_max_jobs_idle,
                 log_root=args.log_root,
                 maxjobs_lhe=args.maxjobs_lhe,
+                helac_diagnostics=args.helac_diagnostics,
                 dry_run=args.dry_run,
             )
         except (OSError, ValueError) as exc:
@@ -3356,7 +7048,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             machine_env = resolve_machine_env(requested_machine_env_name(args))
         except ValueError as exc:
             parser.error(str(exc))
-        campaign_names = expand_campaign_selection(args.campaign)
+        campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
+        if args.output_mode == "merge-ntuple":
+            if args.command != "generate" or not args.split_manifest:
+                parser.error("merge-ntuple requires generate and --split-manifest")
+            try:
+                bundle_dir = os.path.join(os.path.abspath(args.output_dir), "bundles")
+                assets = prepare_ntuple_only_assets(
+                    bundle_dir, cmssw15_runtime_tarball=args.cmssw15_runtime_tarball
+                )
+                names = expand_campaign_selection(args.campaign) if args.campaign else None
+                result = prepare_split_workspace(
+                    args.split_manifest, args.output_dir, BASE_DIR,
+                    assets["ntuple_bundle_path"], names, args.hepjob_group,
+                    args.hepjob_merge_walltime, args.hepjob_ntuple_walltime,
+                    args.hepjob_merge_memory_mb, args.hepjob_ntuple_memory_mb,
+                    args.proxy_path,
+                )
+                print(json.dumps(result, indent=2))
+                return 0
+            except (OSError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        if not args.campaign:
+            parser.error("--campaign is required unless --output-mode merge-ntuple")
         if args.efficiency_ntuple:
             try:
                 validate_efficiency_campaigns(campaign_names)
@@ -3369,6 +7084,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except ValueError as exc:
                 parser.error(str(exc))
         local_output_base = args.local_output_base or (machine_env.local_output_base if machine_env.uses_local_storage else "")
+        lhe_max_events_per_plan = args.lhe_max_events_per_plan
+        if (
+            args.command == "generate-test"
+            and args.skip_lhe_generation
+            and args.enable_lhe_block_subdags
+            and lhe_max_events_per_plan <= 0
+            and args.max_events > 0
+        ):
+            lhe_max_events_per_plan = args.max_events
         options = WorkflowOptions(
             jobs_per_campaign=args.jobs,
             max_events=args.max_events,
@@ -3380,6 +7104,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_generate_lhe=args.force_generate_lhe,
             proxy_path=args.proxy_path,
             lhe_unwevt=args.lhe_unwevt,
+            lhe_nmc=args.lhe_nmc,
+            lhe_request_cpus=args.lhe_request_cpus,
+            lhe_request_memory=args.lhe_request_memory,
+            lhe_request_disk=args.lhe_request_disk,
+            lhe_job_flavour=args.lhe_job_flavour,
             dagman_max_jobs_submitted=args.dagman_max_jobs_submitted,
             dagman_max_jobs_idle=args.dagman_max_jobs_idle,
             machine_env=machine_env,
@@ -3392,6 +7121,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
             shuffle_mixing=args.shuffle_mixing,
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
+            compress_lhe=args.compress_lhe,
+            lhe_compression_level=args.lhe_compression_level,
+            lhe_shuffle_split=args.lhe_shuffle_split,
+            lhe_events_per_block=args.lhe_events_per_block,
+            lhe_max_events_per_plan=lhe_max_events_per_plan,
+            lhe_shuffle_mode=args.lhe_shuffle_mode,
+            lhe_n_strata=args.lhe_n_strata,
+            lhe_drop_incomplete_last_block=args.lhe_drop_incomplete_last_block,
+            enable_lhe_block_subdags=args.enable_lhe_block_subdags,
+            keep_legacy_single_processing_path=args.keep_legacy_single_processing_path,
+            lhe_shuffle_seed_base=args.lhe_shuffle_seed_base,
+            max_block_subdag_jobs=args.max_block_subdag_jobs,
+            miniaod_merge_events=args.miniaod_merge_events,
+            miniaod_merge_validation=args.miniaod_merge_validation,
+            maxjobs_miniaod_merge=args.maxjobs_miniaod_merge,
+            target_mixed_events=args.target_mixed_events,
+            normal_max_lhe_events=args.normal_max_lhe_events,
+            phi_max_lhe_events=args.phi_max_lhe_events,
+            phi_max_hadronization_retries=args.phi_max_hadronization_retries,
+            minimum_output_fraction=args.minimum_output_fraction,
+            phi_consumption_mode=args.phi_consumption_mode,
+            normal_shortfall_policy=args.normal_shortfall_policy,
+            campaign_job_spec=args.campaign_job_spec,
+            archive_subdag_logs=args.archive_subdag_logs,
+            skip_lhe_generation=args.skip_lhe_generation,
+            existing_lhe_base=args.existing_lhe_base,
+            existing_lhe_inventory=args.existing_lhe_inventory,
+            allow_incomplete_lhe_inventory=args.allow_incomplete_lhe_inventory,
+            use_subprocess_naming=args.use_subprocess_naming,
+            target_base_url=args.target_base_url,
+            lhe_group_min_events=args.lhe_group_min_events,
+            output_mode=args.output_mode,
+            log_level=effective_log_level(args),
+            helac_diagnostics=args.helac_diagnostics,
+            lhe_group_max_events=args.lhe_group_max_events,
+            lhe_group_max_files=args.lhe_group_max_files,
         )
         return execute_generation(
             campaign_names=campaign_names,
@@ -3409,7 +7174,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # Resolve campaign names
         if args.campaign:
-            campaign_names = expand_campaign_selection(args.campaign)
+            campaign_names = expand_campaign_selection(args.campaign) if args.campaign else []
         elif args.miniaod_dir:
             # Auto-discover campaigns from directory
             if not os.path.isdir(args.miniaod_dir):
@@ -3461,6 +7226,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cmssw15_runtime_tarball=args.cmssw15_runtime_tarball,
             shuffle_mixing=False,
             strict_vtx_smearing_check=args.strict_vtx_smearing_check,
+            compress_lhe=False,
+            lhe_compression_level=1,
+            lhe_shuffle_split=False,
+            lhe_events_per_block=1000,
+            lhe_shuffle_mode="stratified",
+            lhe_n_strata="auto",
+            lhe_drop_incomplete_last_block=False,
+            use_subprocess_naming=args.use_subprocess_naming,
+            target_base_url=args.target_base_url,
+            ntuple_version=args.ntuple_version,
+            enable_lhe_block_subdags=False,
+            keep_legacy_single_processing_path=False,
+            lhe_shuffle_seed_base=None,
+            max_block_subdag_jobs=0,
+            log_level=effective_log_level(args),
         )
         return execute_ntuple_only_generation(
             campaign_names=campaign_names,
@@ -3470,7 +7250,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             dag_filename=args.output,
             options=options,
-            jobs=args.jobs,
+            jobs=parse_jobs_arg(args.jobs),
             dry_run=args.dry_run,
         )
 

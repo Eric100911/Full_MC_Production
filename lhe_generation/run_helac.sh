@@ -13,6 +13,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OCTET_PDG_TOOL="${BASE_DIR}/common/octet_pdg.py"
+COMMON_DIR="${BASE_DIR}/common"
+
+if [[ -f "${COMMON_DIR}/compression_helpers.sh" ]]; then
+    source "${COMMON_DIR}/compression_helpers.sh"
+fi
 
 # Default values
 POOL_NAME=""
@@ -27,6 +32,10 @@ PARTON_SHOWER_LINE=""
 MIN_PT_CONIA=6.0
 MIN_PT_BONIA=4.0
 MIN_PT_Q=0.0
+# Infrared-safety cuts for a real-emission final-state light parton.
+# The HELAC-Onia NLO* prescription is sqrt(s_ij^min) = 2 m_c.
+MIN_M_QQP=0.0
+MIN_M_Q_BEAM=0.0
 WORKDIR=$(pwd)
 OUTPUT_DIR=""
 CMASS="1.54845"
@@ -46,6 +55,16 @@ NOPT_LIM=100000
 FAST_TEST=0
 TEST_MODE="false"
 UNWEVT_OVERRIDE=0
+NMC_OVERRIDE=0
+COMPRESS_LHE="false"
+LHE_COMPRESSION_LEVEL=1
+LHE_SHUFFLE_SPLIT="false"
+LHE_EVENTS_PER_BLOCK=1000
+LHE_SHUFFLE_MODE="stratified"
+LHE_N_STRATA="auto"
+LHE_DROP_INCOMPLETE_LAST_BLOCK="false"
+HELAC_DIAGNOSTICS_MODE="legacy"
+WORKFLOW_LOG_LEVEL="${WORKFLOW_LOG_LEVEL:-info}"
 # Build locations (populated after unpacking helac_package.tar.gz)
 HEPMC_SRC_TGZ=""
 HELAC_SRC_TAR=""
@@ -55,18 +74,29 @@ COMMAND_LOG_INDEX=0
 LAST_STDOUT_LOG=""
 LAST_STDERR_LOG=""
 LOG_STAGEOUT_ATTEMPTED=0
+DIAGNOSTICS_STAGEOUT_ATTEMPTED=0
 
 # T2_CN_Beijing XRootD storage paths
-EOS_HOST="cceos.ihep.ac.cn"
+# Canonical form: redirector + LFN (see common/node_config_defaults.json).
+# Override TARGET_EOS_BASE to redirect output to a different storage area.
+EOS_REDIRECTOR="cceos.ihep.ac.cn"
+EOS_HOST="${EOS_REDIRECTOR}"
 EOS_XRDFS_TARGET="root://${EOS_HOST}"
-EOS_PATH_BASE="/eos/ihep/cms/store/user/xcheng/MC_Production_v3"
+EOS_LFN_BASE="/store/user/chiw/MC_Production_v3"
+EOS_BASE="${TARGET_EOS_BASE:-root://${EOS_REDIRECTOR}///${EOS_LFN_BASE#/}}"
+EOS_PATH_BASE="${EOS_LFN_BASE}"
+EOS_OUTPUT="${EOS_BASE}/output"
+EOS_GENERATED_LHE_BASE="${EOS_BASE}/lhe_pools"
+NODE_CONFIG=""
 
 # ----------------------------------------------------------------------------
 # Helper functions
 # ----------------------------------------------------------------------------
 
-msg_info() { echo "[INFO] $1"; }
-msg_warn() { echo "[WARN] $1"; }
+_slim() { [[ "${WORKFLOW_LOG_LEVEL}" == "slim" ]]; }
+msg_info() { _slim || echo "[INFO] $1"; }
+msg_ok() { _slim || echo "[OK] $1"; }
+msg_warn() { echo "[WARN] $1" >&2; }
 msg_error() { echo "[ERROR] $1" >&2; }
 
 sanitize_log_label() {
@@ -109,6 +139,59 @@ build_helac_matrix_process() {
     printf '%s\n' "${process}"
 }
 
+load_node_config() {
+    local config_path="$1"
+    [[ -n "${config_path}" ]] || return 0
+    if [[ ! -s "${config_path}" ]]; then
+        msg_error "Node config JSON not found or empty: ${config_path}"
+        return 1
+    fi
+
+    local kind key value extra
+    while IFS=$'\t' read -r kind key value extra; do
+        [[ "${kind}" == "storage" ]] || continue
+        case "${key}" in
+            eos_redirector)
+                EOS_REDIRECTOR="${value}"
+                EOS_HOST="${EOS_REDIRECTOR}"
+                EOS_XRDFS_TARGET="root://${EOS_HOST}"
+                ;;
+            eos_lfn_base)
+                EOS_LFN_BASE="${value}"
+                EOS_PATH_BASE="${EOS_LFN_BASE}"
+                ;;
+            eos_base)
+                EOS_BASE="${TARGET_EOS_BASE:-${value}}"
+                ;;
+            target_eos_base)
+                if [[ -n "${value}" ]]; then
+                    EOS_BASE="${TARGET_EOS_BASE:-${value}}"
+                fi
+                ;;
+            generated_lhe_base)
+                EOS_GENERATED_LHE_BASE="${value}"
+                ;;
+            output_subdir)
+                EOS_OUTPUT="${EOS_BASE}/${value}"
+                ;;
+        esac
+    done < <(python3 - "${config_path}" <<'PYHELPER'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+storage = cfg.get("storage", {})
+if not isinstance(storage, dict):
+    raise SystemExit("storage must be an object")
+for key in ("eos_redirector", "eos_lfn_base", "eos_base", "target_eos_base", "generated_lhe_base", "output_subdir"):
+    value = storage.get(key)
+    if value not in (None, ""):
+        print(f"storage\t{key}\t{value}\t")
+PYHELPER
+    )
+}
+
 ensure_job_log_dir() {
     mkdir -p "${JOB_LOG_DIR}"
 }
@@ -144,14 +227,30 @@ run_logged() {
     LAST_STDERR_LOG="${stderr_log}"
 
     msg_info "执行 ${label}，完整日志写入 ${log_prefix}.[stdout|stderr]"
-    if "$@" >"${stdout_log}" 2>"${stderr_log}"; then
+    if [[ "${HELAC_RETAIN_DIAGNOSTICS:-0}" == "1" ]]; then
+        # Bash time includes the command's waited-for children. Keep timing
+        # separate from native warnings/stopping messages, including on failure.
+        local TIMEFORMAT=$'wall_seconds=%R\ncpu_user_seconds=%U\ncpu_system_seconds=%S'
+        local timing_log="${log_prefix}.timing.log"
+        if { time "$@" >"${stdout_log}" 2>"${stderr_log}"; } 2>"${timing_log}"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf 'exit_code=%s\n' "${rc}" >> "${timing_log}"
+    elif "$@" >"${stdout_log}" 2>"${stderr_log}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if [[ "${rc}" -eq 0 ]]; then
         stdout_size=$(wc -c < "${stdout_log}" 2>/dev/null || echo 0)
         stderr_size=$(wc -c < "${stderr_log}" 2>/dev/null || echo 0)
         msg_info "${label} 完成 (stdout=${stdout_size} B, stderr=${stderr_size} B)"
         return 0
     fi
 
-    rc=$?
     msg_error "${label} 失败 (rc=${rc})"
     show_log_tail "${label} stderr" "${stderr_log}" 80 >&2
     show_log_tail "${label} stdout" "${stdout_log}" 40
@@ -226,7 +325,9 @@ resolve_remote_target() {
         path=$(normalize_remote_path "${EOS_PATH_BASE}/${spec}")
     fi
 
-    url="root://${host#root://}/${path}"
+    # path is normalized to exactly one leading slash; preserve the canonical
+    # root://host[:port]///path XRootD spelling.
+    url="root://${host#root://}///${path#/}"
     printf '%s\t%s\t%s\n' "${host}" "${path}" "${url}"
 }
 
@@ -247,6 +348,11 @@ stage_out_worker_logs() {
     fi
     LOG_STAGEOUT_ATTEMPTED=1
 
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" != "legacy" ]]; then
+        msg_info "HELAC diagnostics mode=${HELAC_DIAGNOSTICS_MODE}; skip legacy worker-log bundle"
+        return 0
+    fi
+
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
         msg_info "SKIP_STAGEOUT=1, skip log stageout"
         return 0
@@ -266,6 +372,8 @@ stage_out_worker_logs() {
         echo "min_pt_conia=${MIN_PT_CONIA}"
         echo "min_pt_bonia=${MIN_PT_BONIA}"
         echo "min_pt_q=${MIN_PT_Q}"
+        echo "min_m_qqp=${MIN_M_QQP}"
+        echo "min_m_q_beam=${MIN_M_Q_BEAM}"
         echo "unwevt=${UNWEVT}"
         echo "nmc=${NMC}"
         echo "preunw=${PREUNW}"
@@ -301,6 +409,107 @@ stage_out_worker_logs() {
     else
         msg_warn "完整日志上传失败: ${remote_url}"
     fi
+}
+
+diagnostics_safe_slug() {
+    sanitize_log_label "${JOB_SLUG:-${POOL_NAME}_${MY_SEED}}"
+}
+
+stage_diagnostic_file() {
+    local local_path="$1"
+    local relative_path="$2"
+    local remote_url=""
+    local local_path_target=""
+
+    [[ -f "${local_path}" ]] || return 1
+    if [[ -n "${LOCAL_OUTPUT_BASE:-}" ]]; then
+        local_path_target="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}/${relative_path}"
+        mkdir -p "$(dirname "${local_path_target}")"
+        cp "${local_path}" "${local_path_target}"
+        msg_info "HELAC diagnostic staged locally: ${local_path_target}"
+        return 0
+    fi
+
+    make_remote_dir "$(dirname "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")" || true
+    remote_url=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "${relative_path}")")
+    msg_info "Staging HELAC diagnostic to: ${remote_url}"
+    if xrdcp --nopbar --force "${local_path}" "${remote_url}" >/dev/null 2>&1; then
+        msg_info "HELAC diagnostic uploaded: ${remote_url}"
+        return 0
+    fi
+    msg_warn "HELAC diagnostic upload failed: ${remote_url}"
+    return 1
+}
+
+stage_out_helac_diagnostics() {
+    local safe_slug=""
+    local diagnostic_dir=""
+    local summary_path=""
+    local archive_path=""
+    local archive_name=""
+    local proc_dir=""
+    local -a proc_dirs=()
+    local inspector_path="${SCRIPT_DIR}/../tools/helac_inspector.py"
+    local helac_dir="${WORKDIR}/HELAC-Onia-2.7.6"
+
+    if [[ "${DIAGNOSTICS_STAGEOUT_ATTEMPTED}" -eq 1 ]]; then
+        return 0
+    fi
+    DIAGNOSTICS_STAGEOUT_ATTEMPTED=1
+
+    case "${HELAC_DIAGNOSTICS_MODE}" in
+        none|legacy)
+            return 0
+            ;;
+        slim|full)
+            ;;
+        *)
+            msg_warn "Unknown HELAC diagnostics mode: ${HELAC_DIAGNOSTICS_MODE}"
+            return 0
+            ;;
+    esac
+
+    if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
+        msg_info "SKIP_STAGEOUT=1, skip HELAC diagnostics stageout"
+        return 0
+    fi
+    if [[ ! -d "${helac_dir}" ]]; then
+        msg_warn "HELAC worktree not found; no diagnostics to stage"
+        return 0
+    fi
+
+    safe_slug=$(diagnostics_safe_slug)
+    diagnostic_dir="diagnostics/${safe_slug}"
+
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "slim" ]]; then
+        summary_path="${WORKDIR}/helac_summary_${safe_slug}_${MY_SEED}.json"
+        if [[ ! -f "${inspector_path}" ]]; then
+            msg_warn "HELAC inspector not found: ${inspector_path}"
+            return 0
+        fi
+        if ! python3 "${inspector_path}" parse --root "${helac_dir}" > "${summary_path}"; then
+            msg_warn "Failed to generate HELAC slim summary"
+            return 0
+        fi
+        stage_diagnostic_file "${summary_path}" "${diagnostic_dir}/helac_summary.json" || true
+        return 0
+    fi
+
+    while IFS= read -r -d '' proc_dir; do
+        proc_dirs+=("${proc_dir#${helac_dir}/}")
+    done < <(find "${helac_dir}" -mindepth 1 -maxdepth 1 -type d \
+        -name 'PROC_HO_*' -print0)
+    if (( ${#proc_dirs[@]} == 0 )); then
+        msg_warn "No PROC_HO_* directory found; no full HELAC diagnostic archive"
+        return 0
+    fi
+    archive_name="helac_proc_${safe_slug}_${MY_SEED}.tar.gz"
+    archive_path="${WORKDIR}/${archive_name}"
+    if ! tar -C "${helac_dir}" -czf "${archive_path}" -- "${proc_dirs[@]}"; then
+        msg_warn "Failed to create full HELAC diagnostic archive"
+        return 0
+    fi
+    stage_diagnostic_file "${archive_path}" "${diagnostic_dir}/${archive_name}" || true
 }
 
 find_helac_calc_output_dir() {
@@ -353,12 +562,12 @@ stage_out_helac_output_archive() {
     local remote_url=""
 
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
-        echo "[INFO] SKIP_STAGEOUT=1, skip HELAC output archive stageout"
+        msg_info "SKIP_STAGEOUT=1, skip HELAC output archive stageout"
         return 0
     fi
 
     if ! calc_output_dir=$(find_helac_calc_output_dir "${run_dir}"); then
-        echo "[ERROR] Could not find HELAC calc output directory under ${run_dir:-PROC_HO_*}"
+    msg_error "Could not find HELAC calc output directory under ${run_dir:-PROC_HO_*}"
         return 1
     fi
 
@@ -366,19 +575,19 @@ stage_out_helac_output_archive() {
     archive_name="helac_output_${safe_slug}_${MY_SEED}.tar.gz"
     archive_path="${WORKDIR}/${archive_name}"
 
-    echo "[INFO] Archiving HELAC output directory: ${calc_output_dir}"
+    msg_info "Archiving HELAC output directory: ${calc_output_dir}"
     run_logged "tar_helac_output" tar -C "$(dirname "${calc_output_dir}")" -czf "${archive_path}" "$(basename "${calc_output_dir}")"
 
     remote_dir=$(join_remote_spec "${OUTPUT_DIR}" "${safe_slug}")
     make_remote_dir "${remote_dir}" || true
     remote_url=$(remote_url_for_spec "$(join_remote_spec "${remote_dir}" "${archive_name}")")
-    echo "[INFO] Staging out HELAC output archive to: ${remote_url}"
+    msg_info "Staging out HELAC output archive to: ${remote_url}"
     run_logged "xrdcp_helac_output_stageout" xrdcp --nopbar --force "${archive_path}" "${remote_url}" || {
         echo "Error: Failed to stage out HELAC output archive"
         return 1
     }
 
-    echo "[INFO] HELAC output archive complete: ${remote_url}"
+    msg_info "HELAC output archive complete: ${remote_url}"
 }
 
 stage_out_forbidden_marker() {
@@ -405,18 +614,18 @@ seed: ${MY_SEED}
 EOF
 
     if [[ "${SKIP_STAGEOUT:-0}" -eq 1 ]]; then
-        echo "[INFO] SKIP_STAGEOUT=1, skip forbidden-channel marker upload"
+        msg_info "SKIP_STAGEOUT=1, skip forbidden-channel marker upload"
         return 0
     fi
 
     remote_dir=$(join_remote_spec "${OUTPUT_DIR}" "forbidden")
     make_remote_dir "${remote_dir}" || true
     remote_url=$(remote_url_for_spec "$(join_remote_spec "${remote_dir}" "${marker_name}")")
-    echo "[INFO] Staging out forbidden-channel marker to: ${remote_url}"
+    msg_info "Staging out forbidden-channel marker to: ${remote_url}"
     if xrdcp --nopbar --force "${marker_path}" "${remote_url}" >/dev/null 2>&1; then
-        echo "[INFO] Forbidden-channel marker uploaded: ${remote_url}"
+        msg_info "Forbidden-channel marker uploaded: ${remote_url}"
     else
-        echo "[WARN] Failed to upload forbidden-channel marker: ${remote_url}"
+        msg_warn "Failed to upload forbidden-channel marker: ${remote_url}"
     fi
 }
 
@@ -424,6 +633,7 @@ upload_logs_on_exit() {
     local exit_code=$?
     set +e
     stage_out_worker_logs
+    stage_out_helac_diagnostics
     exit "${exit_code}"
 }
 
@@ -458,7 +668,7 @@ PYWRAP
 
 ensure_hepmc() {
     if [ -d "${HEPMC_PREFIX}/install" ]; then
-        echo "[INFO] Reusing existing HepMC build at ${HEPMC_PREFIX}"
+        msg_info "Reusing existing HepMC build at ${HEPMC_PREFIX}"
         return 0
     fi
 
@@ -482,7 +692,7 @@ ensure_hepmc() {
 
 ensure_helac() {
     if [ -d "${WORKDIR}/HELAC-Onia-2.7.6" ] && [ -x "${WORKDIR}/HELAC-Onia-2.7.6/ho_cluster" ]; then
-        echo "[INFO] Reusing existing HELAC-Onia build"
+        msg_info "Reusing existing HELAC-Onia build"
         return 0
     fi
 
@@ -524,6 +734,9 @@ normalize_prebuilt_helac_links() {
     fi
     if [[ -L addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS ]] && [[ "$(readlink addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS)" = /* ]]; then
         ln -sfn ../../../bin/HO_pp_NOnia_MPS addon/pp_NOnia_MPS/bin/HO_pp_NOnia_MPS
+    fi
+    if [[ -L addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall ]] && [[ "$(readlink addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall)" = /* ]]; then
+        ln -sfn ../../../bin/HO_pp_psiX_CrystalBall addon/pp_psiX_CrystalBall/bin/HO_pp_psiX_CrystalBall
     fi
 
     cd "${WORKDIR}"
@@ -609,7 +822,7 @@ build_lhe_converter_if_needed() {
     if compiler_supports_flag "-fallow-argument-mismatch"; then
         build_flags+=("-fallow-argument-mismatch")
     else
-        echo "[WARN] 当前 gfortran 不支持 -fallow-argument-mismatch，改用兼容编译参数"
+        msg_warn "当前 gfortran 不支持 -fallow-argument-mismatch，改用兼容编译参数"
     fi
 
     msg_info "Building lhe_pythia6_pythia8 converter..."
@@ -619,11 +832,11 @@ build_lhe_converter_if_needed() {
 verify_lhe_octet_codes() {
     local lhe_file="$1"
     if [[ ! -f "${lhe_file}" ]]; then
-        echo "[ERROR] LHE file not found for octet verification: ${lhe_file}"
+        msg_error "LHE file not found for octet verification: ${lhe_file}"
         return 1
     fi
     if [[ ! -f "${OCTET_PDG_TOOL}" ]]; then
-        echo "[ERROR] Octet PDG tool not found: ${OCTET_PDG_TOOL}"
+        msg_error "Octet PDG tool not found: ${OCTET_PDG_TOOL}"
         return 1
     fi
 
@@ -659,12 +872,15 @@ set_user_inp_value() {
 prepare_runtime_user_inp() {
     local helac_dir="$1"
     local runtime_user_inp="${helac_dir}/input/user.inp"
-    local template_user_inp="../input_templates/user.inp"
+    # The worker runs HELAC from its stage scratch directory, while the
+    # template is shipped in the runtime core.  Resolve it from the script
+    # location instead of relying on the caller's current directory.
+    local template_user_inp="${BASE_DIR}/lhe_generation/input_templates/user.inp"
 
     if [[ -f "${template_user_inp}" ]]; then
         cp "${template_user_inp}" "${runtime_user_inp}"
     elif [[ ! -f "${runtime_user_inp}" ]]; then
-        echo "[ERROR] 找不到可用的 user.inp 模板"
+        msg_error "找不到可用的 user.inp 模板"
         return 1
     fi
 
@@ -676,6 +892,8 @@ prepare_runtime_user_inp() {
         -e "s|^(minptq)[[:space:]].*$|\\1 ${MIN_PT_Q}d0|" \
         -e "s|^(minptconia)[[:space:]].*$|\\1 ${MIN_PT_CONIA}d0|" \
         -e "s|^(minptbonia)[[:space:]].*$|\\1 ${MIN_PT_BONIA}d0|" \
+        -e "s|^(minmqqp)[[:space:]].*$|\\1 ${MIN_M_QQP}d0|" \
+        -e "s|^(minmqbeam)[[:space:]].*$|\\1 ${MIN_M_Q_BEAM}d0|" \
         -e "s|^(preunw)[[:space:]].*$|\\1 ${PREUNW}|" \
         -e "s|^(unwevt)[[:space:]].*$|\\1 ${UNWEVT}|" \
         -e "s|^(nmc)[[:space:]].*$|\\1 ${NMC}|" \
@@ -693,6 +911,12 @@ prepare_runtime_user_inp() {
     set_user_inp_value "${runtime_user_inp}" "useMCFMrun" "T"
     set_user_inp_value "${runtime_user_inp}" "itmax" "1"
     set_user_inp_value "${runtime_user_inp}" "muF_over_ref" "1d0"
+    if [[ "$(basename "${helac_dir}")" == "HELAC-Onia-2.7.6" ]]; then
+        set_user_inp_value "${runtime_user_inp}" "Scale" "0"
+        set_user_inp_value "${runtime_user_inp}" "FScaleValue" "12.8d0"
+        set_user_inp_value "${runtime_user_inp}" "ScaleFactor" "1d0"
+        set_user_inp_value "${runtime_user_inp}" "muR_over_ref" "1d0"
+    fi
     set_user_inp_value "${runtime_user_inp}" "PDF_Hessian2MC" "F"
     set_user_inp_value "${runtime_user_inp}" "N_MCPDFs" "100"
     set_user_inp_value "${runtime_user_inp}" "Way_Hessian2MC" "1"
@@ -716,8 +940,8 @@ prepare_runtime_user_inp() {
     set_user_inp_value "${runtime_user_inp}" "root_output" "F"
     set_user_inp_value "${runtime_user_inp}" "hwu_output" "F"
 
-    echo "[INFO] 运行时 user.inp 中的关键积分参数:"
-    grep -E '^(cmass|bmass|minptq|minptconia|minptbonia|preunw|unwevt|nmc|nopt|nopt_step|noptlim|gener|ranhel)[[:space:]]' "${runtime_user_inp}"
+    msg_info "运行时 user.inp 中的关键积分参数:"
+    grep -E '^(cmass|bmass|minptq|minptconia|minptbonia|miny1c|maxy1c|absoluterap|preunw|unwevt|nmc|nopt|nopt_step|noptlim|gener|ranhel)[[:space:]]' "${runtime_user_inp}"
 }
 
 pool_uses_crystalball_addon() {
@@ -780,13 +1004,18 @@ prepare_crystalball_addon_input() {
     ln -sfn ../../pdf "${addon_dir}/pdf"
     set_user_inp_value "${addon_dir}/input/user.inp" "minpt1c" "${minpt_onia}d0"
     set_user_inp_value "${addon_dir}/input/user.inp" "maxpt1c" "-1d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "-2.4d0"
-    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "2.4d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "miny1c" "0d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "maxy1c" "30d0"
+    set_user_inp_value "${addon_dir}/input/user.inp" "absoluterap" "T"
 
-    echo "[INFO] CrystalBall addon input:"
+    msg_info "CrystalBall addon input:"
     echo "  state.inp: ${state}"
     echo "  crystalball.inp: ${crystalball_card}"
-    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    grep -E '^(minpt1c|maxpt1c|miny1c|maxy1c|absoluterap|itmax|nmc|preunw|unwevt)[[:space:]]' "${addon_dir}/input/user.inp"
+    # RANDA_init.inc interprets this as the number of initial draws to discard.
+    # It is a skip seed, not a direct replacement for the compiled DSEED value.
+    printf '%s\n' "${MY_SEED}" > "${addon_dir}/input/seed.input"
+    msg_info "CrystalBall RANDA skip seed: ${MY_SEED}"
 }
 
 build_crystalball_addon_if_needed() {
@@ -838,6 +1067,14 @@ while [[ $# -gt 0 ]]; do
             STAGEOUT_MODE="$2"
             shift 2
             ;;
+        --helac-diagnostics)
+            HELAC_DIAGNOSTICS_MODE="$2"
+            shift 2
+            ;;
+        --log-level)
+            WORKFLOW_LOG_LEVEL="$2"
+            shift 2
+            ;;
         --min-pt-conia)
             MIN_PT_CONIA="$2"
             shift 2
@@ -850,13 +1087,30 @@ while [[ $# -gt 0 ]]; do
             MIN_PT_Q="$2"
             shift 2
             ;;
+        --min-m-qqp)
+            MIN_M_QQP="$2"
+            shift 2
+            ;;
+        --min-m-q-beam)
+            MIN_M_Q_BEAM="$2"
+            shift 2
+            ;;
         --output-dir)
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --config)
+            NODE_CONFIG="$2"
             shift 2
             ;;
         --unwevt)
             UNWEVT="$2"
             UNWEVT_OVERRIDE=1
+            shift 2
+            ;;
+        --nmc)
+            NMC="$2"
+            NMC_OVERRIDE=1
             shift 2
             ;;
         --fast-test)
@@ -866,6 +1120,34 @@ while [[ $# -gt 0 ]]; do
         --test-mode)
             TEST_MODE="$2"
             shift 2
+            ;;
+        --compress-lhe)
+            COMPRESS_LHE="true"
+            shift 1
+            ;;
+        --lhe-compression-level)
+            LHE_COMPRESSION_LEVEL="$2"
+            shift 2
+            ;;
+        --lhe-shuffle-split)
+            LHE_SHUFFLE_SPLIT="true"
+            shift 1
+            ;;
+        --lhe-events-per-block)
+            LHE_EVENTS_PER_BLOCK="$2"
+            shift 2
+            ;;
+        --lhe-shuffle-mode)
+            LHE_SHUFFLE_MODE="$2"
+            shift 2
+            ;;
+        --lhe-n-strata)
+            LHE_N_STRATA="$2"
+            shift 2
+            ;;
+        --lhe-drop-incomplete-last-block)
+            LHE_DROP_INCOMPLETE_LAST_BLOCK="true"
+            shift 1
             ;;
         *)
             echo "Unknown option: $1"
@@ -912,6 +1194,28 @@ if [ -z "$POOL_NAME" ]; then
     exit 1
 fi
 
+if ! load_node_config "${NODE_CONFIG}"; then
+    exit 1
+fi
+
+case "${WORKFLOW_LOG_LEVEL}" in
+    info|slim)
+        ;;
+    *)
+        echo "Error: --log-level must be one of info, slim" >&2
+        exit 1
+        ;;
+esac
+
+case "${HELAC_DIAGNOSTICS_MODE}" in
+    legacy|none|slim|full)
+        ;;
+    *)
+        echo "Error: --helac-diagnostics must be one of legacy, none, slim, full"
+        exit 1
+        ;;
+esac
+
 # Set default process string based on pool name if not specified
 if [ -z "$PROCESS_STRING" ]; then
     case "$POOL_NAME" in
@@ -956,7 +1260,7 @@ fi
 
 # Set default output directory (XRootD path for T2_CN_Beijing)
 if [ -z "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR="lhe_pools/${POOL_NAME}"
+    OUTPUT_DIR="${EOS_GENERATED_LHE_BASE%/}/${POOL_NAME}"
 fi
 
 # Validate seed
@@ -985,10 +1289,15 @@ if [ "$FAST_TEST" -eq 1 ]; then
         echo "Error: --unwevt must be a positive integer"
         exit 1
     fi
-    if [ "$UNWEVT" -ge 100000 ]; then
-        NMC="$UNWEVT"
-    else
-        NMC=100000
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        if [ "$UNWEVT" -ge 100000 ]; then
+            NMC="$UNWEVT"
+        else
+            NMC=100000
+        fi
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
     fi
     PREUNW=$(( NMC / 10 ))
     NOPT=$(( NMC / 10 ))
@@ -996,12 +1305,23 @@ if [ "$FAST_TEST" -eq 1 ]; then
     NOPT_LIM=$(( NMC ))
 else
     GENER=0
-    UNWEVT=100000
-    PREUNW=500000
-    NMC=5000000
-    NOPT=500000
-    NOPT_STEP=500000
-    NOPT_LIM=5000000
+    if [ "$UNWEVT_OVERRIDE" -eq 0 ]; then
+        UNWEVT=100000
+    fi
+    if ! [[ "$UNWEVT" =~ ^[0-9]+$ ]] || [ "$UNWEVT" -le 0 ]; then
+        echo "Error: --unwevt must be a positive integer"
+        exit 1
+    fi
+    if [ "$NMC_OVERRIDE" -eq 0 ]; then
+        NMC=5000000
+    elif ! [[ "$NMC" =~ ^[0-9]+$ ]] || [ "$NMC" -le 0 ]; then
+        echo "Error: --nmc must be a positive integer"
+        exit 1
+    fi
+    PREUNW=$(( NMC / 10 ))
+    NOPT=$(( NMC / 10 ))
+    NOPT_STEP=$(( NMC / 10 ))
+    NOPT_LIM=$(( NMC ))
 fi
 
 echo "=============================================="
@@ -1021,6 +1341,8 @@ echo "Bottom mass:    ${BMASS} GeV"
 echo "Min pT (conia): $MIN_PT_CONIA GeV"
 echo "Min pT (bonia): $MIN_PT_BONIA GeV"
 echo "Min pT (q):     $MIN_PT_Q GeV"
+echo "Min m (q,q'):   $MIN_M_QQP GeV"
+echo "Min m (q,beam): $MIN_M_Q_BEAM GeV"
 echo "Unw. events:    $UNWEVT"
 echo "Generator:      PHEGAS (gener=${GENER})"
 echo "preunw:         $PREUNW"
@@ -1032,6 +1354,7 @@ if [ "$FAST_TEST" -eq 1 ]; then
     echo "Mode:           FAST TEST"
 fi
 echo "Output dir:     $OUTPUT_DIR"
+echo "HELAC diagnostics: ${HELAC_DIAGNOSTICS_MODE}"
 echo "=============================================="
 
 ensure_job_log_dir
@@ -1057,7 +1380,7 @@ if [ -d "${HEPMC_PREFIX}/install" ]; then
 fi
 
 if has_prebuilt_helac; then
-    echo "[INFO] Reusing prebuilt HELAC-Onia runtime"
+    msg_info "Reusing prebuilt HELAC-Onia runtime"
     normalize_prebuilt_helac_links
 else
     # Build dependencies from packaged sources.
@@ -1124,6 +1447,8 @@ set minptconia = ${MIN_PT_CONIA}d0
 set minptbonia = ${MIN_PT_BONIA}d0
 set maxrapconia = 2.4
 set minptq = ${MIN_PT_Q}
+set minmqqp = ${MIN_M_QQP}d0
+set minmqbeam = ${MIN_M_Q_BEAM}d0
 set ranhel = 4
 ${PARTON_SHOWER_LINE}
 ${PROCESS_STRING}
@@ -1141,10 +1466,10 @@ EOF
     PY8_ONIA_CONFIG="${WORKDIR}/py8_onia_user.inp"
     if write_py8_onia_config "${PY8_ONIA_KIND}" "input/py8_onia_user.inp"; then
         cp "input/py8_onia_user.inp" "${PY8_ONIA_CONFIG}"
-        echo "[INFO] HELAC input/py8_onia_user.inp:"
+        msg_info "HELAC input/py8_onia_user.inp:"
         cat "input/py8_onia_user.inp"
     else
-        echo "[WARN] No py8_onia_user.inp rule for ${PY8_ONIA_KIND}; converter fallback may use raw LHE"
+        msg_warn "No py8_onia_user.inp rule for ${PY8_ONIA_KIND}; converter fallback may use raw LHE"
     fi
 
     msg_info "Running HELAC-Onia..."
@@ -1153,7 +1478,7 @@ EOF
     cp "${HELAC_RUN_LOG}" ../helac_run.log
 
     if grep -q "No nonvanishing subprocesses are found" "${HELAC_RUN_LOG}"; then
-        echo "[INFO] HELAC-Onia found no nonvanishing subprocesses; treating this channel as QCD-forbidden."
+        msg_info "HELAC-Onia found no nonvanishing subprocesses; treating this channel as QCD-forbidden."
         stage_out_forbidden_marker
         exit 0
     fi
@@ -1163,7 +1488,7 @@ EOF
         echo "Error: Could not find HELAC run directory"
         exit 1
     fi
-    echo "[INFO] HELAC run directory: ${RUN_DIR}"
+    msg_info "HELAC run directory: ${RUN_DIR}"
 
     # Find the LHE file from the latest run directory
     if [[ -n "${RUN_DIR}" ]] && [[ -d "${RUN_DIR}/results" ]]; then
@@ -1181,7 +1506,7 @@ elif [[ -n "${PY8_LHE_FILE}" && -f "${PY8_LHE_FILE}" ]]; then
     LHE_FILE="${PY8_LHE_FILE}"
 else
     if pool_uses_crystalball_addon "${POOL_NAME}"; then
-        echo "[ERROR] CrystalBall addon output files:"
+        msg_error "CrystalBall addon output files:"
         find addon/pp_psiX_CrystalBall/output output -maxdepth 1 -type f -printf '  %p\n' 2>/dev/null || true
     fi
     echo "Error: LHE file not found"
@@ -1191,9 +1516,9 @@ fi
 echo "Found LHE file: $LHE_FILE"
 
 RAW_EVENT_COUNT=$(count_lhe_events "${LHE_FILE}")
-echo "[INFO] 原始 LHE 事件数: ${RAW_EVENT_COUNT}"
+msg_info "原始 LHE 事件数: ${RAW_EVENT_COUNT}"
 if (( RAW_EVENT_COUNT <= 0 )); then
-    echo "[ERROR] HELAC 生成的原始 LHE 不包含任何 <event>，终止上传空文件"
+    msg_error "HELAC 生成的原始 LHE 不包含任何 <event>，终止上传空文件"
     exit 1
 fi
 
@@ -1202,65 +1527,124 @@ FINAL_LHE_FILE="${LHE_FILE}"
 CONVERTED_LHE_FILE="${WORKDIR}/sample_${POOL_NAME}_${MY_SEED}_converted.lhe"
 
 if [[ -f "${PY8_ONIA_CONFIG}" ]] && build_lhe_converter_if_needed; then
-    echo "[INFO] Running lhe_pythia6_pythia8 converter..."
+    msg_info "Running lhe_pythia6_pythia8 converter..."
     if run_logged "lhe_pythia6_pythia8" "${WORKDIR}/lhe_pythia6_pythia8" "${LHE_FILE}" "${PY8_ONIA_CONFIG}" "${CONVERTED_LHE_FILE}"; then
         if [[ -f "${CONVERTED_LHE_FILE}" ]]; then
             CONVERTED_EVENT_COUNT=$(count_lhe_events "${CONVERTED_LHE_FILE}")
-            echo "[INFO] 转换后 LHE 事件数: ${CONVERTED_EVENT_COUNT}"
+            msg_info "转换后 LHE 事件数: ${CONVERTED_EVENT_COUNT}"
             if (( CONVERTED_EVENT_COUNT > 0 )); then
                 FINAL_LHE_FILE="${CONVERTED_LHE_FILE}"
-                echo "[INFO] Converted LHE ready: ${FINAL_LHE_FILE}"
+                msg_info "Converted LHE ready: ${FINAL_LHE_FILE}"
             else
-                echo "[WARN] 转换后 LHE 不包含任何 <event>，回退到原始 LHE"
+                msg_warn "转换后 LHE 不包含任何 <event>，回退到原始 LHE"
             fi
         fi
     else
-        echo "[WARN] LHE converter failed, fallback to original LHE"
+        msg_warn "LHE converter failed, fallback to original LHE"
     fi
 elif [[ -n "${PY8_LHE_FILE}" && -f "${PY8_LHE_FILE}" ]]; then
     FINAL_LHE_FILE="${PY8_LHE_FILE}"
-    echo "[INFO] Reusing HELAC generated *_py8.lhe: ${FINAL_LHE_FILE}"
+    msg_info "Reusing HELAC generated *_py8.lhe: ${FINAL_LHE_FILE}"
 else
-    echo "[WARN] No standalone converter available, fallback to original LHE"
+    msg_warn "No standalone converter available, fallback to original LHE"
 fi
 
 FINAL_EVENT_COUNT=$(count_lhe_events "${FINAL_LHE_FILE}")
-echo "[INFO] 最终待上传 LHE 事件数: ${FINAL_EVENT_COUNT}"
+msg_info "最终待上传 LHE 事件数: ${FINAL_EVENT_COUNT}"
 if (( FINAL_EVENT_COUNT <= 0 )); then
-    echo "[ERROR] 最终 LHE 不包含任何 <event>，拒绝上传空文件"
+    msg_error "最终 LHE 不包含任何 <event>，拒绝上传空文件"
     exit 1
 fi
 
 if [[ -f "${OCTET_PDG_TOOL}" ]] && grep -q "\<9900" "${FINAL_LHE_FILE}"; then
-    echo "[INFO] Standalone converter 后仍检测到旧编码，使用统一工具补做转换..."
+    msg_info "Standalone converter 后仍检测到旧编码，使用统一工具补做转换..."
     PYTHONIOENCODING=UTF-8 python3 "${OCTET_PDG_TOOL}" convert-file "${FINAL_LHE_FILE}" --in-place >/dev/null
 fi
 
 verify_lhe_octet_codes "${FINAL_LHE_FILE}"
 
-# Create output directory and copy generated LHE.
+# ---- LHE Stratified Shuffle-Split ----
+SHUFFLE_SPLIT_DIR="${WORKDIR}/lhe_blocks"
+if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+    SHUFFLE_SPLIT_BINARY="${SCRIPT_DIR}/lhe_shuffle_split_el7"
+    mkdir -p "${SHUFFLE_SPLIT_DIR}"
+    # Derive a deterministic shuffle seed from the generation seed with an offset
+    # so shuffles are reproducible but distinct from HELAC's internal RNG.
+    RESOLVED_SHUFFLE_SEED=$(( MY_SEED * 1000 + 37 ))
+    msg_info "Running LHE shuffle-split (seed=${RESOLVED_SHUFFLE_SEED}, mode=${LHE_SHUFFLE_MODE})..."
+    SHUFFLE_SPLIT_ARGS=(
+        --input "${FINAL_LHE_FILE}"
+        --output-dir "${SHUFFLE_SPLIT_DIR}"
+        --seed "${RESOLVED_SHUFFLE_SEED}"
+        --events-per-block "${LHE_EVENTS_PER_BLOCK}"
+        --mode "${LHE_SHUFFLE_MODE}"
+        --n-strata "${LHE_N_STRATA}"
+        --filename-prefix "${MY_SEED}_"
+        --write-provenance
+    )
+    if bool_is_true "${LHE_DROP_INCOMPLETE_LAST_BLOCK}"; then
+        SHUFFLE_SPLIT_ARGS+=(--drop-incomplete-last-block)
+    fi
+    if ! run_logged "lhe_shuffle_split" "${SHUFFLE_SPLIT_BINARY}" "${SHUFFLE_SPLIT_ARGS[@]}"; then
+        msg_error "LHE shuffle-split failed"
+        exit 1
+    fi
+    # Block filenames carry the seed prefix passed via --filename-prefix above.
+    BLOCK_COUNT=$(ls "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe 2>/dev/null | wc -l)
+    if (( BLOCK_COUNT == 0 )); then
+        msg_error "Shuffle-split produced no block files"
+        exit 1
+    fi
+    msg_ok "Shuffle-split: ${BLOCK_COUNT} blocks in ${SHUFFLE_SPLIT_DIR}"
+fi
+
+# Optionally compress LHE output before stageout (atomic: write .tmp then rename).
+STAGEOUT_FILE="${FINAL_LHE_FILE}"
+LHE_EXT="lhe"
+if bool_is_true "${COMPRESS_LHE}" && command -v gzip >/dev/null 2>&1; then
+    LHE_EXT="lhe.gz"
+    STAGEOUT_FILE="${WORKDIR}/sample_${POOL_NAME}_${MY_SEED}.lhe.gz"
+    msg_info "Compressing LHE output (gzip level=${LHE_COMPRESSION_LEVEL})..."
+    gzip -${LHE_COMPRESSION_LEVEL} -c "${FINAL_LHE_FILE}" > "${STAGEOUT_FILE}.tmp" \
+        && mv "${STAGEOUT_FILE}.tmp" "${STAGEOUT_FILE}" \
+        || { msg_error "Failed to compress LHE file"; exit 1; }
+    msg_info "Compressed: ${STAGEOUT_FILE}"
+fi
+
+# Create output directory and stage out LHE.
 if [ -n "${LOCAL_OUTPUT_BASE:-}" ]; then
-    echo "[INFO] Using local stageout to ${LOCAL_OUTPUT_BASE}"
+    msg_info "Using local stageout to ${LOCAL_OUTPUT_BASE}"
     LOCAL_DIR="${LOCAL_OUTPUT_BASE}/${OUTPUT_DIR}"
     mkdir -p "${LOCAL_DIR}" || {
-        echo "[ERROR] Failed to create local directory: ${LOCAL_DIR}"
+        msg_error "Failed to create local directory: ${LOCAL_DIR}"
         exit 1
     }
 
-    LOCAL_OUTPUT="${LOCAL_DIR}/sample_${POOL_NAME}_${MY_SEED}.lhe"
-    echo "[INFO] Staging out LHE file to: ${LOCAL_OUTPUT}"
-    if cp "${FINAL_LHE_FILE}" "${LOCAL_OUTPUT}"; then
-        echo "[INFO] Local stageout successful"
+    LOCAL_OUTPUT="${LOCAL_DIR}/sample_${POOL_NAME}_${MY_SEED}.${LHE_EXT}"
+    msg_info "Staging out LHE file to: ${LOCAL_OUTPUT}"
+    if cp "${STAGEOUT_FILE}" "${LOCAL_OUTPUT}"; then
+        msg_info "Local stageout successful"
         echo "Output: ${LOCAL_OUTPUT}"
     else
-        echo "[ERROR] Failed to stage out LHE file locally"
+        msg_error "Failed to stage out LHE file locally"
         exit 1
     fi
+    # Stage out shuffle-split blocks if enabled
+    if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+        BLOCK_LOCAL_DIR="${LOCAL_DIR}/lhe_blocks"
+        mkdir -p "${BLOCK_LOCAL_DIR}"
+        cp "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json "${BLOCK_LOCAL_DIR}/" 2>/dev/null || true
+        msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_LOCAL_DIR}"
+    fi
 elif [[ "${STAGEOUT_MODE}" == "helac-output" ]]; then
-    stage_out_helac_output_archive "${RUN_DIR}"
+    if [[ "${HELAC_DIAGNOSTICS_MODE}" == "legacy" ]]; then
+        stage_out_helac_output_archive "${RUN_DIR}"
+    else
+        stage_out_helac_diagnostics
+    fi
     echo "HELAC output generation complete!"
 elif [ "${SKIP_STAGEOUT:-0}" -eq 1 ]; then
-    echo "[INFO] SKIP_STAGEOUT=1, skip XRootD stageout"
+    msg_info "SKIP_STAGEOUT=1, skip XRootD stageout"
 else
     # Create remote directory and copy to T2_CN_Beijing storage via XRootD
     echo "Creating remote directory on T2_CN_Beijing..."
@@ -1268,14 +1652,26 @@ else
         echo "Warning: mkdir failed (directory may already exist)"
     }
 
-    OUTPUT_FILE=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "sample_${POOL_NAME}_${MY_SEED}.lhe")")
+    OUTPUT_FILE=$(remote_url_for_spec "$(join_remote_spec "${OUTPUT_DIR}" "sample_${POOL_NAME}_${MY_SEED}.${LHE_EXT}")")
     echo "Staging out LHE file to: ${OUTPUT_FILE}"
-    run_logged "xrdcp_lhe_stageout" xrdcp --nopbar --force "${FINAL_LHE_FILE}" "${OUTPUT_FILE}" || {
+    run_logged "xrdcp_lhe_stageout" xrdcp --nopbar --force "${STAGEOUT_FILE}" "${OUTPUT_FILE}" || {
         echo "Error: Failed to stage out LHE file"
         exit 1
     }
     echo "LHE generation complete!"
     echo "Output: $OUTPUT_FILE"
+    # Stage out shuffle-split blocks if enabled
+    if bool_is_true "${LHE_SHUFFLE_SPLIT}"; then
+        BLOCK_REMOTE_DIR="${OUTPUT_DIR}/lhe_blocks"
+        make_remote_dir "${BLOCK_REMOTE_DIR}" || true
+        for bf in "${SHUFFLE_SPLIT_DIR}/${MY_SEED}_block_"*.lhe "${SHUFFLE_SPLIT_DIR}"/shuffle_split_manifest.json; do
+            bname=$(basename "$bf")
+            BLOCK_OUTPUT=$(remote_url_for_spec "$(join_remote_spec "${BLOCK_REMOTE_DIR}" "${bname}")")
+            xrdcp --nopbar --force "$bf" "${BLOCK_OUTPUT}" || \
+                msg_warn "Failed to stage block: ${bname}"
+        done
+        msg_ok "Staged ${BLOCK_COUNT} shuffle-split blocks to ${BLOCK_REMOTE_DIR}"
+    fi
 fi
 echo "=============================================="
 

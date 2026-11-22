@@ -15,7 +15,7 @@ Universe = vanilla
 
 Executable = /bin/bash
 transfer_executable = False
-Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); install -m 600 credentials/x509_user_proxy /tmp/x509up_u$UID; rm -rf credentials; unset X509_USER_PROXY; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool $(pool) --seed $(seed) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt 50 --test-mode true'"
+Arguments = "-lc 'set -euo pipefail; tar -xzf $(proxy_bundle_name); chmod 600 credentials/x509_user_proxy; export X509_USER_PROXY=\"$PWD/credentials/x509_user_proxy\"; tar -xzf $(lhe_bundle_name); cd runtime/lhe_generation; bash run_helac.sh --pool $(pool) --seed $(seed) --min-pt-conia $(min_pt_conia) --min-pt-bonia $(min_pt_bonia) --min-pt-q $(min_pt_q) --unwevt 50 --test-mode true'"
 
 Should_Transfer_Files = YES
 WhenToTransferOutput = ON_EXIT

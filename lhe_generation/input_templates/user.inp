@@ -55,6 +55,8 @@ minyrapconia -2.4d0
 maxrapbonia 2.4d0   # maximum bottomonium rapidity
 maxyrapbonia 2.4d0
 minyrapbonia -2.4d0
+miny1c 0d0          # lower absolute-rapidity magnitude for the first final-state particle
+maxy1c 30d0         # effectively unrestricted upper magnitude; species cuts still apply
 
 # Separation cuts
 mindrll 0.d0        # minimum delta R (lepton-lepton)
@@ -72,7 +74,7 @@ minmqqp 0.d0        # minimum mass quark with quark
 minmqb 0.d0         # minimum mass quark with b
 minmbb 0.d0         # minimum mass b with b
 minmqbeam 0d0       # minimum mass quarks with partonic beam
-absoluterap F       # absolute rap (T) or not (F)
+absoluterap T       # interpret rapidity cuts as absolute magnitudes for symmetric beams
 
 # Monte Carlo settings
 unwgt T             # unweighting on/off

@@ -16,13 +16,15 @@
 //       -I$HEPMC3/include -L$HEPMC3/lib64 -lHepMC3
 //
 // Usage:
-//   ./shower_phi input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry]
+//   ./shower_phi input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]
 // ==============================================================================
 
 #include "Pythia8/Pythia.h"
 #include "Pythia8Plugins/HepMC3.h"
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <unordered_set>
@@ -185,7 +187,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 3) {
         cerr << "\n====== Phi-Enriched Shower Processing ======" << endl;
-        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [requireLheGluon]" << endl;
+        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minPhiPt] [minMuonPt] [maxMuonEta] [maxRetry] [requireLheGluon] [rngSeed]" << endl;
         cerr << "\nArguments:" << endl;
         cerr << "  input.lhe   : Input LHE file from HELAC-Onia" << endl;
         cerr << "  output.hepmc: Output HepMC file" << endl;
@@ -195,6 +197,7 @@ int main(int argc, char* argv[]) {
         cerr << "  maxMuonEta  : Maximum muon |eta| (default: 2.4)" << endl;
         cerr << "  maxRetry    : Maximum hadronization retries (default: 5000)" << endl;
         cerr << "  requireLheGluon : 1/true 表示要求 phi 可追溯到 LHE 硬过程胶子" << endl;
+        cerr << "  rngSeed     : Optional Pythia RNG seed" << endl;
         cerr << "\nExample:" << endl;
         cerr << "  ./shower_phi jpsi_jpsi.lhe phi_enriched.hepmc 1000 3.0 2.5 2.4 1000" << endl;
         return 1;
@@ -212,20 +215,33 @@ int main(int argc, char* argv[]) {
         string modeArg = argv[8];
         requireLheGluon = (modeArg == "1" || modeArg == "true" || modeArg == "lhegluon");
     }
+    int rngSeed = (argc > 9) ? atoi(argv[9]) : 0;
+    int targetOutputEvents = (argc > 10) ? atoi(argv[10]) : nEvents;
+    string manifestFile = (argc > 11) ? argv[11] : "";
     
     cout << "\n====== Phi-Enriched Shower Processing ======" << endl;
     cout << "Input LHE:    " << inputFile << endl;
     cout << "Output HepMC: " << outputFile << endl;
     cout << "Events:       " << (nEvents > 0 ? to_string(nEvents) : "all") << endl;
+    cout << "Target output:" << (targetOutputEvents > 0 ? to_string(targetOutputEvents) : "all") << endl;
     cout << "Min phi pT:   " << minPhiPt << " GeV" << endl;
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, phi 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, phi 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << endl;
     cout << "Require LHE gluon ancestry: " << (requireLheGluon ? "yes" : "no") << endl;
+    cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
+    if (!manifestFile.empty()) {
+        cout << "Manifest:     " << manifestFile << endl;
+    }
     cout << "=============================================\n" << endl;
     
     // Initialize Pythia
     Pythia pythia;
+
+    if (rngSeed > 0) {
+        pythia.readString("Random:setSeed = on");
+        pythia.readString("Random:seed = " + to_string(rngSeed));
+    }
 
     auto setFlagIfExists = [&](const string& name, bool value) {
         if (pythia.settings.isFlag(name)) {
@@ -396,6 +412,8 @@ int main(int argc, char* argv[]) {
     int totalRetries = 0;
     int successWithPhi = 0;
     int failedToFindPhi = 0;
+    int successfulPythiaEvents = 0;
+    auto wallStart = chrono::steady_clock::now();
     
     // Particle counts
     int totalJpsi = 0, totalUpsilon = 0, totalPhi = 0, totalMuon = 0;
@@ -403,6 +421,7 @@ int main(int argc, char* argv[]) {
     cout << "Starting event processing..." << endl;
     
     while (true) {
+        if (targetOutputEvents > 0 && successWithPhi >= targetOutputEvents) break;
         if (nEvents > 0 && iEvent >= nEvents) break;
         
         // Run parton level (without hadronization)
@@ -411,10 +430,13 @@ int main(int argc, char* argv[]) {
                 cout << "Reached end of LHE file." << endl;
                 break;
             }
-            if (++iAbort < maxAbort) continue;
+            ++iEvent;
+            ++iAbort;
+            if (targetOutputEvents <= 0 || iAbort < maxAbort) continue;
             cout << "Event generation aborted prematurely!" << endl;
             break;
         }
+        successfulPythiaEvents++;
         
         // Save parton level state
         Event savedEvent = pythia.event;
@@ -442,7 +464,7 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        totalRetries += nRetry + 1;
+        totalRetries += min(nRetry + 1, maxRetry);
         
         if (foundValid) {
             successWithPhi++;
@@ -472,6 +494,8 @@ int main(int argc, char* argv[]) {
     }
     
     pythia.stat();
+    auto wallEnd = chrono::steady_clock::now();
+    double wallSeconds = chrono::duration<double>(wallEnd - wallStart).count();
     
     cout << "\n======================================================" << endl;
     cout << "Phi-Enriched Processing Summary:" << endl;
@@ -483,6 +507,7 @@ int main(int argc, char* argv[]) {
          << endl;
     cout << "------------------------------------------------------" << endl;
     cout << "Total LHE events processed:   " << iEvent << endl;
+    cout << "Successful Pythia events:     " << successfulPythiaEvents << endl;
     cout << "Events written (all cuts):    " << successWithPhi 
          << " (" << 100.0*successWithPhi/max(1,iEvent) << "%)" << endl;
     cout << "Events skipped (failed cuts): " << failedToFindPhi << endl;
@@ -498,6 +523,45 @@ int main(int argc, char* argv[]) {
     cout << "Output events: " << successWithPhi << endl;
     cout << "Output file:   " << outputFile << endl;
     cout << "======================================================" << endl;
+
+    if (!manifestFile.empty()) {
+        bool exhaustive = targetOutputEvents <= 0;
+        bool exposureComplete = nEvents <= 0 || iEvent == nEvents;
+        double completion = targetOutputEvents > 0
+            ? static_cast<double>(successWithPhi) / max(1, targetOutputEvents)
+            : 0.0;
+        ofstream manifest(manifestFile);
+        if (!manifest.is_open()) {
+            cerr << "Failed to write manifest: " << manifestFile << endl;
+            return 1;
+        }
+        manifest << "{\n"
+                 << "  \"mode\": \"phi_mpi_on_gluon\",\n"
+                 << "  \"consumption_mode\": \"" << (exhaustive ? "exhaustive" : "target") << "\",\n"
+                 << "  \"require_lhe_gluon\": " << (requireLheGluon ? "true" : "false") << ",\n"
+                 << "  \"target_events\": " << (exhaustive ? "null" : to_string(targetOutputEvents)) << ",\n"
+                 << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"exposure_target_lhe_events\": " << (exhaustive ? to_string(nEvents) : "null") << ",\n"
+                 << "  \"consumed_lhe_events\": " << iEvent << ",\n"
+                 << "  \"pythia_next_failures\": " << iAbort << ",\n"
+                 << "  \"max_hadronization_retries\": " << maxRetry << ",\n"
+                 << "  \"attempted_lhe_events\": " << iEvent << ",\n"
+                 << "  \"successful_pythia_events\": " << successfulPythiaEvents << ",\n"
+                 << "  \"accepted_hepmc_events\": " << successWithPhi << ",\n"
+                 << "  \"actual_hepmc_events\": " << successWithPhi << ",\n"
+                 << "  \"failed_phi_selections\": " << failedToFindPhi << ",\n"
+                 << "  \"total_hadronization_retries\": " << totalRetries << ",\n"
+                 << "  \"average_retries_per_accepted_event\": " << (static_cast<double>(totalRetries) / max(1, successWithPhi)) << ",\n"
+                 << "  \"average_retries_per_attempted_event\": " << (static_cast<double>(totalRetries) / max(1, iEvent)) << ",\n"
+                 << "  \"wall_time_seconds\": " << wallSeconds << ",\n"
+                 << "  \"completion_fraction\": " << (exhaustive ? "null" : to_string(completion)) << ",\n"
+                 << "  \"complete\": " << ((exhaustive ? exposureComplete && successWithPhi > 0 : successWithPhi >= targetOutputEvents) ? "true" : "false") << ",\n"
+                 << "  \"status\": \"" << (exhaustive
+                        ? (exposureComplete && successWithPhi > 0 ? "ok" : "failed")
+                        : (successWithPhi > 0 ? (successWithPhi >= targetOutputEvents ? "ok" : "partial") : "failed")) << "\",\n"
+                 << "  \"output_file\": \"" << outputFile << "\"\n"
+                 << "}\n";
+    }
     
     return 0;
 }

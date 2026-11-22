@@ -3,7 +3,15 @@
 
 This directory should contain the tarballs transferred to worker nodes.
 
-## 1. `helac_package.tar.gz` (required)
+## 1. Seeded HELAC package (required)
+
+The tracked source artifact is `helac_package_cbseed_v1.tar.gz`; its published
+SHA-256 is recorded in `helac_package_cbseed_v1.manifest.json`. Runtime
+preparation verifies that artifact once and installs a copy under the stable
+worker-facing name `helac_package.tar.gz`. Workers and `run_helac.sh` should
+continue to use only that stable runtime basename.
+
+`helac_package.tar.gz` (required at runtime)
 
 `run_helac.sh` accepts either source tarballs or a prebuilt HELAC-Onia runtime.
 When a compiled `HELAC-Onia-2.7.6/ho_cluster` is present, the worker reuses it
@@ -15,14 +23,26 @@ Contents:
 - `HELAC-Onia-2.7.6.tar.gz`
 - `hepmc2.06.11.tgz`
 
-Create it with:
+The versioned package is the reproducibility anchor. Create a replacement only
+through `tools/repack_helac_crystalball_seed.py`, then update the versioned
+artifact and manifest together; never overwrite the input package in place.
+
+Verify the checked-in pair with:
 
 ```bash
-cd /afs/cern.ch/user/x/xcheng/condor/HELAC-on-HTCondor
+python3 tools/repack_helac_crystalball_seed.py --check \
+  --package common/packages/helac_package_cbseed_v1.tar.gz \
+  --manifest common/packages/helac_package_cbseed_v1.manifest.json
+```
+
+For an unseeded source package, the historical packaging shape was:
+
+```bash
+cd <directory-containing-the-HELAC-source-tarballs>
 cp sources/HELAC-Onia-2.7.6.tar.gz .
 cp sources/hepmc2.06.11.tgz .
 tar -czf helac_package.tar.gz HELAC-Onia-2.7.6.tar.gz hepmc2.06.11.tgz
-cp helac_package.tar.gz /afs/cern.ch/user/c/chiw/condor/Full_MC_Production/common/packages/
+cp helac_package.tar.gz <Full_MC_Production>/common/packages/
 ```
 
 ## 2. `tpsonia2mumu_code.tar.gz` (generated automatically)
@@ -32,7 +52,9 @@ The ntuple stage now uses one shared CMSSW 15 package for both `JJP` and `JUP`:
 - runtime configs are repo-owned under `common/cmssw_configs/`
 - `JJP -> common/cmssw_configs/ntuple_jjp_cfg.py`
 - `JUP -> common/cmssw_configs/ntuple_jup_cfg.py`
-- JJP efficiency/acceptance -> `common/cmssw_configs/ntuple_jjp_efficiency_cfg.py`
+- JJP efficiency/acceptance uses the unified
+  `common/cmssw_configs/ntuple_jjp_cfg.py`; `analysisMode` controls analyzer
+  behavior and `--efficiency-ntuple` controls manifest creation.
 
 The wrapper passes only changing runtime values to `cmsRun`
 (`inputFiles`, `outputFile`, `runOnMC`, `maxEvents`). Persistent analyzer choices
@@ -69,12 +91,17 @@ with `--cmssw15-runtime-tarball`. It should contain `CMSSW_15_0_15/` at archive
 root. Worker jobs unpack it, run `scram build ProjectRename`, and skip the
 per-job `scram b HeavyFlavorAnalysis/TPS-Onia2MuMu` rebuild.
 
-The generator validates this contract before packaging. At minimum the archive
-must contain:
+The generator validates this contract before packaging. The archive must
+contain:
 
 - `CMSSW_15_0_15/src/`
 - `CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/`
 - `CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/test/ConfFile_cfg.py`
+- `CMSSW_15_0_15/lib/el9_amd64_gcc12/pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so`
+- `CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache`
+
+Build the runtime with a clean full project rebuild (`scram b clean && scram b
+-j 8`) so the plugin cache is regenerated before packaging.
 
 ## Verification
 

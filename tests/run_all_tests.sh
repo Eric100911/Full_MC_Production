@@ -21,6 +21,8 @@ MAX_EVENTS=5
 SCAN_EXISTING=1
 ENABLE_NTUPLE=0
 CMSSW15_RUNTIME_TARBALL=""
+WITH_MINIAOD_MERGE_SMOKE=0
+WITH_EDM_EVENTID_SMOKE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,9 +54,17 @@ while [[ $# -gt 0 ]]; do
             CMSSW15_RUNTIME_TARBALL="$2"
             shift 2
             ;;
+        --with-miniaod-merge-smoke)
+            WITH_MINIAOD_MERGE_SMOKE=1
+            shift
+            ;;
+        --with-edm-eventid-smoke)
+            WITH_EDM_EVENTID_SMOKE=1
+            shift
+            ;;
         -h|--help)
             cat << EOF
-用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH]
+用法: $0 [--submit] [--wait] [--jobs N] [--max-events N] [--no-scan-existing] [--enable-ntuple] [--cmssw15-runtime-tarball PATH] [--with-miniaod-merge-smoke] [--with-edm-eventid-smoke]
 EOF
             exit 0
             ;;
@@ -97,5 +107,72 @@ echo "[INFO] 先执行八重态 PDG 映射自检"
 
 echo "[INFO] 检查 GEN-SIM 顶点涂抹配置"
 "${BASE_DIR}/tools/check_gensim_vtxsmeared_config.py"
+
+echo "[INFO] 检查 block coordinator 的 TPS 重复输入与 SPS SubDAG"
+python3 "${SCRIPT_DIR}/test_helac_inspector.py"
+python3 "${SCRIPT_DIR}/test_helac_trial_report.py"
+python3 "${SCRIPT_DIR}/test_coordinate_lhe_blocks.py"
+python3 "${SCRIPT_DIR}/test_split_workflow.py"
+python3 "${SCRIPT_DIR}/test_allocate_campaign_shards.py"
+python3 "${SCRIPT_DIR}/test_coordinate_wrapper_large_manifest.py"
+
+echo "[INFO] 检查 exposure recovery 的非连续 inventory job spec"
+python3 "${SCRIPT_DIR}/test_campaign_job_specs.py"
+
+echo "[INFO] 检查 CrystalBall HELAC seed 补丁与 seed.input 桥接"
+python3 "${SCRIPT_DIR}/test_crystalball_seed_repack.py"
+
+echo "[INFO] 检查 worker 端 XRootD URL 的三段斜杠重建"
+"${SCRIPT_DIR}/test_helac_remote_url.sh"
+
+echo "[INFO] 检查 inline shuffle-split 的 seed-prefixed block globs"
+"${SCRIPT_DIR}/test_helac_inline_split_globs.sh"
+
+echo "[INFO] 检查 generated-LHE 输出位置与 inventory 写入护栏"
+python3 "${SCRIPT_DIR}/test_generated_lhe_output_location.py"
+
+echo "[INFO] 检查 production-core storage namespace 与 runtime package safety"
+PYTHONPATH="${BASE_DIR}/src:${BASE_DIR}" python3 -m unittest tests.test_core_storage_safety
+
+echo "[INFO] 检查 CMSSW worker entrypoints 与 runtime bundle"
+"${SCRIPT_DIR}/test_cmssw_helpers.sh"
+
+echo "[INFO] 检查 worker 命令日志封装的退出码传播"
+"${SCRIPT_DIR}/test_run_logged_status.sh"
+"${SCRIPT_DIR}/test_stage_out_verification.sh"
+"${SCRIPT_DIR}/test_stageout_recovery.sh"
+"${SCRIPT_DIR}/test_processing_recovery_fallback.sh"
+
+echo "[INFO] 检查 existing-LHE generate-test 的 planner 事件上限"
+python3 "${SCRIPT_DIR}/test_lhe_planner_cap_generation.py"
+echo "[INFO] 检查 planner 的 LHE 纵向对称性 fail-closed QA"
+python3 "${SCRIPT_DIR}/test_plan_lhe_blocks_symmetry.py"
+
+echo "[INFO] 检查 counted existing-LHE inventory 分组"
+python3 "${SCRIPT_DIR}/test_existing_lhe_inventory.py"
+
+echo "[INFO] 检查 plain-Condor existing-LHE inventory counting"
+python3 "${SCRIPT_DIR}/test_condor_lhe_inventory.py"
+
+echo "[INFO] 检查 block SubDAG final inventory 与日志归档 mock"
+"${SCRIPT_DIR}/test_subdag_final_and_archive.sh"
+"${SCRIPT_DIR}/test_miniaod_merge_partial.sh"
+
+echo "[INFO] 检查顶层 FINAL worker 日志归档"
+python3 "${SCRIPT_DIR}/test_workflow_log_archive.py"
+python3 "${SCRIPT_DIR}/test_summary_final_status.py"
+
+echo "[INFO] 检查 DAGMan 提交批次配置"
+python3 "${SCRIPT_DIR}/test_dagman_config.py"
+
+if [[ ${WITH_MINIAOD_MERGE_SMOKE} -eq 1 ]]; then
+    echo "[INFO] 运行 MiniAOD merge CMSSW/XRootD smoke"
+    "${SCRIPT_DIR}/test_miniaod_merge_smoke.sh"
+fi
+
+if [[ ${WITH_EDM_EVENTID_SMOKE} -eq 1 ]]; then
+    echo "[INFO] 运行 GEN-SIM EDM EventID local smoke"
+    "${SCRIPT_DIR}/mock_test_edm_eventid.sh"
+fi
 
 "${CMD[@]}"

@@ -1,0 +1,364 @@
+{
+  "pools": {
+    "pool_jpsi_CSCO_g": {
+      "name": "pool_jpsi_CSCO_g",
+      "description": "pp -> J/psi + X with CrystalBall pT model",
+      "process_lines": [
+        "addon/pp_psiX_CrystalBall",
+        "state.inp = 1  # J/psi"
+      ],
+      "min_pt_conia": 6.0,
+      "min_pt_bonia": 4.0,
+      "min_pt_q": 0.0,
+      "min_m_qqp": 0.0,
+      "min_m_q_beam": 0.0,
+      "notes": "J/psi \u57fa\u7840\u6c60\u4f7f\u7528 HELAC-Onia addon/pp_psiX_CrystalBall\uff0cCrystalBall \u53c2\u6570\u53d6 addon input \u9ed8\u8ba4\u3002",
+      "storage_name": "pool_jpsi_CSCO_g",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [
+        443,
+        9900441,
+        9900443,
+        9910441,
+        9940003,
+        9941003,
+        9942003
+      ],
+      "seed_offset": 0
+    },
+    "pool_upsilon_CSCO_g": {
+      "name": "pool_upsilon_CSCO_g",
+      "description": "pp -> Upsilon(1S) + X with CrystalBall pT model",
+      "process_lines": [
+        "addon/pp_psiX_CrystalBall",
+        "state.inp = 3  # Upsilon(1S)"
+      ],
+      "min_pt_conia": 6.0,
+      "min_pt_bonia": 4.0,
+      "min_pt_q": 0.0,
+      "min_m_qqp": 0.0,
+      "min_m_q_beam": 0.0,
+      "notes": "Upsilon(1S) \u57fa\u7840\u6c60\u4f7f\u7528 HELAC-Onia addon/pp_psiX_CrystalBall\uff0cCrystalBall \u53c2\u6570\u53d6 addon input \u9ed8\u8ba4\u3002",
+      "storage_name": "pool_upsilon_CSCO_g",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [
+        553,
+        9900551,
+        9900553,
+        9910551,
+        9950003,
+        9951003,
+        9952003
+      ],
+      "seed_offset": 20000
+    },
+    "pool_gg": {
+      "name": "pool_gg",
+      "description": "gg -> gg",
+      "process_lines": [
+        "generate g g > g g"
+      ],
+      "min_pt_conia": 0.0,
+      "min_pt_bonia": 0.0,
+      "min_pt_q": 4.0,
+      "min_m_qqp": 0.0,
+      "min_m_q_beam": 0.0,
+      "notes": "QCD \u80cc\u666f\u80f6\u5b50\u6c60\u3002",
+      "storage_name": "pool_gg",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [],
+      "seed_offset": 40000
+    },
+    "pool_2jpsi_cs": {
+      "name": "pool_2jpsi_cs",
+      "description": "gg -> J/psi + J/psi (born \u5b50\u8fc7\u7a0b)",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11)"
+      ],
+      "min_pt_conia": 6.0,
+      "min_pt_bonia": 4.0,
+      "min_pt_q": 0.0,
+      "min_m_qqp": 0.0,
+      "min_m_q_beam": 0.0,
+      "notes": "double-J/psi born/color-singlet SPS \u57fa\u7840\u6c60\u3002",
+      "storage_name": "pool_2jpsi_cs",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [
+        443,
+        9900441,
+        9900443,
+        9910441,
+        9940003,
+        9941003,
+        9942003
+      ],
+      "seed_offset": 60000
+    },
+    "pool_2jpsi_g": {
+      "name": "pool_2jpsi_g",
+      "description": "gg -> J/psi + J/psi + g",
+      "process_lines": [
+        "generate g g > cc~(3S11) cc~(3S11) g"
+      ],
+      "min_pt_conia": 6.0,
+      "min_pt_bonia": 4.0,
+      "min_pt_q": 0.0,
+      "min_m_qqp": 3.0969,
+      "min_m_q_beam": 3.0969,
+      "notes": "double-J/psi + g SPS \u57fa\u7840\u6c60\u3002",
+      "storage_name": "pool_2jpsi_g",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [
+        443,
+        9900441,
+        9900443,
+        9910441,
+        9940003,
+        9941003,
+        9942003
+      ],
+      "seed_offset": 70000
+    },
+    "pool_jpsi_upsilon_CSCO": {
+      "name": "pool_jpsi_upsilon_CSCO",
+      "description": "gg -> J/psi + Upsilon",
+      "process_lines": [
+        "generate g g > jpsi y(1s)"
+      ],
+      "min_pt_conia": 6.0,
+      "min_pt_bonia": 4.0,
+      "min_pt_q": 0.0,
+      "min_m_qqp": 0.0,
+      "min_m_q_beam": 0.0,
+      "notes": "J/psi + Upsilon SPS \u57fa\u7840\u6c60\u3002",
+      "storage_name": "pool_jpsi_upsilon_CSCO",
+      "variants": [],
+      "public": true,
+      "longitudinal_symmetry_pdg_ids": [
+        443,
+        9900441,
+        9900443,
+        9910441,
+        9940003,
+        9941003,
+        9942003
+      ],
+      "seed_offset": 80000
+    }
+  },
+  "campaigns": {
+    "JJP_SPS_CS": {
+      "name": "JJP_SPS_CS",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_2jpsi_cs"
+      ],
+      "shower_modes": [
+        "phi_mpi_off"
+      ],
+      "description": "double-J/psi born/color-singlet \u5355\u6e90\u505a phi-enriched shower\uff0c\u4e0d\u4e0e\u5e26\u989d\u5916 gluon \u7684\u6837\u672c\u6df7\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_SPS_CS"
+    },
+    "JJP_SPS_G": {
+      "name": "JJP_SPS_G",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_2jpsi_g"
+      ],
+      "shower_modes": [
+        "phi_mpi_off"
+      ],
+      "description": "double-J/psi + g \u5355\u6e90\u505a phi-enriched shower\uff0c\u4e0d\u4e0e born \u6837\u672c\u6df7\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_SPS_G"
+    },
+    "JJP_DPS1": {
+      "name": "JJP_DPS1",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_jpsi_CSCO_g"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "\u4e24\u4e2a J/psi(CS+CO)+g \u6e90\u6df7\u5408\uff0c\u8986\u76d6 normal/phi \u9ed8\u8ba4\u7ec4\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_DPS1"
+    },
+    "JJP_DPS2_CS": {
+      "name": "JJP_DPS2_CS",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_2jpsi_cs",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "double-J/psi born \u6e90\u4e0e gg \u6c60\u6df7\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_DPS2_CS"
+    },
+    "JJP_DPS2_G": {
+      "name": "JJP_DPS2_G",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_2jpsi_g",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "double-J/psi + g \u6e90\u4e0e gg \u6c60\u6df7\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_DPS2_G"
+    },
+    "JJP_TPS": {
+      "name": "JJP_TPS",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_jpsi_CSCO_g",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "\u4e09\u6e90\u6df7\u5408\u7684 JJP TPS \u65b9\u6848\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JJP_TPS"
+    },
+    "JJP_DPS1_MC_v4_1": {
+      "name": "JJP_DPS1_MC_v4_1",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_jpsi_CSCO_g"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "Inventory-driven exhaustive recovery of JJP_DPS1 cap700.",
+      "notes": "",
+      "aggregate": false,
+      "physics_campaign": "JJP_DPS1"
+    },
+    "JJP_TPS_MC_v4_1": {
+      "name": "JJP_TPS_MC_v4_1",
+      "analysis_type": "JJP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_jpsi_CSCO_g",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "Inventory-driven exhaustive recovery of JJP_TPS cap700.",
+      "notes": "",
+      "aggregate": false,
+      "physics_campaign": "JJP_TPS"
+    },
+    "JUP_SPS": {
+      "name": "JUP_SPS",
+      "analysis_type": "JUP",
+      "inputs": [
+        "pool_jpsi_upsilon_CSCO"
+      ],
+      "shower_modes": [
+        "phi_mpi_off"
+      ],
+      "description": "J/psi + Upsilon \u5355\u6e90\u505a phi-enriched shower\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JUP_SPS"
+    },
+    "JUP_DPS1": {
+      "name": "JUP_DPS1",
+      "analysis_type": "JUP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_upsilon_CSCO_g"
+      ],
+      "shower_modes": [
+        "phi_mpi_off",
+        "normal"
+      ],
+      "description": "J/psi \u8d70 phi \u9ed8\u8ba4\u6a21\u5f0f\uff0cUpsilon \u8d70 normal\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JUP_DPS1"
+    },
+    "JUP_DPS2": {
+      "name": "JUP_DPS2",
+      "analysis_type": "JUP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_upsilon_CSCO_g"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "J/psi \u8d70 normal\uff0cUpsilon \u8d70 phi \u9ed8\u8ba4\u6a21\u5f0f\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JUP_DPS2"
+    },
+    "JUP_DPS3": {
+      "name": "JUP_DPS3",
+      "analysis_type": "JUP",
+      "inputs": [
+        "pool_jpsi_upsilon_CSCO",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "J/psi+Upsilon \u6e90\u4e0e gg \u6c60\u6df7\u5408\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JUP_DPS3"
+    },
+    "JUP_TPS": {
+      "name": "JUP_TPS",
+      "analysis_type": "JUP",
+      "inputs": [
+        "pool_jpsi_CSCO_g",
+        "pool_upsilon_CSCO_g",
+        "pool_gg"
+      ],
+      "shower_modes": [
+        "normal",
+        "normal",
+        "phi_mpi_off"
+      ],
+      "description": "\u4e09\u6e90\u6df7\u5408\u7684 JUP TPS \u65b9\u6848\u3002",
+      "notes": "",
+      "aggregate": true,
+      "physics_campaign": "JUP_TPS"
+    }
+  }
+}

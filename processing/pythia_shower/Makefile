@@ -44,11 +44,8 @@ shower: check-env $(SHOWER_PROGS)
 mixer: check-env $(MIXER_PROG)
 
 check-env:
-	@if [ -z "$(CMSSW_BASE)" ]; then \
-		echo "Error: CMSSW environment not set. Run 'cmsenv' first."; \
-		exit 1; \
-	fi
-	@echo "Building with CMSSW environment: $(CMSSW_VERSION)"
+	@echo "Build environment:"
+	@echo "  CXX:            $(CXX)"
 	@echo "  PYTHIA8_INCLUDE: $(PYTHIA8_INCLUDE)"
 	@echo "  PYTHIA8_LIBDIR:  $(PYTHIA8_LIBDIR)"
 	@echo "  HEPMC3_INCLUDE:  $(HEPMC3_INCLUDE)"

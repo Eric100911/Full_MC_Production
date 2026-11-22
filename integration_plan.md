@@ -1,6 +1,12 @@
-  # Sync MC Production With Efficiency/Acceptance Workflow
+# Archived Integration Plan: Efficiency/Acceptance Workflow
 
-  ## Summary
+> **Historical, non-operational document.** This plan predates the unified
+> `T2_CN_Beijing` workflow and has been implemented or superseded. Its branch
+> advice, package assumptions, and IHEP URLs must not be used for current
+> production. Use `README.md`, `docs/testing.md`, and
+> `docs/directory_path_reference.md` for maintained instructions.
+
+## Historical Summary
 
   Use ihep as the integration base, keep hepthu local-HTCondor behavior as a secondary portability
   layer, and make production outputs directly consumable by multileppat_vertex_batch efficiency
@@ -157,4 +163,3 @@
     truth options.
   - Existing production defaults should remain unchanged unless the new efficiency mode is
     explicitly enabled.
-

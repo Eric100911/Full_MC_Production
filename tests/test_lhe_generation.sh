@@ -93,19 +93,19 @@ mkdir -p "${TEST_WORKDIR}"
 cd "${TEST_WORKDIR}"
 
 # ============================================================================
-# Test 1: Check helac_package.tar.gz exists
+# Test 1: Check the tracked seeded HELAC source package
 # ============================================================================
 msg_step "Test 1: Check helac_package.tar.gz"
 
-HELAC_PKG="${BASE_DIR}/common/packages/helac_package.tar.gz"
+HELAC_PKG="${BASE_DIR}/common/packages/helac_package_cbseed_v1.tar.gz"
 if [[ ! -f "${HELAC_PKG}" ]]; then
-    msg_error "helac_package.tar.gz not found at ${HELAC_PKG}"
+    msg_error "helac_package_cbseed_v1.tar.gz not found at ${HELAC_PKG}"
     exit 1
 fi
-msg_ok "helac_package.tar.gz found"
+msg_ok "helac_package_cbseed_v1.tar.gz found"
 
 # Copy required files to workdir
-cp "${HELAC_PKG}" .
+cp "${HELAC_PKG}" helac_package.tar.gz
 cp -r "${LHE_GEN_DIR}/input_templates" .
 
 # ============================================================================

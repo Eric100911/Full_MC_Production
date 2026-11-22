@@ -6,14 +6,15 @@ Universe = vanilla
 
 Executable = $(lhe_wrapper_path)
 transfer_executable = True
-arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(pool) $(seed) $(min_pt_conia) $(min_pt_bonia) $(min_pt_q) $(unwevt) $(test_mode) $(local_output_base)"
+arguments = "$(proxy_bundle_name) $(lhe_bundle_name) $(config_name)"
 
 Should_Transfer_Files = YES
-WhenToTransferOutput = ON_EXIT
+WhenToTransferOutput = ON_EXIT_OR_EVICT
 
-Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path)
+Transfer_Input_Files = $(lhe_bundle_path), $(proxy_bundle_path), $(config_path)
 
-transfer_output_files =
+transfer_output_files = wrapper_logs
+transfer_output_remaps = "wrapper_logs/wrapper.stdout=lhe_$(pool)_$(seed)_$(Cluster)_$(Process).wrapper.stdout;wrapper_logs/wrapper.stderr=lhe_$(pool)_$(seed)_$(Cluster)_$(Process).wrapper.stderr"
 
 Output = lhe_$(pool)_$(seed)_$(Cluster)_$(Process).stdout
 Error  = lhe_$(pool)_$(seed)_$(Cluster)_$(Process).stderr

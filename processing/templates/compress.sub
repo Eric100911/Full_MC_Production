@@ -1,0 +1,35 @@
+# ==============================================================================
+# compress.sub - Backfill LHE compression worker template.
+# ==============================================================================
+# Each job compresses a single pool directory of .lhe files.
+# DAG VARS: compression_bundle_path, compression_bundle_name, compress_wrapper_path,
+#           pool_dir, level, keep, log_root
+# ==============================================================================
+
+Universe = vanilla
+
+Executable = $(compress_wrapper_path)
+transfer_executable = True
+Arguments = "$(compression_bundle_name) $(pool_dir) $(level) $(keep)"
+
+Should_Transfer_Files = YES
+WhenToTransferOutput = ON_EXIT
+Transfer_Input_Files = $(compression_bundle_path)
+
+Output = $(log_root)/compress_$(cluster)_$(process).stdout
+Error  = $(log_root)/compress_$(cluster)_$(process).stderr
+Log    = $(log_root)/compress_$(cluster).log
+
+request_cpus   = 1
+request_memory = 2GB
+request_disk   = 5GB
+
++MaxRuntime = 86400
+Environment = "HOME=/srv"
+
+OnExitHold = (ExitCode != 0)
+OnExitHoldReason = "LHE compression failed"
+OnExitHoldSubCode = 1
+PeriodicRelease = (JobRunCount < 2) && (HoldReasonCode == 3)
+
+Queue 1

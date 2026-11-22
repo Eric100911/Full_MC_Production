@@ -10,12 +10,14 @@
 //       -I$HEPMC3/include -L$HEPMC3/lib64 -lHepMC3
 //
 // Usage:
-//   ./shower_normal input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry]
+//   ./shower_normal input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]
 // ==============================================================================
 
 #include "Pythia8/Pythia.h"
 #include "Pythia8Plugins/HepMC3.h"
 
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -104,7 +106,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 3) {
         cerr << "\n=== Pythia8 Standard Shower Processing ===" << endl;
-        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry]" << endl;
+        cerr << "Usage: " << argv[0] << " input.lhe output.hepmc [nEvents] [minMuonPt] [maxMuonEta] [maxRetry] [rngSeed]" << endl;
         cerr << "\nArguments:" << endl;
         cerr << "  input.lhe   : Input LHE file" << endl;
         cerr << "  output.hepmc: Output HepMC file" << endl;
@@ -112,6 +114,7 @@ int main(int argc, char* argv[]) {
         cerr << "  minMuonPt   : Minimum muon pT in GeV (default: 2.5)" << endl;
         cerr << "  maxMuonEta  : Maximum muon |eta| (default: 2.4)" << endl;
         cerr << "  maxRetry    : Maximum hadronization retries (default: 100)" << endl;
+        cerr << "  rngSeed     : Optional Pythia RNG seed" << endl;
         return 1;
     }
     
@@ -121,18 +124,31 @@ int main(int argc, char* argv[]) {
     double minMuonPt = (argc > 4) ? atof(argv[4]) : 2.5;
     double maxMuonEta = (argc > 5) ? atof(argv[5]) : 2.4;
     int maxRetry = (argc > 6) ? atoi(argv[6]) : 1000;
+    int rngSeed = (argc > 7) ? atoi(argv[7]) : 0;
+    int targetOutputEvents = (argc > 8) ? atoi(argv[8]) : nEvents;
+    string manifestFile = (argc > 9) ? argv[9] : "";
     
     cout << "\n=== Pythia8 Standard Shower Processing ===" << endl;
     cout << "Input LHE:    " << inputFile << endl;
     cout << "Output HepMC: " << outputFile << endl;
     cout << "Events:       " << (nEvents > 0 ? to_string(nEvents) : "all") << endl;
+    cout << "Target output:" << (targetOutputEvents > 0 ? to_string(targetOutputEvents) : "all") << endl;
     cout << "Min muon pT:  " << minMuonPt << " GeV (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max muon eta: " << maxMuonEta << " (legacy arg, standard 模式不做筛选)" << endl;
     cout << "Max retries:  " << maxRetry << " (legacy arg, standard 模式不使用)" << endl;
+    cout << "RNG seed:     " << (rngSeed > 0 ? to_string(rngSeed) : "Pythia default") << endl;
+    if (!manifestFile.empty()) {
+        cout << "Manifest:     " << manifestFile << endl;
+    }
     cout << "==========================================\n" << endl;
     
     // Initialize Pythia
     Pythia pythia;
+
+    if (rngSeed > 0) {
+        pythia.readString("Random:setSeed = on");
+        pythia.readString("Random:seed = " + to_string(rngSeed));
+    }
 
     auto setFlagIfExists = [&](const string& name, bool value) {
         if (pythia.settings.isFlag(name)) {
@@ -292,13 +308,14 @@ int main(int argc, char* argv[]) {
     // Statistics
     int iEvent = 0;
     int iAbort = 0;
-    int maxAbort = 10;
     int successEvents = 0;
     int failedEvents = 0;
+    auto wallStart = chrono::steady_clock::now();
     
     cout << "Starting event processing..." << endl;
     
     while (true) {
+        if (targetOutputEvents > 0 && successEvents >= targetOutputEvents) break;
         if (nEvents > 0 && iEvent >= nEvents) break;
         
         // standard 模式直接执行完整 shower + hadronization。
@@ -307,9 +324,13 @@ int main(int argc, char* argv[]) {
                 cout << "Reached end of LHE file." << endl;
                 break;
             }
-            if (++iAbort < maxAbort) continue;
-            cout << "Event generation aborted prematurely!" << endl;
-            break;
+            ++iEvent;
+            ++iAbort;
+            ++failedEvents;
+            // A failed LHE record is recoverable.  Keep consuming the bounded
+            // input budget so a handful of Pythia failures cannot masquerade
+            // as exhaustion of the normal source.
+            continue;
         }
         
         successEvents++;
@@ -324,6 +345,8 @@ int main(int argc, char* argv[]) {
     }
     
     pythia.stat();
+    auto wallEnd = chrono::steady_clock::now();
+    double wallSeconds = chrono::duration<double>(wallEnd - wallStart).count();
     
     cout << "\n======================================================" << endl;
     cout << "Processing Summary:" << endl;
@@ -335,6 +358,37 @@ int main(int argc, char* argv[]) {
     cout << "Average retries per event:  1 (standard 模式不重试)" << endl;
     cout << "Output file: " << outputFile << endl;
     cout << "======================================================" << endl;
+
+    if (!manifestFile.empty()) {
+        double completion = targetOutputEvents > 0
+            ? static_cast<double>(successEvents) / max(1, targetOutputEvents)
+            : 1.0;
+        ofstream manifest(manifestFile);
+        if (!manifest.is_open()) {
+            cerr << "Failed to write manifest: " << manifestFile << endl;
+            return 1;
+        }
+        manifest << "{\n"
+                 << "  \"mode\": \"normal\",\n"
+                 << "  \"target_events\": " << targetOutputEvents << ",\n"
+                 << "  \"input_budget\": " << nEvents << ",\n"
+                 << "  \"consumed_lhe_events\": " << iEvent << ",\n"
+                 << "  \"pythia_next_failures\": " << iAbort << ",\n"
+                 << "  \"attempted_lhe_events\": " << iEvent << ",\n"
+                 << "  \"successful_pythia_events\": " << successEvents << ",\n"
+                 << "  \"accepted_hepmc_events\": " << successEvents << ",\n"
+                 << "  \"actual_hepmc_events\": " << successEvents << ",\n"
+                 << "  \"failed_phi_selections\": 0,\n"
+                 << "  \"total_hadronization_retries\": 0,\n"
+                 << "  \"average_retries_per_accepted_event\": 0,\n"
+                 << "  \"average_retries_per_attempted_event\": 0,\n"
+                 << "  \"wall_time_seconds\": " << wallSeconds << ",\n"
+                 << "  \"completion_fraction\": " << completion << ",\n"
+                 << "  \"complete\": " << (targetOutputEvents > 0 && successEvents >= targetOutputEvents ? "true" : "false") << ",\n"
+                 << "  \"status\": \"" << (successEvents > 0 ? (targetOutputEvents > 0 && successEvents >= targetOutputEvents ? "ok" : "partial") : "failed") << "\",\n"
+                 << "  \"output_file\": \"" << outputFile << "\"\n"
+                 << "}\n";
+    }
     
     return 0;
 }

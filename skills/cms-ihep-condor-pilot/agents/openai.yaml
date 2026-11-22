@@ -1,0 +1,4 @@
+interface:
+  display_name: "CMS IHEP Condor Pilot"
+  short_description: "Build and validate T2_CN_Beijing pilots"
+  default_prompt: "Use $cms-ihep-condor-pilot to generate, submit, and validate a representative Full_MC_Production pilot."

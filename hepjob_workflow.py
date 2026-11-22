@@ -9,6 +9,7 @@ bash 作业脚本，并提供自动化编排器（提交 LHE → 等待 → 提�
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from common.compression_util import accepts_lhe_ext
 from dag_generator import (
     BASE_DIR,
     BUNDLE_NAMES,
@@ -43,11 +45,15 @@ from dag_generator import (
     scan_existing_pools,
     validate_efficiency_campaigns,
     write_ntuple_manifest,
+    HELAC_DIAGNOSTICS_MODES,
 )
 
-WORKFS2_BASE = "/workfs2/cms/chengxing/Full_MC_Production"
-SCRATCHFS_BASE = "/scratchfs/cms/chengxing"
-WORKFLOW_BASE = os.path.join(SCRATCHFS_BASE, "hepjob")
+IHEP_USER = os.environ.get("IHEP_USER") or os.environ.get("USER") or getpass.getuser()
+WORKFS2_BASE = os.environ.get(
+    "WORKFS2_BASE", f"/workfs2/cms/{IHEP_USER}/Full_MC_Production"
+)
+SCRATCHFS_BASE = os.environ.get("SCRATCHFS_BASE", f"/scratchfs2/cms/{IHEP_USER}")
+WORKFLOW_BASE = os.environ.get("WORKFLOW_BASE", os.path.join(SCRATCHFS_BASE, "hepjob"))
 LOG_BASE = os.path.join(WORKFLOW_BASE, "logs")
 
 CONTAINER_IMAGES = {
@@ -83,6 +89,14 @@ def generate_lhe_job_script(
     bundle_dir: str,
     lhe_bundle_name: str,
     proxy_bundle_name: str,
+    compress_lhe: bool = False,
+    lhe_compression_level: int = 1,
+    lhe_shuffle_split: bool = False,
+    lhe_events_per_block: int = 1000,
+    lhe_shuffle_mode: str = "stratified",
+    lhe_n_strata: str = "auto",
+    lhe_drop_incomplete_last_block: bool = False,
+    helac_diagnostics: str = "legacy",
 ) -> str:
     """生成单个 LHE 生成作业的 bash 脚本内容。
     使用 cmssw-el7 容器运行 HELAC-Onia（提供 gfortran + LCG 环境）。
@@ -92,6 +106,25 @@ def generate_lhe_job_script(
     test_str = bool_str(test_mode)
     work_dir = f"{bundle_dir}/lhe_{pool_name}_{index}"
     proxy_path = f"{work_dir}/credentials/x509_user_proxy"
+    compress_args = ""
+    if compress_lhe:
+        compress_args = f" --compress-lhe --lhe-compression-level {lhe_compression_level}"
+    if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "helac_diagnostics must be one of "
+            + ", ".join(HELAC_DIAGNOSTICS_MODES)
+        )
+    diagnostics_args = f" --helac-diagnostics {helac_diagnostics}"
+    shuffle_args = ""
+    if lhe_shuffle_split:
+        shuffle_args = (
+            f" --lhe-shuffle-split"
+            f" --lhe-events-per-block {lhe_events_per_block}"
+            f" --lhe-shuffle-mode {lhe_shuffle_mode}"
+            f" --lhe-n-strata {lhe_n_strata}"
+        )
+        if lhe_drop_incomplete_last_block:
+            shuffle_args += " --lhe-drop-incomplete-last-block"
 
     return _LHE_SCRIPT_TEMPLATE.format(
         pool_name=pool_name,
@@ -107,6 +140,9 @@ def generate_lhe_job_script(
         test_str=test_str,
         work_dir=work_dir,
         proxy_path=proxy_path,
+        compress_args=compress_args,
+        shuffle_args=shuffle_args,
+        diagnostics_args=diagnostics_args,
     )
 
 
@@ -147,7 +183,7 @@ bash run_helac.sh \\
     --min-pt-bonia {min_pt_bonia} \\
     --min-pt-q {min_pt_q} \\
     --unwevt {unwevt} \\
-    --test-mode {test_str}
+    --test-mode {test_str}{diagnostics_args}{compress_args}{shuffle_args}
 INNER_EOF
 chmod +x "${{WORK_DIR}}/run_inside.sh"
 
@@ -521,6 +557,7 @@ set -euo pipefail
 source ~/.bashrc 2>/dev/null || true
 
 LOG_DIR="{logs_dir}"
+HEPJOB_USER="${{HEPJOB_USER:-$(id -un)}}"
 mkdir -p "${{LOG_DIR}}"
 
 echo "============================================"
@@ -542,7 +579,9 @@ WAITED=0
 
 while [ $WAITED -lt $MAX_WAIT ]; do
     source ~/.bashrc 2>/dev/null || true
-    ACTIVE=$(hep_q -u chengxing 2>/dev/null | tail -1 | grep -oP '\d+ idle' | grep -oP '\d+' || echo "0")
+    ACTIVE=$(hep_q -u "${{HEPJOB_USER}}" 2>/dev/null | tail -1 \\
+        | grep -oP '\\d+ (?:idle|running|run|held)' \\
+        | awk '{{sum += $1}} END {{print sum+0}}' || echo "0")
 
     if [ "${{ACTIVE:-0}}" -eq 0 ]; then
         echo "All LHE jobs completed (no active jobs)"
@@ -555,12 +594,13 @@ while [ $WAITED -lt $MAX_WAIT ]; do
 done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
-    echo "WARNING: LHE job wait timeout reached"
+    echo "ERROR: LHE job wait timeout reached; active jobs remain" >&2
+    exit 4
 fi
 
 echo "Current job status:"
 source ~/.bashrc 2>/dev/null || true
-hep_q -u chengxing 2>/dev/null || echo "  (no active jobs)"
+hep_q -u "${{HEPJOB_USER}}" 2>/dev/null || echo "  (no active jobs)"
 
 # Phase 3: Submit processing jobs
 echo ""
@@ -572,7 +612,7 @@ echo "============================================"
 echo "Workflow submitted successfully"
 echo "============================================"
 echo ""
-echo "Monitor with: source ~/.bashrc && hep_q -u chengxing"
+echo "Monitor with: source ~/.bashrc && hep_q -u ${{HEPJOB_USER}}"
 echo "Check logs: ${{LOG_DIR}}"
 echo "End: $(date)"
 '''
@@ -596,6 +636,7 @@ class HepJobBuilder:
         force_generate_lhe: bool,
         proxy_path: str,
         lhe_unwevt: Optional[int],
+        helac_diagnostics: str = "legacy",
         hep_group: str = "cms",
         walltime: str = "test",
     ):
@@ -611,6 +652,12 @@ class HepJobBuilder:
         self.force_generate_lhe = force_generate_lhe
         self.proxy_path = proxy_path
         self.lhe_unwevt = lhe_unwevt
+        if helac_diagnostics not in HELAC_DIAGNOSTICS_MODES:
+            raise ValueError(
+                "helac_diagnostics must be one of "
+                + ", ".join(HELAC_DIAGNOSTICS_MODES)
+            )
+        self.helac_diagnostics = helac_diagnostics
         self.hep_group = hep_group
         self.walltime = walltime
 
@@ -682,6 +729,7 @@ class HepJobBuilder:
                     pool_name, index, seed,
                     self.resolved_lhe_unwevt(), self.test_mode,
                     self.bundle_dir, lhe_bundle_name, proxy_bundle_name,
+                    helac_diagnostics=self.helac_diagnostics,
                 )
                 write_job_script(script_path, content)
                 lhe_scripts.append(script_path)
@@ -767,6 +815,7 @@ class HepJobBuilder:
             ("efficiency_ntuple", self.efficiency_ntuple),
             ("shuffle_mixing", self.shuffle_mixing),
             ("test_mode", self.test_mode),
+            ("helac_diagnostics", self.helac_diagnostics),
             (
                 "ntuple_manifest",
                 build_ntuple_manifest(campaign_names, self.jobs_per_campaign)
@@ -816,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_parser.add_argument("--max-events", type=int, default=-1, help="每个 job 的事件数，-1 表示全部。")
     generate_parser.add_argument("--lhe-unwevt", type=int, default=None, help="LHE 节点的 unwevt。")
+    generate_parser.add_argument(
+        "--helac-diagnostics", choices=HELAC_DIAGNOSTICS_MODES, default="legacy",
+        help="HELAC post-job diagnostics mode.",
+    )
     generate_parser.add_argument(
         "--enable-ntuple", dest="enable_ntuple", action="store_true", default=False,
         help="启用 Ntuple 步骤。",
@@ -877,6 +930,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出目录（默认: 自动生成时间戳目录）。",
     )
     test_parser.add_argument("--max-events", type=int, default=5, help="每个 job 的事件数。")
+    test_parser.add_argument(
+        "--helac-diagnostics", choices=HELAC_DIAGNOSTICS_MODES, default="legacy",
+        help="HELAC post-job diagnostics mode.",
+    )
     test_parser.add_argument(
         "--enable-ntuple", dest="enable_ntuple", action="store_true", default=False,
         help="测试 workflow 中启用 Ntuple 步骤。",
@@ -981,6 +1038,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scan_existing = args.scan_existing if hasattr(args, "scan_existing") else True
         force_generate_lhe = args.force_generate_lhe if hasattr(args, "force_generate_lhe") else False
         lhe_unwevt = args.lhe_unwevt if hasattr(args, "lhe_unwevt") else None
+        helac_diagnostics = args.helac_diagnostics
         hep_group = args.group
         walltime = args.walltime if hasattr(args, "walltime") else "test"
 
@@ -992,6 +1050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Efficiency ntuple: {efficiency_ntuple}")
         print(f"Shuffle mixing: {shuffle_mixing}")
         print(f"测试模式: {test_mode}")
+        print(f"HELAC diagnostics: {helac_diagnostics}")
         print(f"输出目录: {output_dir}")
         print()
 
@@ -1008,6 +1067,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_generate_lhe=force_generate_lhe,
             proxy_path=args.proxy_path,
             lhe_unwevt=lhe_unwevt,
+            helac_diagnostics=helac_diagnostics,
             hep_group=hep_group,
             walltime=walltime,
         )
