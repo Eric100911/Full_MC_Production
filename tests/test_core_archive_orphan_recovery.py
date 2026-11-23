@@ -18,19 +18,9 @@ class ArchiveOrphanRecoveryTests(ShardFixture):
     def prepare_archive(self, run):
         shards.prepare_source(run, 0)
         self.source_plan(run)
-        shards.prepare_shard(run, "C", 0)
-        self.mix_result(run, "MIX_C_JOB000000_BLOCK000000")
-        descriptor = read_json(shards._manifest_path(run, "SHARD_C_000000"))
-        for task in descriptor["tasks"]:
-            if task["stage"] == "miniaod":
-                output = dict(task["outputs"][0], size_bytes=100, events=1,
-                              expected_events=1, partial=False,
-                              detector_profile=task["parameters"]["detector_profile"],
-                              detector_profile_id=task["parameters"]["detector_profile_id"],
-                              count_source="edmFileUtil")
-                self.accepted(run, task["task_id"], outputs=[output], partial=False)
-        return next(task["task_id"] for task in descriptor["tasks"]
-                    if task["stage"] == "archive")
+        identity = "SOURCE_ARCHIVE_000000"
+        shards.prepare_source_product(run, identity)
+        return identity
 
     def make_orphan(self, run, *, current_change=None, receipt_change=None):
         identity = self.prepare_archive(run)
@@ -44,7 +34,7 @@ class ArchiveOrphanRecoveryTests(ShardFixture):
         outcome = dict(task_id=identity, stage="archive", status="ok",
                        runtime_release="test-release", outputs=[output], members=members)
         orphan = deepcopy(outcome)
-        orphan["outputs"][0]["local_path"] = "/scratch/worker-b/upstream.tar"
+        orphan["outputs"][0].pop("local_path")
         if receipt_change:
             receipt_change(orphan)
         if current_change:
@@ -101,18 +91,8 @@ class ArchiveOrphanRecoveryTests(ShardFixture):
             shards.prepare_source(run, 0)
             self.source_plan(run)
             shards.prepare_shard(run, "C", 0)
-            identity = "MIX_C_JOB000000_BLOCK000000"
+            identity = "PROCESS_C_JOB000000_BLOCK000000"
             with self.assertRaisesRegex(ValueError, "only accepts archive"):
-                shards.recover_archive_orphan(run, identity, confirm_no_active_writer=True)
-
-    def test_rejects_persisted_settlement_contradiction(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            run = self.fixture(directory)
-            identity, _, _, _, _ = self.make_orphan(run)
-            state = read_json(run / "state.json")
-            state["staging"]["settled_publications"][identity] = []
-            atomic_json(run / "state.json", state)
-            with self.assertRaisesRegex(RuntimeError, "contradictory persisted settlement"):
                 shards.recover_archive_orphan(run, identity, confirm_no_active_writer=True)
 
     def test_cli_routes_narrow_recovery_action(self):

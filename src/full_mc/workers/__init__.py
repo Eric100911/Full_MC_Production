@@ -6,7 +6,7 @@ from full_mc.settings import LOG_LEVELS
 from full_mc.storage.transfer import TransferClient, validated_record
 from ._common import expected_runtime
 
-_HYDRATE_ALL = {"miniaod", "merge", "ntuple", "selection", "efficiency"}
+_HYDRATE_ALL = {"merge", "ntuple", "selection", "efficiency"}
 
 
 def _hydrate_inputs(task):
@@ -14,12 +14,6 @@ def _hydrate_inputs(task):
     refs = task.get("inputs", [])
     if stage == "plan":
         selected = [ref for ref in refs if "events" not in ref]
-    elif stage == "archive":
-        # MIX creates HepMC after planning, so its frozen reference may not yet
-        # contain the published byte size. Retained original LHE references
-        # use the PLAN result's authoritative size and do not share this
-        # producer-sidecar contract.
-        selected = [ref for ref in refs if ref.get("kind") == "hepmc"]
     elif stage in _HYDRATE_ALL:
         selected = list(refs)
     else:
@@ -39,7 +33,7 @@ def _hydrate_inputs(task):
 
 def execute_task(task, work_dir):
     stage = task.get("stage")
-    if stage not in STAGE_RUNTIME:
+    if stage not in STAGE_RUNTIME or stage in {"mix", "miniaod"}:
         raise ValueError(f"unknown worker stage: {stage}")
     required_runtime = expected_runtime(task)
     if task.get("runtime") != required_runtime:

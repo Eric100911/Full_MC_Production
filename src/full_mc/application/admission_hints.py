@@ -23,9 +23,7 @@ def enabled():
 
 
 def _path(root):
-    root = Path(root)
-    directory = "ledger" if (root / "ledger/state.lock").is_file() else "staging"
-    return root / directory / "admission-hints.json"
+    return Path(root) / "ledger/admission-hints.json"
 
 
 def _nonnegative_integer(value):

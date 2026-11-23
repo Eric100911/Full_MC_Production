@@ -29,8 +29,8 @@ class ControlTransactionTests(unittest.TestCase):
 
     def assert_deferred_without_commit(self, operation, run, expected_reason):
         before = (run / "state.json").read_bytes()
-        original_check, original_serialize = staging._check, staging._serialize
-        with patch.object(staging, "_check", wraps=original_check) as check, \
+        original_check, original_serialize = staging._check_inventory_segments, staging._serialize
+        with patch.object(staging, "_check_inventory_segments", wraps=original_check) as check, \
                 patch.object(staging, "_serialize",
                              wraps=original_serialize) as serialize:
             results = [operation() for _ in range(3)]
@@ -64,36 +64,8 @@ class ControlTransactionTests(unittest.TestCase):
         _, run = self.temporary_run()
         self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
         self.assert_deferred_without_commit(
-            lambda: shards.admit_producer(run, "SOURCE_ARCHIVE_000000"), run,
+            lambda: shards.prepare_source_product(run, "SOURCE_ARCHIVE_000000"), run,
             "no accepted PLAN result")
-
-    def test_capacity_reject_repeats_without_changing_claim_budget(self):
-        _, run = self.temporary_run()
-        self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
-        ShardFixture().source_plan(run)
-        self.assertEqual(shards.prepare_shard(run, "C", 0)["exit_code"], 0)
-        descriptor = read_json(shards._manifest_path(run, "SHARD_C_000000"))
-        mix = next(task for task in descriptor["tasks"] if task["stage"] == "mix")
-        with staging.transaction(run) as state:
-            account = state["staging"]
-            account["usable_bytes"] = (
-                account["resident_bytes"] + sum(account["claims"].values()))
-        before = (run / "state.json").read_bytes()
-        original_check, original_serialize = staging._check, staging._serialize
-        with patch.object(staging, "_check", wraps=original_check) as check, \
-                patch.object(staging, "_serialize",
-                             wraps=original_serialize) as serialize:
-            pre = [shards.admit_producer(run, mix["task_id"]) for _ in range(3)]
-        self.assertEqual([result["exit_code"] for result in pre], [75, 75, 75])
-        self.assertEqual(check.call_count, 6)  # Entry plus reserve helper per attempt.
-        self.assertEqual(serialize.call_count, 0)
-        self.assertEqual((run / "state.json").read_bytes(), before)
-        post = shards.accept_result(run, mix["task_id"], 75)
-        self.assertEqual(post["exit_code"], 1)
-        self.assertEqual(post["worker_return_code"], 75)
-        self.assertEqual((run / "state.json").read_bytes(), before)
-        account = read_json(run / "state.json")["staging"]
-        self.assertNotIn(mix["task_id"], account["claims"])
 
     def test_source_target_hint_deferral_still_commits_mutation(self):
         _, run = self.temporary_run()
@@ -116,14 +88,14 @@ class ControlTransactionTests(unittest.TestCase):
     def test_non_lock_blocking_io_error_is_not_reported_as_lock_busy(self):
         _, run = self.temporary_run()
         with patch.object(
-                staging, "_check",
+                staging, "_check_inventory_segments",
                 side_effect=BlockingIOError("synthetic read fault")):
             with self.assertRaisesRegex(BlockingIOError, "synthetic read fault"):
                 shards.prepare_shard(run, "C", 0)
 
     def test_actual_nonblocking_flock_contention_is_reported_as_busy(self):
         _, run = self.temporary_run()
-        with (run / "staging/ledger.lock").open("r+b") as lock:
+        with (run / "ledger/state.lock").open("r+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = shards.prepare_shard(run, "C", 0)
         self.assertEqual(result["exit_code"], 75)
@@ -132,41 +104,26 @@ class ControlTransactionTests(unittest.TestCase):
     def test_post_retries_real_lock_busy_then_accepts_once(self):
         _, run = self.temporary_run()
         self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
-        ShardFixture().source_plan(run)
-        self.assertEqual(shards.prepare_shard(run, "C", 0)["exit_code"], 0)
-        descriptor = read_json(shards._manifest_path(run, "SHARD_C_000000"))
-        task = next(task for task in descriptor["tasks"] if task["stage"] == "mix")
-        identity = task["task_id"]
-        self.assertEqual(shards.admit_producer(run, identity)["exit_code"], 0)
-
-        output = dict(task["outputs"][0], size_bytes=64, sidecar_size_bytes=17,
-                      events=task["parameters"]["target_mixed_events"])
-        outcome = dict(task_id=identity, stage="mix", status="ok",
-                       runtime_release="test-release", outputs=[output],
-                       staged_objects=[
-                           {key: output[key] for key in
-                            ("artifact_id", "url", "kind", "size_bytes")},
-                           {"artifact_id": output["artifact_id"] + ":sidecar",
-                            "url": output["sidecar_url"], "kind": "sidecar",
-                            "size_bytes": output["sidecar_size_bytes"]},
-                       ])
+        identity = "PLAN_000000"
+        p = read_json(record_path(run, "tasks", identity))["parameters"]
+        output = dict(artifact_id="BLOCK:pool:s1:000000", kind="lhe-block", events=5,
+                      url=p["block_output_dir"] + "/block_s1_000000.lhe.gz", size_bytes=20)
+        outcome = dict(task_id=identity, stage="plan", status="ok", runtime_release="test-release",
+                       outputs=[output], originals=[dict(p["original_output"], events=40, size_bytes=100)],
+                       actual_input_events=40, planned_events=5)
         atomic_json(record_path(run, "results", identity), outcome)
 
         before = (run / "state.json").read_bytes()
-        state_before = read_json(run / "state.json")
-        claim = state_before["staging"]["claims"][identity]
         receipt = shards._receipt_path(run, identity)
         self.assertFalse(receipt.exists())
 
-        with (run / "staging/ledger.lock").open("r+b") as lock:
+        with (run / "ledger/state.lock").open("r+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy = [shards.accept_result(run, identity, 0) for _ in range(3)]
             self.assertEqual([result["exit_code"] for result in busy], [75, 75, 75])
             self.assertTrue(all(result["reason"] == "local state lock busy"
                                 for result in busy))
             self.assertEqual((run / "state.json").read_bytes(), before)
-            self.assertEqual(read_json(run / "state.json")["staging"]["claims"][identity],
-                             claim)
             self.assertFalse(receipt.exists())
 
             worker_failure = shards.accept_result(run, identity, 75)
@@ -179,12 +136,7 @@ class ControlTransactionTests(unittest.TestCase):
         self.assertEqual(accepted, {"exit_code": 0, "status": "accepted"})
         accepted_state_bytes = (run / "state.json").read_bytes()
         accepted_state = read_json(run / "state.json")
-        self.assertEqual(accepted_state["accepted"][identity], {"stage": "mix"})
-        self.assertNotIn(identity, accepted_state["staging"]["claims"])
-        self.assertEqual(accepted_state["staging"]["resident_bytes"],
-                         state_before["staging"]["resident_bytes"] + 64 + 17)
-        self.assertEqual(accepted_state["staging"]["settled_publications"][identity],
-                         outcome["staged_objects"])
+        self.assertEqual(accepted_state["accepted"][identity], {"stage": "plan"})
         self.assertEqual(read_json(receipt), outcome)
         receipt_bytes = receipt.read_bytes()
 
@@ -192,8 +144,7 @@ class ControlTransactionTests(unittest.TestCase):
         self.assertEqual(duplicate, {"exit_code": 0, "status": "accepted"})
         self.assertEqual((run / "state.json").read_bytes(), accepted_state_bytes)
         self.assertEqual(receipt.read_bytes(), receipt_bytes)
-        self.assertEqual(read_json(run / "state.json")["staging"]["resident_bytes"],
-                         state_before["staging"]["resident_bytes"] + 64 + 17)
+        self.assertEqual(accepted_state["planner"]["inventory_segments"]["pools"]["pool"], [identity])
 
 
 if __name__ == "__main__":

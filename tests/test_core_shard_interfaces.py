@@ -11,7 +11,7 @@ from full_mc.application.handoff import export_handoff
 from full_mc.application.site_validation import REQUIRED_CHECKS, validate_site
 from full_mc.backends.condor import resume_run, submit_run
 from full_mc.cli import build_parser, main
-from full_mc.domain.streams import may_still_need
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json
 from full_mc.settings import load_run_spec
 
@@ -37,11 +37,6 @@ def fixture_spec():
 
 
 class ShardInterfaces(unittest.TestCase):
-    def test_cleanup_cannot_substitute_allocation_for_missing_safe_cursor(self):
-        with self.assertRaisesRegex(ValueError, "safe_cursor"):
-            may_still_need(10, {"stride": 1, "offset": 0, "allocation_cursor": 20,
-                                "closed": False})
-
     def test_opt_in_settings_and_stream_validation(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "spec.json"
@@ -56,15 +51,17 @@ class ShardInterfaces(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_run_spec(path)
 
-    def test_legacy_spec_does_not_acquire_new_requirements(self):
+    def test_omitted_or_wave_orchestration_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "spec.json"
             raw = fixture_spec()
             del raw["orchestration"]
-            atomic_json(path, raw)
-            spec = load_run_spec(path)
-            self.assertNotIn("shard_nodes", spec["limits"])
-            validate_site(spec)
+            for mode in (None, "waves"):
+                if mode is not None:
+                    raw["orchestration"] = mode
+                atomic_json(path, raw)
+                with self.assertRaisesRegex(ValueError, "explicitly declare.*campaign_shards"):
+                    load_run_spec(path)
 
     def test_invalid_new_window_and_modes_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -78,6 +75,16 @@ class ShardInterfaces(unittest.TestCase):
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     load_run_spec(path)
 
+    def test_retired_commands_are_absent(self):
+        parser = build_parser()
+        for argv in (["internal", "advance-wave"], ["internal", "admit-producer"],
+                     ["inventory", "migrate-v2"], ["inventory", "rollback-v2"],
+                     ["controller", "activate"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    parser.parse_args(argv)
+                self.assertEqual(result.exception.code, 2)
+
     def test_internal_parser_and_script_exit_codes(self):
         args = build_parser().parse_args([
             "internal", "complete-shard", "--run-dir", "/tmp/chiw/run",
@@ -89,16 +96,17 @@ class ShardInterfaces(unittest.TestCase):
                     self.assertEqual(main(["internal", "prepare-source", "--run-dir",
                                            "/tmp/chiw/run", "--source-index", "0"]), code)
 
-    def test_live_entrypoints_hold_before_any_external_call(self):
+    def test_legacy_run_rejected_before_any_external_call(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             atomic_json(root / "run.json", fixture_spec())
+            atomic_json(root / "state.json", {"state_schema": FUSED_STATE_SCHEMA})
             (root / "run.dag").write_text("# not submitted\n")
             runner = Mock(side_effect=AssertionError("must not contact Condor"))
             with patch("full_mc.backends.condor.reserve_run_namespaces") as reserve:
                 for operation in (submit_run, resume_run):
                     with self.subTest(operation=operation.__name__), self.assertRaisesRegex(
-                            RuntimeError, "isolated staging budget"):
+                            ValueError, "Use the frozen runtime"):
                         operation(root, runner=runner)
                 reserve.assert_not_called()
             runner.assert_not_called()
@@ -112,7 +120,7 @@ class ShardInterfaces(unittest.TestCase):
             proof_path = root / "proof.json"
             proof = {"schema": "cern-afs-lock-proof-v1", "schedds": ["test-a", "test-b"],
                      "checks": dict.fromkeys(REQUIRED_CHECKS, True), "evidence": [str(evidence)]}
-            spec = fixture_spec()
+            spec = dict(fixture_spec(), state_schema=FUSED_STATE_SCHEMA)
             spec["site_validation"] = {"isolated_budget_bytes": 9000, "proof_path": str(proof_path)}
             atomic_json(proof_path, proof)
             validate_site(spec)
@@ -130,9 +138,10 @@ class ShardInterfaces(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spec = fixture_spec()
+            spec["state_schema"] = FUSED_STATE_SCHEMA
             spec["campaigns"] = []
             atomic_json(root / "run.json", spec)
-            state = {"state_schema": "mcprod-shard-state-v1", "status": "planned",
+            state = {"state_schema": FUSED_STATE_SCHEMA, "status": "planned",
                      "merge_group_counts": {}}
             atomic_json(root / "state.json", state)
             with self.assertRaisesRegex(RuntimeError, "completed run"):

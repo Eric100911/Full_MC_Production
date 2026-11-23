@@ -60,6 +60,9 @@ def _run_paths(run_dir: str | Path) -> tuple[Path, Path, Path]:
         raise FileNotFoundError("missing DAG: %s" % dag)
     if not spec.is_file():
         raise FileNotFoundError("missing run specification: %s" % spec)
+    from full_mc.application.staging import require_schema
+    require_schema(_read_json(spec))
+    require_schema(_read_json(root / "state.json"))
     return root, dag, spec
 
 

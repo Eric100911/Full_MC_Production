@@ -9,35 +9,16 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.application import shards, staging
 from full_mc.io import atomic_json, read_json
-from full_mc.domain.streams import build_streams
-from full_mc.local_paths import LAYOUT_MARKER, record_path
-from full_mc.planning.graph import write_submit_files
-from full_mc.settings import load_run_spec
-from full_mc.planning.shards import child_path, write_root_dag
+from full_mc.local_paths import record_path
+from full_mc.planning.shards import child_path
 from full_mc.planning.shards import shard_name, source_name, source_order
-from tests import test_core_production as legacy_tests
-from tests.test_core_production import remote_io_blocked
-
-
-def plan_legacy_fixture(spec_path, run):
-    """Create the frozen v1 layout exercised by the legacy recovery tests."""
-    spec = load_run_spec(spec_path)
-    spec["storage"].update(staging_bytes=100000, reserve_bytes=1000)
-    spec["core_root"] = str(Path(spec["runtime_dir"]) / "controller/core")
-    spec["core_revision"] = "deadbeef"
-    run.mkdir()
-    (run / LAYOUT_MARKER).touch()
-    atomic_json(run / "run.json", spec)
-    progress = {campaign["name"]: 0 for campaign in spec["campaigns"]}
-    staging.initialize(run, 99000, {"streams": build_streams(spec), "sources": {},
-                                    "assigned_progress": progress, "target_progress": dict(progress)})
-    write_submit_files(run, spec["core_root"], spec["runtime_dir"], "/afs/test/proxy")
-    write_root_dag(run, spec)
+from tests.mcprod_fixtures import run_spec_fixture
+from tests.mcprod_fixtures import remote_io_blocked
 
 
 class ShardFixture(unittest.TestCase):
     def fixture(self, directory, *, nodes=2, campaigns=2, disjoint_pools=False):
-        spec_path, run = legacy_tests.ProductionLifecycle().fixture(Path(directory))
+        spec_path, run = run_spec_fixture(Path(directory))
         spec = read_json(spec_path)
         spec["orchestration"] = "campaign_shards"
         spec["limits"]["shard_nodes"] = 1
@@ -50,7 +31,8 @@ class ShardFixture(unittest.TestCase):
             for slot in spec["campaigns"][1]["sources"]:
                 slot["pool"] = "q"
         atomic_json(spec_path, spec)
-        plan_legacy_fixture(spec_path, run)
+        with patch.object(shards, "resolve_proxy_path", return_value="/afs/test/proxy"):
+            shards.plan_run(spec_path, run)
         return run
 
     def task(self, run, identity):
@@ -72,12 +54,10 @@ class ShardFixture(unittest.TestCase):
         p = task["parameters"]
         original = dict(p["original_output"], events=40, size_bytes=100)
         outputs = [dict(artifact_id=f"BLOCK:{p['pool_name']}:{p['group_id']}:{i:06d}",
-                        url=p["block_output_dir"] + f"/block{i}.lhe.gz", kind="lhe-block",
+                        url=p["block_output_dir"] + f"/block_{p['group_id']}_{i:06d}.lhe.gz", kind="lhe-block",
                         events=5, size_bytes=20) for i in range(count)]
-        objects = [{k: r[k] for k in ("artifact_id", "url", "kind", "size_bytes")}
-                   for r in outputs + [original]]
         return self.accepted(run, identity, outputs=outputs, originals=[original],
-                             actual_input_events=40, planned_events=count * 5, staged_objects=objects)
+                             actual_input_events=40, planned_events=count * 5)
 
     def archive_result(self, run, identity):
         task = self.task(run, identity)
@@ -100,36 +80,11 @@ class ShardFixture(unittest.TestCase):
 
     def source_done(self, run, index=0):
         identity = f"SOURCE_ARCHIVE_{index:06d}"
-        self.assertEqual(shards.admit_producer(run, identity)["exit_code"], 0)
+        self.assertEqual(shards.prepare_source_product(run, identity)["exit_code"], 0)
         self.archive_result(run, identity)
+        shards.prepare_source_product(run, f"SOURCE_RECLAIM_{index:06d}")
         self.reclaim_result(run, f"SOURCE_RECLAIM_{index:06d}")
         self.assertEqual(shards.complete_source(run, index)["exit_code"], 0)
-
-    def mix_result(self, run, identity):
-        self.assertEqual(shards.admit_producer(run, identity)["exit_code"], 0)
-        task = self.task(run, identity)
-        output = dict(task["outputs"][0], size_bytes=64, sidecar_size_bytes=17,
-                      events=task["parameters"]["target_mixed_events"])
-        objects = [{k: output[k] for k in ("artifact_id", "url", "kind", "size_bytes")},
-                   dict(artifact_id=output["artifact_id"] + ":sidecar", url=output["sidecar_url"], kind="sidecar", size_bytes=17)]
-        return self.accepted(run, identity, outputs=[output], staged_objects=objects)
-
-    def finish_shard(self, run, campaign, index, *, mix=True):
-        descriptor = read_json(shards._manifest_path(run, shard_name(campaign, index)))
-        for task in descriptor["tasks"]:
-            identity = task["task_id"]
-            if task["stage"] == "mix":
-                if mix:
-                    self.mix_result(run, identity)
-            elif task["stage"] == "miniaod":
-                output = dict(task["outputs"][0], size_bytes=100, events=1, expected_events=1, partial=False, count_source="edmFileUtil")
-                self.accepted(run, identity, outputs=[output], partial=False)
-            elif task["stage"] == "archive":
-                self.archive_result(run, identity)
-            elif task["stage"] == "reclaim":
-                self.reclaim_result(run, identity)
-        return shards.complete_shard(run, campaign, index)
-
 
 class ShardGraphTests(ShardFixture):
     def test_root_is_finite_independent_and_explicitly_configured(self):
@@ -141,7 +96,7 @@ class ShardGraphTests(ShardFixture):
             for line in text.splitlines():
                 if line.startswith("PARENT") and " CHILD SHARD_" in line:
                     self.fail("shard has a root completion dependency")
-            self.assertEqual(text.count("JOB CLEANUP_pool_"), 6)
+            self.assertEqual(text.count("JOB CLEANUP_pool_"), 1)
             configured = read_json(run / "run.json")["scheduler"]["maxjobs"]
             for category in ("lhe_planning", "block_processing", "lhe_coordination"):
                 self.assertIn(f"MAXJOBS {category} {configured[category]}", text)
@@ -169,11 +124,10 @@ class ShardGraphTests(ShardFixture):
             self.assertIn("PARENT SOURCE_ARCHIVE_000000 CHILD SOURCE_RECLAIM_000000", source_dag)
             child = child_path(run, "SHARD_C_000000").read_text()
             self.assertIn("CONFIG " + str(run / "dagman.config"), child)
-            self.assertIn("SCRIPT DEFER 75 60 PRE MIX_C_", child)
-            self.assertNotIn("SCRIPT DEFER 75 60 PRE MINIAOD_", child)
-            self.assertIn("PARENT MINIAOD_", child)
+            self.assertIn("JOB PROCESS_C_", child)
+            self.assertNotIn(" PRE PROCESS_", child)
 
-    def test_assignment_retry_repairs_dag_and_keeps_inputs_seeds_and_claims(self):
+    def test_assignment_retry_repairs_dag_and_keeps_inputs_and_seeds(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
             run = self.fixture(directory)
             shards.prepare_source(run, 0)
@@ -187,11 +141,6 @@ class ShardGraphTests(ShardFixture):
             shards.prepare_shard(run, "C", 0)
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(manifest.read_bytes(), frozen)
-            mix = next(t for t in read_json(manifest)["tasks"] if t["stage"] == "mix")
-            shards.admit_producer(run, mix["task_id"])
-            state = read_json(run / "state.json")
-            shards.admit_producer(run, mix["task_id"])
-            self.assertEqual(read_json(run / "state.json")["staging"], state["staging"])
 
     def test_worker_failure_and_failed_child_never_commit_success(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
@@ -213,24 +162,17 @@ class ShardGraphTests(ShardFixture):
             shards.prepare_source(run, 0)
             self.assertFalse((record_path(run, "tasks", "SOURCE_ARCHIVE_000000")).exists())
             self.source_plan(run)
-            self.assertEqual(shards.admit_producer(run, "SOURCE_ARCHIVE_000000")["exit_code"], 0)
+            self.assertEqual(shards.prepare_source_product(run, "SOURCE_ARCHIVE_000000")["exit_code"], 0)
             task = self.task(run, "SOURCE_ARCHIVE_000000")
             self.assertEqual(task["inputs"][0]["events"], 40)
             self.assertEqual(task["inputs"][0]["size_bytes"], 100)
             self.assertNotIn("staging_claim_bytes", task["parameters"])
-            shards.admit_producer(run, "SOURCE_ARCHIVE_000000")
+            shards.prepare_source_product(run, "SOURCE_ARCHIVE_000000")
 
 
 class ShardAcceptanceTests(ShardFixture):
-    def test_independent_pool_campaigns_do_not_reserve_each_others_complements(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            run = self.fixture(directory, disjoint_pools=True)
-            with staging.transaction(run) as state:
-                state["staging"]["usable_bytes"] = 3000
-            self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
 
-
-    def test_pool_prefix_is_frozen_despite_other_pool_and_source_completion_order(self):
+    def test_pool_inventory_follows_plan_acceptance_order(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
             run = self.fixture(directory)
             spec = read_json(run / "run.json")
@@ -238,20 +180,23 @@ class ShardAcceptanceTests(ShardFixture):
                                     dict(spec["sources"][0], source_id="s3", pool="q", seed=21)])
             self.assertEqual(source_order(spec), [0, 2, 1])
             state = read_json(run / "state.json")
+            segments = state["planner"]["inventory_segments"]["pools"]
+            segments["q"] = []
             for index in (1, 2, 0):
                 source = spec["sources"][index]
                 identity = f"PLAN_{index:06d}"
                 ref = dict(artifact_id=f"BLOCK:{source['pool']}:{source['source_id']}:000000",
                            url=f"root://stage.example///{index}.lhe.gz", kind="lhe-block", events=5, size_bytes=20)
                 state["accepted"][identity] = {"stage": "plan"}
+                segments[source["pool"]].append(identity)
                 atomic_json(shards._receipt_path(run, identity), {"outputs": [ref]})
                 if index == 2:
                     blocks, _, exhausted = shards._inventory(run, spec, state)
-                    self.assertEqual(blocks.get("pool", []), [])
+                    self.assertEqual([b.source_id for b in blocks["pool"]], ["s2"])
                     self.assertEqual([b.source_id for b in blocks["q"]], ["s3"])
                     self.assertIn("q", exhausted)
             blocks, _, _ = shards._inventory(run, spec, state)
-            self.assertEqual([(b.source_id, b.index) for b in blocks["pool"]], [("s1", 0), ("s2", 1)])
+            self.assertEqual([(b.source_id, b.index) for b in blocks["pool"]], [("s2", 0), ("s1", 1)])
 
     def test_lock_contention_defers_pre_and_post_without_partial_state(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
@@ -277,66 +222,27 @@ class ShardAcceptanceTests(ShardFixture):
                         dict(artifact_id="LHE_000000:sidecar", url=original["sidecar_url"], kind="sidecar", size_bytes=17)]
             self.accepted(run, "LHE_000000", outputs=[original], staged_objects=physical)
             plan = self.task(run, "PLAN_000000")
-            blocks = [dict(artifact_id=f"BLOCK:pool:s1:{i:06d}", url=plan["parameters"]["block_output_dir"] + f"/{i}.lhe.gz",
+            blocks = [dict(artifact_id=f"BLOCK:pool:s1:{i:06d}", url=plan["parameters"]["block_output_dir"] + f"/block_s1_{i:06d}.lhe.gz",
                            kind="lhe-block", events=5, size_bytes=20) for i in range(8)]
             retained = dict(original, events=41)
             outcome = dict(task_id="PLAN_000000", stage="plan", runtime_release="test-release", status="ok",
                            outputs=blocks, originals=[retained], actual_input_events=41, planned_events=40,
                            staged_objects=[{k: r[k] for k in ("artifact_id", "url", "kind", "size_bytes")} for r in blocks])
             atomic_json(record_path(run, "results", "PLAN_000000"), outcome)
-            before = read_json(run / "state.json")["staging"]
+            before = read_json(run / "state.json")
             with self.assertRaisesRegex(RuntimeError, "accepted LHE"):
                 shards.accept_result(run, "PLAN_000000")
-            self.assertEqual(read_json(run / "state.json")["staging"], before)
+            self.assertEqual(read_json(run / "state.json"), before)
             outcome.update(originals=[original], actual_input_events=40)
             atomic_json(record_path(run, "results", "PLAN_000000"), outcome)
             self.assertEqual(shards.accept_result(run, "PLAN_000000")["exit_code"], 0)
-            self.assertEqual(read_json(run / "state.json")["staging"]["resident_bytes"], 277)
-
-    def test_relocated_mixed_sidecar_is_rejected(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            run = self.fixture(directory)
-            shards.prepare_source(run, 0)
-            self.source_plan(run)
-            shards.prepare_shard(run, "C", 0)
-            identity = "MIX_C_JOB000000_BLOCK000000"
-            shards.admit_producer(run, identity)
-            output = dict(self.task(run, identity)["outputs"][0], size_bytes=64, events=1,
-                          sidecar_url="root://unowned.example///other.json", sidecar_size_bytes=17)
-            atomic_json(record_path(run, "results", identity), dict(
-                task_id=identity, stage="mix", runtime_release="test-release", status="ok", outputs=[output], staged_objects=[]))
-            with self.assertRaisesRegex(RuntimeError, "sidecar URL"):
-                shards.accept_result(run, identity)
-            self.assertNotIn(identity, read_json(run / "state.json")["accepted"])
-
-    def test_miniaod_requires_edm_count_and_frozen_detector_provenance(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            run = self.fixture(directory)
-            shards.prepare_source(run, 0)
-            self.source_plan(run)
-            shards.prepare_shard(run, "C", 0)
-            self.mix_result(run, "MIX_C_JOB000000_BLOCK000000")
-            descriptor = read_json(shards._manifest_path(run, "SHARD_C_000000"))
-            task = next(t for t in descriptor["tasks"] if t["stage"] == "miniaod")
-            output = dict(task["outputs"][0], size_bytes=100, events=1, expected_events=1, partial=False,
-                          count_source="filename")
-            outcome = dict(task_id=task["task_id"], stage="miniaod", runtime_release="test-release", status="ok",
-                           outputs=[output], partial=False)
-            path = record_path(run, "results", task["task_id"])
-            atomic_json(path, outcome)
-            with self.assertRaisesRegex(RuntimeError, "count or provenance"):
-                shards.accept_result(run, task["task_id"])
-            output["count_source"] = "edmFileUtil"
-            output["detector_profile"] = {"profile_id": "different"}
-            atomic_json(path, outcome)
-            with self.assertRaisesRegex(RuntimeError, "count or provenance"):
-                shards.accept_result(run, task["task_id"])
+            self.assertIn("PLAN_000000", read_json(run / "state.json")["accepted"])
 
     def test_distinct_oversized_blocks_refill_repeated_same_pool_slots(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
             run = self.fixture(directory, nodes=1, campaigns=1)
             spec = read_json(run / "run.json")
-            spec["sources"].append(dict(spec["sources"][0], source_id="s2", seed=20))
+            spec["sources"].append(dict(spec["sources"][0], source_id="s2", seed=20, actual_events=40))
             for slot in spec["campaigns"][0]["sources"]:
                 slot["lhe_budget"] = 1
             spec["block_events"] = 100
@@ -344,7 +250,7 @@ class ShardAcceptanceTests(ShardFixture):
             shards.prepare_source(run, 0)
             task = self.task(run, "PLAN_000000")
             original = dict(task["parameters"]["original_output"], events=40, size_bytes=100)
-            block = dict(artifact_id="BLOCK:pool:s1:000000", url=task["parameters"]["block_output_dir"] + "/block.lhe.gz",
+            block = dict(artifact_id="BLOCK:pool:s1:000000", url=task["parameters"]["block_output_dir"] + "/block_s1_000000.lhe.gz",
                          kind="lhe-block", events=40, size_bytes=20)
             refs = [original, block]
             self.accepted(run, "PLAN_000000", outputs=[block], originals=[original], actual_input_events=40, planned_events=40,
@@ -352,22 +258,6 @@ class ShardAcceptanceTests(ShardFixture):
             self.source_done(run)
             self.assertEqual(shards.prepare_shard(run, "C", 0)["exit_code"], 75)
             self.assertEqual(shards.prepare_source(run, 1)["exit_code"], 0)
-
-    def test_retained_inputs_cannot_endlessly_defer_when_nothing_can_free_bytes(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as directory:
-            run = self.fixture(directory)
-            spec = read_json(run / "run.json")
-            spec["sources"].append(dict(spec["sources"][0], source_id="s2", seed=20))
-            for campaign in spec["campaigns"]:
-                campaign["max_processing_nodes"] = 4
-            atomic_json(run / "run.json", spec)
-            shards.prepare_source(run, 0)
-            self.source_plan(run, count=1)
-            self.source_done(run)
-            with staging.transaction(run) as state:
-                state["staging"]["usable_bytes"] = 3000
-            with self.assertRaisesRegex(RuntimeError, "no admitted source, allocated shard or eligible cleanup"):
-                shards.prepare_source(run, 1)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from full_mc.planning.graph import write_submit_files, write_tasks_dag
+from full_mc.planning.graph import write_submit_files
+from full_mc.planning.shards import write_child_dag
 
 
 class LHEResourceDefaults(unittest.TestCase):
@@ -37,7 +38,7 @@ class LHEResourceDefaults(unittest.TestCase):
             scratch_bytes = 9 * 1024**3
             task = {"task_id": "LHE_000001", "stage": "lhe",
                     "parameters": {"scratch_bytes": scratch_bytes}}
-            dag = write_tasks_dag(root, 0, [task], [], {})
+            dag = write_child_dag(root, "SOURCE_000001", [task], [], {})
             vars_line = next(line for line in dag.read_text(encoding="utf-8").splitlines()
                              if line.startswith("VARS LHE_000001 "))
 

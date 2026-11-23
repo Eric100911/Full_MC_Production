@@ -87,8 +87,7 @@ def build_streams(spec: Any) -> dict[str, dict[str, Any]]:
         for pool in pools:
             key = stream_key(campaign, pool)
             stride, offset = overrides.get(key, (1, 0))
-            streams[key] = {"stride": stride, "offset": offset, "allocation_cursor": offset,
-                            "safe_cursor": offset, "closed": False}
+            streams[key] = {"stride": stride, "offset": offset, "allocation_cursor": offset}
     return streams
 
 
@@ -100,17 +99,6 @@ def next_matching(index: int, stream: Mapping[str, Any]) -> int:
         raise ValueError("stream.offset must be smaller than stride")
     index = _strict_int(index, "index")
     return index + ((offset - index) % stride)
-
-
-def may_still_need(index: int, stream: Mapping[str, Any]) -> bool:
-    """Whether an inventory index remains in the unconsumed stream suffix."""
-    if stream.get("closed", False):
-        return False
-    index = _strict_int(index, "index")
-    stride = _strict_int(stream.get("stride"), "stream.stride", minimum=1)
-    offset = _strict_int(stream.get("offset"), "stream.offset")
-    cursor = _strict_int(stream.get("safe_cursor"), "stream.safe_cursor")
-    return index >= cursor and (index - offset) % stride == 0
 
 
 def _stream_block(blocks: Sequence[SourceBlock], stream: Mapping[str, Any], cursor: int) -> SourceBlock | None:
@@ -146,9 +134,6 @@ def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mappi
         if stream["offset"] >= stream["stride"]:
             raise ValueError(f"{key}.offset must be smaller than stride")
         _strict_int(stream.get("allocation_cursor", 0), f"{key}.allocation_cursor")
-        _strict_int(stream.get("safe_cursor", 0), f"{key}.safe_cursor")
-        if stream.get("closed", False):
-            raise ValueError(f"consumption stream {key} is closed")
     max_nodes = min(node_limit, max(0, campaign.max_processing_nodes - start_job_index))
     starting = {keys[slot.pool]: streams[keys[slot.pool]]["allocation_cursor"] for slot in campaign.sources}
     cursors = dict(starting)

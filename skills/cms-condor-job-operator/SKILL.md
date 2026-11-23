@@ -53,7 +53,7 @@ For a normal status request, run one concise snapshot and return immediately:
 python3 tools/mcprod_snapshot.py --run <run-dir>
 ```
 
-For mcprod, this selects the unique attempt named by `submission.json`'s
+For v3 mcprod, this selects the unique attempt named by `submission.json`'s
 `current_attempt`, queries only that root cluster on its recorded schedd, and
 falls back to matching persistent DAGMan and ledger evidence after the root
 leaves the queue. Optional `--schedd` and `--cluster` arguments assert the

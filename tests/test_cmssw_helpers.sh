@@ -127,10 +127,10 @@ assert_line "runtime=" "${MOCK_SCRAM_LOG}"
 assert_line "project CMSSW CMSSW_15_0_15" "${MOCK_SCRAMV1_LOG}"
 
 bundle_dir="${TEST_ROOT}/bundle"
-python3 "${BASE_DIR}/dag_generator.py" prepare-runtime \
+"${BASE_DIR}/mcprod" runtime prepare --site cern --profile utilities-el9 --release helper-test \
     --output-dir "${bundle_dir}" >/dev/null
 
-bundle="${bundle_dir}/processing_runtime_bundle.tar.gz"
+bundle="${bundle_dir}/core.tar.gz"
 bundle_listing="${TEST_ROOT}/processing_bundle.list"
 tar -tzf "${bundle}" > "${bundle_listing}"
 for helper in \
@@ -139,7 +139,7 @@ for helper in \
     cmssw15_project_create.sh \
     cmssw15_project_rename.sh
 do
-    grep -Fqx "runtime/processing/cmssw_helpers/${helper}" "${bundle_listing}"
+    grep -Fqx "core/processing/cmssw_helpers/${helper}" "${bundle_listing}"
 done
 
 echo "CMSSW helper tests passed"

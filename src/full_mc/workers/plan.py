@@ -35,7 +35,7 @@ def build_command(task, work_dir, inputs):
 
 
 
-def _original_output(task, inputs, work_dir, deferred_uploads=None):
+def _original_output(task, inputs, work_dir):
     """Return the single retained original LHE reference, if requested.
 
     The splitter accepts multiple source inputs, but an inventory-original is a
@@ -69,10 +69,7 @@ def _original_output(task, inputs, work_dir, deferred_uploads=None):
     source_ref = task["inputs"][0]
     url = str(output["url"])
     if url != str(source_ref["url"]):
-        if deferred_uploads is None:
-            TransferClient().copy_out(retained, url)
-        else:
-            deferred_uploads.append((retained, url))
+        TransferClient().copy_out(retained, url)
     original = artifact_ref(retained, output["artifact_id"], output["kind"],
                             source_ref["events"], url)
     for key in ("generator_profile", "detector_profile_id", "detector_profile"):
@@ -104,19 +101,8 @@ def execute(task, work_dir):
     limit = int(p.get("max_output_bytes", 0))
     if limit and sizes > limit:
         raise RuntimeError("split blocks exceed the planner output byte ceiling")
-    staged = "staging_claim_bytes" in p
-    uploads = [] if staged else None
-    original = _original_output(task, inputs, work_dir, uploads)
-    if staged:
-        ceiling = p["staging_claim_bytes"]
-        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
-            raise ValueError("staging_claim_bytes must be a nonnegative integer")
-        if sizes + sum(path.stat().st_size for path, _url in uploads) > ceiling:
-            raise RuntimeError("planner outputs exceed reserved staging bytes")
+    original = _original_output(task, inputs, work_dir)
     client = TransferClient()
-    if staged:
-        for path, url in uploads:
-            client.copy_out(path, url)
     outputs = []
     for item in blocks:
         url = str(p["block_output_dir"]).rstrip("/") + "/" + item["filename"]
@@ -128,9 +114,4 @@ def execute(task, work_dir):
              "planned_events": sum(item["events"] for item in outputs)}
     if original is not None:
         extra["originals"] = [original]
-    if staged:
-        new_refs = outputs + ([original] if uploads else [])
-        extra["staged_objects"] = [
-            {key: ref[key] for key in ("artifact_id", "url", "size_bytes", "kind")}
-            for ref in new_refs]
     return result(task, outputs, **extra)

@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from full_mc.application.dagman_recovery import events, prepare_rescue, prepared_failure
 from full_mc.application.recovery_records import reconstruct
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json
 
 
@@ -46,9 +47,8 @@ def task(stage, identity='A'):
 
 class Records(unittest.TestCase):
     def test_sidecar_stages_and_runtime_mismatch(self):
-        for stage in ('lhe', 'mix', 'miniaod'):
+        for stage in ('lhe',):
             t = task(stage)
-            t['parameters']['staging_claim_bytes'] = 1000
             metadata = dict(t['outputs'][0], task_id='A', size_bytes=3, events=2,
                             status='ok', complete=True, runtime_release='r1', partial=False)
             store = Store({'root://host/out': b'abc',
@@ -56,7 +56,6 @@ class Records(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 result, _ = reconstruct(t, {}, tmp, store)
                 self.assertEqual(result['outputs'][0]['events'], 2)
-                self.assertEqual(len(result['staged_objects']), 2)
                 metadata['runtime_release'] = 'wrong'
                 store.objects['root://host/out.json'] = json.dumps(metadata).encode()
                 with self.assertRaises(ValueError):
@@ -115,8 +114,8 @@ class Records(unittest.TestCase):
 class Preparation(unittest.TestCase):
     def fixture(self, tmp):
         root = Path(tmp)
-        atomic_json(root / 'run.json', dict(runtime_release='r1'))
-        atomic_json(root / 'state.json', dict(accepted={}, staging={}, planner={'sources': {}}, allocations={}, cleanup_claims={}))
+        atomic_json(root / 'run.json', dict(runtime_release='r1', state_schema=FUSED_STATE_SCHEMA))
+        atomic_json(root / 'state.json', dict(accepted={}, state_schema=FUSED_STATE_SCHEMA, planner={'sources': {}}, allocations={}))
         atomic_json(root / 'submission.json', dict(schema='full-mc-condor-submission-v1', scheduler='schedd', state='submitted', root_cluster_id='42', attempts=[]))
         (root / 'run.dag').write_text('SUBDAG EXTERNAL SOURCE_000000 child.dag\n')
         (root / 'child.dag').write_text('JOB A worker.sub\nSCRIPT POST A controller accept-result\n')
@@ -169,7 +168,8 @@ class Preparation(unittest.TestCase):
                 self.assertEqual(command, ['condor_submit_dag', '-no_recurse', '-AutoRescue', '1', 'run.dag'])
                 self.assertEqual(kwargs['env']['_CONDOR_SCHEDD_HOST'], 'schedd')
                 return response('submitted to cluster 99')
-            resumed = resume_run(root, runner=submit_runner)
+            with patch('full_mc.application.site_validation.validate_site'):
+                resumed = resume_run(root, runner=submit_runner)
             self.assertEqual(resumed['root_cluster_id'], '99')
 
     def test_recovery_replaces_orphan_with_new_verified_product(self):

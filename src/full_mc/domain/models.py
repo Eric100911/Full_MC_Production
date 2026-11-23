@@ -166,14 +166,10 @@ class RunSpec:
         if not self.run_id or not self.runtime_release:
             raise ValueError("run_id and runtime_release are required")
         _positive(self.block_events, "block_events")
-        required_storage = {"cern_staging", "ihep_products", "ihep_archive", "staging_bytes", "reserve_bytes"}
+        required_storage = {"cern_staging", "ihep_products", "ihep_archive"}
         missing = required_storage - set(self.storage)
         if missing:
             raise ValueError(f"storage misses: {', '.join(sorted(missing))}")
-        staging = _positive(self.storage["staging_bytes"], "storage.staging_bytes")
-        reserve = _positive(self.storage["reserve_bytes"], "storage.reserve_bytes", allow_zero=True)
-        if reserve >= staging:
-            raise ValueError("storage.reserve_bytes must be lower than staging_bytes")
         source_keys = [(source.pool, source.source_id) for source in self.sources]
         if len(set(source_keys)) != len(source_keys):
             raise ValueError("source (pool, source_id) pairs must be unique")

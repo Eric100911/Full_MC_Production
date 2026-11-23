@@ -1,7 +1,7 @@
 """Local evidence required before submitting the isolated shard workflow."""
 from pathlib import Path
 
-from full_mc.application.staging import FUSED_STATE_SCHEMA
+from full_mc.application.staging import require_schema
 from full_mc.io import read_json
 
 
@@ -18,18 +18,10 @@ def validate_site(spec):
     The record is supplied after an authorized test, not manufactured by run
     planning. A new run directory is not evidence of an independent quota.
     """
-    if spec.get("orchestration") != "campaign_shards":
-        return
+    require_schema(spec)
     validation = spec.get("site_validation", {})
     if not isinstance(validation, dict):
         raise RuntimeError("site_validation must be an object")
-    if spec.get("state_schema") != FUSED_STATE_SCHEMA:
-        storage = spec.get("storage", {})
-        usable = int(storage.get("staging_bytes", 0)) - int(storage.get("reserve_bytes", 0))
-        isolated = validation.get("isolated_budget_bytes")
-        if (type(isolated) is not int or isolated <= 0 or isolated != usable):
-            raise RuntimeError("campaign_shards requires an explicitly isolated staging budget "
-                               "matching staging_bytes minus reserve_bytes")
     proof_path = validation.get("proof_path")
     if not proof_path or not Path(proof_path).is_absolute():
         raise RuntimeError("campaign_shards requires an absolute G3 proof_path before submission")

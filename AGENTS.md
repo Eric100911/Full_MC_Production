@@ -10,9 +10,8 @@ durable; detailed procedures belong in `docs/testing.md` and path details in
   preparation, run planning, handoff, IHEP batches, aggregation, and workers.
 - `src/full_mc/` contains the refactored domain, planning, lifecycle,
   scheduler, runtime, storage, and worker adapters.
-- `dag_generator.py`, `processing/run_chain.sh`, and `tools/` retain the
-  established production workflow and compatibility utilities; change them
-  only when maintaining the legacy path or its adapters.
+- `processing/run_chain.sh`, `lhe_generation/run_helac.sh`, and
+  `tools/plan_lhe_blocks.py` are native worker components.
 - Exact counted LHE inventories, together with versioned specs under
   `common/campaign_job_specs/`, are authoritative for inventory-driven
   campaigns; preserve their checksums and selected source IDs.
@@ -55,16 +54,15 @@ first use.
 - Prepare a runtime: `./mcprod runtime prepare --site cern --release <release>`
 - Prepare an IHEP batch: `./mcprod batch prepare --handoff <handoff.json> --output-dir <batch-dir>`
 - Prepare aggregation: `./mcprod analysis aggregate --run <run-dir> --prepare`
-- Legacy smoke DAG: `python3 dag_generator.py generate-test --campaign JJP_DPS1 --output-dir tests/generated/smoke --output smoke.dag`
+- Offline pilot DAG: `./tests/submit_tests.sh <pilot-spec.json> <new-run-dir>`
 - Default checks: `./tests/run_all_tests.sh`
-- Local worker mock: `./tests/mock_test_worker.sh`
+- Fused worker regression: `PYTHONPATH=src python3 -m unittest tests.test_core_fused_production`
 - LHE splitter test: `./tests/test_lhe_shuffle_split.sh`
 
 For pilot submission, monitoring, output verification, and optional MiniAOD
 merge smoke tests, follow `docs/testing.md`.
 
-New production and cutover pilots use `./mcprod`; `dag_generator.py` commands
-are for legacy compatibility only. Keep runtime releases, run directories,
+Use `./mcprod` for v3 production and pilots. Keep runtime releases, run directories,
 Condor logs, and operator records on submit-visible CERN AFS. The `lhe` worker
 requests 1 CPU and 3072 MB RAM; keep its explicit scratch/disk ceiling separate.
 For mcprod command syntax and lifecycle, consult `docs/README.md` and
@@ -117,22 +115,15 @@ verified command so the same discovery is not repeated.
 For code changes, run at minimum:
 
 ```bash
-bash -n processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh
-python3 -m py_compile dag_generator.py tools/coordinate_lhe_blocks.py tools/dag_progress.py
-python3 -m unittest tests.test_dag_progress
-python3 tests/test_coordinate_lhe_blocks.py
-python3 tests/test_campaign_job_specs.py
+for script in processing/run_chain.sh tests/run_all_tests.sh tests/submit_tests.sh; do
+  bash -n "$script"
+done
+python3 -m compileall -q src/full_mc
+./tests/run_all_tests.sh
 ```
 
-Also run one `generate-test --dry-run` or generated-DAG inspection relevant to
-the changed workflow. If touching:
-
-- DAG staging/categories: verify emitted `CATEGORY` and `MAXJOBS` lines.
-- Block SubDAGs: verify planner/coordinator configs and generated dependencies.
-- MiniAOD merge: verify `processing -> miniaod_merge -> ntuple` ordering and
-  provenance manifest content.
-- Ntuple packaging: confirm `prepare-runtime --include-ntuple` uses the
-  prebuilt CMSSW15 runtime or submodule fallback.
+Inspect a generated v3 DAG for SOURCE/SHARD dependencies, processing category
+limits, and terminal cleanup before accessing a production scheduler.
 
 ## Production Operations
 
@@ -141,17 +132,9 @@ the changed workflow. If touching:
   DAGMan logs, worker logs, and handoff records under the persistent AFS run.
 - Before submitting a pilot or production DAG, state event count, source-file
   count, events per block, expected blocks per source, merge target, and
-  subprocess coverage. In block mode, `--jobs` counts source LHE files, not
-  final processing jobs.
-- For known existing-LHE pilots, prefer `--skip-lhe-generation --no-scan-existing`
-  with configured exact paths when running from environments where remote scans
-  are unreliable.
-- For small existing-LHE `generate-test` pilots, keep a positive `--max-events`
-  so it auto-caps each planner via `--lhe-max-events-per-plan`; otherwise tiny
-  `--lhe-events-per-block` values can split the whole full-size source file.
-- Set `--log-root` to a submit-visible persistent AFS directory, normally
-  `<output-dir>/logs`. Use `/tmp/chiw/` only for scratch data, never as the
-  durable Condor stdout/stderr and wrapper-log destination.
+  subprocess coverage. Use a positive `planned_events` with a small counted
+  input for an existing-LHE pilot. Keep runtime releases, run records, and
+  Condor logs on submit-visible AFS.
 - Repeated inputs within one subprocess must consume distinct non-overlapping
   blocks. Deterministic shuffling must be preserved.
 - Treat counted inventory events and the campaign job-spec checksum as
@@ -210,7 +193,8 @@ the changed workflow. If touching:
 ## Config and Security
 
 - Keep storage paths centralized in `common/node_config_defaults.json`.
-- Physics constants and campaign definitions live in `dag_generator.py`.
+- Campaign definitions and profiles live under `common/campaigns/` and
+  `common/profiles/`. Keep installed resource copies synchronized.
 - Do not add campaign-specific logic to the upstream
   `external/TPS-Onia2MuMu/test/ConfFile_cfg.py`; use campaign-layer configs in
   `common/cmssw_configs/`.

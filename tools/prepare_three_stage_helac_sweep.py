@@ -15,9 +15,9 @@ sys.path.insert(0, str(CORE / "src"))
 sys.path.insert(0, str(CORE))
 
 from full_mc.domain.models import Artifact, task_dict
-from full_mc.io import atomic_json, read_json
+from full_mc.io import atomic_json, read_json, write_immutable_json
 from full_mc.local_paths import LAYOUT_MARKER, log_path, record_path
-from full_mc.planning.graph import path_text, token, write_submit_files, write_tasks_dag
+from full_mc.planning.graph import path_text, token, worker_job_lines, write_submit_files
 from full_mc.profiles import ProfileCatalog, resolve_source
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.workers._common import count_lhe_events
@@ -173,8 +173,12 @@ def plan(spec_path, output_dir):
     settings = spec["scheduler"]
     (root / "dagman.config").write_text("".join(
         f"{name} = {settings[key]}\n" for key, name in SCHEDULER.items()))
-    dag = write_tasks_dag(root, 0, tasks, [], spec)
-    dag.replace(root / "run.dag")
+    lines = [f"CONFIG {path_text(root / 'dagman.config')}",
+             f"MAXJOBS lhe {settings['maxjobs']['lhe']}"]
+    for task in tasks:
+        write_immutable_json(record_path(root, "tasks", task["task_id"]), task)
+        lines.extend(worker_job_lines(root, task, spec))
+    (root / "run.dag").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"run_dir": str(root), "dag": str(root / "run.dag"),
             "source_files": len(tasks), "submitted": False}
 

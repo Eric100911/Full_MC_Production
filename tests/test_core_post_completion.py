@@ -13,16 +13,16 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from full_mc.application import shards
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.cli import build_parser, dispatch
 from full_mc.io import atomic_json
 
 
 class PostCompletion(unittest.TestCase):
     def fixture(self, root):
-        atomic_json(root / 'run.json', {'sources': [{}], 'runtime_release': 'test'})
-        atomic_json(root / 'state.json', {'planner': {'sources': {'0': 'skipped'}},
-                    'cleanup_claims': {'CLEANUP_p_000000': {
-                        'skipped': True, 'completed': True, 'urls': []}}, 'accepted': {}})
+        atomic_json(root / 'run.json', {'sources': [{}], 'runtime_release': 'test', 'state_schema': FUSED_STATE_SCHEMA})
+        atomic_json(root / 'state.json', {'state_schema': FUSED_STATE_SCHEMA,
+                    'planner': {'sources': {'0': 'skipped'}}, 'accepted': {}})
 
     def test_skip_requires_pre_code_worker_sentinel_and_committed_state(self):
         with tempfile.TemporaryDirectory(dir='/tmp/chiw') as tmp:
@@ -31,7 +31,7 @@ class PostCompletion(unittest.TestCase):
             for _ in range(2):  # A repeated POST after restart has identical semantics.
                 self.assertEqual(shards.complete_source(root, 0, -1004, pre_return_code=99)['exit_code'], 0)
                 self.assertEqual(shards.accept_result(root, 'CLEANUP_p_000000', -1004,
-                                                     pre_return_code=99)['exit_code'], 0)
+                                                     pre_return_code=99)['exit_code'], 1)
             self.assertEqual((root / 'state.json').read_bytes(), before)
             self.assertFalse((root / 'ledger').exists())
             for pre in (1, 75, 98):
@@ -43,7 +43,6 @@ class PostCompletion(unittest.TestCase):
             self.assertEqual(shards.accept_result(root, 'MIX_missing', -1004,
                                                  pre_return_code=99)['exit_code'], 1)
             state = json.loads(before); state['planner']['sources']['0'] = 'admitted'
-            state['cleanup_claims']['CLEANUP_p_000000']['urls'] = ['still-needed']
             atomic_json(root / 'state.json', state)
             self.assertEqual(shards.complete_source(root, 0, -1004, pre_return_code=99)['exit_code'], 1)
             self.assertEqual(shards.accept_result(root, 'CLEANUP_p_000000', -1004,
@@ -58,8 +57,8 @@ class PostCompletion(unittest.TestCase):
             root_text = write_root_dag(root, spec).read_text()
             child_text = write_child_dag(root, 'SOURCE_000000', [
                 dict(task_id='PLAN_000000', stage='plan', parameters={}),
-                dict(task_id='MIX_000000', stage='mix', parameters={})], [], spec,
-                claims=['MIX_000000']).read_text()
+                dict(task_id='SOURCE_ARCHIVE_000000', stage='archive', parameters={})], [], spec,
+                pre_tasks=['SOURCE_ARCHIVE_000000']).read_text()
             self.assertIn('DAGMAN_ALWAYS_RUN_POST = TRUE', (root / 'dagman.config').read_text())
             for text in (root_text, child_text):
                 self.assertNotIn('PRE_SKIP ', text)

@@ -24,7 +24,7 @@ from full_mc.workers.chain import build_command as chain_command, execute_chain,
 from full_mc.workers.lhe import build_command as lhe_command
 from full_mc.workers.edm import parse_event_count
 from full_mc.workers.analysis import build_command as analysis_command, analyzer_tree
-from full_mc.workers.mix import execute as mix_execute
+from full_mc.workers.mix import produce as mix_produce
 
 
 def ref(path, identity, kind):
@@ -97,7 +97,7 @@ class WorkerContracts(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 parse_event_count(payload)
 
-    def test_mixer_publishes_actual_count_not_target(self):
+    def test_mixer_reports_actual_count_not_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "mixed.hepmc").write_text("HepMC::Version 2.06.10\nE 1 a\nE 2 b\n")
@@ -108,10 +108,10 @@ class WorkerContracts(unittest.TestCase):
                         "target_mixed_events": 100, "sources": [{"slot": 0}]},
                     "outputs": [ref(root / "published/mixed.hepmc.gz", "mixed", "hepmc")]}
             with patch("full_mc.workers.mix.execute_chain"):
-                outcome = mix_execute(task, root)
-            self.assertEqual(outcome["outputs"][0]["events"], 2)
-            self.assertTrue(artifact_ready(outcome["outputs"][0]))
-            with gzip.open(root / "published/mixed.hepmc.gz", "rt") as stream:
+                path, events, counts = mix_produce(task, root)
+            self.assertEqual(events, 2)
+            self.assertEqual(counts, [{"slot": 0, "actual_hepmc_events": 2}])
+            with gzip.open(path, "rt") as stream:
                 self.assertIn("E 2 b", stream.read())
 
     def test_raw_ntuple_is_the_only_analyzer_input(self):
@@ -239,43 +239,10 @@ class ArchiveHydrationTests(unittest.TestCase):
             "outputs": [{"artifact_id": "archive", "url":
                          "root://cceos.ihep.ac.cn:1094///store/archive.tar",
                          "kind": "upstream-archive"}],
-            "parameters": {"component_miniaods": [mini_ref]},
+            "parameters": {"archive_role": "source", "source_plan_task": "PLAN_000000"},
         }
 
-    def test_truncated_mixed_hepmc_is_rejected_before_archive_publish(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            hepmc_url = "root://eosuser.cern.ch///eos/user/c/chiw/mixed.hepmc.gz"
-            mini, mini_url = self.mini_ref(root)
-            hepmc = {"artifact_id": "mixed", "url": hepmc_url, "kind": "hepmc"}
-            sidecars = {
-                hepmc_url + ".json": {
-                    "status": "ok", "complete": True, "artifact_id": "mixed",
-                    "url": hepmc_url, "kind": "hepmc", "events": 3,
-                    "size_bytes": 100, "runtime_release": "r1",
-                },
-                mini_url + ".json": {
-                    "status": "ok", "complete": True, "artifact_id": "mini",
-                    "url": mini_url, "kind": "miniaod", "events": 1,
-                    "size_bytes": 7, "runtime_release": "r1",
-                    "count_source": "edmFileUtil",
-                },
-            }
-            client = self.FakeTransfer(
-                sidecars, {hepmc_url: 100, mini_url: 7}, download_size=80)
-            task = self.task(root, [hepmc], mini)
-
-            with patch("full_mc.workers.TransferClient", return_value=client), \
-                    patch("full_mc.workers._common.TransferClient", return_value=client), \
-                    patch("full_mc.storage.transfer.TransferClient", return_value=client):
-                with self.assertRaisesRegex(RuntimeError, "downloaded size disagrees with mixed"):
-                    execute_task(task, root / "work")
-
-            self.assertEqual(task["inputs"][0]["size_bytes"], 100)
-            self.assertFalse(client.copy_out_calls)
-            self.assertFalse((root / "work" / "inputs" / "mixed" / "mixed.hepmc.gz").exists())
-
-    def test_retained_lhe_uses_plan_size_without_a_mix_sidecar(self):
+    def test_retained_lhe_uses_plan_size(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             original = root / "original.lhe.gz"

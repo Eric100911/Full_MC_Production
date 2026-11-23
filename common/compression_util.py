@@ -3,7 +3,7 @@
 Compression-aware file handling for LHE and HepMC files.
 
 Provides suffix detection, atomic gzip/gunzip, and extension-acceptance
-predicates used by dag_generator, hepjob_workflow, and utility scripts.
+predicates used by the native chain and utility scripts.
 """
 
 from __future__ import annotations

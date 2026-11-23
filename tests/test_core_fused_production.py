@@ -18,7 +18,7 @@ from full_mc.runtime.bootstrap import unpack_runtime
 from full_mc.runtime.packages import prepare_runtime
 from full_mc.storage.transfer import TransferClient
 from full_mc.workers import merge as merge_worker, processing, reclaim
-from tests import test_core_production as production_tests
+from tests.mcprod_fixtures import remote_io_blocked, run_spec_fixture
 
 
 class FusedProduction(unittest.TestCase):
@@ -26,7 +26,7 @@ class FusedProduction(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory(dir="/tmp/chiw")
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
-        self.spec_path, self.run = production_tests.ProductionLifecycle().fixture(self.root)
+        self.spec_path, self.run = run_spec_fixture(self.root)
         spec = read_json(self.spec_path)
         spec.update(orchestration="campaign_shards", block_events=5)
         spec["storage"].update(staging_bytes=1, reserve_bytes=2)
@@ -161,7 +161,7 @@ class FusedProduction(unittest.TestCase):
         self.assertIn("request_cpus = 2", submit)
         self.assertIn("transfer_output_files = result.json,diagnostics.tar.gz", submit)
         self.assertFalse((self.run / "submit/mix.sub").exists())
-        with production_tests.remote_io_blocked():
+        with remote_io_blocked():
             refs = self.plan_source()
             source_dag = child_path(self.run, "SOURCE_000000").read_text()
             self.assertNotIn("admit-producer", source_dag)
@@ -200,7 +200,7 @@ class FusedProduction(unittest.TestCase):
             outcome, calls = self.native(task, self.root / task["task_id"])
             self.assertEqual([r for _, r in calls],
                              [task["mix"]["runtime"]] + [v["runtime"] for v in task["variants"]])
-            with production_tests.remote_io_blocked():
+            with remote_io_blocked():
                 self.accept(task, outputs=outcome["outputs"])
                 shards.complete_shard(self.run, campaign, shard)
         with self.assertRaisesRegex(RuntimeError, "terminal LHE block reclamation"):
@@ -379,9 +379,8 @@ class FusedProduction(unittest.TestCase):
                                "checks": dict.fromkeys(REQUIRED_CHECKS, True),
                                "evidence": [str(evidence)]})
         validate_site(dict(self.spec, site_validation={"proof_path": str(evidence)}))
-        with self.assertRaisesRegex(ValueError, "schema"):
-            with staging.transaction(self.run, expected_schema=staging.STATE_SCHEMA):
-                self.fail("v3 was interpreted as legacy")
+        with self.assertRaisesRegex(ValueError, "requires mcprod-shard-state-v3"):
+            staging.require_schema({"state_schema": "mcprod-shard-state-v2"})
         with self.assertRaisesRegex(RuntimeError, "completed run"):
             export_handoff(self.run)
 

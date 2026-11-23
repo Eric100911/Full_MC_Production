@@ -5,7 +5,7 @@ import gzip
 import shutil
 
 from full_mc.io import read_json
-from ._common import prepare, publish, result
+from ._common import prepare
 from .chain import execute_chain
 
 
@@ -30,9 +30,3 @@ def produce(task, work_dir):
         for index, slot in enumerate(task["parameters"]["sources"])
     ]
     return compressed, events, source_counts
-
-
-def execute(task, work_dir):
-    compressed, events, source_counts = produce(task, work_dir)
-    output = publish(compressed, task, events=events)
-    return result(task, [output], source_counts=source_counts)

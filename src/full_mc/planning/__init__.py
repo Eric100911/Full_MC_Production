@@ -1,1 +1,1 @@
-"""Pure capacity, allocation, wave, and DAG planning functions."""
+"""Task and DAGMan planning functions."""
