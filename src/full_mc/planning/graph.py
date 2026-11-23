@@ -25,7 +25,35 @@ def path_text(path):
     return value
 
 
-def write_submit_files(run_dir, core_root, runtime_dir, proxy_path, *, processing_profiles=()):
+def _worker_assets(core, runtime, descriptor, *, processing_profiles, include_lhe):
+    bootstrap = core / "src/full_mc/runtime/bootstrap.py"
+    for stage in CATEGORIES:
+        profile = STAGE_RUNTIME[stage]
+        if (stage == "lhe" and not include_lhe) or profile not in descriptor["profiles"]:
+            continue
+        assets = [runtime / descriptor["bundles"]["core"], runtime / "runtime.json",
+                  bootstrap]
+        profiles = {profile, *processing_profiles} if stage == "processing" else {profile}
+        assets.extend(runtime / name for name in sorted({descriptor["bundles"][p]
+                     for p in profiles if p in descriptor["bundles"]}))
+        yield stage, assets
+
+
+def validate_submit_paths(root, core, runtime, proxy_path, descriptor, *,
+                          processing_profiles, include_lhe):
+    # The new run directory is empty and its generated names are DAG tokens
+    # or fixed names, so checking the root covers all paths beneath it.
+    for path in (root, core / "mcprod", proxy_path):
+        path_text(path)
+    for _, assets in _worker_assets(core, runtime, descriptor,
+                                    processing_profiles=processing_profiles,
+                                    include_lhe=include_lhe):
+        for path in assets:
+            path_text(path)
+
+
+def write_submit_files(run_dir, core_root, runtime_dir, proxy_path, *,
+                       processing_profiles=(), include_lhe=True):
     root, core, runtime = map(Path, (run_dir, core_root, runtime_dir))
     descriptor = json.loads((runtime / "runtime.json").read_text())
     submit = root / "submit"
@@ -34,16 +62,9 @@ def write_submit_files(run_dir, core_root, runtime_dir, proxy_path, *, processin
         (root / directory).mkdir(exist_ok=True)
     task_macro = "$(task_path)" if bucketed(root) else "$(task)"
     log_macro = "$(log_path)" if bucketed(root) else "$(task)"
-    bootstrap = core / "src/full_mc/runtime/bootstrap.py"
-    for stage in CATEGORIES:
-        profile = STAGE_RUNTIME[stage]
-        if profile not in descriptor["profiles"]:
-            continue
-        assets = [runtime / descriptor["bundles"]["core"], runtime / "runtime.json",
-                  bootstrap]
-        profiles = {profile, *processing_profiles} if stage == "processing" else {profile}
-        assets.extend(runtime / name for name in sorted({descriptor["bundles"][p]
-                     for p in profiles if p in descriptor["bundles"]}))
+    for stage, assets in _worker_assets(core, runtime, descriptor,
+                                       processing_profiles=processing_profiles,
+                                       include_lhe=include_lhe):
         cpus = 2 if stage == "processing" else 1
         lines = [
             "universe = vanilla", "executable = /usr/bin/python3",

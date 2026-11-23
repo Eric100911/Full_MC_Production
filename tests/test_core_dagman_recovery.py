@@ -168,8 +168,7 @@ class Preparation(unittest.TestCase):
                 self.assertEqual(command, ['condor_submit_dag', '-no_recurse', '-AutoRescue', '1', 'run.dag'])
                 self.assertEqual(kwargs['env']['_CONDOR_SCHEDD_HOST'], 'schedd')
                 return response('submitted to cluster 99')
-            with patch('full_mc.application.site_validation.validate_site'):
-                resumed = resume_run(root, runner=submit_runner)
+            resumed = resume_run(root, runner=submit_runner)
             self.assertEqual(resumed['root_cluster_id'], '99')
 
     def test_recovery_replaces_orphan_with_new_verified_product(self):

@@ -32,9 +32,6 @@ def run(root, schedd="schedd.example"):
 
 class CondorContracts(unittest.TestCase):
     def setUp(self):
-        site = patch("full_mc.application.site_validation.validate_site")
-        site.start()
-        self.addCleanup(site.stop)
         proxy_check = patch("full_mc.backends.condor.require_initial_proxy_lifetime",
                             return_value=172801)
         proxy_check.start()

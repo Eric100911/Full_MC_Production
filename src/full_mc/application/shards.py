@@ -25,7 +25,7 @@ from full_mc.domain.inventory import SourceBlock
 from full_mc.domain.streams import allocate_shard, build_streams, next_matching, stream_key
 from full_mc.io import atomic_json, read_json, write_immutable_json
 from full_mc.local_paths import LAYOUT_MARKER, record_path
-from full_mc.planning.graph import token, write_submit_files
+from full_mc.planning.graph import token, validate_submit_paths, write_submit_files
 from full_mc.planning.script_defer import (controller_render_override,
                                            resolve_script_defer)
 from full_mc.planning.shards import (child_path, cleanup_name, shard_name,
@@ -203,8 +203,9 @@ def plan_run(spec_path, output_dir, log_level=None):
     runtime_dir = spec.get("runtime_dir")
     if not runtime_dir:
         raise ValueError("runtime_dir must identify a prepared reusable CERN runtime")
+    include_lhe = any(source.get("generator_profile") for source in spec["sources"])
     runtime = validate_runtime_release(runtime_dir, expected_release=spec["runtime_release"],
-                                       expected_site="cern")
+                                       expected_site="cern", check_helac=include_lhe)
     if spec.get("core_revision") and spec["core_revision"] != runtime["git_revision"]:
         raise ValueError("supplied core_revision does not match the prepared runtime")
     if runtime.get("cern_state_schema") != staging.FUSED_STATE_SCHEMA:
@@ -214,8 +215,11 @@ def plan_run(spec_path, output_dir, log_level=None):
     simulations = {runtime_for_profile(p, "simulation") for c in spec["campaigns"]
                    for p in c["resolved_detector_variants"]}
     required.update(simulations)
-    if any(s.get("generator_profile") for s in spec["sources"]):
-        required.add(STAGE_RUNTIME["lhe"])
+    if include_lhe:
+        lhe_profile = STAGE_RUNTIME["lhe"]
+        required.add(lhe_profile)
+        if lhe_profile not in runtime["bundles"]:
+            raise ValueError("runtime release lacks the HELAC bundle")
     if not required <= set(runtime["profiles"]):
         raise ValueError("runtime release lacks required worker profiles")
     controller = Path(runtime_dir) / "controller/core"
@@ -227,6 +231,9 @@ def plan_run(spec_path, output_dir, log_level=None):
     root = Path(output_dir).resolve()
     if root.exists() and any(root.iterdir()):
         raise FileExistsError("run directory is not empty; use existing run for recovery")
+    processing_profiles = {STAGE_RUNTIME["mix"], *simulations}
+    validate_submit_paths(root, controller, Path(runtime_dir), proxy_path, runtime,
+                          processing_profiles=processing_profiles, include_lhe=include_lhe)
     root.mkdir(parents=True, exist_ok=True)
     (root / LAYOUT_MARKER).touch()
     atomic_json(root / "run.json", spec)
@@ -235,7 +242,7 @@ def plan_run(spec_path, output_dir, log_level=None):
         "target_progress": {c["name"]: 0 for c in spec["campaigns"]}},
         {source["pool"] for source in spec["sources"]})
     write_submit_files(root, spec["core_root"], runtime_dir, proxy_path,
-                       processing_profiles={STAGE_RUNTIME["mix"], *simulations})
+                       processing_profiles=processing_profiles, include_lhe=include_lhe)
     write_root_dag(root, spec)
     return {"run_id": spec["run_id"], "run_dir": str(root), "dag": str(root / "run.dag"),
             "runtime_release": spec["runtime_release"], "source_files": len(spec["sources"]),

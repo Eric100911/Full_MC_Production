@@ -302,12 +302,6 @@ def load_run_spec(path):
     if spec["normal_shortfall_policy"] != "report-and-truncate":
         raise ValueError("campaign_shards requires report-and-truncate")
     build_streams(spec)
-    validation = spec.get("site_validation", {})
-    if not isinstance(validation, dict):
-        raise ValueError("site_validation must be an object")
-    validation.pop("isolated_budget_bytes", None)
-    if validation.get("proof_path"):
-        validation["proof_path"] = _path(validation["proof_path"], path.parent)
-    spec["site_validation"] = validation
+    spec.pop("site_validation", None)
     _validate_generated_staging(spec)
     return spec

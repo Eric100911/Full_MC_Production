@@ -9,13 +9,13 @@ from unittest.mock import patch
 from full_mc.application import dagman_recovery, shards, staging
 from full_mc.application.handoff import export_handoff
 from full_mc.application.recovery_records import reconstruct
-from full_mc.application.site_validation import REQUIRED_CHECKS, validate_site
 from full_mc.domain.streams import allocate_shard
 from full_mc.io import atomic_json, read_json
 from full_mc.local_paths import record_path
 from full_mc.planning.shards import child_path
 from full_mc.runtime.bootstrap import unpack_runtime
-from full_mc.runtime.packages import prepare_runtime
+from full_mc.runtime.packages import (HELAC_PACKAGE_SHA256, HELAC_RUNTIME_PACKAGE,
+                                      HELAC_SOURCE_PACKAGE, prepare_runtime)
 from full_mc.storage.transfer import TransferClient
 from full_mc.workers import merge as merge_worker, processing, reclaim
 from tests.mcprod_fixtures import remote_io_blocked, run_spec_fixture
@@ -146,6 +146,59 @@ class FusedProduction(unittest.TestCase):
                 patch("full_mc.workers.chain.native_tree", return_value=Path("run_chain.sh")):
             result = processing.execute(task, work)
         return result, calls
+
+    def test_helac_bundle_is_checked_only_for_generated_sources(self):
+        spec = read_json(self.spec_path)
+        runtime = Path(spec["runtime_dir"])
+        descriptor = read_json(runtime / "runtime.json")
+        descriptor["profiles"].append("helac-el7")
+        descriptor["bundles"]["helac-el7"] = HELAC_RUNTIME_PACKAGE
+        descriptor["helac_package"] = {"source": HELAC_SOURCE_PACKAGE,
+                                       "runtime_name": HELAC_RUNTIME_PACKAGE,
+                                       "sha256": HELAC_PACKAGE_SHA256}
+        atomic_json(runtime / "runtime.json", descriptor)
+        existing = self.root / "existing"
+        with patch.object(shards, "resolve_proxy_path", return_value="/afs/test/proxy"):
+            shards.plan_run(self.spec_path, existing)
+        self.assertTrue((existing / "submit/plan.sub").is_file())
+        self.assertFalse((existing / "submit/lhe.sub").exists())
+
+        spec["sources"] = [{"pool": "pool_jpsi_CSCO_g", "source_id": "fresh",
+                            "seed": 19, "generator_profile": "helac_jpsi_csco_g_v1"}]
+        for campaign in spec["campaigns"]:
+            for slot in campaign["sources"]:
+                slot["pool"] = "pool_jpsi_CSCO_g"
+        atomic_json(self.spec_path, spec)
+        generated = self.root / "generated"
+        with self.assertRaisesRegex(FileNotFoundError, "helac_package"):
+            shards.plan_run(self.spec_path, generated)
+        (runtime / HELAC_RUNTIME_PACKAGE).write_bytes(b"bad archive")
+        with self.assertRaisesRegex(ValueError, "HELAC runtime package sha256"):
+            shards.plan_run(self.spec_path, generated)
+        self.assertFalse(generated.exists())
+
+    def test_invalid_submit_paths_leave_no_partial_plan(self):
+        def plan(output, proxy):
+            with patch.object(shards, "resolve_proxy_path", return_value=proxy):
+                with self.assertRaisesRegex(ValueError, "unsupported submit path"):
+                    shards.plan_run(self.spec_path, output)
+
+        missing = self.root / "bad run"
+        plan(missing, "/afs/test/proxy")
+        self.assertFalse(missing.exists())
+
+        empty = self.root / "empty"
+        empty.mkdir()
+        plan(empty, "/afs/test/proxy,with-comma")
+        self.assertEqual(list(empty.iterdir()), [])
+
+        runtime = Path(read_json(self.spec_path)["runtime_dir"])
+        descriptor = read_json(runtime / "runtime.json")
+        descriptor["bundles"]["core"] = "core with space.tgz"
+        (runtime / "core.tgz").rename(runtime / descriptor["bundles"]["core"])
+        atomic_json(runtime / "runtime.json", descriptor)
+        plan(empty, "/afs/test/proxy")
+        self.assertEqual(list(empty.iterdir()), [])
 
     def test_graph_allocation_cleanup_and_handoff(self):
         state = self.state()
@@ -374,11 +427,6 @@ class FusedProduction(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "core revision"):
             unpack_runtime(release, self.root / "bad", profiles[0], "offline",
                            stage_profiles=profiles[1:], revision="wrong")
-        evidence = self.root / "proof.json"
-        atomic_json(evidence, {"schema": "cern-afs-lock-proof-v1", "schedds": ["a", "b"],
-                               "checks": dict.fromkeys(REQUIRED_CHECKS, True),
-                               "evidence": [str(evidence)]})
-        validate_site(dict(self.spec, site_validation={"proof_path": str(evidence)}))
         with self.assertRaisesRegex(ValueError, "requires mcprod-shard-state-v3"):
             staging.require_schema({"state_schema": "mcprod-shard-state-v2"})
         with self.assertRaisesRegex(RuntimeError, "completed run"):

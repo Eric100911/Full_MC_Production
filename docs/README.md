@@ -54,6 +54,11 @@ Freeze and prepare a bounded CERN run without submitting it:
   --log-level info
 ```
 
+Planning a run that uses only existing LHE files neither validates the HELAC
+bundle nor writes an LHE-generation submit file. To use a source generator,
+the run must have a valid HELAC bundle. Condor path checks run before the
+planner writes to the output directory.
+
 For new runs set `"orchestration": "campaign_shards"` as in the workspace
 example. SOURCE SubDAGs publish PLAN blocks to CERN EOS. The controller can
 allocate and start a SHARD as soon as its needed PLAN segments are accepted.
@@ -112,6 +117,8 @@ SOURCE or SHARD admission in v3.
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
+The historical G3 site proof is no longer required. New plans ignore the
+legacy `site_validation` field.
 Before `run submit`, `mcprod` checks the X.509 proxy paths pinned in the worker
 submit files with `voms-proxy-info --timeleft`. Every proxy must have more than
 48 hours remaining. A failed check stops before namespace ownership checks or Condor

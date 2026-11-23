@@ -117,7 +117,7 @@ replayed, and a missing exact payload is recorded as `already-missing`.
 For a separately authorized pilot with one or two processing jobs:
 
 1. Confirm the frozen source count, event counts, block size and count, merge
-   target, subprocess coverage, and site validation record.
+   target, and subprocess coverage.
 2. Verify the native profiles, two-thread simulation, IHEP POSC publication
    and checksum queries, and checkpoint creation before MiniAOD.
 3. Exercise a controlled retry after HepMC publication. Confirm that completed

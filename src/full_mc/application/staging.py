@@ -82,9 +82,9 @@ def _write_state(root, state, previous=None):
     reads state must not pay a full-record rewrite. Callers that require an
     unconditional write pass no ``previous``.
 
-    G3 deployment validation must verify file/directory fsync and flock on the
-    actual submit filesystem (including AFS). Unsupported durability operations
-    are hard failures; local tests establish no claim about those site semantics.
+    Unsupported durability operations on the submit filesystem are hard
+    failures. Local tests do not establish file/directory fsync or flock
+    behavior on AFS.
     A directory fsync failure occurs after replace, so the new state may already
     be visible and must be reread on retry rather than assumed rolled back.
     """

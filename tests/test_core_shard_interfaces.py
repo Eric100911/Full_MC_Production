@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import Mock, patch
 
 from full_mc.application.handoff import export_handoff
-from full_mc.application.site_validation import REQUIRED_CHECKS, validate_site
 from full_mc.backends.condor import resume_run, submit_run
 from full_mc.cli import build_parser, main
 from full_mc.application.staging import FUSED_STATE_SCHEMA
@@ -112,27 +111,13 @@ class ShardInterfaces(unittest.TestCase):
             runner.assert_not_called()
             self.assertFalse((root / "submission.json").exists())
 
-    def test_proof_requires_two_hosts_all_checks_and_real_evidence(self):
+    def test_legacy_site_validation_is_ignored(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            evidence = root / "isolated-test-record.json"
-            evidence.write_text("{}\n")
-            proof_path = root / "proof.json"
-            proof = {"schema": "cern-afs-lock-proof-v1", "schedds": ["test-a", "test-b"],
-                     "checks": dict.fromkeys(REQUIRED_CHECKS, True), "evidence": [str(evidence)]}
-            spec = dict(fixture_spec(), state_schema=FUSED_STATE_SCHEMA)
-            spec["site_validation"] = {"isolated_budget_bytes": 9000, "proof_path": str(proof_path)}
-            atomic_json(proof_path, proof)
-            validate_site(spec)
-            proof["checks"]["read_after_unlock"] = False
-            atomic_json(proof_path, proof)
-            with self.assertRaisesRegex(RuntimeError, "not all passed"):
-                validate_site(spec)
-            proof["checks"]["read_after_unlock"] = True
-            proof["schedds"] = ["test-a", "test-a"]
-            atomic_json(proof_path, proof)
-            with self.assertRaisesRegex(RuntimeError, "two different"):
-                validate_site(spec)
+            path = Path(temporary) / "spec.json"
+            raw = fixture_spec()
+            raw["site_validation"] = {"proof_path": "missing-proof.json"}
+            atomic_json(path, raw)
+            self.assertNotIn("site_validation", load_run_spec(path))
 
     def test_handoff_accepts_complete_new_state_and_rejects_unfinished(self):
         with tempfile.TemporaryDirectory() as temporary:

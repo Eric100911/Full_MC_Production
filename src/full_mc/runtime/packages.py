@@ -124,12 +124,12 @@ def _package_tpsonia2mumu_source(core, destination):
     validate_cmssw15_source_package(destination)
 
 
-def validate_runtime_release(release_dir, *, expected_release=None, expected_site=None):
-    """Validate every descriptor-referenced release asset before use.
+def validate_runtime_release(release_dir, *, expected_release=None, expected_site=None,
+                             check_helac=True):
+    """Check that the release descriptor and its assets agree.
 
-    This is existence and metadata validation, not per-worker content hashing.
-    It catches moved, incomplete, or incorrectly paired releases before a DAG
-    or IHEP batch can reference them.
+    CERN plans using only counted LHE can skip the unused HELAC bundle.
+    Runtime preparation checks all declared assets.
     """
     root = Path(release_dir).resolve()
     descriptor_path = root / "runtime.json"
@@ -153,6 +153,8 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
     if recorded_sizes is not None and not isinstance(recorded_sizes, dict):
         raise ValueError("runtime bundle_bytes must be an object")
     for key, name in bundles.items():
+        if key == "helac-el7" and not check_helac:
+            continue
         if not isinstance(key, str) or not isinstance(name, str) or Path(name).name != name:
             raise ValueError("runtime bundle names must be safe basenames")
         asset = root / name
@@ -173,7 +175,7 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
             validate_cmssw15_source_package(asset)
         else:
             raise ValueError("unrecognized CMSSW15 runtime asset: %s" % cmssw_asset)
-    if "helac-el7" in bundles:
+    if check_helac and "helac-el7" in bundles:
         if bundles["helac-el7"] != HELAC_RUNTIME_PACKAGE:
             raise ValueError("helac-el7 must use the stable runtime package basename")
         metadata = descriptor.get("helac_package")
