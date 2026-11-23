@@ -102,21 +102,53 @@ def _bundle(root, paths, destination, prefix="core"):
                         recursive=False)
 
 
-def _package_tpsonia2mumu_source(core, destination):
-    """Create the documented source fallback used by ``run_chain.sh``."""
-    source = Path(core) / "external/TPS-Onia2MuMu"
+def _initialized_submodule(core, relative_path):
+    core = Path(core)
+    relative_path = Path(relative_path)
+    source = core / relative_path
+    indexed = subprocess.check_output(
+        ["git", "-C", str(core), "ls-files", "-s", "--", str(relative_path)],
+        text=True).strip()
+    fields = indexed.split()
+    if len(fields) != 4 or fields[0] != "160000" or fields[2] != "0":
+        raise ValueError(f"core revision does not pin {relative_path}")
+    expected_revision = fields[1]
     if not source.is_dir():
-        raise FileNotFoundError("TPS-Onia2MuMu submodule is not initialized: %s" % source)
+        raise FileNotFoundError(f"submodule is not initialized: {source}")
     try:
         files = subprocess.check_output(["git", "-C", str(source), "ls-files"], text=True).splitlines()
-    except subprocess.CalledProcessError as exc:
-        raise ValueError("TPS-Onia2MuMu must be an initialized git submodule") from exc
+        actual_revision = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    except subprocess.CalledProcessError:
+        files, actual_revision = [], ""
+    if not files or actual_revision != expected_revision:
+        subprocess.run(["git", "-C", str(core), "submodule", "update", "--init",
+                        "--", str(relative_path)], check=True)
+        files = subprocess.check_output(
+            ["git", "-C", str(source), "ls-files"], text=True).splitlines()
     if not files:
-        raise ValueError("TPS-Onia2MuMu submodule is not initialized")
+        raise ValueError(f"submodule checkout contains no tracked files: {source}")
+    actual_revision = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if actual_revision != expected_revision:
+        raise ValueError(f"submodule checkout does not match the core gitlink for {relative_path}: "
+                         f"expected {expected_revision}, got {actual_revision}")
+    return source, files, actual_revision
+
+
+def _package_tpsonia2mumu_source(core, destination):
+    """Create the documented source fallback used by ``run_chain.sh``."""
+    source, files, _ = _initialized_submodule(core, "external/TPS-Onia2MuMu")
     destination = Path(destination)
     with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
         for relative in files:
             path = source / relative
+            entry = subprocess.check_output(
+                ["git", "-C", str(source), "ls-tree", "HEAD", "--", relative],
+                text=True).strip().split()
+            if len(entry) == 4 and entry[0] == "160000" and entry[1] == "commit":
+                # Nested data repositories are not runtime source files.
+                continue
             if not path.is_file() or path.is_symlink():
                 raise ValueError("invalid TPS-Onia2MuMu source member: %s" % path)
             archive.add(path, arcname=str(Path("HeavyFlavorAnalysis/TPS-Onia2MuMu") / relative),
@@ -243,14 +275,9 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                 bundles.update({profile: fallback.name for profile in cmssw15_profiles})
         analyzer_revision = None
         if "analyzer-el9" in selected:
-            analyzer = core / "external/NtupleAnalyzer"
-            files = subprocess.check_output(
-                ["git", "-C", str(analyzer), "ls-files"], text=True).splitlines()
-            if not files:
-                raise ValueError("NtupleAnalyzer submodule is not initialized")
+            analyzer, files, analyzer_revision = _initialized_submodule(
+                core, "external/NtupleAnalyzer")
             _bundle(analyzer, files, staging / "analyzer.tar.gz", "NtupleAnalyzer")
-            analyzer_revision = subprocess.check_output(
-                ["git", "-C", str(analyzer), "rev-parse", "HEAD"], text=True).strip()
             bundles["analyzer-el9"] = "analyzer.tar.gz"
         record = dict(runtime_identity(release, revision), site=site,
                       source_dirty=dirty, profiles=selected, bundles=bundles,

@@ -3,4 +3,4 @@
 	url = git@github.com:Eric100911/TPS-Onia2MuMu.git
 [submodule "external/NtupleAnalyzer"]
 	path = external/NtupleAnalyzer
-	url = https://github.com/Eric100911/NtupleAnalyzer.git
+	url = git@github.com:Eric100911/NtupleAnalyzer.git
