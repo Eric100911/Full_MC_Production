@@ -6,6 +6,15 @@ defines a separate namespace below each root. Existing LHEs use exact counted
 URLs recorded in the specification. IHEP URLs retain the form
 `root://cceos.ihep.ac.cn:1094///store/...`.
 
+## IHEP storage and login terminology
+
+In operational notes, **IHEP T2** and **`T2_CN_Beijing`** refer to the IHEP
+CMS storage site. Use its configured XRootD endpoint for storage access, with
+the triple slash before the LFN: `root://cceos.ihep.ac.cn:1094///store/...`.
+The **`ihep`** SSH alias refers to an IHEP login machine; it is not an XRootD
+endpoint. Use SSH through that alias for login-host operations, and use XRootD
+URLs for access to the storage site.
+
 | Location | v3 products |
 | --- | --- |
 | CERN staging | `<run>/sources/<pool>/<source>/source.lhe.gz` and `blocks/block_<source>_<index>.lhe.gz` |
