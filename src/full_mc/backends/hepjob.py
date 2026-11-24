@@ -82,20 +82,62 @@ def _combined_tasks(handoff: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         }
 
 
-def _write_worker(path, task_path, core_root, proxy):
+def _write_worker(path, task_path, core_root, proxy, job_logs):
     source = shlex.quote(str(proxy)) if proxy else '"${X509_USER_PROXY:?missing proxy}"'
     command = shlex.join(["python3", str(Path(core_root) / "mcprod"), "batch", "worker",
                           "--task", str(task_path)])
     text = (
         "#!/bin/bash\nset -euo pipefail\n"
-        "proxy_source=" + source + "\n"
+        "job_logs=" + shlex.quote(str(job_logs)) + "\n"
+        r"""attempt=${1:?missing HepJob attempt}
+[[ "$attempt" =~ ^attempt-[0-9]+$ ]] || exit 2
+log_dir="$job_logs/$attempt"
+
+archive_logs() {
+    local rc=$1 stage file temporary name archive
+    local -a files=(execution.txt)
+    printf 'attempt=%s\nnode=%s\nexit_code=%s\n' "$attempt" "$HOSTNAME" "$rc" \
+        > "$job_scratch/execution.txt" || return
+    shopt -s nullglob
+    for stage in merge ntuple selection efficiency; do
+        for file in "$job_scratch/worker/$stage/commands.log" \
+            "$job_scratch/worker/$stage/command_logs/"*.{stdout,stderr}; do
+            if [[ -f "$file" && ! -L "$file" ]]; then
+                files+=("${file#"$job_scratch/"}")
+            fi
+        done
+    done
+    temporary=$(mktemp "$log_dir/.execution-XXXXXXXX.tar.gz") || return
+    name=${temporary##*/}
+    archive="$log_dir/${name#.}"
+    if tar -czf "$temporary" -C "$job_scratch" "${files[@]}" &&
+        tar -tzf "$temporary" >/dev/null &&
+        mv -T -n -- "$temporary" "$archive" && [[ ! -e "$temporary" ]]; then
+        printf 'HepJob diagnostics: %s\n' "$archive" >&2
+    else
+        rm -f -- "$temporary" || true
+        return 1
+    fi
+}
+
+finish() {
+    local rc=$1
+    if ! archive_logs "$rc"; then
+        printf 'HepJob diagnostics could not be archived in %s (worker exit %s)\n' "$log_dir" "$rc" >&2
+    fi
+    exit "$rc"
+}
+
+"""
         "mkdir -p /tmp/chiw\n"
         "job_scratch=$(mktemp -d /tmp/chiw/mcprod-ihep.XXXXXX)\n"
+        "trap 'finish \"$?\"' EXIT\n"
+        "proxy_source=" + source + "\n"
         'cd "$job_scratch"\n'
         "mkdir credentials\n"
         'install -m 600 "$proxy_source" credentials/x509_user_proxy\n'
         'export X509_USER_PROXY="$PWD/credentials/x509_user_proxy"\n'
-        "exec " + command + ' --work-dir "$job_scratch/worker"\n'
+        + command + ' --work-dir "$job_scratch/worker"\n'
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -168,7 +210,7 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
             subtask.setdefault("parameters", {})["core_root"] = str(effective_core)
         _atomic_json(task_path, combined)
         wrapper = root / "wrappers" / ("%04d.sh" % index)
-        _write_worker(wrapper, task_path, effective_core, proxy)
+        _write_worker(wrapper, task_path, effective_core, proxy, root / "logs" / ("%04d" % index))
         jobs.append({"job_id": None, "index": index, "state": "prepared", "task_path": str(task_path),
                      "wrapper": str(wrapper), "task_ids": combined.get("task_membership", [combined["task_id"]]),
                      "node": safe_nodes[index % len(safe_nodes)] + ".ihep.ac.cn"})
@@ -185,14 +227,16 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
     return manifest
 
 
-def _submit_command(manifest: Dict[str, Any], job: Dict[str, Any]) -> List[str]:
+def _submit_command(manifest: Dict[str, Any], job: Dict[str, Any], attempt: int) -> List[str]:
     command = ["hep_sub", str(job["wrapper"]), "-g", str(manifest["group"]), "-gwn", "CMS", "-wt", str(manifest["walltime"]),
                "-n", str(int(manifest.get("request_cpus", 1))), "-wn", str(job["node"])]
     if int(manifest.get("memory_mb", 0)) > 0:
         command.extend(["-mem", str(manifest["memory_mb"])])
-    logs = Path(manifest["workspace"]) / "logs"
+    attempt_name = f"attempt-{attempt:03d}"
+    logs = Path(manifest["workspace"]) / "logs" / ("%04d" % job["index"]) / attempt_name
     logs.mkdir(parents=True, exist_ok=True)
-    command.extend(["-o", str(logs / ("%04d.out" % job["index"])), "-e", str(logs / ("%04d.err" % job["index"]))])
+    command.extend(["-argu", attempt_name, "-o", str(logs / "hepjob.out"),
+                    "-e", str(logs / "hepjob.err")])
     return command
 
 
@@ -257,7 +301,7 @@ def _submit_prepared_batch(path: Path, manifest: Dict[str, Any], runner) -> Dict
     for job in manifest["jobs"]:
         if job.get("state") != "prepared":
             continue
-        command = _submit_command(manifest, job)
+        command = _submit_command(manifest, job, len(job.get("attempts", [])) + 1)
         attempt = _record_attempt(job, command)
         job.update(state="submitting", submit_command=command,
                    submitted_at=attempt["submitted_at"], reconciliation_required=False)

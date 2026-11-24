@@ -1,8 +1,10 @@
 """Offline IHEP preparation and exact-attempt submission tests."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -93,6 +95,59 @@ class IhepContracts(unittest.TestCase):
             resume_batch(batch["manifest_path"], runner=no_submit)
             no_submit.assert_not_called()
 
+    def test_worker_archives_ntuple_diagnostics_and_preserves_exit_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proxy = root / "proxy"
+            proxy.write_text("test proxy")
+            (root / "mcprod").write_text(
+                "from pathlib import Path\n"
+                "import os, sys\n"
+                "work = Path(sys.argv[-1])\n"
+                "print(work.parent)\n"
+                "stage = work / 'ntuple'\n"
+                "(stage / 'command_logs').mkdir(parents=True)\n"
+                "(stage / 'commands.log').write_text('ntuple stage summary')\n"
+                "(stage / 'command_logs/001_cmsRun.stderr').write_text('original CMSSW error')\n"
+                "(stage / 'output_ntuple.root').touch()\n"
+                "sys.exit(int(os.environ['TEST_WORKER_RC']))\n"
+            )
+            batch = prepare_batch(handoff(root), root / "batch", proxy=proxy, core_root=root)
+            submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
+                returncode=0, stdout="submitted to cluster 27", stderr="")))
+            command = read_json(batch["manifest_path"])["jobs"][0]["attempts"][0]["command"]
+            logs = Path(command[command.index("-e") + 1]).parent
+            attempt = command[command.index("-argu") + 1]
+
+            for rc in (42, 0):
+                with self.subTest(rc=rc):
+                    execution = subprocess.run([command[1], attempt], text=True, capture_output=True,
+                                               env=dict(os.environ, TEST_WORKER_RC=str(rc)))
+                    self.assertEqual(execution.returncode, rc, execution.stderr)
+                    self.addCleanup(shutil.rmtree, execution.stdout.strip(), ignore_errors=True)
+                    destination = Path(execution.stderr.removeprefix("HepJob diagnostics: ").strip())
+                    self.assertEqual(destination.parent, logs)
+                    with tarfile.open(destination) as diagnostics:
+                        self.assertEqual(set(diagnostics.getnames()), {
+                            "execution.txt", "worker/ntuple/commands.log",
+                            "worker/ntuple/command_logs/001_cmsRun.stderr",
+                        })
+                        self.assertIn(f"exit_code={rc}".encode(),
+                                      diagnostics.extractfile("execution.txt").read())
+                        self.assertEqual(
+                            diagnostics.extractfile(
+                                "worker/ntuple/command_logs/001_cmsRun.stderr").read(),
+                            b"original CMSSW error")
+            self.assertEqual(len(list(logs.glob("execution-*.tar.gz"))), 2)
+            self.assertEqual(list(logs.glob(".execution-*")), [])
+
+            no_destination = subprocess.run(
+                [command[1], "attempt-002"], text=True, capture_output=True,
+                env=dict(os.environ, TEST_WORKER_RC="42"))
+            self.addCleanup(shutil.rmtree, no_destination.stdout.strip(), ignore_errors=True)
+            self.assertEqual(no_destination.returncode, 42)
+            self.assertIn("HepJob diagnostics could not be archived", no_destination.stderr)
+
     def test_crash_after_attempt_record_does_not_duplicate_submission(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -124,6 +179,12 @@ class IhepContracts(unittest.TestCase):
             self.assertEqual((job["state"], job["job_id"], job["recovery_of"]),
                              ("submitted", "28", "27"))
             self.assertEqual(len(job["attempts"]), 2)
+            for number, attempt in enumerate(job["attempts"], 1):
+                command = attempt["command"]
+                name = f"attempt-{number:03d}"
+                self.assertEqual(command[command.index("-argu") + 1], name)
+                self.assertEqual(Path(command[command.index("-e") + 1]),
+                                 root / "batch" / "logs" / "0000" / name / "hepjob.err")
 
     def test_hep_q_summary_and_other_jobs_cannot_authorize_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:

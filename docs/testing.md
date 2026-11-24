@@ -79,6 +79,15 @@ before submission. A ready IHEP cutover requires all of the following:
 wrappers before submitting the first HepJob job. Each proxy certificate must
 have more than 48 hours remaining. `batch resume` does not repeat this check.
 
+For newly prepared batches, look under
+`<batch-dir>/logs/<job-index>/attempt-<number>/` on shared IHEP storage. The
+attempt number and HepJob ID are recorded together in `batch_manifest.json`.
+`hepjob.err` reports the path to the per-execution diagnostics archive or
+reports an archive failure. The worker wrapper saves the available stage
+`commands.log` and native command stdout/stderr before node-local scratch is
+released. It preserves the worker exit code. For an ntuple failure, inspect
+`worker/ntuple/commands.log` and `worker/ntuple/command_logs/` inside the archive.
+
 Monitor exact recorded root/job IDs. An empty queue result or an aggregate
 `0 completed`/`0 removed` counter is not a job outcome; retry an empty query
 once, then reconcile against persistent logs, task results, checkpoints, and
