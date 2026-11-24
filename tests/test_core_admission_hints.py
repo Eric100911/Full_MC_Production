@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from full_mc.application import admission_hints, shards, staging
 from full_mc.io import atomic_json, read_json
-from tests import test_core_production
+from tests.mcprod_fixtures import run_spec_fixture
 from tests.test_core_shards import ShardFixture
 
 
@@ -21,7 +21,7 @@ class AdmissionHintTests(unittest.TestCase):
 
     def fixture(self, directory):
         root = Path(directory)
-        spec_path, _ = test_core_production.ProductionLifecycle().fixture(root)
+        spec_path, _ = run_spec_fixture(root)
         spec = read_json(spec_path)
         spec["sources"].extend([
             dict(spec["sources"][0], source_id="s2", seed=20),
@@ -37,7 +37,7 @@ class AdmissionHintTests(unittest.TestCase):
                 "shard_next": {"C": 2, "D": 0} if shard_next is None else shard_next}
 
     def write_view(self, root, value):
-        atomic_json(root / "staging" / "admission-hints.json", value)
+        atomic_json(root / "ledger" / "admission-hints.json", value)
 
     def shard_run(self, directory, *, nodes=8, campaigns=1):
         fixture = ShardFixture()
@@ -142,7 +142,7 @@ class AdmissionHintTests(unittest.TestCase):
     def test_missing_malformed_stale_wrong_run_and_invalid_numbers_fall_back(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
             root, spec = self.fixture(temporary)
-            hint_path = root / "staging" / "admission-hints.json"
+            hint_path = root / "ledger" / "admission-hints.json"
             self.assertIsNone(admission_hints.reject_source(root, spec, 1))
             hint_path.parent.mkdir(exist_ok=True)
             hint_path.write_text("{broken", encoding="utf-8")
@@ -180,7 +180,7 @@ class AdmissionHintTests(unittest.TestCase):
                 admission_hints.publish(root, {"planner": {"sources": {},
                     "assigned_progress": {"C": 0}}}, observed_at)
             write.assert_not_called()
-            self.assertFalse((root / "staging" / "admission-hints.json").exists())
+            self.assertFalse((root / "ledger" / "admission-hints.json").exists())
 
     def test_publication_failure_cannot_modify_committed_state(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:

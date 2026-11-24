@@ -57,10 +57,10 @@ class ScriptDeferSettingsTests(unittest.TestCase):
                     _script("/run", "phase", "NODE", "", interval)
 
     def test_opt_in_survives_spec_loading_and_is_frozen_into_run_json(self):
-        from tests.test_core_production import ProductionLifecycle
+        from tests.mcprod_fixtures import run_spec_fixture
 
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
-            spec_path, run = ProductionLifecycle().fixture(Path(temporary))
+            spec_path, run = run_spec_fixture(Path(temporary))
             spec = read_json(spec_path)
             spec["scheduler"]["script_defer"] = {
                 "default_seconds": 60,
@@ -97,12 +97,12 @@ class ScriptDeferDagTests(unittest.TestCase):
         tasks = [
             {"task_id": "PLAN_000000", "stage": "plan",
              "parameters": {"source_plan_task": True}},
-            {"task_id": "MIX_C_000000", "stage": "mix", "parameters": {}},
-            {"task_id": "MINIAOD_C_000000", "stage": "miniaod", "parameters": {}},
+            {"task_id": "PROCESS_C_000000", "stage": "processing", "parameters": {"scratch_bytes": 1000}},
+            {"task_id": "LHE_000000", "stage": "lhe", "parameters": {}},
             {"task_id": "ARCHIVE_C_000000", "stage": "archive", "parameters": {}},
             {"task_id": "RECLAIM_C_000000", "stage": "reclaim", "parameters": {}},
         ]
-        dependencies = [(["PLAN_000000"], "MIX_C_000000")]
+        dependencies = [(["PLAN_000000"], "PROCESS_C_000000")]
         return write_child_dag(root, "CHILD", tasks, dependencies,
                                {"scheduler": scheduler}).read_text()
 
@@ -124,7 +124,7 @@ class ScriptDeferDagTests(unittest.TestCase):
         self.assertIn("--return-code $RETURN", root_text)
         self.assertIn("CATEGORY SHARD_C_000000 block_processing", root_text)
         self.assertIn("SCRIPT DEFER 75 60 POST PLAN_000000", child_text)
-        for identity in ("MIX_C_000000", "MINIAOD_C_000000",
+        for identity in ("PROCESS_C_000000", "LHE_000000",
                          "ARCHIVE_C_000000", "RECLAIM_C_000000"):
             with self.subTest(child_node=identity):
                 self.assertIn(f"SCRIPT DEFER 75 60 POST {identity}", child_text)
@@ -144,15 +144,15 @@ class ScriptDeferDagTests(unittest.TestCase):
             self.assertIn("SCRIPT DEFER 75 60 PRE SOURCE_000000", root_text)
             self.assertIn("SCRIPT DEFER 75 60 POST SHARD_C_000000", root_text)
             self.assertIn("SCRIPT DEFER 75 60 POST CLEANUP_pool_000000", root_text)
-            self.assertNotIn("SCRIPT DEFER 75 10 POST MIX_C_000000", text)
-            self.assertNotIn("SCRIPT DEFER 75 15 POST MIX_C_000000", text)
-            for identity in ("MIX_C_000000", "MINIAOD_C_000000",
+            self.assertNotIn("SCRIPT DEFER 75 10 POST PROCESS_C_000000", text)
+            self.assertNotIn("SCRIPT DEFER 75 15 POST PROCESS_C_000000", text)
+            for identity in ("PROCESS_C_000000", "LHE_000000",
                              "ARCHIVE_C_000000", "RECLAIM_C_000000"):
                 self.assertIn(f"SCRIPT DEFER 75 60 POST {identity}", text)
             self.assertIn("RETRY PLAN_000000 1", text)
             self.assertIn("CATEGORY PLAN_000000 lhe_planning", text)
             self.assertIn("--return-code $RETURN", text)
-            self.assertIn("PARENT PLAN_000000 CHILD MIX_C_000000", text)
+            self.assertIn("PARENT PLAN_000000 CHILD PROCESS_C_000000", text)
 
     def test_custom_default_applies_to_other_scripts_and_plan_can_override(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -162,17 +162,17 @@ class ScriptDeferDagTests(unittest.TestCase):
                 "plan_accept_post_seconds": 12,
             }})
         self.assertIn("SCRIPT DEFER 75 12 POST PLAN_000000", text)
-        self.assertIn("SCRIPT DEFER 75 45 POST MIX_C_000000", text)
-        self.assertIn("SCRIPT DEFER 75 45 POST MINIAOD_C_000000", text)
+        self.assertIn("SCRIPT DEFER 75 45 POST PROCESS_C_000000", text)
+        self.assertIn("SCRIPT DEFER 75 45 POST LHE_000000", text)
 
     def test_controller_override_is_run_bound_and_existing_child_is_preserved(self):
         name = "SOURCE_000000"
         plan = {"task_id": "PLAN_000000", "stage": "plan",
                 "parameters": {"source_plan_task": True}}
-        mix = {"task_id": "MIX_C_000000", "stage": "mix",
-               "parameters": {"source_plan_task": True}}
+        mix = {"task_id": "PROCESS_C_000000", "stage": "processing",
+               "parameters": {"scratch_bytes": 1000}}
         manifest = {"tasks": [plan, mix],
-                    "dependencies": [(["PLAN_000000"], "MIX_C_000000")]}
+                    "dependencies": [(["PLAN_000000"], "PROCESS_C_000000")]}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             atomic_json(shards._manifest_path(root, name), manifest)
@@ -196,7 +196,7 @@ class ScriptDeferDagTests(unittest.TestCase):
             first_bytes = path.read_bytes()
             first_inode = path.stat().st_ino
             self.assertIn("SCRIPT DEFER 75 10 POST PLAN_000000", first_bytes.decode())
-            self.assertIn("SCRIPT DEFER 75 60 POST MIX_C_000000", first_bytes.decode())
+            self.assertIn("SCRIPT DEFER 75 60 POST PROCESS_C_000000", first_bytes.decode())
 
             with patch.dict("os.environ", {
                     "MCPROD_PLAN_ACCEPT_POST_SECONDS": "15",

@@ -8,12 +8,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json
-from .profiles import PROFILES
+from .profiles import PROFILES, run_profile
 
 CMSSW15_RUNTIME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 CMSSW15_SOURCE_PACKAGE = "tpsonia2mumu_code.tar.gz"
@@ -26,6 +27,9 @@ CMSSW15_REQUIRED = (
     "CMSSW_15_0_15/src/",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/",
 )
+CMSSW15_PROJECT = "CMSSW_15_0_15"
+CMSSW15_LIBRARY_DIR = f"{CMSSW15_PROJECT}/lib/el9_amd64_gcc12"
+CMSSW15_PLUGIN_CACHE = f"{CMSSW15_LIBRARY_DIR}/.edmplugincache"
 SITE_PROFILES = {
     "cern": ("helac-el7", "utilities-el9", "pythia-el8", "cmssw12-sim-el8"),
     "ihep": ("utilities-el9", "cmssw12-sim-el8", "cmssw15-sim-el9",
@@ -48,11 +52,28 @@ def validate_cmssw15_runtime(path):
     if not path.is_file():
         raise FileNotFoundError(path)
     with tarfile.open(path, "r:gz") as archive:
-        names = tuple(m.name.lstrip("./").rstrip("/") + "/" for m in archive)
+        names = set()
+        libraries = set()
+        plugin_cache = b""
+        for member in archive:
+            name = member.name.removeprefix("./").rstrip("/")
+            names.add(name + "/")
+            if member.isfile() and name == CMSSW15_PLUGIN_CACHE:
+                with archive.extractfile(member) as stream:
+                    plugin_cache = stream.read()
+            if (member.isfile() and member.size > 0
+                    and name.startswith(CMSSW15_LIBRARY_DIR + "/")
+                    and name.endswith("HeavyFlavorAnalysisTPS-Onia2MuMu.so")):
+                libraries.add(Path(name).name.encode())
     missing = [entry for entry in CMSSW15_REQUIRED
                if not any(name.startswith(entry) for name in names)]
     if missing:
         raise ValueError("CMSSW15 runtime missing required paths: " + ", ".join(missing))
+    if not libraries:
+        raise ValueError("CMSSW15 runtime lacks the compiled TPS-Onia2MuMu plugin library")
+    if not any(fields[0] in libraries and fields[1] == b"MultiLepPAT"
+               for fields in map(bytes.split, plugin_cache.splitlines()) if len(fields) >= 2):
+        raise ValueError("CMSSW15 runtime plugin cache lacks the TPS-Onia2MuMu MultiLepPAT entry")
 
 
 def validate_cmssw15_source_package(path):
@@ -102,21 +123,53 @@ def _bundle(root, paths, destination, prefix="core"):
                         recursive=False)
 
 
-def _package_tpsonia2mumu_source(core, destination):
-    """Create the documented source fallback used by ``run_chain.sh``."""
-    source = Path(core) / "external/TPS-Onia2MuMu"
+def _initialized_submodule(core, relative_path):
+    core = Path(core)
+    relative_path = Path(relative_path)
+    source = core / relative_path
+    indexed = subprocess.check_output(
+        ["git", "-C", str(core), "ls-files", "-s", "--", str(relative_path)],
+        text=True).strip()
+    fields = indexed.split()
+    if len(fields) != 4 or fields[0] != "160000" or fields[2] != "0":
+        raise ValueError(f"core revision does not pin {relative_path}")
+    expected_revision = fields[1]
     if not source.is_dir():
-        raise FileNotFoundError("TPS-Onia2MuMu submodule is not initialized: %s" % source)
+        raise FileNotFoundError(f"submodule is not initialized: {source}")
     try:
         files = subprocess.check_output(["git", "-C", str(source), "ls-files"], text=True).splitlines()
-    except subprocess.CalledProcessError as exc:
-        raise ValueError("TPS-Onia2MuMu must be an initialized git submodule") from exc
+        actual_revision = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    except subprocess.CalledProcessError:
+        files, actual_revision = [], ""
+    if not files or actual_revision != expected_revision:
+        subprocess.run(["git", "-C", str(core), "submodule", "update", "--init",
+                        "--", str(relative_path)], check=True)
+        files = subprocess.check_output(
+            ["git", "-C", str(source), "ls-files"], text=True).splitlines()
     if not files:
-        raise ValueError("TPS-Onia2MuMu submodule is not initialized")
+        raise ValueError(f"submodule checkout contains no tracked files: {source}")
+    actual_revision = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if actual_revision != expected_revision:
+        raise ValueError(f"submodule checkout does not match the core gitlink for {relative_path}: "
+                         f"expected {expected_revision}, got {actual_revision}")
+    return source, files, actual_revision
+
+
+def _package_tpsonia2mumu_source(core, destination):
+    """Collect the pinned source files for the CMSSW build."""
+    source, files, _ = _initialized_submodule(core, "external/TPS-Onia2MuMu")
     destination = Path(destination)
     with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
         for relative in files:
             path = source / relative
+            entry = subprocess.check_output(
+                ["git", "-C", str(source), "ls-tree", "HEAD", "--", relative],
+                text=True).strip().split()
+            if len(entry) == 4 and entry[0] == "160000" and entry[1] == "commit":
+                # Nested data repositories are not runtime source files.
+                continue
             if not path.is_file() or path.is_symlink():
                 raise ValueError("invalid TPS-Onia2MuMu source member: %s" % path)
             archive.add(path, arcname=str(Path("HeavyFlavorAnalysis/TPS-Onia2MuMu") / relative),
@@ -124,12 +177,35 @@ def _package_tpsonia2mumu_source(core, destination):
     validate_cmssw15_source_package(destination)
 
 
-def validate_runtime_release(release_dir, *, expected_release=None, expected_site=None):
-    """Validate every descriptor-referenced release asset before use.
+def _build_cmssw15_runtime(core, destination):
+    from .bootstrap import _extract
 
-    This is existence and metadata validation, not per-worker content hashing.
-    It catches moved, incomplete, or incorrectly paired releases before a DAG
-    or IHEP batch can reference them.
+    scratch = Path("/tmp/chiw")
+    scratch.mkdir(exist_ok=True)
+    helpers = core / "processing/cmssw_helpers"
+    profile = "cmssw15-ntuple-el9"
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="mcprod-cmssw15-") as temporary:
+        build = Path(temporary)
+        project = build / CMSSW15_PROJECT
+        source = build / CMSSW15_SOURCE_PACKAGE
+        _package_tpsonia2mumu_source(core, source)
+        run_profile(profile, ["bash", helpers / "cmssw15_project_create.sh", build,
+                              CMSSW15_PROJECT], cwd=build, bind_paths=(helpers,),
+                    stdout=sys.stderr)
+        _extract(source, project / "src", "HeavyFlavorAnalysis")
+        run_profile(profile, ["bash", helpers / "cmssw15_exec.sh", project,
+                              "scram", "b", "-j", "4"], cwd=build, bind_paths=(helpers,),
+                    stdout=sys.stderr)
+        with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
+            archive.add(project, arcname=project.name)
+
+
+def validate_runtime_release(release_dir, *, expected_release=None, expected_site=None,
+                             check_helac=True):
+    """Check that the release descriptor and its assets agree.
+
+    CERN plans using only counted LHE can skip the unused HELAC bundle.
+    Runtime preparation checks all declared assets.
     """
     root = Path(release_dir).resolve()
     descriptor_path = root / "runtime.json"
@@ -153,6 +229,8 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
     if recorded_sizes is not None and not isinstance(recorded_sizes, dict):
         raise ValueError("runtime bundle_bytes must be an object")
     for key, name in bundles.items():
+        if key == "helac-el7" and not check_helac:
+            continue
         if not isinstance(key, str) or not isinstance(name, str) or Path(name).name != name:
             raise ValueError("runtime bundle names must be safe basenames")
         asset = root / name
@@ -173,7 +251,7 @@ def validate_runtime_release(release_dir, *, expected_release=None, expected_sit
             validate_cmssw15_source_package(asset)
         else:
             raise ValueError("unrecognized CMSSW15 runtime asset: %s" % cmssw_asset)
-    if "helac-el7" in bundles:
+    if check_helac and "helac-el7" in bundles:
         if bundles["helac-el7"] != HELAC_RUNTIME_PACKAGE:
             raise ValueError("helac-el7 must use the stable runtime package basename")
         metadata = descriptor.get("helac_package")
@@ -231,24 +309,17 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                             if name in selected]
         if cmssw15_profiles:
             source = core / "common/packages" / CMSSW15_RUNTIME
+            runtime_asset = staging / CMSSW15_RUNTIME
             if source.is_file():
-                validate_cmssw15_runtime(source)
-                shutil.copy2(source, staging / source.name)
-                bundles.update({profile: source.name for profile in cmssw15_profiles})
+                shutil.copy2(source, runtime_asset)
             else:
-                fallback = staging / CMSSW15_SOURCE_PACKAGE
-                _package_tpsonia2mumu_source(core, fallback)
-                bundles.update({profile: fallback.name for profile in cmssw15_profiles})
+                _build_cmssw15_runtime(core, runtime_asset)
+            bundles.update({profile: runtime_asset.name for profile in cmssw15_profiles})
         analyzer_revision = None
         if "analyzer-el9" in selected:
-            analyzer = core / "external/NtupleAnalyzer"
-            files = subprocess.check_output(
-                ["git", "-C", str(analyzer), "ls-files"], text=True).splitlines()
-            if not files:
-                raise ValueError("NtupleAnalyzer submodule is not initialized")
+            analyzer, files, analyzer_revision = _initialized_submodule(
+                core, "external/NtupleAnalyzer")
             _bundle(analyzer, files, staging / "analyzer.tar.gz", "NtupleAnalyzer")
-            analyzer_revision = subprocess.check_output(
-                ["git", "-C", str(analyzer), "rev-parse", "HEAD"], text=True).strip()
             bundles["analyzer-el9"] = "analyzer.tar.gz"
         record = dict(runtime_identity(release, revision), site=site,
                       source_dirty=dirty, profiles=selected, bundles=bundles,

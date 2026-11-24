@@ -14,7 +14,7 @@ from full_mc.io import atomic_json
 from full_mc.local_paths import record_path
 from full_mc.storage.transfer import TransferClient
 from .recovery_records import reconstruct
-from .staging import FUSED_STATE_SCHEMA
+from .staging import require_schema
 
 SUFFIXES = ('.nodes.log', '.lock', '.dagman.out', '.dagman.log', '.condor.sub',
             '.lib.out', '.lib.err', '.metrics')
@@ -117,6 +117,9 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
     if not str(root_cluster_id).isdigit():
         raise ValueError('root cluster ID must be numeric')
     client = client or TransferClient()
+    spec, state = read(root / 'run.json'), read(root / 'state.json')
+    require_schema(spec)
+    require_schema(state)
     active = root / 'recovery' / 'current.json'
     if active.exists():
         previous = read(active)
@@ -128,10 +131,6 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
             return previous
         elif not apply:
             return previous
-    spec, state = read(root / 'run.json'), read(root / 'state.json')
-    fused = state.get('state_schema') == FUSED_STATE_SCHEMA
-    if fused != (spec.get('state_schema') == FUSED_STATE_SCHEMA):
-        raise ValueError('run and recovery state schemas disagree')
     submission = read(root / 'submission.json')
     if submission.get('scheduler') != schedd:
         raise ValueError('schedd differs from recorded submission')
@@ -262,9 +261,7 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                                 # same URL. Preserve the orphan, then let the deployed
                                 # controller validate and publish the replacement receipt.
                                 current = read(root / 'state.json')
-                                if (task['stage'] == 'processing' or identity in current['accepted']
-                                        or identity in current.get('staging', {}).get('settled_publications', {})
-                                        or identity in current.get('staging', {}).get('settled_reclaims', {})):
+                                if (task['stage'] == 'processing' or identity in current['accepted']):
                                     raise ValueError('replacement receipt already committed: ' + identity)
                                 if consumed_artifacts is None:
                                     consumed_artifacts = set()
@@ -340,8 +337,7 @@ def prepare_rescue(run_dir, *, schedd, root_cluster_id, apply=False,
                     elif identity.startswith('SHARD_'):
                         complete = state['allocations'].get(identity, {}).get('completed', False)
                     elif identity.startswith('CLEANUP_'):
-                        complete = (identity in done if fused else
-                                    state['cleanup_claims'].get(identity, {}).get('completed', False))
+                        complete = identity in done
                     else:
                         complete = False  # FINALIZE still repairs its completion marker.
                     if complete:

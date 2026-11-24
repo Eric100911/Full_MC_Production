@@ -90,18 +90,10 @@ def reconstruct(task, accepted, scratch, client=None, *, commit_checkpoints=Fals
             local.unlink()
         original = measured(p['original_output'], actual)
         outcome.update(actual_input_events=actual, planned_events=planned, originals=[original])
-        # Generated source originals were settled by LHE, not PLAN.
-        new_original = original['url'] not in {r['url'] for r in task['inputs']}
-        refs = outcome['outputs'] + ([original] if new_original else [])
-        if 'staging_claim_bytes' in p:
-            outcome['staged_objects'] = [
-                {k: r[k] for k in ('artifact_id', 'url', 'kind', 'size_bytes')} for r in refs]
     else:
-        if stage not in {'lhe', 'mix', 'miniaod', 'archive'}:
+        if stage not in {'lhe', 'archive'}:
             raise ValueError('unsupported recovery stage: ' + stage)
         outcome['outputs'] = [published(ref) for ref in task['outputs']]
-        if stage == 'miniaod':
-            outcome['partial'] = outcome['outputs'][0]['partial']
         if stage == 'archive':
             output = outcome['outputs'][0]
             archive_path = client.copy_in(output['url'], scratch / 'upstream.tar')
@@ -127,12 +119,4 @@ def reconstruct(task, accepted, scratch, client=None, *, commit_checkpoints=Fals
                     raise ValueError('archive has unexpected members')
             archive_path.unlink()
             outcome['members'] = members
-        if 'staging_claim_bytes' in task['parameters']:
-            objects = []
-            for ref in outcome['outputs']:
-                objects.append({k: ref[k] for k in ('artifact_id', 'url', 'kind', 'size_bytes')})
-                objects.append(dict(artifact_id=ref['artifact_id'] + ':sidecar',
-                                    url=ref['sidecar_url'], kind='sidecar',
-                                    size_bytes=ref['sidecar_size_bytes']))
-            outcome['staged_objects'] = objects
     return outcome, proof

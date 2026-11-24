@@ -26,7 +26,7 @@ def spec_payload(root, *, cern_staging, source=None):
         "generator_profile": "helac_jpsi_csco_g_v1",
     }
     return {
-        "schema_version": 2,
+        "schema_version": 2, "orchestration": "campaign_shards",
         "run_id": "safety-test",
         "runtime_release": "test-release",
         "storage": {

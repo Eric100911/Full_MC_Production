@@ -45,7 +45,7 @@ tar -czf helac_package.tar.gz HELAC-Onia-2.7.6.tar.gz hepmc2.06.11.tgz
 cp helac_package.tar.gz <Full_MC_Production>/common/packages/
 ```
 
-## 2. `tpsonia2mumu_code.tar.gz` (generated automatically)
+## 2. TPS-Onia2MuMu source
 
 The ntuple stage now uses one shared CMSSW 15 package for both `JJP` and `JUP`:
 - package path inside CMSSW: `src/HeavyFlavorAnalysis/TPS-Onia2MuMu`
@@ -74,7 +74,7 @@ Initialize or refresh it with:
 git submodule update --init --recursive
 ```
 
-When no prebuilt CMSSW15 runtime is available, `dag_generator.py generate
+For the legacy generator, when no prebuilt CMSSW15 runtime is available, `dag_generator.py generate
 --enable-ntuple`, `generate-test --enable-ntuple`, and `prepare-runtime
 --include-ntuple` build `tpsonia2mumu_code.tar.gz` from the submodule
 automatically and insert it into the ntuple runtime bundle. No manual copy into
@@ -84,24 +84,22 @@ For `hepthu` local-storage DAGs the ntuple payload may be inserted into the
 processing runtime bundle so the ntuple can run inline with the local MiniAOD.
 For lxplus/T2 DAGs it is kept in a separate ntuple runtime bundle.
 
-## 3. `cmssw15_tpsonia2mumu_runtime.tar.gz` (optional, preferred)
+## 3. `cmssw15_tpsonia2mumu_runtime.tar.gz`
 
-For ntuple production, place a prebuilt CMSSW 15 project tarball here or pass it
-with `--cmssw15-runtime-tarball`. It should contain `CMSSW_15_0_15/` at archive
-root. Worker jobs unpack it, run `scram build ProjectRename`, and skip the
-per-job `scram b HeavyFlavorAnalysis/TPS-Onia2MuMu` rebuild.
+For new IHEP batches, `mcprod runtime prepare --site ihep` reuses a validated
+prebuilt CMSSW 15 tarball from this directory when available. Otherwise it
+creates a fresh `CMSSW_15_0_15` project in EL9, installs the pinned
+TPS-Onia2MuMu source, runs the full `scram b -j 4` build from `src/`, and
+packages the project as part of the release. The batch worker unpacks the
+compiled project and runs `scram build ProjectRename` before loading its
+environment and running `cmsRun`.
 
-The generator validates this contract before packaging. The archive must
-contain:
+The mcprod release validator checks the source tree, the compiled
+TPS-Onia2MuMu library, and the corresponding `MultiLepPAT` entry in
+`CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache`.
 
-- `CMSSW_15_0_15/src/`
-- `CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/`
-- `CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/test/ConfFile_cfg.py`
-- `CMSSW_15_0_15/lib/el9_amd64_gcc12/pluginHeavyFlavorAnalysisTPS-Onia2MuMu.so`
-- `CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache`
-
-Build the runtime with a clean full project rebuild (`scram b clean && scram b
--j 8`) so the plugin cache is regenerated before packaging.
+The legacy generator accepts the same project tarball via
+`--cmssw15-runtime-tarball`.
 
 ## Verification
 
@@ -112,9 +110,7 @@ ls -lh *.tar.gz
 ```
 
 Checks:
-- runtime generation should produce `tpsonia2mumu_code.tar.gz` under the selected DAG output directory
-- the archive must contain `HeavyFlavorAnalysis/TPS-Onia2MuMu/`
-- source-package fallback worker build target is `scram b -j 4 HeavyFlavorAnalysis/TPS-Onia2MuMu`
+- the IHEP runtime release should expose `cmssw15_tpsonia2mumu_runtime.tar.gz` as the `cmssw15-ntuple-el9` bundle
 - prebuilt CMSSW15 worker relocation target is `scram build ProjectRename`
 - ntuple tests on this branch should be run in `CMSSW_15_0_15`
 

@@ -54,6 +54,11 @@ Freeze and prepare a bounded CERN run without submitting it:
   --log-level info
 ```
 
+Planning a run that uses only existing LHE files neither validates the HELAC
+bundle nor writes an LHE-generation submit file. To use a source generator,
+the run must have a valid HELAC bundle. Condor path checks run before the
+planner writes to the output directory.
+
 For new runs set `"orchestration": "campaign_shards"` as in the workspace
 example. SOURCE SubDAGs publish PLAN blocks to CERN EOS. The controller can
 allocate and start a SHARD as soon as its needed PLAN segments are accepted.
@@ -70,9 +75,9 @@ limits cap individual products and inform worker scratch requests. Queue width
 and submission cadence remain configurable through `scheduler`.
 
 New runs freeze `mcprod-shard-state-v3` in both `run.json` and `state.json` and
-require a CERN runtime prepared by this core. Keep legacy wave and v1/v2 SHARD
-runs on their frozen runtimes. Their source inventory and task manifests stay
-with those runs.
+require a CERN runtime prepared by this core. The specification must explicitly
+set `"orchestration": "campaign_shards"`. Frozen historical runs belong to their
+original runtime and Git revision. See [historical operations](legacy-production.md).
 
 ### DAGMan deferred-script intervals
 
@@ -112,6 +117,8 @@ SOURCE or SHARD admission in v3.
 Use `run status`, `run submit`, and `run resume` with
 `--run <run-directory-or-id>` for the recorded CERN run. Submission records
 the schedd and root DAGMan ID; resume targets that exact run.
+The historical G3 site proof is no longer required. New plans ignore the
+legacy `site_validation` field.
 Before `run submit`, `mcprod` checks the X.509 proxy paths pinned in the worker
 submit files with `voms-proxy-info --timeleft`. Every proxy must have more than
 48 hours remaining. A failed check stops before namespace ownership checks or Condor
@@ -216,8 +223,7 @@ The public worker adapter runs a single staged task:
 ```
 
 Generated v3 DAGs use `internal` commands for SOURCE and SHARD preparation,
-result acceptance, terminal cleanup, and finalization. Legacy wave DAGs use
-`internal advance-wave`.
+result acceptance, terminal cleanup, and finalization.
 
 ## Validation
 
@@ -227,8 +233,8 @@ The core contract suite can run offline:
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_core_*.py'
 ```
 
-Use `docs/testing.md` for mcprod pilot/cutover procedures, the retained legacy
-workflow, live scheduler checks, and storage or CMSSW validation.
+Use `docs/testing.md` for mcprod pilot procedures and live scheduler, storage,
+and CMSSW validation.
 
 The 2026-09-29 DPS1 cutover pilot completed at core revision `ae60528` and
 NtupleAnalyzer revision `1cd1a5a`. Its CERN and IHEP job IDs, product counts,
@@ -245,7 +251,7 @@ historical attempt and must not supply job IDs or runtime paths for a new run.
 
 - [LHE 运动学审计指南](lhe_kinematics_audit.md)
 
-## DAGMan assertion recovery (v06_01)
+## DAGMan rescue preparation
 
 `mcprod recovery prepare-rescue --run-dir <run> --schedd <schedd>
 --root-cluster-id <old-root>` previews per-DAG recovery. Add `--apply` to
@@ -253,5 +259,5 @@ reconstruct missing published-product records, accept results through the run's
 deployed controller, write native rescues and archive old control files. It
 never submits jobs. Then use `mcprod run resume --run <run>`.
 
-See [the PRE_SKIP incident and operating procedure](v06_01_dagman_preskip_assertion_20261104.md)
-for evidence requirements, interruption recovery and submission boundaries.
+The historical [PRE_SKIP incident](v06_01_dagman_preskip_assertion_20261104.md)
+explains why v3 uses validated SOURCE POST for the skip outcome.

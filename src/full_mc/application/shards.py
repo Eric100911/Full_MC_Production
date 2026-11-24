@@ -4,24 +4,28 @@ DAGMan remains the execution authority. This controller accepts immutable worker
 results and allocates finite inputs using durable local transactions.
 No function in the scheduling seams contacts remote storage.
 """
-import hashlib
-import json
 import time
 from collections import defaultdict
 from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 
-from full_mc.application import (admission_hints, control_events, producer_index,
-                                 production as legacy, staging)
+from full_mc.application import admission_hints, control_events, producer_index, staging
+from full_mc.application.merge_groups import merge_groups
+from full_mc.application.result_validation import (
+    validate_archive_result, validate_planner_result, validate_reclaim_result,
+    validate_result_envelope, validate_source_inventory,
+)
 from full_mc.application.ledger import load_groups, sample_key, write_group
 from full_mc.credentials import resolve_proxy_path
+from full_mc.planning.tasks import artifact_reference, reclaim_references, staging_root, task_manifest
+from full_mc.storage.archive import restore_members
 from full_mc.domain.identity import shuffle_seed
 from full_mc.domain.inventory import SourceBlock
-from full_mc.domain.streams import allocate_shard, build_streams, may_still_need, next_matching, stream_key
+from full_mc.domain.streams import allocate_shard, build_streams, next_matching, stream_key
 from full_mc.io import atomic_json, read_json, write_immutable_json
 from full_mc.local_paths import LAYOUT_MARKER, record_path
-from full_mc.planning.graph import token, write_submit_files
+from full_mc.planning.graph import token, validate_submit_paths, write_submit_files
 from full_mc.planning.script_defer import (controller_render_override,
                                            resolve_script_defer)
 from full_mc.planning.shards import (child_path, cleanup_name, shard_name,
@@ -31,9 +35,6 @@ from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 from full_mc.settings import load_run_spec
 from full_mc.workers.processing import validate_outputs as validate_processing_outputs
-
-_INVENTORY_CHECKPOINT_SCHEMA = "mcprod-inventory-v2-checkpoint-v1"
-
 
 def _entry(function):
     def argument(args, kwargs, name, position):
@@ -54,7 +55,7 @@ def _entry(function):
             run_dir = kwargs.get("run_dir", args[0] if args else None)
             task_id = kwargs.get("task_id")
             if task_id is None:
-                if function.__name__ in {"admit_producer", "prepare_source_product", "accept_result",
+                if function.__name__ in {"prepare_source_product", "accept_result",
                                          "recover_archive_orphan"}:
                     task_id = argument(args, kwargs, "task_id", 1)
                 elif function.__name__ == "prepare_source":
@@ -112,21 +113,10 @@ def _answer(code=0, **extra):
 def _paths(run_dir):
     root = Path(run_dir).resolve()
     spec = read_json(root / "run.json")
+    staging.require_schema(spec)
     control_events.update_metadata(run_id=spec.get("run_id"),
                                   runtime_release=spec.get("runtime_release"))
     return root, spec
-
-
-def _fused(spec):
-    return spec.get("state_schema") == staging.FUSED_STATE_SCHEMA
-
-
-def _transaction(root, spec):
-    if _fused(spec):
-        return staging.transaction(root, expected_schema=staging.FUSED_STATE_SCHEMA)
-    if (root / "ledger/state.lock").exists():
-        raise ValueError("fused state requires its matching frozen run.json")
-    return staging.transaction(root)
 
 
 def _manifest_path(root, name):
@@ -166,21 +156,12 @@ def _render(root, name, spec, *, allow_plan_accept_post_override=False):
             script_defer["default_seconds"] = defer["default_seconds"]
             script_defer["plan_accept_post_seconds"] = override
     path = write_child_dag(root, name, manifest["tasks"], manifest["dependencies"],
-                           render_spec, manifest.get("pre_tasks", manifest.get("claims", {})))
+                           render_spec, manifest.get("pre_tasks", ()))
     return _answer(dag=str(path), status="prepared")
 
 
 def _freeze(root, name, descriptor):
     write_immutable_json(_manifest_path(root, name), descriptor)
-
-
-def _run_owned(spec, ref):
-    return str(ref["url"]).startswith(legacy._staging(spec) + "/")
-
-
-def _claim(task, ceiling):
-    task["parameters"]["staging_claim_bytes"] = int(ceiling)
-    return task
 
 
 def _processing_scratch(limits):
@@ -193,7 +174,9 @@ def plan_run(spec_path, output_dir, log_level=None):
     spec = deepcopy(spec_path) if isinstance(spec_path, dict) else load_run_spec(spec_path)
     if log_level:
         spec["log_level"] = log_level
-    legacy._authority(spec)
+    if spec.get("orchestration") != "campaign_shards":
+        raise ValueError("run spec must explicitly declare orchestration: campaign_shards")
+    validate_source_inventory(spec)
     limits = spec.setdefault("limits", {})
     limits.setdefault("miniaod_bytes", 2_000_000_000)
     for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes", "miniaod_bytes"):
@@ -209,9 +192,6 @@ def plan_run(spec_path, output_dir, log_level=None):
         raise ValueError("target_window_nodes must be positive")
     ranges = shard_ranges(spec)
     streams = build_streams(spec)
-    for stream in streams.values():
-        # Completion cursors in v1/v2 existed to decide when blocks could be deleted.
-        del stream["safe_cursor"], stream["closed"]
     for source in spec["sources"]:
         token(source["pool"])
         token(source["source_id"])
@@ -223,25 +203,23 @@ def plan_run(spec_path, output_dir, log_level=None):
     runtime_dir = spec.get("runtime_dir")
     if not runtime_dir:
         raise ValueError("runtime_dir must identify a prepared reusable CERN runtime")
+    include_lhe = any(source.get("generator_profile") for source in spec["sources"])
     runtime = validate_runtime_release(runtime_dir, expected_release=spec["runtime_release"],
-                                       expected_site="cern")
+                                       expected_site="cern", check_helac=include_lhe)
     if spec.get("core_revision") and spec["core_revision"] != runtime["git_revision"]:
         raise ValueError("supplied core_revision does not match the prepared runtime")
     if runtime.get("cern_state_schema") != staging.FUSED_STATE_SCHEMA:
         raise ValueError("prepare a new CERN runtime for fused campaign shards")
     spec["state_schema"] = staging.FUSED_STATE_SCHEMA
-    for key in ("staging_bytes", "reserve_bytes"):
-        spec["storage"].pop(key, None)
-    for key in ("policy_headroom_bytes", "source_selection_mode", "source_files_per_step",
-                "processing_nodes_per_wave"):
-        limits.pop(key, None)
-    spec.get("site_validation", {}).pop("isolated_budget_bytes", None)
     required = {STAGE_RUNTIME[s] for s in ("plan", "mix", "archive", "reclaim", "processing")}
     simulations = {runtime_for_profile(p, "simulation") for c in spec["campaigns"]
                    for p in c["resolved_detector_variants"]}
     required.update(simulations)
-    if any(s.get("generator_profile") for s in spec["sources"]):
-        required.add(STAGE_RUNTIME["lhe"])
+    if include_lhe:
+        lhe_profile = STAGE_RUNTIME["lhe"]
+        required.add(lhe_profile)
+        if lhe_profile not in runtime["bundles"]:
+            raise ValueError("runtime release lacks the HELAC bundle")
     if not required <= set(runtime["profiles"]):
         raise ValueError("runtime release lacks required worker profiles")
     controller = Path(runtime_dir) / "controller/core"
@@ -253,15 +231,18 @@ def plan_run(spec_path, output_dir, log_level=None):
     root = Path(output_dir).resolve()
     if root.exists() and any(root.iterdir()):
         raise FileExistsError("run directory is not empty; use existing run for recovery")
+    processing_profiles = {STAGE_RUNTIME["mix"], *simulations}
+    validate_submit_paths(root, controller, Path(runtime_dir), proxy_path, runtime,
+                          processing_profiles=processing_profiles, include_lhe=include_lhe)
     root.mkdir(parents=True, exist_ok=True)
     (root / LAYOUT_MARKER).touch()
     atomic_json(root / "run.json", spec)
-    staging.initialize_fused(root, {"streams": streams, "sources": {},
+    staging.initialize(root, {"streams": streams, "sources": {},
         "assigned_progress": {c["name"]: 0 for c in spec["campaigns"]},
         "target_progress": {c["name"]: 0 for c in spec["campaigns"]}},
         {source["pool"] for source in spec["sources"]})
     write_submit_files(root, spec["core_root"], runtime_dir, proxy_path,
-                       processing_profiles={STAGE_RUNTIME["mix"], *simulations})
+                       processing_profiles=processing_profiles, include_lhe=include_lhe)
     write_root_dag(root, spec)
     return {"run_id": spec["run_id"], "run_dir": str(root), "dag": str(root / "run.dag"),
             "runtime_release": spec["runtime_release"], "source_files": len(spec["sources"]),
@@ -273,308 +254,25 @@ def _inventory(root, spec, state):
     """Build pool indexes using the run's selected inventory ordering model."""
     refs, blocks, exhausted = {}, defaultdict(list), set()
     pools = {source["pool"] for source in spec["sources"]}
-    if state.get("state_schema") in {staging.INVENTORY_STATE_SCHEMA, staging.FUSED_STATE_SCHEMA}:
-        segments = state["planner"]["inventory_segments"]["pools"]
-        if set(segments) != pools:
-            raise RuntimeError("PLAN inventory pools disagree with the frozen source spec")
-        for pool in pools:
-            for identity in segments[pool]:
-                index = int(identity.removeprefix("PLAN_"))
-                if index >= len(spec["sources"]) or spec["sources"][index]["pool"] != pool:
-                    raise RuntimeError("PLAN inventory segment disagrees with its frozen source")
-                source = spec["sources"][index]
-                for ref in _receipt(root, state, identity)["outputs"]:
-                    refs[ref["artifact_id"]] = ref
-                    blocks[pool].append(SourceBlock(ref["artifact_id"], pool,
-                        source["source_id"], len(blocks[pool]), int(ref["events"]), ref["url"]))
-            if all(state["planner"]["sources"].get(str(index)) == "skipped"
-                   or f"PLAN_{index:06d}" in state["accepted"]
-                   for index, source in enumerate(spec["sources"])
-                   if source["pool"] == pool):
-                exhausted.add(pool)
-        return dict(blocks), refs, exhausted
-
+    segments = state["planner"]["inventory_segments"]["pools"]
+    if set(segments) != pools:
+        raise RuntimeError("PLAN inventory pools disagree with the frozen source spec")
     for pool in pools:
-        complete = True
-        for index, source in enumerate(spec["sources"]):
-            if source["pool"] != pool:
-                continue
-            status = state["planner"]["sources"].get(str(index))
-            if status == "skipped":
-                continue
-            identity = f"PLAN_{index:06d}"
-            if identity not in state["accepted"]:
-                complete = False
-                break
+        for identity in segments[pool]:
+            index = int(identity.removeprefix("PLAN_"))
+            if index >= len(spec["sources"]) or spec["sources"][index]["pool"] != pool:
+                raise RuntimeError("PLAN inventory segment disagrees with its frozen source")
+            source = spec["sources"][index]
             for ref in _receipt(root, state, identity)["outputs"]:
                 refs[ref["artifact_id"]] = ref
                 blocks[pool].append(SourceBlock(ref["artifact_id"], pool,
                     source["source_id"], len(blocks[pool]), int(ref["events"]), ref["url"]))
-        if complete:
+        if all(state["planner"]["sources"].get(str(index)) == "skipped"
+               or f"PLAN_{index:06d}" in state["accepted"]
+               for index, source in enumerate(spec["sources"])
+               if source["pool"] == pool):
             exhausted.add(pool)
     return dict(blocks), refs, exhausted
-
-
-def _canonical_digest(value):
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _checkpoint_path(root, path):
-    path = Path(path).expanduser().resolve(strict=False)
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("inventory checkpoint must be inside its run directory") from exc
-    if (path.parent != root / ".controller-switch"
-            or not path.parent.is_dir()
-            or path == root / "state.json"
-            or path.is_symlink()
-            or (path.exists() and not path.is_file())):
-        raise ValueError("invalid inventory checkpoint path")
-    return path
-
-
-def _checkpoint_expected_state(checkpoint, root, spec):
-    required = {"schema", "run_dir", "run_id", "run_spec_sha256",
-                "original_v1_state", "original_v1_sha256",
-                "inventory_segments", "expected_v2_sha256"}
-    if not isinstance(checkpoint, dict) or set(checkpoint) != required:
-        raise ValueError("invalid inventory migration checkpoint")
-    if (checkpoint["schema"] != _INVENTORY_CHECKPOINT_SCHEMA
-            or checkpoint["run_dir"] != str(root)
-            or checkpoint["run_id"] != spec.get("run_id")
-            or checkpoint["run_spec_sha256"] != _canonical_digest(spec)):
-        raise ValueError("inventory checkpoint belongs to a different run or spec")
-    original = checkpoint["original_v1_state"]
-    if (not isinstance(original, dict)
-            or original.get("state_schema") != staging.STATE_SCHEMA
-            or checkpoint["original_v1_sha256"] != _canonical_digest(original)):
-        raise ValueError("inventory checkpoint v1 state checksum is invalid")
-    expected = deepcopy(original)
-    expected["state_schema"] = staging.INVENTORY_STATE_SCHEMA
-    expected.setdefault("planner", {})["inventory_segments"] = deepcopy(
-        checkpoint["inventory_segments"])
-    if checkpoint["expected_v2_sha256"] != _canonical_digest(expected):
-        raise ValueError("inventory checkpoint v2 state checksum is invalid")
-    staging._check(original)
-    staging._check(expected)
-    return original, expected
-
-
-def _write_inventory_checkpoint(path, root, spec, original, expected):
-    checkpoint = {
-        "schema": _INVENTORY_CHECKPOINT_SCHEMA,
-        "run_dir": str(root),
-        "run_id": spec.get("run_id"),
-        "run_spec_sha256": _canonical_digest(spec),
-        # Store the original state once; expected v2 is reconstructed from its
-        # schema field and the small append-only pool index.
-        "original_v1_state": deepcopy(original),
-        "original_v1_sha256": _canonical_digest(original),
-        "inventory_segments": deepcopy(
-            expected["planner"]["inventory_segments"]),
-        "expected_v2_sha256": _canonical_digest(expected),
-    }
-    write_immutable_json(path, checkpoint)
-    return checkpoint
-
-
-def migrate_inventory_v2(run_dir, *, checkpoint_path=None):
-    """Migrate an independent v1 ledger to append-ordered PLAN segments.
-
-    The currently visible v1 prefix keeps its exact order. Accepted PLAN
-    results hidden behind a missing source are appended afterward in source
-    order, so no block index already present in an allocation can move.
-    """
-    root, spec = _paths(run_dir)
-    checkpoint = (_checkpoint_path(root, checkpoint_path)
-                  if checkpoint_path is not None else None)
-    with staging.transaction(root) as state:
-        if state.get("state_schema") == staging.INVENTORY_STATE_SCHEMA:
-            checkpoint_record = None
-            if checkpoint is not None:
-                checkpoint_record = read_json(checkpoint)
-                _, expected = _checkpoint_expected_state(checkpoint_record, root, spec)
-                if state != expected:
-                    raise RuntimeError("ledger differs from the migration checkpoint")
-            _inventory(root, spec, state)
-            result = {"status": "already migrated"}
-            if checkpoint_record is not None:
-                result.update({"run_id": spec.get("run_id"),
-                    "checkpoint": str(checkpoint),
-                    "run_spec_sha256": checkpoint_record["run_spec_sha256"],
-                    "v1_state_sha256": checkpoint_record["original_v1_sha256"],
-                    "v2_state_sha256": checkpoint_record["expected_v2_sha256"],
-                    "state_schema": staging.INVENTORY_STATE_SCHEMA})
-            return result
-
-        old_blocks, _, _ = _inventory(root, spec, state)
-        old_indices = {pool: {block.artifact_id: block.index for block in blocks}
-                       for pool, blocks in old_blocks.items()}
-        pools = {source["pool"] for source in spec["sources"]}
-        segments = {pool: [] for pool in pools}
-        exposed = set()
-        for pool in pools:
-            for index, source in enumerate(spec["sources"]):
-                if source["pool"] != pool:
-                    continue
-                status = state["planner"]["sources"].get(str(index))
-                if status == "skipped":
-                    continue
-                identity = f"PLAN_{index:06d}"
-                if identity not in state["accepted"]:
-                    break
-                segments[pool].append(identity)
-                exposed.add(identity)
-
-        accepted_plans = sorted((identity for identity, marker in state["accepted"].items()
-                                 if isinstance(marker, dict) and marker.get("stage") == "plan"),
-                                key=lambda identity: int(identity[5:])
-                                if identity.startswith("PLAN_") and identity[5:].isascii()
-                                and identity[5:].isdigit()
-                                else -1)
-        for identity in accepted_plans:
-            if (not identity.startswith("PLAN_") or not identity[5:].isascii()
-                    or not identity[5:].isdigit()
-                    or f"PLAN_{int(identity[5:]):06d}" != identity):
-                raise RuntimeError("accepted PLAN marker has an invalid identity")
-            index = int(identity[5:])
-            if index >= len(spec["sources"]):
-                raise RuntimeError("accepted PLAN result is outside the frozen source list")
-            source = spec["sources"][index]
-            if state["planner"]["sources"].get(str(index)) not in {"admitted", "completed"}:
-                raise RuntimeError("accepted PLAN source has an inconsistent planner state")
-            task = read_json(record_path(root, "tasks", identity))
-            outcome = _receipt(root, state, identity)
-            legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
-            legacy._validate_planner_result(root, spec,
-                {"plan_task": identity, "source_index": index}, outcome)
-            if identity not in exposed:
-                # Hidden results have never been safe to reclaim through
-                # v1 inventory cleanup. Verify that migration will not make
-                # an already absent block allocatable.
-                for ref in outcome["outputs"]:
-                    physical = state["staging"]["objects"].get(ref["url"])
-                    if (not physical or not physical.get("resident")
-                            or any(physical.get(key) != ref.get(key)
-                                   for key in ("artifact_id", "url", "kind", "size_bytes"))):
-                        raise RuntimeError("hidden accepted PLAN block is not resident")
-                segments[source["pool"]].append(identity)
-
-        candidate = deepcopy(state)
-        candidate["state_schema"] = staging.INVENTORY_STATE_SCHEMA
-        candidate["planner"]["inventory_segments"] = {
-            "schema": staging.INVENTORY_SEGMENT_SCHEMA,
-            "pools": segments,
-        }
-        new_blocks, _, _ = _inventory(root, spec, candidate)
-        new_indices = {pool: {block.artifact_id: block.index for block in blocks}
-                       for pool, blocks in new_blocks.items()}
-        for pool, index_by_id in old_indices.items():
-            for artifact_id, index in index_by_id.items():
-                if new_indices.get(pool, {}).get(artifact_id) != index:
-                    raise RuntimeError("migration would renumber a legacy inventory block")
-
-        # Frozen allocation manifests are the durable record of which pool
-        # ordinals workers consumed. Prove every stored reference retains that
-        # exact ordinal before switching the state schema.
-        campaigns = {campaign["name"]: campaign for campaign in spec["campaigns"]}
-        for name, allocation_state in state["allocations"].items():
-            manifest = read_json(_manifest_path(root, name))
-            allocation = manifest.get("allocation")
-            if not isinstance(allocation, dict) or allocation.get("campaign") not in campaigns:
-                raise RuntimeError("existing allocation manifest has no valid allocation")
-            if (allocation.get("campaign") != allocation_state.get("campaign")
-                    or allocation.get("start_job_index") != allocation_state.get("start_job_index")
-                    or not isinstance(allocation.get("nodes"), list)
-                    or len(allocation["nodes"]) != allocation_state.get("node_count")):
-                raise RuntimeError("existing allocation manifest disagrees with its state marker")
-            campaign = campaigns[allocation["campaign"]]
-            for node in allocation.get("nodes", []):
-                slots = node.get("sources")
-                if not isinstance(slots, list) or len(slots) != len(campaign["sources"]):
-                    raise RuntimeError("existing allocation manifest has incomplete source slots")
-                if [slot.get("slot") for slot in slots] != list(range(len(campaign["sources"]))):
-                    raise RuntimeError("existing allocation manifest source slots are reordered")
-                for slot in slots:
-                    slot_index = slot.get("slot")
-                    if type(slot_index) is not int or not 0 <= slot_index < len(campaign["sources"]):
-                        raise RuntimeError("existing allocation manifest has an invalid source slot")
-                    pool = campaign["sources"][slot_index]["pool"]
-                    if slot.get("pool") != pool:
-                        raise RuntimeError("existing allocation manifest pool disagrees with its slot")
-                    block_refs = slot.get("block_refs")
-                    if not isinstance(block_refs, list) or not block_refs:
-                        raise RuntimeError("existing allocation manifest has no block references")
-                    for artifact_id in block_refs:
-                        old_index = old_indices.get(pool, {}).get(artifact_id)
-                        if (old_index is None
-                                or new_indices.get(pool, {}).get(artifact_id) != old_index):
-                            raise RuntimeError("existing allocation reference is absent or renumbered")
-
-        checkpoint_record = None
-        if checkpoint is not None:
-            checkpoint_record = _write_inventory_checkpoint(
-                checkpoint, root, spec, state, candidate)
-
-        state["planner"]["inventory_segments"] = candidate["planner"]["inventory_segments"]
-        state["state_schema"] = staging.INVENTORY_STATE_SCHEMA
-        result = {"status": "migrated", "segments": sum(map(len, segments.values())),
-                  "hidden_segments": len(accepted_plans) - len(exposed)}
-        if checkpoint_record is not None:
-            result.update({"run_id": spec.get("run_id"),
-                "checkpoint": str(checkpoint),
-                "run_spec_sha256": checkpoint_record["run_spec_sha256"],
-                "v1_state_sha256": checkpoint_record["original_v1_sha256"],
-                "v2_state_sha256": checkpoint_record["expected_v2_sha256"],
-                "state_schema": staging.INVENTORY_STATE_SCHEMA})
-        return result
-
-
-def rollback_inventory_v2_from_checkpoint(run_dir, checkpoint_path):
-    """Restore the exact checkpointed v1 ledger if no post-migration write occurred."""
-    root, spec = _paths(run_dir)
-    checkpoint_file = _checkpoint_path(root, checkpoint_path)
-    checkpoint = read_json(checkpoint_file)
-    original, expected = _checkpoint_expected_state(checkpoint, root, spec)
-    result = rollback_inventory_v2(root, original_v1_state=original,
-                                   expected_v2_state=expected)
-    result.update({"run_id": spec.get("run_id"), "checkpoint": str(checkpoint_file),
-                   "run_spec_sha256": checkpoint["run_spec_sha256"],
-                   "v1_state_sha256": checkpoint["original_v1_sha256"],
-                   "v2_state_sha256": checkpoint["expected_v2_sha256"],
-                   "state_schema": staging.STATE_SCHEMA})
-    return result
-
-
-def rollback_inventory_v2(run_dir, *, original_v1_state, expected_v2_state):
-    """Restore a caller-held v1 snapshot only while the ledger is unchanged.
-
-    This offline rehearsal hook deliberately creates no checkpoint file. The
-    caller must retain both snapshots. Any accepted work or state mutation
-    after migration makes the equality check fail and requires forward repair.
-    """
-    root, _ = _paths(run_dir)
-    original = deepcopy(original_v1_state)
-    expected = deepcopy(expected_v2_state)
-    if original.get("state_schema") != staging.STATE_SCHEMA:
-        raise ValueError("rollback snapshot is not a v1 staging state")
-    if expected.get("state_schema") != staging.INVENTORY_STATE_SCHEMA:
-        raise ValueError("expected rollback state is not a v2 staging state")
-    baseline = deepcopy(original)
-    baseline["state_schema"] = staging.INVENTORY_STATE_SCHEMA
-    baseline.setdefault("planner", {})["inventory_segments"] = deepcopy(
-        expected.get("planner", {}).get("inventory_segments"))
-    if baseline != expected:
-        raise ValueError("v2 snapshot contains changes beyond inventory migration")
-
-    with staging.transaction(root) as state:
-        if state != expected:
-            raise RuntimeError("ledger changed after migration; rollback is unsafe")
-        state.clear()
-        state.update(original)
-    return {"status": "rolled back"}
 
 
 def _targets(spec, state):
@@ -595,7 +293,6 @@ def _deficits(root, spec, state):
     blocks, _, _ = _inventory(root, spec, state)
     targets = _targets(spec, state)
     deficits = defaultdict(int)
-    by_campaign = {}
     for campaign in spec["campaigns"]:
         name = campaign["name"]
         assigned = state["planner"]["assigned_progress"][name]
@@ -620,7 +317,6 @@ def _deficits(root, spec, state):
                     have += selected[cursors[pool]].events
                     cursors[pool] += stream["stride"]
                 missing[pool] += max(0, budget - have)
-        by_campaign[name] = dict(missing)
         for pool, missing_events in missing.items():
             deficits[pool] = max(deficits[pool], missing_events)
     # An admitted source remains supply even before its PLAN result is accepted.
@@ -630,38 +326,30 @@ def _deficits(root, spec, state):
             profile = source.get("resolved_generator_profile", {})
             hint = source.get("planned_events") or source.get("actual_events") or profile.get("planning_events_hint", 0)
             deficits[source["pool"]] = max(0, deficits[source["pool"]] - int(hint))
-            for missing in by_campaign.values():
-                if source["pool"] in missing:
-                    missing[source["pool"]] = max(0, missing[source["pool"]] - int(hint))
-    return deficits, by_campaign
+    return deficits
 
 
 def _source_tasks(spec, index):
     source = spec["sources"][index]
     limits = spec["limits"]
-    base = f"{legacy._staging(spec)}/sources/{source['pool']}/{source['source_id']}"
+    base = f"{staging_root(spec)}/sources/{source['pool']}/{source['source_id']}"
     generation = source.get("resolved_generator_profile")
     extra = {"generator_profile": deepcopy(generation)} if generation else {}
-    original = legacy._ref(f"LHE_{index:06d}", base + "/source.lhe.gz", "lhe", **extra)
+    original = artifact_reference(f"LHE_{index:06d}", base + "/source.lhe.gz", "lhe", **extra)
     if generation:
         original["sidecar_url"] = original["url"] + ".json"
-    tasks, dependencies, claims = [], [], {}
+    tasks, dependencies = [], []
     plan_id = f"PLAN_{index:06d}"
     if generation:
-        lhe = legacy._task(spec, f"LHE_{index:06d}", "lhe", [], [original], dict(
+        lhe = task_manifest(spec, f"LHE_{index:06d}", "lhe", [], [original], dict(
             generator_profile=generation, pool_name=source["pool"], seed=int(source["seed"]),
             max_output_bytes=limits["source_lhe_bytes"], scratch_bytes=limits["source_lhe_bytes"] * 4))
-        if not _fused(spec):
-            claims[lhe["task_id"]] = limits["source_lhe_bytes"]
-            _claim(lhe, claims[lhe["task_id"]])
         tasks.append(lhe)
         inputs = [original]
         dependencies.append(([lhe["task_id"]], plan_id))
-        planner_ceiling = limits["source_block_bytes"]
     else:
-        inputs = [legacy._ref(f"INPUT_{index:06d}", source["url"], "lhe", events=int(source["actual_events"]))]
-        planner_ceiling = limits["source_lhe_bytes"] + limits["source_block_bytes"]
-    planner = legacy._task(spec, plan_id, "plan", inputs, [], {
+        inputs = [artifact_reference(f"INPUT_{index:06d}", source["url"], "lhe", events=int(source["actual_events"]))]
+    planner = task_manifest(spec, plan_id, "plan", inputs, [], {
         "pool_name": source["pool"], "primary_seed": int(source["seed"]),
         "group_id": source["source_id"], "events_per_block": spec["block_events"],
         "shuffle_seed": shuffle_seed(int(source["seed"])),
@@ -669,53 +357,34 @@ def _source_tasks(spec, index):
         "block_output_dir": base + "/blocks", "original_output": original,
         "original_max_bytes": limits["source_lhe_bytes"], "max_output_bytes": limits["source_block_bytes"],
         "scratch_bytes": 4 * (limits["source_lhe_bytes"] + limits["source_block_bytes"])})
-    if not _fused(spec):
-        claims[plan_id] = planner_ceiling
-        _claim(planner, planner_ceiling)
     tasks.append(planner)
     archive_id = f"SOURCE_ARCHIVE_{index:06d}"
-    archive = _archive(spec, archive_id, [original], [], limits["source_lhe_bytes"])
-    if _fused(spec):
-        archive["outputs"][0]["sidecar_url"] = archive["outputs"][0]["url"] + ".json"
+    archive = _archive(spec, archive_id, [original], limits["source_lhe_bytes"])
     archive["parameters"].update(archive_role="source", source_plan_task=plan_id)
     reclaim = _reclaim(spec, f"SOURCE_RECLAIM_{index:06d}", [original])
     tasks.extend([archive, reclaim])
     dependencies.extend([([plan_id], archive_id), ([archive_id], reclaim["task_id"])])
-    descriptor = {"tasks": tasks, "dependencies": dependencies,
-                  "pre_tasks": list(claims) + [archive_id],
-                  "source_index": index, "pool": source["pool"]}
-    if _fused(spec):
-        reclaim["parameters"]["source_archive_task"] = archive_id
-        descriptor["pre_tasks"].append(reclaim["task_id"])
-    else:
-        descriptor["claims"] = claims
-    return descriptor
+    reclaim["parameters"]["source_archive_task"] = archive_id
+    return {"tasks": tasks, "dependencies": dependencies,
+            "pre_tasks": [archive_id, reclaim["task_id"]],
+            "source_index": index, "pool": source["pool"]}
 
 
-def _archive(spec, identity, refs, miniaods, upper_bytes):
+def _archive(spec, identity, refs, upper_bytes):
     scratch = 3 * int(upper_bytes)
     disk = spec.get("resources", {}).get("archive", {}).get("disk_bytes")
     if disk is not None and scratch > int(disk):
         raise ValueError("archive scratch exceeds its requested disk budget")
-    output = legacy._ref(identity, spec["storage"]["ihep_archive"].rstrip("/") + "/"
+    output = artifact_reference(identity, spec["storage"]["ihep_archive"].rstrip("/") + "/"
         + spec["run_id"] + "/" + identity + ".tar", "upstream-archive")
-    return legacy._task(spec, identity, "archive", refs, [output],
-                        {"component_miniaods": miniaods, "scratch_bytes": scratch})
+    output["sidecar_url"] = output["url"] + ".json"
+    return task_manifest(spec, identity, "archive", refs, [output],
+                        {"scratch_bytes": scratch})
 
 
 def _reclaim(spec, identity, refs):
-    return legacy._task(spec, identity, "reclaim", legacy._reclaim_refs(refs), [],
-                        {"staging_prefix": legacy._staging(spec)})
-
-
-def _work_can_free_bytes(root, spec, state):
-    if any(status == "admitted" for status in state["planner"]["sources"].values()):
-        return True
-    if any(not value["completed"] for value in state["allocations"].values()):
-        return True
-    if any(not value["completed"] for value in state["cleanup_claims"].values()):
-        return True
-    return any(_cleanup_refs(root, spec, state, pool) for pool in {s["pool"] for s in spec["sources"]})
+    return task_manifest(spec, identity, "reclaim", reclaim_references(refs), [],
+                        {"staging_prefix": staging_root(spec)})
 
 
 @_entry
@@ -732,7 +401,7 @@ def prepare_source(run_dir, source_index):
             control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
         if reason:
             return _answer(75, reason=reason, admission_hint=True)
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         current = state["planner"]["sources"].get(str(index))
         if current == "skipped":
             return _answer(99, status="unneeded")
@@ -745,49 +414,19 @@ def prepare_source(run_dir, source_index):
             if any(previous["pool"] == source["pool"] and str(j) not in state["planner"]["sources"]
                    for j, previous in enumerate(spec["sources"][:index])):
                 raise staging.Deferred("waiting for earlier source admission in this pool")
-            deficits, by_campaign = _deficits(root, spec, state)
+            deficits = _deficits(root, spec, state)
             if deficits[source["pool"]] <= 0:
                 return _answer(75, reason="pool already supplies the soft planning window")
             descriptor = _source_tasks(spec, index)
-            if not _fused(spec):
-                # Reserve a real campaign's complementary supply and full next
-                # archive group as a threshold, not a second ledger claim. Unrelated
-                # campaigns must not reserve one another's source headroom.
-                per_source = spec["limits"]["source_lhe_bytes"] + spec["limits"]["source_block_bytes"]
-                pending_pools = {s["pool"] for j, s in enumerate(spec["sources"])
-                                 if state["planner"]["sources"].get(str(j)) == "admitted"
-                                 and f"PLAN_{j:06d}" not in state["accepted"]}
-                thresholds = []
-                for campaign in relevant:
-                    missing = by_campaign[campaign["name"]]
-                    remaining = int(campaign["max_processing_nodes"]) - state["planner"]["assigned_progress"][campaign["name"]]
-                    if remaining <= 0 or missing.get(source["pool"], 0) <= 0:
-                        continue
-                    complement = sum(per_source for pool, deficit in missing.items()
-                                     if pool != source["pool"] and deficit > 0 and pool not in pending_pools)
-                    group_nodes = min(int(spec["limits"].get("shard_nodes", 10)), remaining)
-                    headroom = max(group_nodes * spec["limits"]["mixed_hepmc_bytes"],
-                                   int(spec["limits"].get("policy_headroom_bytes", 0)))
-                    thresholds.append(complement + headroom)
-                threshold = min(thresholds)
-                account = state["staging"]
-                demand = account["resident_bytes"] + sum(account["claims"].values()) + sum(descriptor["claims"].values())
-                if demand + threshold > account["usable_bytes"]:
-                    if not _work_can_free_bytes(root, spec, state):
-                        raise RuntimeError("insufficient staging capacity for the next complete shard input range; "
-                                           "no admitted source, allocated shard or eligible cleanup can free bytes")
-                    return _answer(75, reason="preserving complementary source and MIX headroom")
-                if staging.reserve_bundle(state, descriptor["claims"]) == 75:
-                    return _answer(75, reason="staging capacity")
             _freeze(root, name, descriptor)
             state["planner"]["sources"][str(index)] = "admitted"
             state["status"] = "running"
     return _render(root, name, spec, allow_plan_accept_post_override=True)
 
 
-def _processing_tasks(spec, allocation, refs, name):
+def _processing_tasks(spec, allocation, refs):
     campaign = next(c for c in spec["campaigns"] if c["name"] == allocation["campaign"])
-    tasks, dependencies, miniaods, mixed, claims = [], [], [], [], {}
+    tasks = []
     for node in allocation["nodes"]:
         identity = campaign["name"] + "_" + node["job_id"]
         inputs, slots = [], []
@@ -803,59 +442,35 @@ def _processing_tasks(spec, allocation, refs, name):
             "edm_event_id": node["edm_event_id"], "normal_shortfall_policy": spec["normal_shortfall_policy"],
             "unused_hepmc_warning_fraction": spec["unused_hepmc_warning_fraction"],
             "processing_environment": spec["processing_environment"]}
-        fused = _fused(spec)
-        mixed_base = (spec["storage"]["ihep_archive"].rstrip("/") + "/" + spec["run_id"]
-                      if fused else legacy._staging(spec))
-        hepmc = legacy._ref("HEPMC_" + identity, mixed_base + "/mixed/" + identity + ".hepmc.gz", "hepmc")
+        mixed_base = spec["storage"]["ihep_archive"].rstrip("/") + "/" + spec["run_id"]
+        hepmc = artifact_reference("HEPMC_" + identity, mixed_base + "/mixed/" + identity + ".hepmc.gz", "hepmc")
         hepmc["sidecar_url"] = hepmc["url"] + ".json"
         ceiling = spec["limits"]["mixed_hepmc_bytes"]
-        mix = legacy._task(spec, "MIX_" + identity, "mix", inputs, [hepmc],
+        mix = task_manifest(spec, "MIX_" + identity, "mix", inputs, [hepmc],
             dict(parameters, sources=slots, mixing_rng_seed=node["mixing_rng_seed"],
                  max_output_bytes=ceiling, scratch_bytes=ceiling * 10))
         variants = []
-        if not fused:
-            mix["parameters"]["staging_bundle"] = name
-            tasks.append(_claim(mix, ceiling))
-            claims[mix["task_id"]] = ceiling
         for profile in campaign["resolved_detector_variants"]:
             variant = profile["profile_id"]
             detector_identity = f"{campaign['name']}_{variant}_{node['job_id']}"
             detector_parameters = dict(parameters, detector_profile_id=variant,
                 detector_profile=deepcopy(profile), simulation_runtime=runtime_for_profile(profile, "simulation"),
                 merge_runtime=runtime_for_profile(profile, "merge"), ntuple_runtime=runtime_for_profile(profile, "ntuple"))
-            product = legacy._ref("MINIAOD_" + detector_identity,
+            product = artifact_reference("MINIAOD_" + detector_identity,
                 spec["storage"]["ihep_products"].rstrip("/") + "/" + spec["run_id"] + "/"
                 + campaign["name"] + "/" + variant + "/" + node["job_id"] + ".root", "miniaod",
                 detector_profile_id=variant, detector_profile=deepcopy(profile))
-            mini = legacy._task(spec, "MINIAOD_" + detector_identity, "miniaod", [hepmc], [product], detector_parameters)
-            if fused:
-                product["sidecar_url"] = product["url"] + ".json"
-                mini["parameters"]["max_output_bytes"] = spec["limits"]["miniaod_bytes"]
-                variants.append(mini)
-            else:
-                tasks.append(mini)
-                dependencies.append(([mix["task_id"]], mini["task_id"]))
-                miniaods.append(mini)
-        if fused:
-            outputs = [hepmc] + [mini["outputs"][0] for mini in variants]
-            processing = legacy._task(spec, "PROCESS_" + identity, "processing", inputs,
-                                      outputs, dict(scratch_bytes=_processing_scratch(spec["limits"])))
-            processing.update(mix=mix, variants=variants, core_revision=spec["core_revision"])
-            tasks.append(processing)
-        else:
-            mixed.append(hepmc)
-    if _fused(spec):
-        return {"tasks": tasks, "dependencies": [], "allocation": allocation,
-                "campaign": campaign["name"]}
-    archive = _archive(spec, "ARCHIVE_" + name, mixed,
-        [m["outputs"][0] for m in miniaods], len(mixed) * spec["limits"]["mixed_hepmc_bytes"])
-    reclaim = _reclaim(spec, "RECLAIM_" + name, mixed)
-    tasks.extend([archive, reclaim])
-    dependencies.extend([([m["task_id"] for m in miniaods], archive["task_id"]),
-                         ([archive["task_id"]], reclaim["task_id"])])
-    return {"tasks": tasks, "dependencies": dependencies, "claims": claims,
-            "allocation": allocation, "campaign": campaign["name"],
-            "archive_task": archive["task_id"]}
+            mini = task_manifest(spec, "MINIAOD_" + detector_identity, "miniaod", [hepmc], [product], detector_parameters)
+            product["sidecar_url"] = product["url"] + ".json"
+            mini["parameters"]["max_output_bytes"] = spec["limits"]["miniaod_bytes"]
+            variants.append(mini)
+        outputs = [hepmc] + [mini["outputs"][0] for mini in variants]
+        processing = task_manifest(spec, "PROCESS_" + identity, "processing", inputs,
+                                  outputs, dict(scratch_bytes=_processing_scratch(spec["limits"])))
+        processing.update(mix=mix, variants=variants, core_revision=spec["core_revision"])
+        tasks.append(processing)
+    return {"tasks": tasks, "dependencies": [], "allocation": allocation,
+            "campaign": campaign["name"]}
 
 
 @_entry
@@ -873,7 +488,7 @@ def prepare_shard(run_dir, campaign, shard_index):
             control_events.record_duration("admission_hint", time.perf_counter() - hint_started)
         if reason:
             return _answer(75, reason=reason, admission_hint=True)
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         if name not in state["allocations"]:
             if state["planner"]["assigned_progress"][campaign] != start:
                 raise staging.Deferred("waiting for earlier assignments in this campaign")
@@ -883,7 +498,7 @@ def prepare_shard(run_dir, campaign, shard_index):
                                         exhausted, int(config.get("global_job_index_start", 0)))
             if allocation is None:
                 raise staging.Deferred("waiting for a complete shard input range")
-            descriptor = _processing_tasks(spec, allocation, refs, name)
+            descriptor = _processing_tasks(spec, allocation, refs)
             _freeze(root, name, descriptor)
             for key, cursor in allocation["end_cursors"].items():
                 state["planner"]["streams"][key]["allocation_cursor"] = cursor
@@ -900,7 +515,7 @@ def _prepare_source_product(root, spec, identity):
     index = int(identity.removeprefix(prefix))
     descriptor = read_json(_manifest_path(root, source_name(index)))
     task = deepcopy(next(t for t in descriptor["tasks"] if t["task_id"] == identity))
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         plan = f"PLAN_{index:06d}"
         if plan not in state["accepted"]:
             raise staging.Deferred("source original has no accepted PLAN result")
@@ -912,7 +527,7 @@ def _prepare_source_product(root, spec, identity):
             if archive_id not in state["accepted"]:
                 raise staging.Deferred("source original has no accepted archive")
             task["parameters"]["verified_archive"] = _receipt(root, state, archive_id)["outputs"][0]
-            task["inputs"] = legacy._reclaim_refs(originals)
+            task["inputs"] = reclaim_references(originals)
     write_immutable_json(record_path(root, "tasks", identity), task)
     return _answer()
 
@@ -921,32 +536,9 @@ def _prepare_source_product(root, spec, identity):
 def prepare_source_product(run_dir, task_id):
     root, spec = _paths(run_dir)
     identity = token(task_id)
-    if not _fused(spec) or not identity.startswith(("SOURCE_ARCHIVE_", "SOURCE_RECLAIM_")):
+    if not identity.startswith(("SOURCE_ARCHIVE_", "SOURCE_RECLAIM_")):
         raise ValueError("expected a fused run SOURCE archive or reclaim task")
     return _prepare_source_product(root, spec, identity)
-
-
-@_entry
-def admit_producer(run_dir, task_id):
-    root, spec = _paths(run_dir)
-    identity = token(task_id)
-    if _fused(spec):
-        raise ValueError("producer capacity admission is only available to legacy runs")
-    if identity.startswith("SOURCE_ARCHIVE_"):
-        return _prepare_source_product(root, spec, identity)
-    task = read_json(record_path(root, "tasks", identity))
-    ceiling = task["parameters"].get("staging_claim_bytes")
-    if ceiling is None:
-        raise ValueError("producer PRE requires an explicit frozen staging claim")
-    with _transaction(root, spec) as state:
-        if identity.startswith(("LHE_", "PLAN_")) and identity not in state["staging"]["ceilings"]:
-            raise RuntimeError("source child has no atomic source-bundle admission")
-        bundle = task["parameters"].get("staging_bundle")
-        claims = read_json(_manifest_path(root, bundle))["claims"] if bundle else {identity: ceiling}
-        code = staging.reserve_bundle(state, claims)
-        if code == 75:
-            raise staging.Deferred("staging capacity")
-    return _answer(code, reason="staging capacity" if code else "admitted")
 
 
 def _validate_outputs(task, outcome):
@@ -966,65 +558,16 @@ def _validate_outputs(task, outcome):
             raise RuntimeError("worker output has invalid byte size")
 
 
-def _validate_staged(spec, task, outcome):
-    objects = outcome.get("staged_objects")
-    if not isinstance(objects, list):
-        raise RuntimeError("staging producer result has no exact physical object list")
-    refs = outcome.get("outputs", [])
-    if task["stage"] == "plan":
-        new_originals = [r for r in outcome.get("originals", [])
-                         if r["url"] not in {r["url"] for r in task["inputs"]}]
-        refs = refs + new_originals
-    expected = []
-    for ref in refs:
-        if not _run_owned(spec, ref):
-            raise RuntimeError("producer claims an object outside run-owned staging")
-        expected.append({key: ref[key] for key in ("artifact_id", "url", "kind", "size_bytes")})
-        if "sidecar_url" in ref:
-            expected.append(dict(artifact_id=ref["artifact_id"] + ":sidecar", url=ref["sidecar_url"],
-                                 kind="sidecar", size_bytes=ref.get("sidecar_size_bytes")))
-    if sorted(objects, key=lambda r: r["url"]) != sorted(expected, key=lambda r: r["url"]):
-        raise RuntimeError("staged physical objects differ from accepted producer references")
-    return objects
-
-
 def _find_producer(root, state, artifact_id):
     if producer_index.enabled():
         return producer_index.find(root, state, artifact_id, _receipt)
     for identity, marker in state["accepted"].items():
-        if marker["stage"] in {"lhe", "plan", "mix"}:
+        if marker["stage"] in {"lhe", "plan"}:
             result = _receipt(root, state, identity)
             for ref in result.get("outputs", []) + result.get("originals", []):
                 if ref["artifact_id"] == artifact_id:
                     return ref
     raise RuntimeError("input has no accepted producer: " + artifact_id)
-
-
-def _validate_miniaod(root, spec, state, task, outcome):
-    output = outcome["outputs"][0]
-    actual = output.get("events")
-    expected = _find_producer(root, state, task["inputs"][0]["artifact_id"])["events"]
-    partial = output.get("partial")
-    profile = task["parameters"]["detector_profile_id"]
-    if (type(actual) is not int or not 0 < actual <= expected
-            or output.get("expected_events") != expected or type(partial) is not bool
-            or partial != (actual < expected) or outcome.get("partial") != partial
-            or output.get("detector_profile_id") != profile
-            or output.get("detector_profile") != task["parameters"]["detector_profile"]
-            or output.get("count_source") != "edmFileUtil"
-            or (partial and spec["normal_shortfall_policy"] != "report-and-truncate")):
-        raise RuntimeError("MiniAOD count or provenance disagrees with its accepted HepMC")
-
-
-def _physical_refs(state, refs):
-    objects = state["staging"]["objects"]
-    result = []
-    for ref in refs:
-        for url in [ref["url"]] + ([ref["sidecar_url"]] if "sidecar_url" in ref else []):
-            if url not in objects:
-                raise RuntimeError("reclaim reference was never staged by this run: " + url)
-            result.append({k: objects[url][k] for k in ("artifact_id", "url", "kind", "size_bytes")})
-    return result
 
 
 def _post_pre_status(pre_return_code, return_code):
@@ -1045,21 +588,17 @@ def _pre_failure(pre_return_code):
 def _accept_validated_outcome(root, spec, state, identity, task, outcome):
     """Settle a previously validated task outcome in the caller's transaction."""
     stage = task["stage"]
-    if (_fused(spec) and stage in {"mix", "miniaod"}) or (stage == "processing" and not _fused(spec)):
-        raise ValueError("processing task does not match the run state schema")
     if stage == "plan":
-        legacy._validate_planner_result(root, spec, {"plan_task": identity,
-            "source_index": int(identity.removeprefix("PLAN_"))}, outcome)
         source_index = int(identity.removeprefix("PLAN_"))
-        if _fused(spec):
-            p = task["parameters"]
-            for index, block in enumerate(outcome["outputs"]):
-                expected = f"{p['block_output_dir']}/block_{p['group_id']}_{index:06d}.lhe.gz"
-                if block["url"] != expected or "sidecar_url" in block:
-                    raise ValueError("PLAN result does not name an exact run-owned LHE block")
-            original = outcome["originals"][0]
-            if original.get("sidecar_url") != p["original_output"].get("sidecar_url"):
-                raise ValueError("PLAN result has an unexpected source-original sidecar")
+        validate_planner_result(task, spec["sources"][source_index], outcome)
+        p = task["parameters"]
+        for index, block in enumerate(outcome["outputs"]):
+            expected = f"{p['block_output_dir']}/block_{p['group_id']}_{index:06d}.lhe.gz"
+            if block["url"] != expected or "sidecar_url" in block:
+                raise ValueError("PLAN result does not name an exact run-owned LHE block")
+        original = outcome["originals"][0]
+        if original.get("sidecar_url") != p["original_output"].get("sidecar_url"):
+            raise ValueError("PLAN result has an unexpected source-original sidecar")
         if spec["sources"][source_index].get("resolved_generator_profile"):
             produced = _receipt(root, state, f"LHE_{source_index:06d}")["outputs"][0]
             retained = outcome["originals"][0]
@@ -1068,47 +607,34 @@ def _accept_validated_outcome(root, spec, state, identity, task, outcome):
                            ("artifact_id", "url", "kind", "size_bytes", "events", "sidecar_url"))):
                 raise RuntimeError("generated PLAN original differs from accepted LHE producer")
     elif stage == "archive":
-        legacy._validate_archive_result(root, spec, {"archive_task": identity}, outcome)
-        if _fused(spec):
-            _validate_outputs(task, outcome)
+        validate_archive_result(task, outcome)
+        _validate_outputs(task, outcome)
         for member in outcome["members"]:
             accepted = _find_producer(root, state, member["artifact_id"])
             if any(member.get(k) != accepted.get(k) for k in ("url", "kind", "size_bytes", "events")):
                 raise RuntimeError("archive member differs from its accepted producer")
     elif stage == "reclaim":
-        legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, outcome)
-        if not _fused(spec):
-            staging.settle_reclaim(state, identity, _physical_refs(state, task["inputs"]), outcome["reclaimed"])
-            if identity in state["cleanup_claims"]:
-                state["cleanup_claims"][identity]["completed"] = True
+        validate_reclaim_result(task, outcome)
     elif stage == "processing":
         validate_processing_outputs(task, outcome["outputs"])
-    else:
+    elif stage == "lhe":
         _validate_outputs(task, outcome)
-        if stage in {"lhe", "mix"}:
-            for output in outcome["outputs"]:
-                if type(output.get("events")) is not int or output["events"] <= 0:
-                    raise RuntimeError("staging producer has no valid event count")
-            if stage == "mix" and outcome["outputs"][0]["events"] > task["parameters"]["target_mixed_events"]:
-                raise RuntimeError("mixed event count exceeds frozen target")
-        elif stage == "miniaod":
-            _validate_miniaod(root, spec, state, task, outcome)
-    if "staging_claim_bytes" in task["parameters"]:
-        staging.settle_publication(state, identity, _validate_staged(spec, task, outcome))
-    if _fused(spec):
-        # Worker paths are ephemeral and must not create receipt differences.
-        outcome = dict(outcome, outputs=[{k: v for k, v in ref.items() if k != "local_path"}
-                                         for ref in outcome["outputs"]])
+        events = outcome["outputs"][0].get("events")
+        if type(events) is not int or events <= 0:
+            raise RuntimeError("LHE producer has no valid event count")
+    else:
+        raise ValueError(f"unexpected CERN task stage: {stage}")
+    # Scratch locations are attempt-specific.
+    outcome = dict(outcome, outputs=[{k: v for k, v in ref.items() if k != "local_path"}
+                                     for ref in outcome["outputs"]])
     receipt = _receipt_path(root, identity)
-    if _fused(spec) and stage == "reclaim" and receipt.is_file():
+    if stage == "reclaim" and receipt.is_file():
         previous = read_json(receipt)
-        legacy._validate_reclaim_result(root, spec, {"reclaim_task": identity}, previous)
+        validate_reclaim_result(task, previous)
         outcome = previous
     write_immutable_json(receipt, outcome)
     state["accepted"][identity] = {"stage": stage}
-    if stage == "plan" and state.get("state_schema") in {
-            staging.INVENTORY_STATE_SCHEMA, staging.FUSED_STATE_SCHEMA}:
-        source_index = int(identity.removeprefix("PLAN_"))
+    if stage == "plan":
         pool = spec["sources"][source_index]["pool"]
         pool_segments = state["planner"]["inventory_segments"]["pools"].get(pool)
         if pool_segments is None:
@@ -1119,35 +645,25 @@ def _accept_validated_outcome(root, spec, state, identity, task, outcome):
 
 @_entry
 def accept_result(run_dir, task_id, return_code=0, *, pre_return_code=0):
-    pre_status = _post_pre_status(pre_return_code, return_code)
-    if pre_status == "failed":
+    if _post_pre_status(pre_return_code, return_code) != "run":
         return _pre_failure(pre_return_code)
-    if pre_status == "skip":
-        root, _ = _paths(run_dir)
-        identity = token(task_id)
-        state = read_json(root / "state.json")
-        cleanup = state.get("cleanup_claims", {}).get(identity, {})
-        if (not identity.startswith("CLEANUP_") or cleanup.get("skipped") is not True
-                or cleanup.get("completed") is not True or cleanup.get("urls") != []):
-            return _answer(1, reason="cleanup skip lacks committed empty-cleanup state")
-        return _answer(status="skipped")
     if int(return_code) != 0:
         return _answer(1 if int(return_code) == 75 else int(return_code),
                        reason="worker failed", worker_return_code=int(return_code))
     root, spec = _paths(run_dir)
     identity = token(task_id)
     task = read_json(record_path(root, "tasks", identity))
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         if identity in state["accepted"]:
             return _answer(status="accepted")
         outcome = read_json(record_path(root, "results", identity))
-        legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
+        validate_result_envelope(task, outcome, spec["runtime_release"])
         _accept_validated_outcome(root, spec, state, identity, task, outcome)
     return _answer(status="accepted")
 
 
 def _without_archive_local_paths(outcome):
-    value = json.loads(json.dumps(outcome))
+    value = deepcopy(outcome)
     outputs = value.get("outputs") if isinstance(value, dict) else None
     if not isinstance(outputs, list):
         raise ValueError("archive orphan result has no outputs list")
@@ -1165,7 +681,7 @@ def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
         raise ValueError("archive orphan recovery requires explicit no-active-writer confirmation")
     root, spec = _paths(run_dir)
     identity = token(task_id)
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         if identity in state["accepted"]:
             raise RuntimeError("archive orphan already has an accepted marker")
         task = read_json(record_path(root, "tasks", identity))
@@ -1174,14 +690,10 @@ def recover_archive_orphan(run_dir, task_id, *, confirm_no_active_writer=False):
         outcome = read_json(record_path(root, "results", identity))
         receipt_path = _receipt_path(root, identity)
         orphan = read_json(receipt_path)
-        legacy.validate_result_envelope(task, outcome, spec["runtime_release"])
-        legacy.validate_result_envelope(task, orphan, spec["runtime_release"])
+        validate_result_envelope(task, outcome, spec["runtime_release"])
+        validate_result_envelope(task, orphan, spec["runtime_release"])
         if _without_archive_local_paths(outcome) != _without_archive_local_paths(orphan):
             raise RuntimeError("archive orphan differs beyond output local_path")
-        if (identity in state.get("staging", {}).get("settled_publications", {})
-                or identity in state.get("staging", {}).get("settled_reclaims", {})
-                or identity in state.get("cleanup_claims", {})):
-            raise RuntimeError("archive orphan has contradictory persisted settlement state")
         index = state.get("producer_index", {})
         refs = {item.get("artifact_id") for item in orphan.get("outputs", [])}
         if any(artifact_id in index.get("artifacts", {}) for artifact_id in refs):
@@ -1214,6 +726,7 @@ def complete_source(run_dir, source_index, return_code=0, *, pre_return_code=0):
         if not 0 <= index < len(spec["sources"]):
             raise ValueError("unknown source slot")
         state = read_json(root / "state.json")
+        staging.require_schema(state)
         if state["planner"]["sources"].get(str(index)) != "skipped":
             return _answer(1, reason="source skip lacks committed unneeded-source state")
         return _answer(status="skipped")
@@ -1223,7 +736,7 @@ def complete_source(run_dir, source_index, return_code=0, *, pre_return_code=0):
     root, spec = _paths(run_dir)
     index = int(source_index)
     descriptor = read_json(_manifest_path(root, source_name(index)))
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         _require_all(root, state, descriptor)
         state["planner"]["sources"][str(index)] = "completed"
     return _answer(status="completed")
@@ -1240,55 +753,10 @@ def complete_shard(run_dir, campaign, shard_index, return_code=0, *, pre_return_
     root, spec = _paths(run_dir)
     name = shard_name(campaign, shard_index)
     descriptor = read_json(_manifest_path(root, name))
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         _require_all(root, state, descriptor)
         state["allocations"][name]["completed"] = True
-        if _fused(spec):
-            return _answer(status="completed")
-        # Completion order is independent of allocation order. Only a contiguous
-        # finished prefix may advance the physical safe cursors.
-        entries = sorted((value["start_job_index"], key, value)
-                         for key, value in state["allocations"].items() if value["campaign"] == campaign)
-        completed_nodes = 0
-        for start, key, entry in entries:
-            if start != completed_nodes or not entry["completed"]:
-                break
-            manifest = read_json(_manifest_path(root, key))["allocation"]
-            for stream, cursor in manifest["end_cursors"].items():
-                state["planner"]["streams"][stream]["safe_cursor"] = cursor
-            completed_nodes += entry["node_count"]
-        config = next(c for c in spec["campaigns"] if c["name"] == campaign)
-        closed = completed_nodes == int(config["max_processing_nodes"])
-        for pool in {s["pool"] for s in config["sources"]}:
-            state["planner"]["streams"][stream_key(campaign, pool)]["closed"] = closed
     return _answer(status="completed")
-
-
-def _pending_cleanup_urls(state):
-    return {url for value in state["cleanup_claims"].values() if not value.get("completed", False)
-            for url in value.get("urls", [])}
-
-
-def _cleanup_refs(root, spec, state, pool):
-    blocks, refs, _ = _inventory(root, spec, state)
-    streams = [state["planner"]["streams"][stream_key(c["name"], pool)]
-               for c in spec["campaigns"] if any(s["pool"] == pool for s in c["sources"])]
-    archived_sources = set()
-    for index, source in enumerate(spec["sources"]):
-        if source["pool"] == pool and f"SOURCE_ARCHIVE_{index:06d}" in state["accepted"]:
-            archived_sources.add(source["source_id"])
-    pending = _pending_cleanup_urls(state)
-    objects = state["staging"]["objects"]
-    result = []
-    for block in blocks.get(pool, []):
-        if (block.source_id not in archived_sources
-                or any(may_still_need(block.index, stream) for stream in streams)):
-            continue
-        ref = refs[block.artifact_id]
-        physical = objects.get(ref["url"])
-        if physical and physical["resident"] and ref["url"] not in pending:
-            result.append(deepcopy(ref))
-    return result
 
 
 def _require_finished_work(spec, state):
@@ -1301,11 +769,13 @@ def _require_finished_work(spec, state):
         raise RuntimeError("requires all campaign shards completed")
 
 
-def _prepare_terminal_cleanup(root, spec, pool, slot):
+@_entry
+def prepare_cleanup(run_dir, pool, slot):
+    root, spec = _paths(run_dir)
     if int(slot) != 0 or pool not in {source["pool"] for source in spec["sources"]}:
         raise ValueError("unknown terminal cleanup slot")
     name = cleanup_name(pool, slot)
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         _require_finished_work(spec, state)
         refs = []
         for index, source in enumerate(spec["sources"]):
@@ -1318,78 +788,62 @@ def _prepare_terminal_cleanup(root, spec, pool, slot):
     return _answer(status="prepared", task_id=name)
 
 
-@_entry
-def prepare_cleanup(run_dir, pool, slot):
-    root, spec = _paths(run_dir)
-    name = cleanup_name(pool, slot)
-    if _fused(spec):
-        return _prepare_terminal_cleanup(root, spec, pool, slot)
-    # Each slot has one source/shard trigger, plus one terminal slot per pool.
-    count = sum(s["pool"] == pool for s in spec["sources"]) + sum(
-        any(s["pool"] == pool for s in next(c for c in spec["campaigns"] if c["name"] == campaign)["sources"])
-        for campaign, _, _, _ in shard_ranges(spec))
-    if pool not in {s["pool"] for s in spec["sources"]} or not 0 <= int(slot) <= count:
-        raise ValueError("unknown pool cleanup slot")
-    with _transaction(root, spec) as state:
-        previous = state["cleanup_claims"].get(name)
-        if previous and previous.get("skipped"):
-            return _answer(99, status="empty cleanup")
-        if previous is None:
-            refs = _cleanup_refs(root, spec, state, pool)
-            if not refs:
-                state["cleanup_claims"][name] = {"skipped": True, "completed": True, "urls": []}
-                return _answer(99, status="empty cleanup")
-            task = _reclaim(spec, name, refs)
-            descriptor = {"tasks": [task], "dependencies": [], "claims": {}, "pool": pool}
-            _freeze(root, name, descriptor)
-            # Exact frozen set and pending references have the same commit marker.
-            state["cleanup_claims"][name] = {"completed": False,
-                "urls": [r["url"] for r in _physical_refs(state, task["inputs"])]}
-    descriptor = read_json(_manifest_path(root, name))
-    task = descriptor["tasks"][0]
-    write_immutable_json(record_path(root, "tasks", name), task)
-    return _answer(status="prepared", task_id=name)
-
-
 def committed_archives(run_dir, state=None):
     root = Path(run_dir)
     state = read_json(root / "state.json") if state is None else state
+    staging.require_schema(state)
     return [_receipt(root, state, identity) for identity in sorted(state["accepted"])
             if state["accepted"][identity]["stage"] == "archive"]
+
+
+
+def restore_archived_sources(run_dir, archive_id, destination, artifact_ids=None):
+    """Restore recorded original LHE members for an operator recovery or replan."""
+    root = Path(run_dir).resolve()
+    staging.require_schema(read_json(root / "run.json"))
+    archives = committed_archives(root)
+    archive = next((item for item in archives
+                    if any(ref.get("artifact_id") == archive_id for ref in item.get("outputs", []))), None)
+    if archive is None:
+        raise ValueError("unknown verified archive artifact")
+    selected = [item for item in archive["members"] if item.get("kind") == "lhe"]
+    if artifact_ids is not None:
+        wanted = set(artifact_ids)
+        selected = [item for item in selected if item["artifact_id"] in wanted]
+        if wanted != {item["artifact_id"] for item in selected}:
+            raise ValueError("requested original is not recorded in this archive")
+    if not selected:
+        raise ValueError("archive has no selected original LHE members")
+    output = next(ref for ref in archive["outputs"] if ref["artifact_id"] == archive_id)
+    return {"archive_id": archive_id,
+            "restored": restore_members(output, selected, destination)}
 
 
 def committed_groups(run_dir, state=None):
     root, spec = _paths(run_dir)
     state = read_json(root / "state.json") if state is None else state
+    staging.require_schema(state)
     return load_groups(root, spec, state["merge_group_counts"])
 
 
 @_entry
 def finalize_run(run_dir):
     root, spec = _paths(run_dir)
-    with _transaction(root, spec) as state:
+    with staging.transaction(root) as state:
         if state["status"] != "complete":
             _require_finished_work(spec, state)
-            if _fused(spec):
-                for pool in {source["pool"] for source in spec["sources"]}:
-                    identity = cleanup_name(pool, 0)
-                    if state["accepted"].get(identity, {}).get("stage") != "reclaim":
-                        raise RuntimeError("finalizer requires terminal LHE block reclamation: " + identity)
-                    _receipt(root, state, identity)
-            else:
-                if any(not value["completed"] for value in state["cleanup_claims"].values()):
-                    raise RuntimeError("finalizer requires all frozen cleanup operations completed")
-                if state["staging"]["resident_bytes"] or state["staging"]["claims"]:
-                    raise RuntimeError("finalizer requires all run-owned staging reclaimed")
+            for pool in {source["pool"] for source in spec["sources"]}:
+                identity = cleanup_name(pool, 0)
+                if state["accepted"].get(identity, {}).get("stage") != "reclaim":
+                    raise RuntimeError("finalizer requires terminal LHE block reclamation: " + identity)
+                _receipt(root, state, identity)
             ordered = []
             for identity, marker in state["accepted"].items():
-                stage = marker["stage"]
-                if stage not in {"miniaod", "processing"}:
+                if marker["stage"] != "processing":
                     continue
                 task = read_json(record_path(root, "tasks", identity))
                 outputs = _receipt(root, state, identity)["outputs"]
-                variants = task["variants"] if stage == "processing" else [task]
-                for variant, ref in zip(variants, outputs[1:] if stage == "processing" else outputs):
+                for variant, ref in zip(task["variants"], outputs[1:]):
                     p = variant["parameters"]
                     ordered.append((p["campaign"], p["detector_profile_id"],
                                     int(p["job_id"].rsplit("BLOCK", 1)[1]), ref))
@@ -1397,7 +851,7 @@ def finalize_run(run_dir):
             for campaign, profile, _, ref in sorted(ordered):
                 groups_state["merge_buffers"].setdefault(sample_key(campaign, profile), []).append(ref)
             # Immutable groups first, state counters and status next, sentinel last.
-            for campaign, profile, ordinal, group in legacy._merge_groups(spec, groups_state, flush=True):
+            for campaign, profile, ordinal, group in merge_groups(spec, groups_state):
                 write_group(root, campaign, profile, ordinal, group)
             state["merge_group_counts"] = groups_state["merge_group_counts"]
             state["status"] = "complete"

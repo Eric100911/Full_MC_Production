@@ -6,7 +6,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.application.handoff import export_handoff
-from full_mc.application.ledger import STATE_SCHEMA, sample_key, write_group
+from full_mc.application.ledger import sample_key, write_group
+from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json, read_json
 
 CAMPAIGN = "C"
@@ -32,16 +33,14 @@ def run_dir(root, groups, committed, analysis_output=None):
     are below the state counter and therefore committed.
     """
     run_spec = {
-        "run_id": "r", "runtime_release": "r1", "core_revision": "abc",
+        "state_schema": FUSED_STATE_SCHEMA, "run_id": "r", "runtime_release": "r1", "core_revision": "abc",
         "campaigns": [{"name": CAMPAIGN,
                        "resolved_detector_variants": [{"profile_id": PROFILE}]}]}
     if analysis_output is not None:
         run_spec["analysis_output"] = analysis_output
     atomic_json(root / "run.json", run_spec)
     atomic_json(root / "state.json",
-                {"state_schema": STATE_SCHEMA, "status": "complete", "next_step": 1,
-                 "pending": {}, "pool_cursors": {}, "job_offsets": {},
-                 "merge_buffers": {}, "merge_group_counts": {SAMPLE: committed}})
+                {"state_schema": FUSED_STATE_SCHEMA, "status": "complete", "merge_group_counts": {SAMPLE: committed}})
     for ordinal, group in enumerate(groups):
         write_group(root, CAMPAIGN, PROFILE, ordinal, group)
 
@@ -77,7 +76,7 @@ class HandoffContracts(unittest.TestCase):
             run_dir(root, [combined("group", root, [ref])], committed=1)
             # A stale snapshot, as the old coordinator would have left it.
             atomic_json(root / "merge_groups.json", {
-                "run_id": "r", "runtime_release": "r1",
+                "state_schema": FUSED_STATE_SCHEMA, "run_id": "r", "runtime_release": "r1",
                 "groups": [combined("snapshot-only", root, [ref])]})
             payload = export_handoff(root)
             self.assertEqual([task["task_id"] for task in payload["tasks"]],

@@ -1,5 +1,5 @@
 """CMSSW12 processing from an validated mixed-HepMC checkpoint."""
-from ._common import parameters, prepare, publish, result
+from ._common import parameters, prepare
 from .chain import execute_chain
 from .edm import count_events
 
@@ -21,9 +21,3 @@ def produce(task, work_dir):
                           "partial": partial,
                           "global_job_index": parameters(task).get("global_job_index"),
                           "edm_event_id": parameters(task).get("edm_event_id")}
-
-
-def execute(task, work_dir):
-    path, events, metadata = produce(task, work_dir)
-    output = publish(path, task, events=events, metadata=metadata)
-    return result(task, [output], partial=metadata["partial"])

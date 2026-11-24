@@ -2,8 +2,8 @@
 from copy import deepcopy
 from pathlib import Path
 
-from full_mc.application.ledger import STATE_SCHEMA, load_groups
-from full_mc.application.staging import FUSED_STATE_SCHEMA, INVENTORY_STATE_SCHEMA, STATE_SCHEMA as SHARD_STATE_SCHEMA
+from full_mc.application.ledger import load_groups
+from full_mc.application.staging import require_schema
 from full_mc.io import atomic_json, read_json
 from full_mc.storage.transfer import TransferClient, artifact_ready
 
@@ -40,17 +40,9 @@ def export_handoff(run_dir, ready_only=True):
     root = Path(run_dir).resolve()
     spec = read_json(root / "run.json")
     state = read_json(root / "state.json")
-    # Fail closed like the seam does.  A pre-refactor state has no
-    # merge_group_counts, so exporting one would silently yield zero tasks and
-    # overwrite the operator's merge_groups.json snapshot with an empty index.
-    schema = state.get("state_schema")
-    shard_schemas = {SHARD_STATE_SCHEMA, INVENTORY_STATE_SCHEMA, FUSED_STATE_SCHEMA}
-    if schema not in {STATE_SCHEMA, *shard_schemas}:
-        raise RuntimeError("handoff export requires a " + STATE_SCHEMA + " run; "
-                           "existing runs keep their frozen runtime and are not migrated")
-    if (schema == FUSED_STATE_SCHEMA) != (spec.get("state_schema") == FUSED_STATE_SCHEMA):
-        raise RuntimeError("handoff run and state schemas disagree")
-    if schema in shard_schemas and state.get("status") != "complete":
+    require_schema(spec)
+    require_schema(state)
+    if state.get("status") != "complete":
         raise RuntimeError("campaign-shard handoff requires a completed run")
     run_id, runtime_release = spec.get("run_id"), spec.get("runtime_release")
     if not run_id or not runtime_release:

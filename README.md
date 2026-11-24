@@ -1,9 +1,7 @@
 # Full MC Production
 
 This repository contains the refactored production core for the CERN/IHEP
-heavy-flavor Monte Carlo workflow. The supported entry point for new work is
-`mcprod`; the retained `dag_generator.py` and related scripts support
-existing production workflows and compatibility operations.
+heavy-flavor Monte Carlo workflow. `mcprod` is the production entry point for v3 campaign-shard runs.
 
 The core separates campaign data, deterministic source/block planning, progressive
 CERN SOURCE and SHARD SubDAGs, IHEP batch execution, runtime packaging, storage transfers, and
@@ -53,7 +51,7 @@ The full CLI lifecycle, configuration fields, handoff, IHEP batch, aggregation,
 recovery, and worker commands are documented in
 [docs/README.md](docs/README.md). Use
 [docs/testing.md](docs/testing.md) for live scheduler/storage validation and
-the retained legacy workflow.
+[historical production procedures](docs/legacy-production.md).
 
 ## Development checks
 

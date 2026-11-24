@@ -9,7 +9,7 @@ import os
 
 SCHEMA = "mcprod-producer-index-v1"
 ENVIRONMENT_VARIABLE = "MCPROD_PRODUCER_INDEX"
-PRODUCER_STAGES = frozenset(("lhe", "plan", "mix"))
+PRODUCER_STAGES = frozenset(("lhe", "plan"))
 _REFERENCE_FIELDS = ("artifact_id", "url", "kind", "size_bytes", "events",
                      "sidecar_url")
 

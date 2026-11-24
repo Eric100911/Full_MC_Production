@@ -48,7 +48,7 @@ flowchart TD
     P --> A["Progressive SHARD allocation"]
     A --> M["Fused worker · MIX in Pythia"]
     M --> H["Commit compressed HepMC at IHEP"]
-    H --> C["Produce missing detector MiniAOD variants at IHEP"]
+    H --> C["Run detector MiniAOD variants at CERN and publish to IHEP"]
     C --> T["Terminal reclamation of all run-owned LHE blocks"]
     SR --> T
     T --> F["Finalize MiniAOD groups and export handoff"]
@@ -145,8 +145,8 @@ reconciliation and are not automatically duplicated.
 The refactored CLI is the supported interface for new work. Prepared pilots,
 live CERN/IHEP scheduler reconciliation, full analyzer execution, and the
 CMSSW15 fallback still require environment validation before production cutover.
-The wave and v1/v2 SHARD controllers remain available to frozen legacy runs.
-Use the v3 worker, state, and controller together for new campaign-shard runs.
+Use the v3 worker, state, and controller together. Historical runs keep their
+frozen runtime and matching Git revision. See [historical operations](legacy-production.md).
 
 Offline checks for the current contracts:
 

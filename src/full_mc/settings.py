@@ -104,7 +104,7 @@ def _validate_scheduler_and_resources(spec):
         resources = {}
     if not isinstance(resources, dict):
         raise ValueError("resources must be an object")
-    expected_cpus = {"lhe": 1, "plan": 1, "mix": 1, "miniaod": 2, "processing": 2, "archive": 1,
+    expected_cpus = {"lhe": 1, "plan": 1, "processing": 2, "archive": 1,
                      "reclaim": 1}
     for stage, resource in resources.items():
         if stage not in expected_cpus or not isinstance(resource, dict):
@@ -179,15 +179,10 @@ def load_run_spec(path):
             raise ValueError(f"missing storage.{key}")
         if not value.startswith("root://"):
             storage[key] = _path(value, path.parent)
-    orchestration = spec.get("orchestration", "waves")
-    if orchestration == "waves":
-        storage["staging_bytes"] = int(storage.get("staging_bytes", 100_000_000_000))
-        storage["reserve_bytes"] = int(storage.get("reserve_bytes", 10_000_000_000))
-        if not 0 <= storage["reserve_bytes"] < storage["staging_bytes"]:
-            raise ValueError("staging reserve must be nonnegative and smaller than budget")
-    else:
-        for key in ("staging_bytes", "reserve_bytes"):
-            storage.pop(key, None)
+    if spec.get("orchestration") != "campaign_shards":
+        raise ValueError("run spec must explicitly declare orchestration: campaign_shards")
+    for key in ("staging_bytes", "reserve_bytes"):
+        storage.pop(key, None)
     spec["storage"] = storage
     spec["log_level"] = str(spec.get("log_level", "info"))
     if spec["log_level"] not in LOG_LEVELS:
@@ -201,28 +196,14 @@ def load_run_spec(path):
     spec.setdefault("unused_hepmc_warning_fraction", 0.15)
     spec.setdefault("processing_environment", defaults()["processing_environment"])
     limits = spec.setdefault("limits", {})
-    capacity_defaults = defaults().get("production_capacity", {}).get(
-        "planning_defaults", {})
-    for key, value in (("source_lhe_bytes", 2_000_000_000),
-                       ("source_block_bytes", 2_000_000_000),
-                       ("mixed_hepmc_bytes", 2_000_000_000),
-                       ("source_files_per_step", 4),
-                       ("processing_nodes_per_wave", 10)):
-        limits.setdefault(key, capacity_defaults.get(key, value))
-    limits.setdefault("source_selection_mode", "demand")
-    if orchestration == "waves" and limits["source_selection_mode"] not in ("demand", "prefetch"):
-        raise ValueError("limits.source_selection_mode must be demand or prefetch")
-    if orchestration == "waves" and limits["source_selection_mode"] == "prefetch":
-        archive_disk = capacity_defaults.get("archive_disk_bytes")
-        resources = spec.setdefault("resources", {})
-        if isinstance(resources, dict) and archive_disk is not None:
-            archive = resources.setdefault("archive", {})
-            if isinstance(archive, dict):
-                archive.setdefault("disk_bytes", archive_disk)
+    output_defaults = defaults().get("production_output_limits", {})
+    for key in ("source_selection_mode", "source_files_per_step",
+                "processing_nodes_per_wave", "policy_headroom_bytes"):
+        limits.pop(key, None)
+    for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes", "miniaod_bytes"):
+        limits[key] = _integer(limits.get(key, output_defaults.get(key, 2_000_000_000)),
+                               "limits." + key, minimum=1)
     _validate_scheduler_and_resources(spec)
-    if (orchestration == "waves" and limits["source_selection_mode"] == "prefetch"
-            and "disk_bytes" not in spec["resources"].get("archive", {})):
-        raise ValueError("prefetch requires resources.archive.disk_bytes")
     for key in ("runtime_dir", "analyzer_path", "inventory_path"):
         if spec.get(key):
             spec[key] = _path(spec[key], path.parent)
@@ -310,28 +291,17 @@ def load_run_spec(path):
     if unknown_pools:
         raise ValueError("campaign references undeclared source pool(s): "
                          + ", ".join(sorted(unknown_pools)))
-    if orchestration not in ("waves", "campaign_shards"):
-        raise ValueError("orchestration must be waves or campaign_shards")
-    if orchestration == "campaign_shards":
-        from .domain.streams import build_streams
-        limits["shard_nodes"] = _integer(
-            limits.get("shard_nodes", 10), "limits.shard_nodes", minimum=1)
-        limits["target_window_nodes"] = _integer(
-            limits.get("target_window_nodes", 2 * limits["shard_nodes"]),
-            "limits.target_window_nodes", minimum=1)
-        if limits["target_window_nodes"] < limits["shard_nodes"]:
-            raise ValueError("target_window_nodes must cover at least one shard")
-        limits.setdefault("miniaod_bytes", 2_000_000_000)
-        for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes", "miniaod_bytes"):
-            limits[key] = _integer(limits[key], "limits." + key, minimum=1)
-        if spec["normal_shortfall_policy"] != "report-and-truncate":
-            raise ValueError("campaign_shards requires report-and-truncate")
-        build_streams(spec)
-        validation = spec.get("site_validation", {})
-        if not isinstance(validation, dict):
-            raise ValueError("site_validation must be an object")
-        if validation.get("proof_path"):
-            validation["proof_path"] = _path(validation["proof_path"], path.parent)
-        spec["site_validation"] = validation
+    from .domain.streams import build_streams
+    limits["shard_nodes"] = _integer(limits.get("shard_nodes", 10),
+                                     "limits.shard_nodes", minimum=1)
+    limits["target_window_nodes"] = _integer(
+        limits.get("target_window_nodes", 2 * limits["shard_nodes"]),
+        "limits.target_window_nodes", minimum=1)
+    if limits["target_window_nodes"] < limits["shard_nodes"]:
+        raise ValueError("target_window_nodes must cover at least one shard")
+    if spec["normal_shortfall_policy"] != "report-and-truncate":
+        raise ValueError("campaign_shards requires report-and-truncate")
+    build_streams(spec)
+    spec.pop("site_validation", None)
     _validate_generated_staging(spec)
     return spec

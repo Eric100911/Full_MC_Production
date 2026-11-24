@@ -5,16 +5,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from full_mc.application.production import _process_phase
 from full_mc.io import atomic_json
 from full_mc.profiles import load_catalogues
 from full_mc.settings import load_run_spec
 
 
 class SimulationProfileContracts(unittest.TestCase):
+    def test_packaged_generator_catalogue_matches_repository(self):
+        root = Path(__file__).resolve().parents[1]
+        common = root / "common/profiles/generator_profiles.json"
+        packaged = root / "src/full_mc/resources/generator_profiles.json"
+        self.assertEqual(json.loads(packaged.read_text()), json.loads(common.read_text()))
+
     def spec(self, root):
         payload = {
-            "schema_version": 2,
+            "schema_version": 2, "orchestration": "campaign_shards",
             "run_id": "profile-test",
             "runtime_release": "test-release",
             "block_events": 100,
@@ -104,57 +109,6 @@ class SimulationProfileContracts(unittest.TestCase):
                     "min_m_qqp", "min_m_q_beam"})
         self.assertEqual(profiles.require_ready("helac_jpsi_csco_g_v1")["unwevt_semantics"],
                          "addon-input-not-output-cap")
-
-    def test_one_shared_mix_fans_out_to_distinct_detector_tasks(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "steps").mkdir()
-            (root / "tasks").mkdir()
-            base = load_run_spec(self.spec(root))
-            profile = base["campaigns"][0]["resolved_detector_variants"][0]
-            variants = []
-            for index in range(5):
-                variant = copy.deepcopy(profile)
-                variant["profile_id"] = "variant%d" % index
-                variants.append(variant)
-            spec = dict(base, campaigns=[dict(base["campaigns"][0],
-                                              resolved_detector_variants=variants,
-                                              detector_variants=[p["profile_id"] for p in variants])],
-                        limits={"mixed_hepmc_bytes": 1000})
-            allocation = {"campaigns": [{
-                "campaign": "C", "nodes": [{
-                    "job_id": "JOB000000_BLOCK000000",
-                    "job_index": 0,
-                    "target_mixed_events": 10,
-                    "edm_event_id": {"first_run": 1},
-                    "mixing_rng_seed": 11,
-                    "sources": [{"slot": 0, "mode": "normal",
-                                  "block_refs": ["BLOCK:pool_2jpsi_g:source-1:000000"],
-                                  "source_rng_seed": 12, "lhe_events": 10}],
-                }],
-            }]}
-            state = {"resident": {}, "originals": [], "blocks": {
-                "pool_2jpsi_g": [{"artifact_id": "BLOCK:pool_2jpsi_g:source-1:000000",
-                                   "events": 10, "url": str(root / "block.lhe.gz")}]
-            }}
-            result = _process_phase(root, 0, spec, state, allocation)
-            tasks = [json.loads(path.read_text()) for path in (root / "tasks").glob("*.json")]
-            mix = [task for task in tasks if task["stage"] == "mix"]
-            mini = [task for task in tasks if task["stage"] == "miniaod"]
-            archive = [task for task in tasks if task["stage"] == "archive"]
-            self.assertEqual((len(mix), len(mini), len(archive)), (1, 5, 1))
-            self.assertEqual({task["inputs"][0]["artifact_id"] for task in mini},
-                             {mix[0]["outputs"][0]["artifact_id"]})
-            self.assertEqual(len({task["outputs"][0]["url"] for task in mini}), 5)
-            self.assertEqual({item["artifact_id"] for item in archive[0]["inputs"]
-                              if item["kind"] == "hepmc"},
-                             {mix[0]["outputs"][0]["artifact_id"]})
-            dag = (root / "steps" / "000000.dag").read_text()
-            self.assertEqual(dag.count("CHILD ARCHIVE_"), 1)
-            self.assertEqual(dag.count(" CHILD ARCHIVE_"), 1)
-            archive_parent = next(line for line in dag.splitlines()
-                                  if line.startswith("PARENT MINIAOD_"))
-            self.assertEqual(archive_parent.count("MINIAOD_"), 5)
 
 
 if __name__ == "__main__":

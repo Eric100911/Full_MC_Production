@@ -33,7 +33,7 @@ class ProducerIndexTests(unittest.TestCase):
         self.addCleanup(self.enabled.stop)
 
     def test_old_writer_acceptance_makes_count_stale_and_rebuilds_once(self):
-        state = state_with(("PLAN_000001", "plan"), ("MIX_C_000001", "mix"))
+        state = state_with(("PLAN_000001", "plan"), ("MIX_C_000001", "lhe"))
         receipts = {"PLAN_000001": {"outputs": [ref("BLOCK:A")]},
                     "MIX_C_000001": {"outputs": [ref("HEPMC:B")]}}
         reader = ReceiptReader(receipts)
@@ -44,7 +44,7 @@ class ProducerIndexTests(unittest.TestCase):
 
         # A legacy writer changes accepted but leaves the auxiliary index alone.
         state["accepted"]["ARCHIVE_000001"] = {"stage": "archive"}
-        state["accepted"]["MIX_C_000002"] = {"stage": "mix"}
+        state["accepted"]["MIX_C_000002"] = {"stage": "lhe"}
         receipts["MIX_C_000002"] = {"outputs": [ref("HEPMC:NEW")]}
         reader.calls.clear()
         self.assertEqual(producer_index.find("run", state, "HEPMC:NEW", reader),
@@ -117,7 +117,7 @@ class ProducerIndexTests(unittest.TestCase):
 
     def test_index_hit_reads_and_verifies_only_target_receipt(self):
         state = state_with(("LHE_000001", "lhe"), ("PLAN_000002", "plan"),
-                           ("MIX_C_000003", "mix"))
+                           ("MIX_C_000003", "lhe"))
         receipts = {"LHE_000001": {"outputs": [ref("A")]},
                     "PLAN_000002": {"outputs": [ref("B")]},
                     "MIX_C_000003": {"outputs": [ref("C")]}}
@@ -143,7 +143,7 @@ class ProducerIndexTests(unittest.TestCase):
         state = state_with(("ARCHIVE_000000", "archive"))
         state["producer_index"] = {"schema": producer_index.SCHEMA, "accepted_count": 1,
                                    "artifacts": {}}
-        state["accepted"]["MIX_C_000000"] = {"stage": "mix"}
+        state["accepted"]["MIX_C_000000"] = {"stage": "lhe"}
         outcome = {"outputs": [ref("HEPMC:C")]}
         reader = ReceiptReader({})
 
@@ -165,7 +165,7 @@ class ProducerIndexTests(unittest.TestCase):
         self.assertEqual(reader.calls, [])
 
     def test_rebuild_failure_leaves_existing_auxiliary_state_untouched(self):
-        state = state_with(("LHE_000001", "lhe"), ("MIX_C_000002", "mix"))
+        state = state_with(("LHE_000001", "lhe"), ("MIX_C_000002", "lhe"))
         state["producer_index"] = {"schema": producer_index.SCHEMA, "accepted_count": 0,
                                    "artifacts": {"stale": "LHE_000001"}}
         before = deepcopy(state["producer_index"])
@@ -177,7 +177,7 @@ class ProducerIndexTests(unittest.TestCase):
             producer_index.find("run", state, "target", broken_reader)
         self.assertEqual(state["producer_index"], before)
 
-        state["accepted"]["MIX_C_000003"] = {"stage": "mix"}
+        state["accepted"]["MIX_C_000003"] = {"stage": "lhe"}
         with self.assertRaisesRegex(OSError, "receipt read failed"):
             producer_index.record("run", state, "MIX_C_000003",
                                   {"outputs": [ref("new")]}, broken_reader)

@@ -1,8 +1,11 @@
 """Offline IHEP preparation and exact-attempt submission tests."""
+import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -12,6 +15,7 @@ from full_mc.backends.hepjob import (prepare_batch, resume_batch, SAFE_NTUPLE_NO
                                      status_batch, submit_batch)
 from full_mc.cli import build_parser, dispatch
 from full_mc.io import atomic_json, read_json
+from full_mc.runtime.packages import CMSSW15_RUNTIME, CMSSW15_SOURCE_PACKAGE
 
 
 def handoff(root, count=1):
@@ -27,17 +31,35 @@ def handoff(root, count=1):
     return path
 
 
-def runtime(root, release="r1", revision="core1"):
+def runtime(root, release="r1", revision="core1", *, compiled=True):
     root.mkdir()
     (root / "core.tgz").write_bytes(b"core")
     controller = root / "controller/core/src/full_mc/runtime"
     controller.mkdir(parents=True)
     (root / "controller/core/mcprod").write_text("#!/bin/sh\n", encoding="utf-8")
     (controller / "bootstrap.py").write_text("# bootstrap\n", encoding="utf-8")
+    library = "libHeavyFlavorAnalysisTPS-Onia2MuMu.so"
+    if compiled:
+        asset = CMSSW15_RUNTIME
+        members = {
+            "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/BuildFile.xml": b"# fixture",
+            f"CMSSW_15_0_15/lib/el9_amd64_gcc12/{library}": b"plugin",
+            "CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache":
+                f"{library} MultiLepPAT CMS%20EDM%20Framework%20Module\n".encode(),
+        }
+    else:
+        asset = CMSSW15_SOURCE_PACKAGE
+        members = {"HeavyFlavorAnalysis/TPS-Onia2MuMu/BuildFile.xml": b"# fixture"}
+    with tarfile.open(root / asset, "w:gz") as archive:
+        for name, contents in members.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(contents)
+            archive.addfile(member, io.BytesIO(contents))
     atomic_json(root / "runtime.json", {"runtime_release": release, "site": "ihep",
                                          "git_revision": revision,
                                          "profiles": ["cmssw12-sim-el8", "cmssw15-ntuple-el9", "analyzer-el9"],
-                                         "bundles": {"core": "core.tgz"}})
+                                         "bundles": {"core": "core.tgz",
+                                                     "cmssw15-ntuple-el9": asset}})
     return root
 
 
@@ -93,6 +115,59 @@ class IhepContracts(unittest.TestCase):
             resume_batch(batch["manifest_path"], runner=no_submit)
             no_submit.assert_not_called()
 
+    def test_worker_archives_ntuple_diagnostics_and_preserves_exit_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proxy = root / "proxy"
+            proxy.write_text("test proxy")
+            (root / "mcprod").write_text(
+                "from pathlib import Path\n"
+                "import os, sys\n"
+                "work = Path(sys.argv[-1])\n"
+                "print(work.parent)\n"
+                "stage = work / 'ntuple'\n"
+                "(stage / 'command_logs').mkdir(parents=True)\n"
+                "(stage / 'commands.log').write_text('ntuple stage summary')\n"
+                "(stage / 'command_logs/001_cmsRun.stderr').write_text('original CMSSW error')\n"
+                "(stage / 'output_ntuple.root').touch()\n"
+                "sys.exit(int(os.environ['TEST_WORKER_RC']))\n"
+            )
+            batch = prepare_batch(handoff(root), root / "batch", proxy=proxy, core_root=root)
+            submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
+                returncode=0, stdout="submitted to cluster 27", stderr="")))
+            command = read_json(batch["manifest_path"])["jobs"][0]["attempts"][0]["command"]
+            logs = Path(command[command.index("-e") + 1]).parent
+            attempt = command[command.index("-argu") + 1]
+
+            for rc in (42, 0):
+                with self.subTest(rc=rc):
+                    execution = subprocess.run([command[1], attempt], text=True, capture_output=True,
+                                               env=dict(os.environ, TEST_WORKER_RC=str(rc)))
+                    self.assertEqual(execution.returncode, rc, execution.stderr)
+                    self.addCleanup(shutil.rmtree, execution.stdout.strip(), ignore_errors=True)
+                    destination = Path(execution.stderr.removeprefix("HepJob diagnostics: ").strip())
+                    self.assertEqual(destination.parent, logs)
+                    with tarfile.open(destination) as diagnostics:
+                        self.assertEqual(set(diagnostics.getnames()), {
+                            "execution.txt", "worker/ntuple/commands.log",
+                            "worker/ntuple/command_logs/001_cmsRun.stderr",
+                        })
+                        self.assertIn(f"exit_code={rc}".encode(),
+                                      diagnostics.extractfile("execution.txt").read())
+                        self.assertEqual(
+                            diagnostics.extractfile(
+                                "worker/ntuple/command_logs/001_cmsRun.stderr").read(),
+                            b"original CMSSW error")
+            self.assertEqual(len(list(logs.glob("execution-*.tar.gz"))), 2)
+            self.assertEqual(list(logs.glob(".execution-*")), [])
+
+            no_destination = subprocess.run(
+                [command[1], "attempt-002"], text=True, capture_output=True,
+                env=dict(os.environ, TEST_WORKER_RC="42"))
+            self.addCleanup(shutil.rmtree, no_destination.stdout.strip(), ignore_errors=True)
+            self.assertEqual(no_destination.returncode, 42)
+            self.assertIn("HepJob diagnostics could not be archived", no_destination.stderr)
+
     def test_crash_after_attempt_record_does_not_duplicate_submission(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -124,6 +199,12 @@ class IhepContracts(unittest.TestCase):
             self.assertEqual((job["state"], job["job_id"], job["recovery_of"]),
                              ("submitted", "28", "27"))
             self.assertEqual(len(job["attempts"]), 2)
+            for number, attempt in enumerate(job["attempts"], 1):
+                command = attempt["command"]
+                name = f"attempt-{number:03d}"
+                self.assertEqual(command[command.index("-argu") + 1], name)
+                self.assertEqual(Path(command[command.index("-e") + 1]),
+                                 root / "batch" / "logs" / "0000" / name / "hepjob.err")
 
     def test_hep_q_summary_and_other_jobs_cannot_authorize_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -183,6 +264,9 @@ class IhepContracts(unittest.TestCase):
             atomic_json(root / "handoff.json", payload)
             with self.assertRaisesRegex(ValueError, "runtime-dir"):
                 prepare_batch(root / "handoff.json", root / "missing")
+            source_only = runtime(root / "source-runtime", compiled=False)
+            with self.assertRaisesRegex(ValueError, "requires a compiled CMSSW15 runtime"):
+                prepare_batch(root / "handoff.json", root / "batch", runtime_dir=source_only)
             release = runtime(root / "runtime")
             batch = prepare_batch(root / "handoff.json", root / "batch", runtime_dir=release)
             task = read_json(batch["jobs"][0]["task_path"])

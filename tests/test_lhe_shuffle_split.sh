@@ -11,7 +11,7 @@ GEN_PY="${SCRIPT_DIR}/generate_synthetic_lhe.py"
 TMP_ROOT="/tmp/chiw"
 mkdir -p "${TMP_ROOT}"
 TMP_DIR="$(mktemp -d "${TMP_ROOT}/lhe_shuffle_split_XXXXX")"
-TOOL="${TMP_DIR}/lhe_shuffle_split_el7"
+TOOL="${TMP_DIR}/lhe_shuffle_split"
 PASS=0
 FAIL=0
 
@@ -22,12 +22,18 @@ SINGULARITY_IMAGE="/cvmfs/unpacked.cern.ch/registry.hub.docker.com/cmssw/el7:x86
 LCG_SETUP="/cvmfs/sft.cern.ch/lcg/views/LCG_88b/x86_64-centos7-gcc62-opt/setup.sh"
 SINGULARITY_BASE=(singularity exec --bind "${BASE_DIR}:${BASE_DIR}:ro" --bind "${TMP_DIR}:${TMP_DIR}" --bind /cvmfs:/cvmfs "${SINGULARITY_IMAGE}")
 
-run_in_container() {
-    "${SINGULARITY_BASE[@]}" bash -c "$*"
-}
+case "${1:-}" in
+    --host) use_host=1 ;;
+    "") use_host=0 ;;
+    *) echo "Usage: $0 [--host]" >&2; exit 2 ;;
+esac
 
-run_with_lcg() {
-    "${SINGULARITY_BASE[@]}" bash -c "source ${LCG_SETUP} && $*"
+run_splitter_command() {
+    if (( use_host )); then
+        "$@"
+    else
+        "${SINGULARITY_BASE[@]}" bash -c 'source "$1"; shift; exec "$@"' bash "${LCG_SETUP}" "$@"
+    fi
 }
 
 cleanup() {
@@ -57,17 +63,17 @@ check_fail() {
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-msg_info "Building lhe_shuffle_split (cmssw/el7 + LCG_88b)..."
-if run_with_lcg "g++ -std=c++14 -O2 -Wall -o ${TOOL} ${TOOL_SRC}" 2>&1; then
+msg_info "Building lhe_shuffle_split..."
+if run_splitter_command g++ -std=c++14 -O2 -Wall -o "${TOOL}" "${TOOL_SRC}" 2>&1; then
     check_pass "Compilation"
 else
     check_fail "Compilation"
     exit 1
 fi
 
-# Run all tool invocations inside the container (matches worker glibc/ABI).
+# Use the same environment for compilation and execution.
 shuffle_split() {
-    run_with_lcg "${TOOL}" "$@"
+    run_splitter_command "${TOOL}" "$@"
 }
 
 # ---------------------------------------------------------------------------

@@ -774,7 +774,7 @@ def validate_structure_graph(graph: DagGraph) -> None:
             supported = node.name == "SUMMARY" or node.name.startswith("FINAL_")
         elif node.directive == "SUBDAG":
             supported = node.name.startswith(
-                ("MIX_", "WAVE_", "SOURCE_", "SHARD_")
+                ("MIX_", "SOURCE_", "SHARD_")
             )
         else:
             supported = node.name.startswith(SUPPORTED_JOB_PREFIXES)
@@ -989,43 +989,6 @@ def render_collapsed_structure(
     ]
     append_wrapped(lines, "  Root MAXJOBS: ", controls_text(graph), width)
 
-    waves = [
-        node for node in graph.nodes.values()
-        if node.directive == "SUBDAG" and node.name.startswith("WAVE_")
-    ]
-    if waves:
-        lines.append("  Wave/SubDAGs:")
-        for wave in sorted(waves, key=lambda item: item.name):
-            record = records.get(wave.name)
-            status = record_status(record) if record else "pending"
-            marker = status_marker(status, color_enabled)
-            child = graph.children.get(wave.name)
-            if child is None:
-                lines.append(
-                    f"    {marker} {wave.name}: "
-                    f"{missing_child_description(status)}"
-                )
-                continue
-            stage_counts: dict[str, Counter] = defaultdict(Counter)
-            stage_totals = Counter()
-            for child_node in collect_graph_nodes(child):
-                child_record = records.get(child_node.name)
-                child_status = (
-                    record_status(child_record) if child_record else "pending"
-                )
-                stage_counts[child_node.stage][child_status] += 1
-                stage_totals[child_node.stage] += 1
-            summaries = []
-            for stage, label in STAGES:
-                total = stage_totals[stage]
-                if total:
-                    summaries.append(
-                        f"{label} ×{total} "
-                        f"[{status_counts_text(stage_counts[stage], color_enabled)}]"
-                    )
-            suffix = "; ".join(summaries) if summaries else "no child nodes"
-            lines.append(f"    {marker} {wave.name}: {suffix}")
-
     sources = [
         node for node in graph.nodes.values()
         if node.directive == "SUBDAG" and node.name.startswith("SOURCE_")
@@ -1045,7 +1008,8 @@ def render_collapsed_structure(
         for source in sources:
             child = graph.children.get(source.name)
             if child is None:
-                unresolved += 1
+                if source.name not in records or record_status(records[source.name]) != "skipped":
+                    unresolved += 1
                 continue
             for child_node in collect_graph_nodes(child):
                 record = records.get(child_node.name)
