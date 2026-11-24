@@ -8,12 +8,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 from full_mc.application.staging import FUSED_STATE_SCHEMA
 from full_mc.io import atomic_json
-from .profiles import PROFILES
+from .profiles import PROFILES, run_profile
 
 CMSSW15_RUNTIME = "cmssw15_tpsonia2mumu_runtime.tar.gz"
 CMSSW15_SOURCE_PACKAGE = "tpsonia2mumu_code.tar.gz"
@@ -26,6 +27,9 @@ CMSSW15_REQUIRED = (
     "CMSSW_15_0_15/src/",
     "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/",
 )
+CMSSW15_PROJECT = "CMSSW_15_0_15"
+CMSSW15_LIBRARY_DIR = f"{CMSSW15_PROJECT}/lib/el9_amd64_gcc12"
+CMSSW15_PLUGIN_CACHE = f"{CMSSW15_LIBRARY_DIR}/.edmplugincache"
 SITE_PROFILES = {
     "cern": ("helac-el7", "utilities-el9", "pythia-el8", "cmssw12-sim-el8"),
     "ihep": ("utilities-el9", "cmssw12-sim-el8", "cmssw15-sim-el9",
@@ -48,11 +52,28 @@ def validate_cmssw15_runtime(path):
     if not path.is_file():
         raise FileNotFoundError(path)
     with tarfile.open(path, "r:gz") as archive:
-        names = tuple(m.name.lstrip("./").rstrip("/") + "/" for m in archive)
+        names = set()
+        libraries = set()
+        plugin_cache = b""
+        for member in archive:
+            name = member.name.removeprefix("./").rstrip("/")
+            names.add(name + "/")
+            if member.isfile() and name == CMSSW15_PLUGIN_CACHE:
+                with archive.extractfile(member) as stream:
+                    plugin_cache = stream.read()
+            if (member.isfile() and member.size > 0
+                    and name.startswith(CMSSW15_LIBRARY_DIR + "/")
+                    and name.endswith("HeavyFlavorAnalysisTPS-Onia2MuMu.so")):
+                libraries.add(Path(name).name.encode())
     missing = [entry for entry in CMSSW15_REQUIRED
                if not any(name.startswith(entry) for name in names)]
     if missing:
         raise ValueError("CMSSW15 runtime missing required paths: " + ", ".join(missing))
+    if not libraries:
+        raise ValueError("CMSSW15 runtime lacks the compiled TPS-Onia2MuMu plugin library")
+    if not any(fields[0] in libraries and fields[1] == b"MultiLepPAT"
+               for fields in map(bytes.split, plugin_cache.splitlines()) if len(fields) >= 2):
+        raise ValueError("CMSSW15 runtime plugin cache lacks the TPS-Onia2MuMu MultiLepPAT entry")
 
 
 def validate_cmssw15_source_package(path):
@@ -137,7 +158,7 @@ def _initialized_submodule(core, relative_path):
 
 
 def _package_tpsonia2mumu_source(core, destination):
-    """Create the documented source fallback used by ``run_chain.sh``."""
+    """Collect the pinned source files for the CMSSW build."""
     source, files, _ = _initialized_submodule(core, "external/TPS-Onia2MuMu")
     destination = Path(destination)
     with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
@@ -154,6 +175,29 @@ def _package_tpsonia2mumu_source(core, destination):
             archive.add(path, arcname=str(Path("HeavyFlavorAnalysis/TPS-Onia2MuMu") / relative),
                         recursive=False)
     validate_cmssw15_source_package(destination)
+
+
+def _build_cmssw15_runtime(core, destination):
+    from .bootstrap import _extract
+
+    scratch = Path("/tmp/chiw")
+    scratch.mkdir(exist_ok=True)
+    helpers = core / "processing/cmssw_helpers"
+    profile = "cmssw15-ntuple-el9"
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="mcprod-cmssw15-") as temporary:
+        build = Path(temporary)
+        project = build / CMSSW15_PROJECT
+        source = build / CMSSW15_SOURCE_PACKAGE
+        _package_tpsonia2mumu_source(core, source)
+        run_profile(profile, ["bash", helpers / "cmssw15_project_create.sh", build,
+                              CMSSW15_PROJECT], cwd=build, bind_paths=(helpers,),
+                    stdout=sys.stderr)
+        _extract(source, project / "src", "HeavyFlavorAnalysis")
+        run_profile(profile, ["bash", helpers / "cmssw15_exec.sh", project,
+                              "scram", "b", "-j", "4"], cwd=build, bind_paths=(helpers,),
+                    stdout=sys.stderr)
+        with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
+            archive.add(project, arcname=project.name)
 
 
 def validate_runtime_release(release_dir, *, expected_release=None, expected_site=None,
@@ -265,14 +309,12 @@ def prepare_runtime(core, destination, release, site, profiles=None):
                             if name in selected]
         if cmssw15_profiles:
             source = core / "common/packages" / CMSSW15_RUNTIME
+            runtime_asset = staging / CMSSW15_RUNTIME
             if source.is_file():
-                validate_cmssw15_runtime(source)
-                shutil.copy2(source, staging / source.name)
-                bundles.update({profile: source.name for profile in cmssw15_profiles})
+                shutil.copy2(source, runtime_asset)
             else:
-                fallback = staging / CMSSW15_SOURCE_PACKAGE
-                _package_tpsonia2mumu_source(core, fallback)
-                bundles.update({profile: fallback.name for profile in cmssw15_profiles})
+                _build_cmssw15_runtime(core, runtime_asset)
+            bundles.update({profile: runtime_asset.name for profile in cmssw15_profiles})
         analyzer_revision = None
         if "analyzer-el9" in selected:
             analyzer, files, analyzer_revision = _initialized_submodule(

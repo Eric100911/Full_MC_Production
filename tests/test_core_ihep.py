@@ -1,4 +1,5 @@
 """Offline IHEP preparation and exact-attempt submission tests."""
+import io
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ from full_mc.backends.hepjob import (prepare_batch, resume_batch, SAFE_NTUPLE_NO
                                      status_batch, submit_batch)
 from full_mc.cli import build_parser, dispatch
 from full_mc.io import atomic_json, read_json
+from full_mc.runtime.packages import CMSSW15_RUNTIME, CMSSW15_SOURCE_PACKAGE
 
 
 def handoff(root, count=1):
@@ -29,17 +31,35 @@ def handoff(root, count=1):
     return path
 
 
-def runtime(root, release="r1", revision="core1"):
+def runtime(root, release="r1", revision="core1", *, compiled=True):
     root.mkdir()
     (root / "core.tgz").write_bytes(b"core")
     controller = root / "controller/core/src/full_mc/runtime"
     controller.mkdir(parents=True)
     (root / "controller/core/mcprod").write_text("#!/bin/sh\n", encoding="utf-8")
     (controller / "bootstrap.py").write_text("# bootstrap\n", encoding="utf-8")
+    library = "libHeavyFlavorAnalysisTPS-Onia2MuMu.so"
+    if compiled:
+        asset = CMSSW15_RUNTIME
+        members = {
+            "CMSSW_15_0_15/src/HeavyFlavorAnalysis/TPS-Onia2MuMu/BuildFile.xml": b"# fixture",
+            f"CMSSW_15_0_15/lib/el9_amd64_gcc12/{library}": b"plugin",
+            "CMSSW_15_0_15/lib/el9_amd64_gcc12/.edmplugincache":
+                f"{library} MultiLepPAT CMS%20EDM%20Framework%20Module\n".encode(),
+        }
+    else:
+        asset = CMSSW15_SOURCE_PACKAGE
+        members = {"HeavyFlavorAnalysis/TPS-Onia2MuMu/BuildFile.xml": b"# fixture"}
+    with tarfile.open(root / asset, "w:gz") as archive:
+        for name, contents in members.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(contents)
+            archive.addfile(member, io.BytesIO(contents))
     atomic_json(root / "runtime.json", {"runtime_release": release, "site": "ihep",
                                          "git_revision": revision,
                                          "profiles": ["cmssw12-sim-el8", "cmssw15-ntuple-el9", "analyzer-el9"],
-                                         "bundles": {"core": "core.tgz"}})
+                                         "bundles": {"core": "core.tgz",
+                                                     "cmssw15-ntuple-el9": asset}})
     return root
 
 
@@ -244,6 +264,9 @@ class IhepContracts(unittest.TestCase):
             atomic_json(root / "handoff.json", payload)
             with self.assertRaisesRegex(ValueError, "runtime-dir"):
                 prepare_batch(root / "handoff.json", root / "missing")
+            source_only = runtime(root / "source-runtime", compiled=False)
+            with self.assertRaisesRegex(ValueError, "requires a compiled CMSSW15 runtime"):
+                prepare_batch(root / "handoff.json", root / "batch", runtime_dir=source_only)
             release = runtime(root / "runtime")
             batch = prepare_batch(root / "handoff.json", root / "batch", runtime_dir=release)
             task = read_json(batch["jobs"][0]["task_path"])

@@ -69,7 +69,10 @@ before submission. A ready IHEP cutover requires all of the following:
 3. `mcprod handoff transfer` uses the explicit IHEP site configuration.
 4. The IHEP receiving runtime is clean and matches both the handoff release and
    core revision. Stage the handoff JSON into an IHEP-visible persistent
-   workspace before preparing its batch.
+   workspace before preparing its batch. Check that its ntuple bundle is
+   `cmssw15_tpsonia2mumu_runtime.tar.gz`. Runtime preparation uses the full
+   `scram b -j 4` build if a prebuilt archive is unavailable. The worker logs
+   should show `scram_ProjectRename_CMSSW_15_0_15` before `cmsRun`.
 5. Inspect `batch_manifest.json` before the one-time submit. Keep batch logs and
    checkpoints on persistent IHEP storage, install the proxy into the
    job-private `credentials/x509_user_proxy`, and pin CMSSW15 ntuple tasks to

@@ -1298,18 +1298,14 @@ prepare_cmssw15_from_package() {
 }
 
 prepare_cmssw15_from_runtime() {
-    local pkg="${PACKAGES_DIR}/cmssw15_tpsonia2mumu_runtime.tar.gz"
+    local pkg="$1"
     local project_dir="${WORKDIR}/CMSSW_15_0_15"
-
-    if [[ ! -f "${pkg}" ]]; then
-        return 1
-    fi
 
     export CMSSW_15_BASE="${project_dir}"
 
     if [[ ! -d "${project_dir}/src" ]]; then
         msg_info "Unpacking prebuilt CMSSW_15_0_15 runtime from ${pkg}..."
-        tar -xzf "${pkg}" -C "${WORKDIR}"
+        tar -xzf "${pkg}" -C "${WORKDIR}" || return 1
     fi
 
     if [[ ! -d "${project_dir}/src" ]]; then
@@ -1331,11 +1327,12 @@ prepare_cmssw15_from_runtime() {
 }
 
 prepare_cmssw15_for_ntuple() {
-    if prepare_cmssw15_from_runtime; then
-        return 0
+    local runtime="${PACKAGES_DIR}/cmssw15_tpsonia2mumu_runtime.tar.gz"
+    if [[ -f "${runtime}" ]]; then
+        prepare_cmssw15_from_runtime "${runtime}"
+    else
+        prepare_cmssw15_from_package "$@"
     fi
-
-    prepare_cmssw15_from_package "$@"
 }
 
 ntuple_cfg_path() {

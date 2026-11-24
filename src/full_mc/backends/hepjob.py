@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List
 
 from full_mc.credentials import require_initial_proxy_lifetime
 from full_mc.io import atomic_json as _atomic_json
-from full_mc.runtime.packages import validate_runtime_release
+from full_mc.runtime.packages import CMSSW15_RUNTIME, validate_runtime_release
 from full_mc.settings import CORE_ROOT, LOG_LEVELS
 
 
@@ -161,9 +161,11 @@ def _runtime_for_handoff(handoff, runtime_dir):
     if runtime.get("source_dirty"):
         raise ValueError("refusing a receiving runtime built from a dirty core source")
     available_profiles = set(runtime["profiles"])
+    ntuple_profile = ("cmssw15-ntuple-el9" if "cmssw15-ntuple-el9" in available_profiles
+                      else "cmssw15-el9")
     required = {
         "cmssw12-sim-el8" if "cmssw12-sim-el8" in available_profiles else "cmssw12-el8",
-        "cmssw15-ntuple-el9" if "cmssw15-ntuple-el9" in available_profiles else "cmssw15-el9",
+        ntuple_profile,
     }
     analyses = {str(task.get("parameters", {}).get("analysis", "JJP"))
                 for task in handoff.get("tasks", []) if task.get("stage") != "combined"}
@@ -173,6 +175,8 @@ def _runtime_for_handoff(handoff, runtime_dir):
         required.add("analyzer-el9")
     if not required <= set(runtime["profiles"]):
         raise ValueError("IHEP runtime lacks required merge/ntuple/analysis profiles")
+    if runtime["bundles"].get(ntuple_profile) != CMSSW15_RUNTIME:
+        raise ValueError("IHEP batch requires a compiled CMSSW15 runtime; run mcprod runtime prepare")
     return Path(runtime_dir).resolve() / "controller/core"
 
 
