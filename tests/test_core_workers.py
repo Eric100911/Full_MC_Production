@@ -138,9 +138,14 @@ class WorkerContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch, \
                 patch.dict("os.environ", {"X509_USER_PROXY": "/afs/proxy"}, clear=True), \
                 patch("full_mc.runtime.profiles.subprocess.run") as run:
-            run_profile("utilities-el9", ["xrdcp", "x", "y"], cwd=Path(scratch))
+            run_profile("utilities-el9", ["xrdcp", "x", "y"], cwd=Path(scratch),
+                        env={"EXAMPLE": "first,second=value"})
         argv = run.call_args.args[0]
-        self.assertIn("X509_CERT_DIR=" + GRID_CA_DIR, argv)
+        self.assertNotIn("--env", argv)
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["APPTAINERENV_X509_CERT_DIR"], GRID_CA_DIR)
+        self.assertEqual(environment["APPTAINERENV_EXAMPLE"], "first,second=value")
+        self.assertEqual(environment["APPTAINERENV_FULL_MC_RUNTIME_PROFILE"], "utilities-el9")
 
     def test_transfer_does_not_bind_remote_xrdfs_lfns(self):
         with patch("full_mc.runtime.profiles.run_profile") as run:

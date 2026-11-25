@@ -159,17 +159,21 @@ def _initialized_submodule(core, relative_path):
 
 def _package_tpsonia2mumu_source(core, destination):
     """Collect the pinned source files for the CMSSW build."""
-    source, files, _ = _initialized_submodule(core, "external/TPS-Onia2MuMu")
+    source, files, revision = _initialized_submodule(core, "external/TPS-Onia2MuMu")
+    tree = subprocess.check_output(
+        ["git", "-C", str(source), "ls-tree", "-rz", revision])
+    gitlinks = set()
+    for entry in tree.split(b"\0"):
+        metadata, _, path = entry.partition(b"\t")
+        if metadata.startswith(b"160000 commit "):
+            gitlinks.add(os.fsdecode(path))
     destination = Path(destination)
     with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
         for relative in files:
-            path = source / relative
-            entry = subprocess.check_output(
-                ["git", "-C", str(source), "ls-tree", "HEAD", "--", relative],
-                text=True).strip().split()
-            if len(entry) == 4 and entry[0] == "160000" and entry[1] == "commit":
+            if relative in gitlinks:
                 # Nested data repositories are not runtime source files.
                 continue
+            path = source / relative
             if not path.is_file() or path.is_symlink():
                 raise ValueError("invalid TPS-Onia2MuMu source member: %s" % path)
             archive.add(path, arcname=str(Path("HeavyFlavorAnalysis/TPS-Onia2MuMu") / relative),

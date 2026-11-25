@@ -1,5 +1,6 @@
 """Reclaim worker and batched staged-deletion contracts."""
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from full_mc.storage import reclaim
+from full_mc.storage.transfer import TransferClient
 
 
 STAGING = "root://eosuser.cern.ch///eos/user/c/chiw/staging/run-1"
@@ -39,6 +41,27 @@ class ReclaimStorage(unittest.TestCase):
         runner = Mock(return_value=Mock(returncode=1, stdout="", stderr="[3010] denied"))
         with self.assertRaisesRegex(RuntimeError, "reclaim command failed"):
             reclaim.remove_many([STAGING + "/x.lhe.gz"], runner=runner, work_dir=self.work)
+
+    def test_only_not_found_diagnostics_are_treated_as_missing(self):
+        url = STAGING + "/3011.lhe.gz"
+        missing = "[ERROR] Server responded with an error: [3011] No such file or directory"
+        denied = "[ERROR] Server responded with an error: [3010] Permission denied for /store/3011"
+        for diagnostic, exception in ((missing, FileNotFoundError), (denied, RuntimeError)):
+            with self.subTest(diagnostic=diagnostic):
+                runner = Mock(return_value=Mock(returncode=1, stderr=diagnostic))
+                with self.assertRaises(exception):
+                    TransferClient(runner=runner).remove(url)
+                script = 'xrdfs() { printf "%s\\n" "$TEST_DIAGNOSTIC" >&2; return 1; }\n'
+                script += reclaim._build_script([(0, "root://example/", "/store/3011")])
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", script], text=True, capture_output=True,
+                    env={"TEST_DIAGNOSTIC": diagnostic, "PATH": "/usr/bin:/bin"}, check=False)
+                if exception is FileNotFoundError:
+                    self.assertEqual((completed.returncode, completed.stdout),
+                                     (0, "0\talready-missing\n"))
+                else:
+                    self.assertEqual(completed.returncode, 1)
+                    self.assertIn(diagnostic, completed.stderr)
 
     def test_broad_removal_is_refused(self):
         with self.assertRaisesRegex(ValueError, "refusing broad removal"):

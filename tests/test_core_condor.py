@@ -87,6 +87,41 @@ class CondorContracts(unittest.TestCase):
                 submit_run(root2, runner=Mock(side_effect=KeyboardInterrupt))
             self.assertEqual(read_json(root2 / "submission.json")["state"], "submitting")
 
+    def test_submit_requires_one_distinct_receipt_before_truncating_diagnostics(self):
+        receipt = "1 job(s) submitted to cluster 42."
+        conflict = "1 job(s) submitted to cluster 43."
+        diagnostic = "Warning: condor_q reports cluster 99; no submit confirmation\n"
+        tail = "x" * 4500
+        cases = [
+            (response(stdout=diagnostic + receipt, stderr=receipt + "\n" + tail),
+             "submitted", "42", [receipt]),
+            (response(stdout=receipt, stderr=conflict), "unknown", None, [receipt, conflict]),
+            (response(stdout=diagnostic), "unknown", None, []),
+            (response(1, stdout=receipt), "unknown", "42", [receipt]),
+        ]
+        for completed, state, cluster, receipts in cases:
+            with self.subTest(state=state, receipts=receipts), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run(root)
+                result = submit_run(root, runner=Mock(return_value=completed))
+                self.assertEqual((result["state"], result["root_cluster_id"]), (state, cluster))
+                attempt = read_json(root / "submission.json")["attempts"][-1]
+                self.assertEqual(attempt["submit_receipts"], receipts)
+                self.assertEqual(attempt["submit_output"],
+                                 (completed.stdout + "\n" + completed.stderr)[-4000:])
+
+    def test_submit_timeout_is_persisted_as_unknown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run(root)
+            runner = Mock(side_effect=subprocess.TimeoutExpired("condor_submit_dag", 300))
+            submit_run(root, runner=runner)
+            saved = read_json(root / "submission.json")
+            self.assertEqual(saved["state"], "unknown")
+            self.assertTrue(saved["reconciliation_required"])
+            self.assertEqual(saved["attempts"][-1]["state"], "unknown")
+            self.assertEqual(runner.call_args.kwargs["timeout"], 300)
+
     def test_storage_reservation_failure_prevents_scheduler_submission(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
@@ -110,7 +145,7 @@ class CondorContracts(unittest.TestCase):
     def test_status_queries_only_the_recorded_root_on_recorded_schedd(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             runner = Mock(return_value=response(stdout="42 0 2\n"))
             status = status_run(root, runner=runner)
             self.assertEqual(status["state"], "active")
@@ -119,7 +154,7 @@ class CondorContracts(unittest.TestCase):
     def test_history_query_bounds_the_schedd_side_scan(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             seen = {}
             def runner(command, **kwargs):
                 seen[command[0]] = (command, kwargs)
@@ -134,12 +169,12 @@ class CondorContracts(unittest.TestCase):
     def test_empty_queue_and_history_use_exact_local_success_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             (root / "results").mkdir()
             (root / "results/RECLAIM.json").write_text('{"status":"ok"}')
             (root / "handoff.json").write_text('{}')
             (root / "run.dag.metrics").write_text(json.dumps({
-                "dagman_id": "42", "exitcode": 0, "DagStatus": 0,
+                "dagman_id": "42.0", "exitcode": 0, "DagStatus": 0,
                 "dag_nodes": 28, "dag_nodes_succeeded": 28,
                 "dag_nodes_failed": 0,
             }), encoding="utf-8")
@@ -157,12 +192,12 @@ class CondorContracts(unittest.TestCase):
     def test_local_success_evidence_rejects_metrics_from_another_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             (root / "results").mkdir()
             (root / "results/RECLAIM.json").write_text('{"status":"ok"}')
             (root / "handoff.json").write_text('{}')
             (root / "run.dag.metrics").write_text(json.dumps({
-                "dagman_id": "41", "exitcode": 0, "DagStatus": 0,
+                "dagman_id": "42.1", "exitcode": 0, "DagStatus": 0,
                 "dag_nodes": 28, "dag_nodes_succeeded": 28,
                 "dag_nodes_failed": 0,
             }), encoding="utf-8")
@@ -175,10 +210,10 @@ class CondorContracts(unittest.TestCase):
     def test_empty_queue_and_history_use_exact_local_failed_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             (root / "run.dag.rescue001").write_text("DONE A\n", encoding="utf-8")
             (root / "run.dag.metrics").write_text(json.dumps({
-                "dagman_id": "42", "exitcode": 1, "DagStatus": 2,
+                "dagman_id": "42.0", "exitcode": 1, "DagStatus": 2,
                 "dag_nodes": 28, "dag_nodes_succeeded": 27,
                 "dag_nodes_failed": 1,
             }), encoding="utf-8")
@@ -194,7 +229,7 @@ class CondorContracts(unittest.TestCase):
     def test_resume_requires_terminal_state_and_a_concrete_rescue_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             with self.assertRaises(RuntimeError):
                 resume_run(root, runner=Mock(return_value=response(stdout="42 0 2\n")))
             rescue = root / "run.dag.rescue002"; rescue.write_text("DONE A\n", encoding="utf-8")
@@ -208,15 +243,18 @@ class CondorContracts(unittest.TestCase):
                 self.assertEqual(_kwargs["env"]["_CONDOR_SCHEDD_HOST"], "schedd.example")
                 self.assertEqual(read_json(root / "submission.json")["attempts"][-1]
                                  ["rescue_file"], str(rescue))
-                return response(stdout="submitted to cluster 43")
+                return response(stdout="1 job(s) submitted to cluster 43.")
             result = resume_run(root, runner=runner)
             self.assertEqual(result["root_cluster_id"], "43")
             self.assertEqual(result["attempts"][-1]["kind"], "rescue")
+            last_status = read_json(root / "submission.json")["last_status"]
+            self.assertEqual(last_status["root_cluster_id"], "42")
+            self.assertTrue(last_status["terminal"])
 
     def test_completed_root_cannot_be_resumed_from_a_stale_rescue(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
-            submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
+            submit_run(root, runner=Mock(return_value=response(stdout="1 job(s) submitted to cluster 42.")))
             (root / "run.dag.rescue001").write_text("DONE A\n", encoding="utf-8")
             runner = Mock(return_value=response(stdout="42 0 4 0\n"))
             with self.assertRaisesRegex(RuntimeError, "confirmed failed"):

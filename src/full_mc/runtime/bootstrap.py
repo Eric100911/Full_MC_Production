@@ -59,15 +59,15 @@ def unpack_runtime(release_dir, destination, profile, release, *, stage_profiles
     _extract(bundle("core"), destination, "core")
     core = destination / "core"
     installed = set()
-    for profile in dict.fromkeys((profile, *stage_profiles)):
-        if profile in descriptor["bundles"]:
-            name = descriptor["bundles"][profile]
+    for stage_profile in dict.fromkeys((profile, *stage_profiles)):
+        if stage_profile in descriptor["bundles"]:
+            name = descriptor["bundles"][stage_profile]
             if name in installed:
                 continue
             installed.add(name)
-        if profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
-            asset = bundle(profile)
-            if not asset.is_file() and profile == "helac-el7":
+        if stage_profile in ("helac-el7", "cmssw15-el9", "cmssw15-sim-el9", "cmssw15-ntuple-el9"):
+            asset = bundle(stage_profile)
+            if not asset.is_file() and stage_profile == "helac-el7":
                 # Some Condor schedds transfer the package under its source
                 # basename even when the release descriptor uses the stable
                 # runtime basename.  Accept that transfer spelling, but always
@@ -78,13 +78,13 @@ def unpack_runtime(release_dir, destination, profile, release, *, stage_profiles
                     asset = source_alias
             packages = core / "common/packages"
             packages.mkdir(parents=True, exist_ok=True)
-            target = packages / Path(descriptor["bundles"][profile]).name
+            target = packages / name
             try:
                 os.link(asset, target)
             except OSError:
                 shutil.copy2(asset, target)
-        elif profile == "analyzer-el9":
-            _extract(bundle(profile), core / "external", "NtupleAnalyzer")
+        elif stage_profile == "analyzer-el9":
+            _extract(bundle(stage_profile), core / "external", "NtupleAnalyzer")
     return core
 
 
@@ -185,8 +185,9 @@ def main(argv=None):
         if args.products and not args.products.exists():
             # ON_EXIT still transfers diagnostics after a nonzero exit.
             if task["stage"] == "plan":
-                args.products.mkdir()
+                args.products.mkdir(parents=True, exist_ok=True)
             else:
+                args.products.parent.mkdir(parents=True, exist_ok=True)
                 args.products.write_text("{}\n")
         if task["stage"] == "reclaim" and args.products:
             snapshot = args.products.with_name("merge_groups.json")

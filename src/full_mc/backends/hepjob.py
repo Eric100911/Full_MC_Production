@@ -105,7 +105,8 @@ log_dir="$job_logs/$attempt"
 archive_logs() {
     local rc=$1 stage file temporary name archive
     local -a files=(execution.txt)
-    printf 'attempt=%s\nnode=%s\nexit_code=%s\n' "$attempt" "$HOSTNAME" "$rc" \
+    printf 'attempt=%s\nnode=%s\nexit_code=%s\n' "$attempt" \
+        "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" "$rc" \
         > "$job_scratch/execution.txt" || return
     shopt -s nullglob
     for stage in merge ntuple selection efficiency; do
@@ -245,9 +246,12 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
         wrapper = root / "wrappers" / ("%04d.sh" % index)
         _write_worker(wrapper, task_path, effective_core, proxy,
                       root / "logs" / ("%04d" % index), needs_proxy=needs_proxy)
+        node = safe_nodes[index % len(safe_nodes)]
+        if not node.lower().endswith(".ihep.ac.cn"):
+            node += ".ihep.ac.cn"
         jobs.append({"job_id": None, "index": index, "state": "prepared", "task_path": str(task_path),
                      "wrapper": str(wrapper), "requires_proxy": needs_proxy, "task_ids": combined.get("task_membership", [combined["task_id"]]),
-                     "node": safe_nodes[index % len(safe_nodes)] + ".ihep.ac.cn"})
+                     "node": node})
     run_id = str(handoff.get("run_id") or Path(handoff_path).resolve().parent.name)
     manifest = {"schema": SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                 "handoff": str(Path(handoff_path).resolve()), "workspace": str(root), "group": group,

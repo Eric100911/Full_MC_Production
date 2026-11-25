@@ -89,6 +89,7 @@ def run_profile(profile, command, *, cwd, env=None, check=True, stdout=None, std
                  ("X509_USER_PROXY", "KRB5CCNAME", "X509_CERT_DIR") if k in os.environ}
     inherited.setdefault("X509_CERT_DIR", GRID_CA_DIR)
     inherited.update({str(k): str(v) for k, v in (env or {}).items()})
+    environment = dict(os.environ, **inherited)
     shell = profile_shell(selected, command, cwd=cwd)
     if os.environ.get("FULL_MC_RUNTIME_PROFILE") == selected.identifier:
         argv = ["/bin/bash", "--noprofile", "--norc", "-c", shell]
@@ -101,10 +102,8 @@ def run_profile(profile, command, *, cwd, env=None, check=True, stdout=None, std
             extra.add(str(Path(proxy).resolve().parent))
         for path in sorted(extra):
             argv += ["--bind", path]
-        for key, value in inherited.items():
-            argv += ["--env", f"{key}={value}"]
-        argv += ["--env", f"FULL_MC_RUNTIME_PROFILE={selected.identifier}",
-                 selected.image, "/bin/bash", "--noprofile", "--norc", "-c", shell]
-    environment = dict(os.environ, **inherited)
+        environment.update({f"APPTAINERENV_{key}": value for key, value in inherited.items()})
+        environment["APPTAINERENV_FULL_MC_RUNTIME_PROFILE"] = selected.identifier
+        argv += [selected.image, "/bin/bash", "--noprofile", "--norc", "-c", shell]
     return subprocess.run(argv, cwd=cwd, env=environment, text=True,
                           stdout=stdout, stderr=stderr, check=check)

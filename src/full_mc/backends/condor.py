@@ -23,7 +23,10 @@ from full_mc.storage.reservation import reserve_run_namespaces
 
 
 SCHEMA = "full-mc-condor-submission-v1"
-_CLUSTER = re.compile(r"(?:submitted\s+to\s+)?cluster\s+(\d+)", re.IGNORECASE)
+_SUBMIT_RECEIPT = re.compile(
+    r"^[ \t]*[1-9][0-9]* job\(s\) submitted to cluster ([0-9]+)\.[ \t]*\r?$",
+    re.MULTILINE,
+)
 _RESCUE = re.compile(r"^run\.dag\.rescue(\d+)$")
 _JOB_STATUS = {
     "1": "idle", "2": "running", "3": "removed", "4": "completed",
@@ -38,6 +41,9 @@ _TERMINAL = {"removed", "completed"}
 # -scanlimit alone.
 _HISTORY_SCAN_LIMIT = 10000
 _STATUS_QUERY_TIMEOUT_SECONDS = 60
+_CONFIG_TIMEOUT_SECONDS = 30
+_SUBMIT_TIMEOUT_SECONDS = 300
+_SUBMIT_OUTPUT_LIMIT = 4000
 
 
 def _now() -> str:
@@ -123,9 +129,9 @@ def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path,
                   **({"env": environment} if environment is not None else {}))
 
 
-def _output(completed: Any) -> str:
-    return (str(getattr(completed, "stdout", "")) + "\n" +
-            str(getattr(completed, "stderr", "")))[-4000:]
+def _output_tail(stdout: str, stderr: str) -> str:
+    limit = _SUBMIT_OUTPUT_LIMIT
+    return (stdout[-limit:] + "\n" + stderr[-limit:])[-limit:]
 
 
 def _schedd(spec: Dict[str, Any], runner: Callable[..., Any], root: Path) -> str:
@@ -134,12 +140,14 @@ def _schedd(spec: Dict[str, Any], runner: Callable[..., Any], root: Path) -> str
     if configured:
         return configured
     try:
-        completed = _run(["condor_config_val", "SCHEDD_NAME"], runner, cwd=root)
-    except OSError as exc:
+        completed = _run(["condor_config_val", "SCHEDD_NAME"], runner, cwd=root,
+                         timeout=_CONFIG_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError("cannot resolve the default schedd: %s" % exc) from exc
     value = str(getattr(completed, "stdout", "")).strip()
     if getattr(completed, "returncode", 1) != 0 or not value:
-        raise RuntimeError("cannot resolve the default schedd: %s" % _output(completed))
+        raise RuntimeError("cannot resolve the default schedd: %s" %
+                           _output_tail(value, completed.stderr or ""))
     return value.splitlines()[0].strip()
 
 
@@ -178,10 +186,14 @@ def _begin_attempt(record: Dict[str, Any], *, kind: str, scheduler: str,
 
 
 def _finish_attempt(record: Dict[str, Any], attempt: Dict[str, Any], completed: Any) -> None:
-    text = _output(completed)
-    match = _CLUSTER.search(text)
-    cluster = match.group(1) if match else None
-    attempt.update(finished_at=_now(), submit_output=text, root_cluster_id=cluster)
+    stdout, stderr = completed.stdout or "", completed.stderr or ""
+    receipts = {}
+    for stream in (stdout, stderr):
+        for match in _SUBMIT_RECEIPT.finditer(stream):
+            receipts.setdefault(match.group(1), match.group(0).strip())
+    cluster = next(iter(receipts)) if len(receipts) == 1 else None
+    attempt.update(finished_at=_now(), submit_output=_output_tail(stdout, stderr),
+                   submit_receipts=list(receipts.values()), root_cluster_id=cluster)
     if getattr(completed, "returncode", 1) == 0 and cluster:
         attempt["state"] = "submitted"
         record.update(state="submitted", scheduler=attempt["scheduler"],
@@ -193,6 +205,22 @@ def _finish_attempt(record: Dict[str, Any], attempt: Dict[str, Any], completed: 
         record.update(state="unknown", scheduler=attempt["scheduler"],
                       root_cluster_id=cluster, reconciliation_required=True,
                       updated_at=_now())
+
+
+def _submit_attempt(root: Path, record: Dict[str, Any], attempt: Dict[str, Any],
+                    runner: Callable[..., Any]) -> Dict[str, Any]:
+    _write(root, record)
+    try:
+        completed = _run(attempt["command"], runner, cwd=root,
+                         scheduler=attempt["scheduler"], timeout=_SUBMIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        attempt.update(state="unknown", reconciliation_required=True, finished_at=_now(),
+                       submit_output=str(exc))
+        record.update(state="unknown", reconciliation_required=True, updated_at=_now())
+    else:
+        _finish_attempt(record, attempt, completed)
+    _write(root, record)
+    return record
 
 
 def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
@@ -221,18 +249,7 @@ def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
                               "dag": str(root / "run.dag"), "created_at": _now(),
                               "attempts": []}
     attempt = _begin_attempt(record, kind="submit", scheduler=scheduler, command=command)
-    _write(root, record)
-    try:
-        completed = _run(command, runner, cwd=root, scheduler=scheduler)
-    except OSError as exc:
-        attempt.update(state="unknown", reconciliation_required=True, finished_at=_now(),
-                       submit_output=str(exc))
-        record.update(state="unknown", reconciliation_required=True, updated_at=_now())
-        _write(root, record)
-        return record
-    _finish_attempt(record, attempt, completed)
-    _write(root, record)
-    return record
+    return _submit_attempt(root, record, attempt, runner)
 
 
 def _parse_status(text: str, cluster: str) -> List[tuple[str, str | None]]:
@@ -283,7 +300,7 @@ def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
     if not (
         completion.get("status") == "ok"
         and (root / "handoff.json").is_file()
-        and metrics_cluster == cluster
+        and metrics_cluster in (cluster, f"{cluster}.0")
         and exit_code == 0
         and dag_status == 0
         and failed == 0
@@ -325,7 +342,7 @@ def _local_failed_terminal_evidence(root: Path, cluster: str) -> Dict[str, Any] 
         return None
     rescue = _latest_rescue(root)
     if not (
-        metrics_cluster == cluster
+        metrics_cluster in (cluster, f"{cluster}.0")
         and rescue is not None
         and (exit_code != 0 or dag_status != 0 or failed != 0)
     ):
@@ -405,6 +422,13 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     observed = status_run(root, runner=runner)
     if not observed.get("terminal") or observed.get("successful") is not False:
         raise RuntimeError("rescue resume requires a confirmed failed root DAGMan state")
+    current = _load_submission(root)
+    if (current.get("current_attempt") != record.get("current_attempt")
+            or current.get("state") in {"submitting", "unknown"}
+            or str(current.get("root_cluster_id")) != observed["root_cluster_id"]
+            or current.get("scheduler") != observed["scheduler"]):
+        raise RuntimeError("submission changed during status check; inspect it before resuming")
+    record = current
     rescue = _latest_rescue(root)
     if rescue is None:
         raise FileNotFoundError("rescue resume requires an explicit run.dag.rescueNNN file")
@@ -418,15 +442,4 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     command = ["condor_submit_dag", "-no_recurse", "-AutoRescue", "1", "run.dag"]
     attempt = _begin_attempt(record, kind="rescue", scheduler=scheduler, command=command,
                              rescue_file=str(rescue))
-    _write(root, record)
-    try:
-        completed = _run(command, runner, cwd=root, scheduler=scheduler)
-    except OSError as exc:
-        attempt.update(state="unknown", reconciliation_required=True, finished_at=_now(),
-                       submit_output=str(exc))
-        record.update(state="unknown", reconciliation_required=True, updated_at=_now())
-        _write(root, record)
-        return record
-    _finish_attempt(record, attempt, completed)
-    _write(root, record)
-    return record
+    return _submit_attempt(root, record, attempt, runner)

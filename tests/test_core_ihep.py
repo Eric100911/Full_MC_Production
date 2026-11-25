@@ -143,7 +143,7 @@ class IhepContracts(unittest.TestCase):
                     patch("full_mc.backends.hepjob.ensure_valid_proxy") as check, \
                     self.assertLogs("full_mc.backends.hepjob", level="INFO") as logs:
                 batch = prepare_batch(handoff_path, root / "batch")
-                completed = Mock(returncode=0, stdout="submitted to cluster 27", stderr="")
+                completed = Mock(returncode=0, stdout="1 job(s) submitted to cluster 27.", stderr="")
                 submitted = submit_batch(batch["manifest_path"], runner=Mock(return_value=completed))
             self.assertFalse(batch["jobs"][0]["requires_proxy"])
             self.assertNotIn("credentials/x509_user_proxy", Path(batch["jobs"][0]["wrapper"]).read_text())
@@ -198,7 +198,7 @@ class IhepContracts(unittest.TestCase):
             )
             batch = prepare_batch(handoff(root), root / "batch", proxy=proxy, core_root=root)
             submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
-                returncode=0, stdout="submitted to cluster 27", stderr="")))
+                returncode=0, stdout="1 job(s) submitted to cluster 27.", stderr="")))
             command = read_json(batch["manifest_path"])["jobs"][0]["attempts"][0]["command"]
             logs = Path(command[command.index("-e") + 1]).parent
             attempt = command[command.index("-argu") + 1]
@@ -257,7 +257,7 @@ class IhepContracts(unittest.TestCase):
             root = Path(temporary)
             batch = prepare_batch(handoff(root), root / "batch")
             submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
-                returncode=0, stdout="submitted to cluster 27", stderr="")))
+                returncode=0, stdout="1 job(s) submitted to cluster 27.", stderr="")))
             active = Mock(return_value=Mock(returncode=0, stdout=hep_q_output("27"), stderr=""))
             status_batch(batch["manifest_path"], runner=active)
             self.assertEqual(active.call_args.args[0], ["hep_q", "-i", "27"])
@@ -267,7 +267,7 @@ class IhepContracts(unittest.TestCase):
             status_batch(batch["manifest_path"], runner=failed)
             self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"], "failed")
             recovered = resume_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
-                returncode=0, stdout="submitted to cluster 28", stderr="")))
+                returncode=0, stdout="1 job(s) submitted to cluster 28.", stderr="")))
             job = recovered["jobs"][0]
             self.assertEqual((job["state"], job["job_id"], job["recovery_of"]),
                              ("submitted", "28", "27"))
@@ -284,7 +284,7 @@ class IhepContracts(unittest.TestCase):
             root = Path(temporary)
             batch = prepare_batch(handoff(root), root / "batch")
             submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
-                returncode=0, stdout="submitted to cluster 27", stderr="")))
+                returncode=0, stdout="1 job(s) submitted to cluster 27.", stderr="")))
             for output, expected in (
                 (hep_q_output("27"), "active"),
                 (hep_q_output(), "unknown"),
@@ -314,7 +314,7 @@ class IhepContracts(unittest.TestCase):
             root = Path(temporary)
             batch = prepare_batch(handoff(root), root / "batch")
             submit_batch(batch["manifest_path"], runner=Mock(return_value=Mock(
-                returncode=0, stdout="submitted to cluster 27", stderr="")))
+                returncode=0, stdout="1 job(s) submitted to cluster 27.", stderr="")))
 
             usage_error = (
                 "usage: hep_q.py [-h] [-i ID]\n"

@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from full_mc.runtime.profiles import run_profile
-from full_mc.storage.transfer import _remote_parts, is_remote, local_path
+from full_mc.storage.transfer import XROOTD_NOT_FOUND, _remote_parts, is_remote, local_path
 
 UTILITIES_PROFILE = "utilities-el9"
 # Removal of a namespace root would delete objects this run never staged.
@@ -22,11 +22,10 @@ _REMOVE_FUNCTION = [
     "        printf '%s\\tremoved\\n' \"$index\"",
     "        return 0",
     "    fi",
-    '    case "$output" in',
-    '        *3011*|*"No such file"*)',
-    "            printf '%s\\talready-missing\\n' \"$index\"",
-    "            return 0 ;;",
-    "    esac",
+    f'    if grep -Eq -- {shlex.quote(XROOTD_NOT_FOUND)} <<< "$output"; then',
+    "        printf '%s\\talready-missing\\n' \"$index\"",
+    "        return 0",
+    "    fi",
     "    printf 'reclaim failed for %s: %s\\n' \"$lfn\" \"$output\" >&2",
     "    return 1",
     "}",

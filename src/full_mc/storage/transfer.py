@@ -11,6 +11,12 @@ import zlib
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# Keep this expression compatible with both Python re and grep -E.
+XROOTD_NOT_FOUND = (
+    r"^((Run: )?\[ERROR\] Server responded with an error: )?\[3011\]([ :]|$)"
+    r"|^Error 3011([ :]|$)|^No such file( or directory)?([ :]|$)"
+)
+
 def is_remote(url):
     return str(url).startswith("root://")
 
@@ -56,7 +62,7 @@ class TransferClient:
                 result = run_profile("utilities-el9", command, cwd=scratch, check=False,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, bind_paths=binds)
         if result.returncode:
-            if "3011" in result.stderr or "No such file" in result.stderr:
+            if re.search(XROOTD_NOT_FOUND, result.stderr, re.MULTILINE):
                 raise FileNotFoundError(result.stderr)
             raise RuntimeError(f"transfer command failed: {command[0]}: {result.stderr[-2000:]}")
         return result
@@ -120,19 +126,15 @@ class TransferClient:
             except FileExistsError:
                 pass
             return
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8",
-                                         prefix="mcprod-marker-", delete=False) as handle:
-            handle.write(encoded)
-            temporary = Path(handle.name)
-        try:
-            self._run(["xrdcp", "--nopbar", str(temporary), str(destination)])
-        except (FileNotFoundError, RuntimeError) as exc:
-            # A no-replace copy reports an existing marker as an error.  The
-            # caller reads it immediately afterwards and rejects mismatches.
-            if "exists" not in str(exc).lower() and "file exists" not in str(exc).lower():
-                raise
-        finally:
-            temporary.unlink(missing_ok=True)
+        with _transfer_scratch() as scratch:
+            temporary = Path(scratch) / "marker.json"
+            temporary.write_text(encoded, encoding="utf-8")
+            try:
+                self._run(["xrdcp", "--nopbar", str(temporary), str(destination)])
+            except RuntimeError as exc:
+                # The caller reads back an existing marker and checks its contents.
+                if "exists" not in str(exc).lower():
+                    raise
 
     def checksum(self, url):
         """Return the Adler-32 checksum of an exact stored object."""
