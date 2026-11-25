@@ -1,4 +1,4 @@
-"""Deterministic, campaign-local views over shared source-block inventories."""
+"""Deterministic static allocation over campaign-local source streams."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -6,11 +6,7 @@ from typing import Any
 
 from .identity import deterministic_seed, edm_event_id
 from .inventory import SourceBlock
-from .models import Campaign, CampaignSource
-
-
-class FinalInputShortfall(ValueError):
-    """A proven exhausted pool cannot fill even one event in a requested slot."""
+from .models import Campaign
 
 
 def stream_key(campaign: str, pool: str) -> str:
@@ -40,22 +36,8 @@ def _campaign_entries(spec: Any) -> list[tuple[str, list[str]]]:
     return result
 
 
-def _as_campaign(value: Campaign | Mapping[str, Any]) -> Campaign:
-    if isinstance(value, Campaign):
-        return value
-    sources = [CampaignSource(item["pool"], item["mode"], item["lhe_budget"],
-                              item.get("efficiency", 1.0)) for item in value["sources"]]
-    variants = list(value.get("resolved_detector_variants", []))
-    names = [item["profile_id"] for item in variants]
-    return Campaign(value["name"], value["analysis"], sources,
-                    value["target_mixed_events"], value["max_processing_nodes"],
-                    value["merge_events"], names, variants,
-                    int(value.get("global_job_index_start", 0)),
-                    int(value.get("merge_group_index_start", 0)))
-
-
 def build_streams(spec: Any) -> dict[str, dict[str, Any]]:
-    """Build stream state for every campaign/pool membership in a run spec.
+    """Build the selection rules for each campaign/pool membership.
 
     Optional ``consumption_streams`` entries use ``campaign``, ``pool``,
     ``stride`` and ``offset`` fields. Unspecified streams consume every block.
@@ -87,7 +69,7 @@ def build_streams(spec: Any) -> dict[str, dict[str, Any]]:
         for pool in pools:
             key = stream_key(campaign, pool)
             stride, offset = overrides.get(key, (1, 0))
-            streams[key] = {"stride": stride, "offset": offset, "allocation_cursor": offset}
+            streams[key] = {"stride": stride, "offset": offset}
     return streams
 
 
@@ -101,94 +83,62 @@ def next_matching(index: int, stream: Mapping[str, Any]) -> int:
     return index + ((offset - index) % stride)
 
 
-def _stream_block(blocks: Sequence[SourceBlock], stream: Mapping[str, Any], cursor: int) -> SourceBlock | None:
-    index = next_matching(cursor, stream)
-    return blocks[index] if index < len(blocks) else None
 
+def allocate_campaign(campaign: Mapping[str, Any],
+                      blocks_by_pool: Mapping[str, Sequence[SourceBlock]],
+                      streams: Mapping[str, Mapping[str, Any]], block_events: int) -> dict[str, Any]:
+    """Bind complete sets of source slots up to the campaign node limit.
 
-def allocate_shard(campaign: Campaign | Mapping[str, Any], blocks_by_pool: Mapping[str, Sequence[SourceBlock]],
-                   streams: Mapping[str, Mapping[str, Any]], start_job_index: int,
-                   node_limit: int, exhausted_pools: set[str],
-                   global_job_index_start: int | None = None) -> dict[str, Any] | None:
-    """Allocate a deterministic shard without changing caller-owned state.
-
-    A temporary shortage in any requested slot rejects the whole shard. A
-    proven exhausted pool may contribute a nonempty tail, which is reported in
-    ``shortfalls`` so downstream mixing can truncate to the common event prefix.
+    Full blocks can fill multi-block slot budgets. A source tail gets a slot of
+    its own. If any slot has run out, leave every block considered for that
+    incomplete node in the unused list.
     """
-    campaign = _as_campaign(campaign)
-    start_job_index = _strict_int(start_job_index, "start_job_index")
-    if global_job_index_start is None:
-        global_job_index_start = campaign.global_job_index_start
-    global_job_index_start = _strict_int(global_job_index_start, "global_job_index_start")
-    node_limit = _strict_int(node_limit, "node_limit", minimum=1)
-    if not isinstance(exhausted_pools, set):
-        raise ValueError("exhausted_pools must be a set")
-    keys = {slot.pool: stream_key(campaign.name, slot.pool) for slot in campaign.sources}
-    for pool, key in keys.items():
-        if key not in streams:
-            raise ValueError(f"missing consumption stream {key}")
-        stream = streams[key]
-        _strict_int(stream.get("stride"), f"{key}.stride", minimum=1)
-        _strict_int(stream.get("offset"), f"{key}.offset")
-        if stream["offset"] >= stream["stride"]:
-            raise ValueError(f"{key}.offset must be smaller than stride")
-        _strict_int(stream.get("allocation_cursor", 0), f"{key}.allocation_cursor")
-    max_nodes = min(node_limit, max(0, campaign.max_processing_nodes - start_job_index))
-    starting = {keys[slot.pool]: streams[keys[slot.pool]]["allocation_cursor"] for slot in campaign.sources}
-    cursors = dict(starting)
-    nodes: list[dict[str, Any]] = []
-    shortfalls: list[dict[str, Any]] = []
-    for node_offset in range(max_nodes):
-        job_index = start_job_index + node_offset
-        global_job_index = global_job_index_start + job_index
-        job_id = f"JOB000000_BLOCK{job_index:06d}"
-        trial = dict(cursors)
-        slot_records = []
-        node_shortfalls = []
-        for slot_index, slot in enumerate(campaign.sources):
-            key = keys[slot.pool]
-            stream = streams[key]
-            blocks = blocks_by_pool.get(slot.pool, ())
-            next_index = next_matching(trial[key], stream)
-            chosen: list[SourceBlock] = []
-            total = 0
-            while total < slot.lhe_budget:
-                block = _stream_block(blocks, stream, next_index)
-                if block is None:
-                    if slot.pool not in exhausted_pools:
-                        return None
-                    if not chosen:
-                        raise FinalInputShortfall(
-                            f"campaign {campaign.name} slot {slot_index} pool {slot.pool} has no remaining blocks")
-                    node_shortfalls.append({"slot": slot_index, "pool": slot.pool,
-                                            "requested_events": slot.lhe_budget,
-                                            "available_events": total,
-                                            "missing_events": slot.lhe_budget - total})
+    name = campaign["name"]
+    global_start = campaign.get("global_job_index_start", 0)
+    target = campaign["target_mixed_events"]
+    slots = campaign["sources"]
+    pools = {slot["pool"]: streams[stream_key(name, slot["pool"])] for slot in slots}
+    selected = {pool: blocks_by_pool.get(pool, ())[rule["offset"]::rule["stride"]]
+                for pool, rule in pools.items()}
+    positions = dict.fromkeys(selected, 0)
+    nodes = []
+    for job_index in range(campaign["max_processing_nodes"]):
+        global_job_index = global_start + job_index
+        next_positions = positions.copy()
+        bound = []
+        for slot_index, slot in enumerate(slots):
+            pool, mode = slot["pool"], slot["mode"]
+            blocks, start = selected[pool], next_positions[pool]
+            end, total = start, 0
+            while end < len(blocks) and total < slot["lhe_budget"]:
+                block = blocks[end]
+                if total and block.events < block_events:
                     break
-                chosen.append(block)
                 total += block.events
-                next_index += stream["stride"]
-            trial[key] = next_index
-            refs = [block.artifact_id for block in chosen]
-            slot_records.append({"slot": slot_index, "pool": slot.pool, "mode": slot.mode,
-                                 "lhe_budget": slot.lhe_budget, "block_refs": refs,
-                                 "lhe_events": total,
-                                 "source_rng_seed": deterministic_seed(
-                                     f"{campaign.name}|{global_job_index}|source={slot_index}|"
-                                     f"{';'.join(refs)}|{slot.mode}")})
-        inputs = [ref for record in slot_records for ref in record["block_refs"]]
-        modes = [slot.mode for slot in campaign.sources]
-        nodes.append({"job_index": job_index, "job_id": job_id, "sources": slot_records,
-                      "target_mixed_events": campaign.target_mixed_events,
-                      "global_job_index": global_job_index,
-                      "edm_event_id": edm_event_id(0, global_job_index, campaign.target_mixed_events),
+                end += 1
+                if block.events < block_events:
+                    break
+            if end == start:
+                break
+            next_positions[pool] = end
+            refs = [block.artifact_id for block in blocks[start:end]]
+            bound.append({"slot": slot_index, "pool": pool, "mode": mode,
+                          "block_refs": refs, "lhe_events": total,
+                          "source_rng_seed": deterministic_seed(
+                              f"{name}|{global_job_index}|source={slot_index}|"
+                              f"{';'.join(refs)}|{mode}")})
+        if len(bound) != len(slots):
+            break
+        positions = next_positions
+        inputs = [ref for record in bound for ref in record["block_refs"]]
+        modes = [slot["mode"] for slot in slots]
+        events = min(target, *(slot["lhe_events"] for slot in bound))
+        nodes.append({"job_index": job_index, "sources": bound,
+                      "target_mixed_events": events, "global_job_index": global_job_index,
+                      "edm_event_id": edm_event_id(0, global_job_index, target),
                       "mixing_rng_seed": deterministic_seed(
-                          f"{campaign.name}|{global_job_index}|shuffle|"
+                          f"{name}|{global_job_index}|shuffle|"
                           f"{','.join(inputs)}|{','.join(modes)}")})
-        for entry in node_shortfalls:
-            shortfalls.append({"job_index": job_index, **entry})
-        cursors = trial
-    return {"campaign": campaign.name, "start_job_index": start_job_index,
-            "start_cursors": starting, "end_cursors": cursors, "nodes": nodes,
-            "shortfalls": shortfalls, "complete": len(nodes) == max_nodes}
+    unused = {pool: [block.artifact_id for block in selected[pool][position:]]
+              for pool, position in sorted(positions.items())}
+    return {"nodes": nodes, "unused_blocks": unused}

@@ -6,8 +6,7 @@
   },
   "production_output_limits": {
     "source_lhe_bytes": 100000000,
-    "source_block_bytes": 100000000,
-    "mixed_hepmc_bytes": 64000000
+    "source_block_bytes": 100000000
   },
   "storage": {
     "eos_redirector": "cceos.ihep.ac.cn:1094",
@@ -41,8 +40,6 @@
     "premix_redirector": "root://eoscms.cern.ch",
     "premix_cache_files": "1",
     "premix_cache_redirector": "root://eoscms.cern.ch",
-    "raw_threads": "2",
-    "raw_streams": "2",
     "raw_watchdog_timeout": "7200s",
     "raw_watchdog_kill_after": "300s",
     "raw_cmsdriver_timeout": "600s",

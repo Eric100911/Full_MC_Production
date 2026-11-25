@@ -1,4 +1,4 @@
-"""CMSSW12 processing from an validated mixed-HepMC checkpoint."""
+"""CMSSW12 processing from the local mixed HepMC."""
 from ._common import parameters, prepare
 from .chain import execute_chain
 from .edm import count_events

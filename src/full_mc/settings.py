@@ -9,7 +9,6 @@ import re
 from pathlib import Path
 
 from .profiles import load_catalogues, resolve_detector_variants, resolve_source
-from .planning.script_defer import resolve_script_defer
 from .storage.layout import (
     canonical_storage_location,
     storage_location_is_within,
@@ -18,6 +17,7 @@ from .storage.layout import (
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
 LOG_LEVELS = ("debug", "info", "warning", "error")
+STATIC_WORKFLOW = "static_subdag"
 
 
 def read_json(path):
@@ -93,10 +93,10 @@ def _validate_scheduler_and_resources(spec):
         maxjobs[category] = _integer(value, f"scheduler.maxjobs.{category}", minimum=1)
     for key in ("max_jobs_submitted", "max_jobs_idle", "max_submits_per_interval"):
         if key in scheduler:
-            scheduler[key] = _integer(scheduler[key], f"scheduler.{key}", minimum=1)
+            scheduler[key] = _integer(scheduler[key], f"scheduler.{key}",
+                                      minimum=int(key == "max_submits_per_interval"))
     if "submit_delay" in scheduler:
         scheduler["submit_delay"] = _integer(scheduler["submit_delay"], "scheduler.submit_delay")
-    resolve_script_defer(scheduler)
     spec["scheduler"] = scheduler
 
     resources = spec.get("resources", {})
@@ -104,20 +104,21 @@ def _validate_scheduler_and_resources(spec):
         resources = {}
     if not isinstance(resources, dict):
         raise ValueError("resources must be an object")
-    expected_cpus = {"lhe": 1, "plan": 1, "processing": 2, "archive": 1,
-                     "reclaim": 1}
+    stages = {"lhe", "plan", "processing", "reclaim"}
     for stage, resource in resources.items():
-        if stage not in expected_cpus or not isinstance(resource, dict):
+        if stage not in stages or not isinstance(resource, dict):
             raise ValueError("resources must use known worker-stage objects")
         for key in ("memory_mb", "disk_bytes"):
             if key in resource:
                 resource[key] = _integer(resource[key], f"resources.{stage}.{key}", minimum=1)
         if "cpus" in resource:
             cpus = _integer(resource["cpus"], f"resources.{stage}.cpus", minimum=1)
-            if cpus != expected_cpus[stage]:
+            resource["cpus"] = cpus
+            if stage != "processing" and cpus != 1:
                 raise ValueError(f"resources.{stage}.cpus disagrees with the worker runtime contract")
         if "flavour" in resource and not re.fullmatch(r"[A-Za-z0-9_.-]+", str(resource["flavour"])):
             raise ValueError(f"resources.{stage}.flavour is not a DAG token")
+    resources.setdefault("processing", {}).setdefault("cpus", 2)
     spec["resources"] = resources
 
 
@@ -179,10 +180,8 @@ def load_run_spec(path):
             raise ValueError(f"missing storage.{key}")
         if not value.startswith("root://"):
             storage[key] = _path(value, path.parent)
-    if spec.get("orchestration") != "campaign_shards":
-        raise ValueError("run spec must explicitly declare orchestration: campaign_shards")
-    for key in ("staging_bytes", "reserve_bytes"):
-        storage.pop(key, None)
+    if spec.get("orchestration") != STATIC_WORKFLOW:
+        raise ValueError(f"run spec must explicitly declare orchestration={STATIC_WORKFLOW}")
     spec["storage"] = storage
     spec["log_level"] = str(spec.get("log_level", "info"))
     if spec["log_level"] not in LOG_LEVELS:
@@ -197,10 +196,7 @@ def load_run_spec(path):
     spec.setdefault("processing_environment", defaults()["processing_environment"])
     limits = spec.setdefault("limits", {})
     output_defaults = defaults().get("production_output_limits", {})
-    for key in ("source_selection_mode", "source_files_per_step",
-                "processing_nodes_per_wave", "policy_headroom_bytes"):
-        limits.pop(key, None)
-    for key in ("source_lhe_bytes", "source_block_bytes", "mixed_hepmc_bytes", "miniaod_bytes"):
+    for key in ("source_lhe_bytes", "source_block_bytes"):
         limits[key] = _integer(limits.get(key, output_defaults.get(key, 2_000_000_000)),
                                "limits." + key, minimum=1)
     _validate_scheduler_and_resources(spec)
@@ -243,8 +239,13 @@ def load_run_spec(path):
             if not 0 < efficiency <= 1:
                 raise ValueError(f"{name}: efficiency must be in (0, 1]")
             slot["efficiency"] = efficiency
-        for field in ("target_mixed_events", "max_processing_nodes", "merge_events"):
+        for field in ("target_mixed_events", "max_processing_nodes"):
             campaign[field] = _integer(campaign.get(field, 0), f"{name}: {field}", minimum=1)
+        for field in ("merge_events", "merge_bytes"):
+            if field in campaign:
+                campaign[field] = _integer(campaign[field], f"{name}: {field}", minimum=1)
+        if not (campaign.get("merge_events") or campaign.get("merge_bytes")):
+            raise ValueError(f"{name}: specify merge_events or merge_bytes")
         campaign["global_job_index_start"] = _integer(
             campaign.get("global_job_index_start", 0), f"{name}: global_job_index_start")
         campaign["merge_group_index_start"] = _integer(
@@ -263,12 +264,9 @@ def load_run_spec(path):
         source = resolve_source(source, profile_catalog["generator"])
         # Replace the caller's mutable input with the immutable resolved record.
         spec["sources"][source_index] = source
-        if source.get("generator_profile"):
-            available = int(source["resolved_generator_profile"]["planning_events_hint"])
-        else:
+        if not source.get("generator_profile"):
             source["actual_events"] = _integer(source.get("actual_events", 0),
                                                  f"{key}: actual_events", minimum=1)
-            available = source["actual_events"]
             if not source.get("url"):
                 raise ValueError(f"{key}: existing input requires URL and exact counted events")
             source["size_bytes"] = _integer(source.get("size_bytes", 0),
@@ -276,7 +274,7 @@ def load_run_spec(path):
         if "planned_events" in source and source["planned_events"] is not None:
             source["planned_events"] = _integer(source["planned_events"],
                                                   f"{key}: planned_events", minimum=1)
-            if source["planned_events"] > available:
+            if not source.get("generator_profile") and source["planned_events"] > source["actual_events"]:
                 raise ValueError(f"{key}: planned_events exceeds exact source capacity")
         if source.get("url") and not str(source["url"]).startswith("root://"):
             source["url"] = _path(str(source["url"]).removeprefix("file:"), path.parent)
@@ -292,16 +290,8 @@ def load_run_spec(path):
         raise ValueError("campaign references undeclared source pool(s): "
                          + ", ".join(sorted(unknown_pools)))
     from .domain.streams import build_streams
-    limits["shard_nodes"] = _integer(limits.get("shard_nodes", 10),
-                                     "limits.shard_nodes", minimum=1)
-    limits["target_window_nodes"] = _integer(
-        limits.get("target_window_nodes", 2 * limits["shard_nodes"]),
-        "limits.target_window_nodes", minimum=1)
-    if limits["target_window_nodes"] < limits["shard_nodes"]:
-        raise ValueError("target_window_nodes must cover at least one shard")
     if spec["normal_shortfall_policy"] != "report-and-truncate":
-        raise ValueError("campaign_shards requires report-and-truncate")
+        raise ValueError("static_subdag requires report-and-truncate")
     build_streams(spec)
-    spec.pop("site_validation", None)
     _validate_generated_staging(spec)
     return spec

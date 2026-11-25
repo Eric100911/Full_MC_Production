@@ -161,6 +161,9 @@ def infer_dag_file(records: Iterable[dict]) -> Path | None:
 
 
 def node_stage(name: str, directive: str) -> str:
+    fixed = {"PLAN": "plan", "RECLAIM": "reclaim"}
+    if name in fixed:
+        return fixed[name]
     if directive == "FINAL":
         return "final"
     if directive == "SUBDAG":
@@ -173,8 +176,8 @@ def node_stage(name: str, directive: str) -> str:
         return "archive"
     if re.search(r"(?:^|_)RECLAIM_", name):
         return "reclaim"
-    if name.startswith(("SOURCE_", "SHARD_")):
-        return "subdag"
+    if name.startswith("SOURCE_"):
+        return "source"
     if name.startswith("LHE_"):
         return "lhe"
     if name.startswith("PLAN_"):

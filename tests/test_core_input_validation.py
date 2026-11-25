@@ -63,7 +63,7 @@ class MaterializeSizeTests(unittest.TestCase):
                 materialize_input(reference, work, FakeTransfer(source))
             self.assertFalse((work / "inputs" / "blk" / "block.lhe.gz").exists())
 
-    def test_local_file_size_mismatch_is_removed_and_raises(self):
+    def test_local_file_size_mismatch_is_preserved_and_raises(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             local = root / "block.lhe"
@@ -74,7 +74,7 @@ class MaterializeSizeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,
                                         "downloaded size disagrees with blk"):
                 materialize_input(reference, root / "work")
-            self.assertFalse(local.exists())
+            self.assertTrue(local.exists())
 
     def test_stale_cached_copy_cannot_leak_through(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -30,6 +30,11 @@ options.register('nThreads',
                  VarParsing.multiplicity.singleton,
                  VarParsing.varType.int,
                  "Number of threads")
+options.register('nStreams',
+                 0,
+                 VarParsing.multiplicity.singleton,
+                 VarParsing.varType.int,
+                 "Number of streams")
 options.register('firstRun',
                  1,
                  VarParsing.multiplicity.singleton,
@@ -217,7 +222,7 @@ process.schedule = cms.Schedule(
 
 # Multithreading
 process.options.numberOfThreads = options.nThreads
-process.options.numberOfStreams = options.nThreads
+process.options.numberOfStreams = options.nStreams or options.nThreads
 
 # Customization
 from Configuration.DataProcessing.Utils import addMonitoring

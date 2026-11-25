@@ -1,120 +1,21 @@
-"""Offline fanout bounds and writer/reader contracts for bucketed local files."""
-from collections import defaultdict
+"""File layout for bounded AFS directory fanout."""
+from collections import Counter
 from pathlib import Path
-import os
-import re
-import shutil
-import subprocess
-import tempfile
 import unittest
-from unittest.mock import patch
 
-from full_mc.application import shards
-from full_mc.backends.condor import _worker_proxy_paths
-from full_mc.io import read_json
-from full_mc.local_paths import (dag_path, identity_bucket,
-                                log_path, record_path)
-from full_mc.planning.shards import child_path
-from tests.test_core_shards import ShardFixture
-from tools.dag_progress import parse_dag_graph
+from full_mc.planning.graph import log_stem, node_stem
 
 
 class BucketPaths(unittest.TestCase):
-    def test_numeric_boundaries_and_namespaces(self):
-        self.assertEqual(identity_bucket("PLAN_000999"), Path("PLAN_/000000"))
-        self.assertEqual(identity_bucket("PLAN_001000"), Path("PLAN_/000001"))
-        self.assertEqual(identity_bucket("PLAN_000332", 333), Path("PLAN_/000000"))
-        self.assertEqual(identity_bucket("PLAN_000333", 333), Path("PLAN_/000001"))
-        self.assertEqual(identity_bucket("PLAN_000999", 333), Path("PLAN_/000003"))
-        self.assertEqual(identity_bucket("PLAN_001000", 333), Path("PLAN_/000003"))
-        ids = ["MIX_C_JOB000000_BLOCK001000", "MIX_D_JOB000000_BLOCK001000",
-               "MINIAOD_C_v1_JOB000000_BLOCK001000", "MINIAOD_C_v2_JOB000000_BLOCK001000",
-               "ARCHIVE_SHARD_C_001000", "RECLAIM_SHARD_C_001000"]
-        self.assertEqual(len({identity_bucket(i) for i in ids}), len(ids))
-        with self.assertRaises(ValueError):
-            identity_bucket("../PLAN_000000")
-
-    def test_formal_scale_file_counts_and_directory_bounds(self):
-        # 12,460 generated sources, six campaigns * 1000 nodes, 10-node shards,
-        # one fused processing task per node.
-        workers = [f"{stage}_{i:06d}" for i in range(12460)
-                   for stage in ("LHE", "PLAN", "SOURCE_ARCHIVE", "SOURCE_RECLAIM")]
-        children = [f"SOURCE_{i:06d}" for i in range(12460)]
-        for campaign in range(6):
-            workers.extend(f"PROCESS_C{campaign}_JOB000000_BLOCK{i:06d}" for i in range(1000))
-            children.extend(f"SHARD_C{campaign}_{i:06d}" for i in range(100))
-        self.assertEqual(len(workers), 55840)
-        workers.extend(f"CLEANUP_p{pool}_000000" for pool in range(4))
-        self.assertEqual(len(workers), 55844)
-        files, entries = defaultdict(set), defaultdict(set)
-
-        def add(path):
-            files[path.parent].add(path.name)
-            while path.parent != Path("/run"):
-                entries[path.parent].add(path.name)
-                path = path.parent
-
-        with patch("full_mc.local_paths.bucketed", new=lambda root: True):
-            for identity in workers:
-                for directory in ("tasks", "results", "ledger/accepted"):
-                    add(record_path("/run", directory, identity))
-                for suffix in (".out", ".err", ".tar.gz"):
-                    add(log_path("/run", identity, suffix))
-            for identity in children:
-                add(record_path("/run", "ledger/shards", identity))
-                dag = dag_path("/run", identity)
-                # Native DAGMan side files share only this child's directory.
-                for suffix in ("", ".condor.sub", ".dagman.log", ".lib.out", ".lib.err",
-                               ".metrics", ".nodes.log", ".lock", ".rescue001", ".rescue002"):
-                    add(Path(str(dag) + suffix))
-        self.assertEqual(sum(len(v) for p, v in files.items() if "/logs/" in str(p)), 167532)
-        self.assertEqual(max(len(v) for p, v in files.items() if "/logs/" in str(p)), 999)
-        self.assertEqual(max(map(len, files.values())), 1000)
-        self.assertLessEqual(max(map(len, entries.values())), 1000)
-
-
-class BucketLifecycle(ShardFixture):
-    def test_generated_submit_paths_and_receipt_replay(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run = self.fixture(directory, nodes=1, campaigns=1)
-            shards.prepare_source(run, 0)
-            dag = child_path(run, "SOURCE_000000")
-            graph = parse_dag_graph(run / "run.dag")
-            self.assertEqual(graph.children["SOURCE_000000"].dag_file, dag)
-            frozen = dag.read_bytes()
-            shards.prepare_source(run, 0)
-            self.assertEqual(dag.read_bytes(), frozen)
-            identity = "PLAN_000000"
-            variables = next(line for line in dag.read_text().splitlines()
-                             if line.startswith("VARS " + identity + " "))
-            macros = dict(re.findall(r'(\w+)="([^"]*)"', variables))
-            submit = (run / "submit/plan.sub").read_text()
-            for key, value in macros.items():
-                submit = submit.replace("$(" + key + ")", value)
-            self.assertIn(str(record_path(run, "tasks", identity)), submit)
-            self.assertIn(str(record_path(run, "results", identity)), submit)
-            for suffix in (".out", ".err", ".tar.gz"):
-                self.assertIn(str(log_path(run, identity, suffix)), submit)
-            self.assertIn("arguments = bootstrap.py --task PLAN_000000.json", submit)
-            self.assertEqual(_worker_proxy_paths(run), ["/afs/test/proxy"])
-            self.source_plan(run)
-            self.assertEqual(shards.accept_result(run, identity)["exit_code"], 0)
-            self.assertTrue(shards._receipt_path(run, identity).is_file())
-
-    @unittest.skipUnless(shutil.which("condor_submit_dag"), "native DAGMan unavailable")
-    def test_native_subdag_adjacent_files_and_auto_rescue(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run = self.fixture(directory, nodes=1, campaigns=1)
-            shards.prepare_source(run, 0)
-            child = child_path(run, "SOURCE_000000")
-            # -no_submit is offline: render native DAGMan descriptors only.
-            outcome = subprocess.run(["condor_submit_dag", "-no_submit", "-do_recurse",
-                                      "-AutoRescue", "1", str(child)], cwd=run,
-                                     env={**os.environ, "CONDOR_CONFIG": "/dev/null"},
-                                     capture_output=True, text=True, check=False)
-            self.assertEqual(outcome.returncode, 0, outcome.stderr[-1000:])
-            native = Path(str(child) + ".condor.sub").read_text()
-            self.assertIn(str(child), native)
-            self.assertIn("-AutoRescue 1", native)
-            self.assertTrue(Path(str(child) + ".condor.sub").is_file())
-            self.assertIn(str(run / "submit/plan.sub"), child.read_text())
+    def test_numbered_job_records_are_bucketed(self):
+        self.assertEqual(node_stem("SOURCE_000999"), "SOURCE_/000000/SOURCE_000999")
+        self.assertEqual(node_stem("SOURCE_001000"), "SOURCE_/000001/SOURCE_001000")
+        self.assertEqual(node_stem("PLAN"), "PLAN")
+        self.assertEqual(node_stem("RECLAIM"), "RECLAIM")
+        stems = [node_stem(f"PROC_C_JOB000123_BLOCK{i:06d}") for i in range(12460)]
+        counts = Counter(Path(stem).parent for stem in stems)
+        self.assertEqual(len(set(stems)), 12460)
+        self.assertEqual(max(counts.values()), 1000)
+        logs = Counter(Path(log_stem(f"PROC_C_JOB000123_BLOCK{i:06d}")).parent
+                       for i in range(12460))
+        self.assertLessEqual(max(logs.values()) * 3, 1000)

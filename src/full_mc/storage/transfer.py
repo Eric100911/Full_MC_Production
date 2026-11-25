@@ -1,6 +1,7 @@
 """Exact local/XRootD transfers and compact product records."""
 from __future__ import annotations
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,13 @@ def _remote_parts(url):
         raise ValueError(f"not an XRootD URL: {url}")
     return f"root://{parsed.netloc}/", "/" + parsed.path.lstrip("/")
 
+def _transfer_scratch():
+    root = Path(os.environ.get("_CONDOR_SCRATCH_DIR") or "/tmp/chiw")
+    scratch = root / "mcprod-transfer"
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 class TransferClient:
     def __init__(self, runner=None):
         self.runner = runner
@@ -32,7 +40,7 @@ class TransferClient:
             result = self.runner(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         else:
             from full_mc.runtime.profiles import run_profile
-            scratch = Path("/tmp/chiw/mcprod-transfer")
+            scratch = _transfer_scratch()
             # ``xrdfs`` receives a remote endpoint followed by remote LFN
             # arguments (which are conventionally rooted at /store or /eos),
             # so none of its positional paths are host paths to bind.  For
@@ -143,35 +151,6 @@ class TransferClient:
             raise RuntimeError(f"invalid remote checksum: {url}")
         return value.zfill(8)
 
-    def copy_out_exclusive(self, source, destination, checksum):
-        """Publish atomically without replacing an existing object."""
-        source = Path(source)
-        if source.stat().st_size <= 0:
-            raise ValueError(f"refusing empty output: {source}")
-        self.mkdir_parent(destination)
-        if is_remote(destination):
-            try:
-                self._run(["xrdcp", "--nopbar", "--posc", "--retry", "0",
-                           "--rm-bad-cksum", "--cksum", "adler32:" + checksum,
-                           str(source), str(destination)])
-            except RuntimeError as exc:
-                if not re.search(r"(?:\balready exists\b|\bfile exists\b|\[3018\])",
-                                 str(exc), flags=re.IGNORECASE):
-                    raise
-                return False
-        else:
-            target = local_path(destination)
-            with tempfile.NamedTemporaryFile(dir=target.parent) as temporary:
-                with source.open("rb") as incoming:
-                    shutil.copyfileobj(incoming, temporary)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-                try:
-                    os.link(temporary.name, target)
-                except FileExistsError:
-                    return False
-        return True
-
     def copy_out(self, source, destination):
         source = Path(source)
         if source.stat().st_size <= 0:
@@ -185,6 +164,58 @@ class TransferClient:
         if size != source.stat().st_size:
             raise RuntimeError(f"stage-out size mismatch: {destination}")
         return size
+
+    def copy_atomic(self, source, destination, proc_id):
+        """Verify a same-directory temporary payload before replacing its final name."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", proc_id):
+            raise ValueError("invalid publication ID")
+        source = Path(source)
+        expected_size = source.stat().st_size
+        if expected_size <= 0:
+            raise ValueError(f"output size actual={expected_size} expected=positive: {source}")
+        expected_checksum = file_checksum(source)
+        temporary = str(destination) + ".tmp." + proc_id
+        try:
+            self.mkdir_parent(destination)
+            if is_remote(destination):
+                self._run(["xrdcp", "--nopbar", "--force", str(source), temporary])
+            else:
+                shutil.copyfile(source, local_path(temporary))
+            try:
+                actual_size = self.size(temporary)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"upload size actual=unavailable expected={expected_size}: {temporary}: {exc}") from exc
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"upload size actual={actual_size} expected={expected_size}: {temporary}")
+            try:
+                actual_checksum = self.checksum(temporary)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"upload Adler-32 actual=unavailable expected={expected_checksum}: {temporary}: {exc}") from exc
+            if actual_checksum != expected_checksum:
+                raise RuntimeError(
+                    f"upload Adler-32 actual={actual_checksum} expected={expected_checksum}: {temporary}")
+            if is_remote(destination):
+                endpoint, target = _remote_parts(destination)
+                _, source_lfn = _remote_parts(temporary)
+                try:
+                    self.remove(destination)
+                except FileNotFoundError:
+                    pass
+                self._run(["xrdfs", endpoint, "mv", source_lfn, target])
+            else:
+                os.replace(local_path(temporary), local_path(destination))
+        except BaseException:
+            try:
+                self.remove(temporary)
+            except FileNotFoundError:
+                pass
+            except (OSError, RuntimeError) as exc:
+                logging.warning("could not remove temporary upload %s: %s", temporary, exc)
+            raise
+        return expected_size, expected_checksum
 
     def copy_in(self, source, destination):
         destination = Path(destination)
@@ -200,8 +231,7 @@ class TransferClient:
     def read_json(self, url):
         if not is_remote(url):
             return json.loads(local_path(url).read_text())
-        Path("/tmp/chiw").mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="mcprod-record-", dir="/tmp/chiw") as tmp:
+        with tempfile.TemporaryDirectory(prefix="record-", dir=_transfer_scratch()) as tmp:
             path = self.copy_in(url, Path(tmp)/"record.json")
             return json.loads(path.read_text())
 
@@ -228,7 +258,8 @@ def materialize_input(reference, work_dir, transfer=None):
     cached = reference.get("local_path")
     if cached and Path(cached).is_file() and Path(cached).stat().st_size == expected:
         return Path(cached).resolve()
-    if not is_remote(url) and local_path(url).is_file():
+    direct = not is_remote(url) and local_path(url).is_file()
+    if direct:
         destination = local_path(url).resolve()
     else:
         name = Path(urlsplit(url).path).name
@@ -240,7 +271,8 @@ def materialize_input(reference, work_dir, transfer=None):
     # stale file would otherwise be showered silently.  A mismatch is a hard
     # failure, so remove the bad copy rather than leave it to be reused.
     if expected is not None and destination.stat().st_size != int(expected):
-        destination.unlink(missing_ok=True)
+        if not direct:
+            destination.unlink(missing_ok=True)
         raise RuntimeError(f"downloaded size disagrees with {reference['artifact_id']}")
     return destination
 

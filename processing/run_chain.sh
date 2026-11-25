@@ -882,7 +882,7 @@ ensure_cmssw12_project() {
 
 setup_cmssw12() {
     msg_info "Setting up CMSSW_12_4_14..."
-    source /cvmfs/cms.cern.ch/cmsset_default.sh
+    source /cvmfs/cms.cern.ch/cmsset_default.sh || return 1
     # Force el8 architecture for CMSSW_12
     export SCRAM_ARCH=el8_amd64_gcc10
     
@@ -891,9 +891,11 @@ setup_cmssw12() {
     base_path=$(ensure_cmssw12_project) || return 1
     export CMSSW_12_BASE="${base_path}"
 
-    cd "${base_path}/src"
-    eval $(scramv1 runtime -sh)
-    cd - > /dev/null
+    cd "${base_path}/src" || return 1
+    local runtime_env
+    runtime_env=$(scramv1 runtime -sh) || return 1
+    eval "${runtime_env}" || return 1
+    cd - > /dev/null || return 1
     msg_ok "CMSSW environment: ${CMSSW_VERSION}"
 }
 
@@ -1039,42 +1041,6 @@ run_cmssw12_command() {
 
     run_logged "${label}" /bin/bash \
         "${entrypoint}" "${CMSSW_12_BASE}" "$@"
-}
-
-validate_root_file() {
-    local label="$1"
-    local file_path="$2"
-
-    if [[ ! -s "${file_path}" ]]; then
-        msg_error "${label} output missing or empty: ${file_path}"
-        return 1
-    fi
-
-    local checker="${WORKDIR}/validate_root_file.py"
-    cat > "${checker}" <<'PYCHECK'
-import sys
-
-import ROOT
-
-path = sys.argv[1]
-root_file = ROOT.TFile.Open(path)
-if not root_file:
-    print(f"ROOT validation failed: could not open {path}", file=sys.stderr)
-    sys.exit(2)
-if root_file.IsZombie():
-    print(f"ROOT validation failed: zombie file {path}", file=sys.stderr)
-    sys.exit(3)
-if root_file.TestBit(ROOT.TFile.kRecovered):
-    print(f"ROOT validation failed: recovered/incompletely closed file {path}", file=sys.stderr)
-    sys.exit(4)
-if root_file.GetNkeys() <= 0:
-    print(f"ROOT validation failed: no keys in {path}", file=sys.stderr)
-    sys.exit(5)
-print(f"ROOT validation OK: {path} keys={root_file.GetNkeys()}")
-sys.exit(0)
-PYCHECK
-
-    run_cmssw12_command "validate_root_${label}" python3 "${checker}" "${file_path}"
 }
 
 prepare_premix_filelist() {
@@ -1405,7 +1371,7 @@ run_shower() {
     done
     COMMON_MIX_TARGET="${TARGET_MIXED_EVENTS}"
     
-    setup_cmssw12
+    setup_cmssw12 || return 1
     cd "${SHOWER_DIR}"
     ensure_worker_shower_tools || return 1
 
@@ -1449,12 +1415,12 @@ run_shower() {
         
         if [[ "$normalized_mode" == "phi_mpi_off" ]]; then
             msg_info "Running phi-enriched mode-1 shower (MPI off)..."
-            run_logged "shower_sps_${source_slot}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" "${source_seed}" "${target_events}" "${manifest_output}"
+            run_logged "shower_sps_${source_slot}" ./shower_sps "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" "${source_seed}" "${target_events}" "${manifest_output}" || return 1
         elif [[ "$normalized_mode" == "phi_mpi_on_gluon" ]]; then
             msg_info "Running phi-enriched mode-2 shower (MPI on)..."
-            run_logged "shower_phi_${source_slot}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" 1 "${source_seed}" "${target_events}" "${manifest_output}"
+            run_logged "shower_phi_${source_slot}" ./shower_phi "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 3.0 2.5 2.4 "${max_retries}" 1 "${source_seed}" "${target_events}" "${manifest_output}" || return 1
         else
-            run_logged "shower_normal_${source_slot}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 2.5 2.4 1000 "${source_seed}" "${target_events}" "${manifest_output}"
+            run_logged "shower_normal_${source_slot}" ./shower_normal "${lhe_file}" "${hepmc_output}" "${max_lhe_events}" 2.5 2.4 1000 "${source_seed}" "${target_events}" "${manifest_output}" || return 1
         fi
         
         if [[ ! -f "${hepmc_output}" ]]; then
@@ -1556,7 +1522,7 @@ run_mix() {
     
     if [[ $n_sources -eq 1 ]]; then
         msg_info "Single source - converting to HepMC2 format..."
-        run_logged "event_mixer_single" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[0]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}"
+        run_logged "event_mixer_single" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[0]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}" || return 1
     else
         msg_info "Mixing ${n_sources} sources..."
         if [[ "${SHUFFLE_MIXING}" == "true" ]]; then
@@ -1569,9 +1535,9 @@ run_mix() {
             run_logged "event_mixer_shuffle" ./event_mixer_multisource \
                 "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" \
                 --nevents "${mix_nevents}" --manifest "${mixed_manifest}" \
-                --shuffle-sources --shuffle-seed-base "${shuffle_seed}"
+                --shuffle-sources --shuffle-seed-base "${shuffle_seed}" || return 1
         else
-            run_logged "event_mixer_multi" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}"
+            run_logged "event_mixer_multi" ./event_mixer_multisource "${MIXED_HEPMC}" "${HEPMC_FILES[@]}" --nevents "${mix_nevents}" --manifest "${mixed_manifest}" || return 1
         fi
     fi
     
@@ -1663,7 +1629,7 @@ run_gensim() {
         return 1
     fi
     
-    setup_cmssw12
+    setup_cmssw12 || return 1
     
     msg_info "Running HepMC -> GEN-SIM..."
     msg_info "EDM EventID: run=${FIRST_RUN} lumi=${FIRST_LUMINOSITY_BLOCK} firstEvent=${FIRST_EVENT} reserved=${RESERVED_EVENTS:-?}"
@@ -1674,11 +1640,11 @@ run_gensim() {
         inputFiles="file:${MIXED_HEPMC}" \
         outputFile="file:${GENSIM_OUTPUT}" \
         maxEvents=-1 \
-        nThreads=2 \
+        nThreads="${PROCESSING_CPUS:-2}" nStreams="${PROCESSING_CPUS:-2}" \
         firstRun=${FIRST_RUN} \
         firstLuminosityBlock=${FIRST_LUMINOSITY_BLOCK} \
         firstEvent=${FIRST_EVENT} \
-        numberEventsInLuminosityBlock=${N_EVENTS_IN_LUMI}
+        numberEventsInLuminosityBlock=${N_EVENTS_IN_LUMI} || return 1
     
     if [[ ! -f "${GENSIM_OUTPUT}" ]]; then
         msg_error "GEN-SIM failed: ${GENSIM_OUTPUT} not created"
@@ -1694,15 +1660,13 @@ run_raw() {
     
     RAW_OUTPUT="${WORKDIR}/output_RAW.root"
     
-    setup_cmssw12
+    setup_cmssw12 || return 1
     
     local cfg_file
     cfg_file=$(mktemp --suffix=_raw_cfg.py) || {
         msg_error "Failed to create temporary RAW configuration"
         return 1
     }
-    local raw_threads="${RAW_THREADS:-2}"
-    local raw_streams="${RAW_STREAMS:-2}"
     local raw_watchdog_timeout="${RAW_WATCHDOG_TIMEOUT:-7200s}"
     local raw_watchdog_kill_after="${RAW_WATCHDOG_KILL_AFTER:-300s}"
 
@@ -1746,12 +1710,12 @@ run_raw() {
         --geometry DB:Extended \
         -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
-        --nThreads "${raw_threads}" --nStreams "${raw_streams}" \
+        --nThreads "${PROCESSING_CPUS:-2}" --nStreams "${PROCESSING_CPUS:-2}" \
         --pileup_input "${premix_input}" \
         --filein "file:${GENSIM_OUTPUT}" \
-        --fileout "file:${RAW_OUTPUT}"
+        --fileout "file:${RAW_OUTPUT}" || return 1
     
-    msg_info "Running RAW step with nThreads=${raw_threads}, nStreams=${raw_streams}, watchdog=${raw_watchdog_timeout}..."
+    msg_info "Running RAW step with nThreads=${PROCESSING_CPUS:-2}, nStreams=${PROCESSING_CPUS:-2}, watchdog=${raw_watchdog_timeout}..."
     local raw_rc=0
     run_cmssw12_command "cmsRun_step2_raw" timeout --preserve-status --kill-after="${raw_watchdog_kill_after}" "${raw_watchdog_timeout}" cmsRun "${cfg_file}" || raw_rc=$?
     rm -f "${cfg_file}"
@@ -1762,25 +1726,10 @@ run_raw() {
     fi
 
     if [[ "${raw_rc}" -ne 0 ]]; then
-        validate_root_file "partial_raw" "${RAW_OUTPUT}" || {
-            msg_error "RAW cmsRun exited ${raw_rc} and its output is not a valid closed ROOT file"
-            return "${raw_rc}"
-        }
-        ACTUAL_RAW_EVENTS=$(count_root_events "${RAW_OUTPUT}")
-        if ! [[ "${ACTUAL_RAW_EVENTS}" =~ ^[1-9][0-9]*$ ]]; then
-            msg_error "RAW cmsRun exited ${raw_rc} and its output has no verifiable events"
-            return "${raw_rc}"
-        fi
-        RAW_COMMAND_EXIT_CODE="${raw_rc}"
-        PROCESSING_PARTIAL_REASON="raw_cmsrun_nonzero_with_valid_output"
-        msg_warn "RAW cmsRun exited ${raw_rc}; retaining valid partial RAW with ${ACTUAL_RAW_EVENTS} events"
+        msg_error "RAW cmsRun exited ${raw_rc}"
+        return "${raw_rc}"
     fi
-    
-    if [[ "${RAW_COMMAND_EXIT_CODE}" -ne 0 ]]; then
-        msg_ok "RAW partial output accepted: ${RAW_OUTPUT} (${ACTUAL_RAW_EVENTS} verified events)"
-    else
-        msg_ok "RAW complete: ${RAW_OUTPUT}"
-    fi
+    msg_ok "RAW complete: ${RAW_OUTPUT}"
 }
 
 # Step 5: RECO
@@ -1789,7 +1738,7 @@ run_reco() {
     
     RECO_OUTPUT="${WORKDIR}/output_RECO.root"
     
-    setup_cmssw12
+    setup_cmssw12 || return 1
     
     local cfg_file
     cfg_file=$(mktemp --suffix=_reco_cfg.py) || {
@@ -1811,12 +1760,12 @@ run_reco() {
         --geometry DB:Extended \
         -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
-        --nThreads 2 --nStreams 2 \
+        --nThreads "${PROCESSING_CPUS:-2}" --nStreams "${PROCESSING_CPUS:-2}" \
         --filein "file:${RAW_OUTPUT}" \
-        --fileout "file:${RECO_OUTPUT}"
+        --fileout "file:${RECO_OUTPUT}" || return 1
     
     msg_info "Running RECO step..."
-    run_cmssw12_command "cmsRun_step3_reco" cmsRun "${cfg_file}"
+    run_cmssw12_command "cmsRun_step3_reco" cmsRun "${cfg_file}" || return 1
     rm -f "${cfg_file}"
     
     if [[ ! -f "${RECO_OUTPUT}" ]]; then
@@ -2067,172 +2016,13 @@ stage_failed_processing_manifest() {
     fi
 }
 
-recover_existing_stageout() {
-    local output_subpath="${CUSTOM_OUTPUT_SUBPATH:-output/${CAMPAIGN_NAME}/${JOB_ID}}"
-    local miniaod_name="output_MINIAOD.root"
-    local manifest_name="processing_manifest_${CAMPAIGN_NAME}_${JOB_ID}.json"
-    local miniaod_url="${EOS_BASE}/${output_subpath}/${miniaod_name}"
-    local miniaod_path="${EOS_PATH_BASE}/${output_subpath}/${miniaod_name}"
-    local manifest_url="${EOS_BASE}/${output_subpath}/${manifest_name}"
-    local manifest_path="${EOS_PATH_BASE}/${output_subpath}/${manifest_name}"
-    local local_manifest="${WORKDIR}/${manifest_name}.original"
-    local repaired_manifest="${WORKDIR}/${manifest_name}"
-    local remote_size=""
-    local manifest_size=""
-    local manifest_status=""
-    local expected_events=""
-    local manifest_merge_eligible=""
-    local actual_events=""
-    local original_sha=""
-    local archive_subpath=""
-
-    msg_step "Stageout recovery: validate existing MiniAOD"
-
-    remote_size=$(run_xrdfs "${EOS_XRDFS_TARGET}" stat "${miniaod_path}" 2>/dev/null |
-        awk '$1 == "Size:" {print $2; exit}') || true
-    if ! [[ "${remote_size}" =~ ^[1-9][0-9]*$ ]]; then
-        msg_error "Existing MiniAOD is missing or empty: ${miniaod_url}"
-        return 20
-    fi
-
-    manifest_size=$(run_xrdfs "${EOS_XRDFS_TARGET}" stat "${manifest_path}" 2>/dev/null |
-        awk '$1 == "Size:" {print $2; exit}') || true
-    if ! [[ "${manifest_size}" =~ ^[1-9][0-9]*$ ]]; then
-        msg_error "Existing processing manifest is missing or empty: ${manifest_url}"
-        return 21
-    fi
-
-    run_logged "download_existing_manifest_${JOB_ID}" \
-        run_xrdcp --nopbar --force "${manifest_url}" "${local_manifest}" || return 22
-
-    IFS=$'\t' read -r manifest_status expected_events manifest_merge_eligible < <(
-        python3 - "${local_manifest}" "${CAMPAIGN_NAME}" "${JOB_ID}" "${miniaod_url}" <<'PYHELPER'
-import json
-import sys
-
-path, campaign, job_id, expected_url = sys.argv[1:]
-with open(path, "r", encoding="utf-8") as handle:
-    manifest = json.load(handle)
-if manifest.get("campaign") != campaign:
-    raise SystemExit("manifest campaign does not match recovery config")
-if manifest.get("job_id") != job_id:
-    raise SystemExit("manifest job_id does not match recovery config")
-if manifest.get("miniaod_url") != expected_url:
-    raise SystemExit("manifest miniaod_url does not match the final stageout target")
-events = int(manifest.get("actual_miniaod_events") or 0)
-if events <= 0:
-    raise SystemExit("manifest does not contain a positive MiniAOD event count")
-print(
-    f"{manifest.get('status') or ''}\t{events}\t"
-    f"{str(manifest.get('merge_eligible') is True).lower()}"
-)
-PYHELPER
-    ) || {
-        msg_error "Existing processing manifest failed structural validation: ${manifest_url}"
-        return 23
-    }
-
-    actual_events=$(count_root_events "${miniaod_url}")
-    if ! [[ "${actual_events}" =~ ^[1-9][0-9]*$ ]]; then
-        msg_error "edmFileUtil could not open/count existing MiniAOD: ${miniaod_url}"
-        return 24
-    fi
-    if [[ "${actual_events}" != "${expected_events}" ]]; then
-        msg_error "Existing MiniAOD event mismatch: manifest=${expected_events} edmFileUtil=${actual_events} url=${miniaod_url}"
-        return 25
-    fi
-
-    if [[ "${manifest_status}" == "ok" ]] && python3 - "${local_manifest}" <<'PYHELPER'
-import json
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    manifest = json.load(handle)
-raise SystemExit(0 if manifest.get("complete") is True and not manifest.get("failure_reason") else 1)
-PYHELPER
-    then
-        msg_ok "Existing stageout already valid and size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
-        return 0
-    fi
-    if [[ "${manifest_status}" == "partial" && "${manifest_merge_eligible}" == "true" ]] && python3 - "${local_manifest}" <<'PYHELPER'
-import json
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    manifest = json.load(handle)
-raise SystemExit(0 if not manifest.get("failure_reason") else 1)
-PYHELPER
-    then
-        msg_warn "Existing partial stageout is merge-eligible and size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
-        return 0
-    fi
-
-    original_sha=$(sha256sum "${local_manifest}" | awk '{print $1}') || return 26
-    archive_subpath="${output_subpath}/recovery/original_processing_manifest_${original_sha}.json"
-    make_remote_dir "${output_subpath}/recovery" || return 27
-    stage_out "${local_manifest}" "${archive_subpath}" || return 28
-
-    python3 - "${local_manifest}" "${repaired_manifest}" "${actual_events}" \
-        "${remote_size}" "${original_sha}" "${EOS_BASE}/${archive_subpath}" \
-        "${PROCESSING_RUNTIME_BUNDLE_SHA256:-unknown}" <<'PYHELPER'
-import json
-import sys
-from datetime import datetime, timezone
-
-(
-    source_path,
-    output_path,
-    actual_events,
-    remote_size,
-    original_sha,
-    archived_url,
-    runtime_bundle_sha,
-) = sys.argv[1:]
-with open(source_path, "r", encoding="utf-8") as handle:
-    manifest = json.load(handle)
-actual_events = int(actual_events)
-actual_mixed = int(manifest.get("actual_mixed_hepmc_events") or 0)
-is_partial = actual_mixed > 0 and actual_events < actual_mixed
-missing_events = max(0, actual_mixed - actual_events)
-loss_fraction = missing_events / actual_mixed if actual_mixed else 0.0
-warning_fraction = float(manifest.get("miniaod_loss_warning_fraction") or 0.25)
-manifest.update({
-    "status": "partial" if is_partial else "ok",
-    "complete": not is_partial,
-    "merge_eligible": True,
-    "failure_reason": None,
-    "partial_reason": "miniaod_event_count_shortfall" if is_partial else None,
-    "actual_miniaod_events": actual_events,
-    "completion_fraction": actual_events / actual_mixed if actual_mixed else 0.0,
-    "missing_miniaod_events": missing_events,
-    "miniaod_loss_fraction": loss_fraction,
-    "miniaod_loss_warning_fraction": warning_fraction,
-    "miniaod_loss_assessment": "warning" if loss_fraction > warning_fraction else "within_threshold",
-    "miniaod_count_source": "edmFileUtil-remote-recovery",
-    "timestamp": datetime.now(timezone.utc).isoformat(),
-    "recovery": {
-        "mode": "validate-existing",
-        "validated_at": datetime.now(timezone.utc).isoformat(),
-        "miniaod_remote_size": int(remote_size),
-        "original_manifest_sha256": original_sha,
-        "original_manifest_url": archived_url,
-        "runtime_bundle_sha256": runtime_bundle_sha,
-    },
-})
-with open(output_path, "w", encoding="utf-8") as handle:
-    json.dump(manifest, handle, indent=2)
-    handle.write("\n")
-PYHELPER
-
-    stage_out "${repaired_manifest}" "${output_subpath}/${manifest_name}" || return 29
-    msg_ok "Existing MiniAOD and repaired manifest size-verified (${remote_size} B, ${actual_events} events): ${miniaod_url}"
-}
-
 # Step 6: MiniAOD
 run_miniaod() {
     msg_step "Step 6: MiniAOD"
     
     MINIAOD_OUTPUT="${WORKDIR}/output_MINIAOD.root"
     
-    setup_cmssw12
+    setup_cmssw12 || return 1
     
     local cfg_file
     cfg_file=$(mktemp --suffix=_miniaod_cfg.py) || {
@@ -2252,12 +2042,12 @@ run_miniaod() {
         --geometry DB:Extended \
         -n -1 \
         --customise Configuration/DataProcessing/Utils.addMonitoring \
-        --nThreads 2 --nStreams 2 \
+        --nThreads "${PROCESSING_CPUS:-2}" --nStreams "${PROCESSING_CPUS:-2}" \
         --filein "file:${RECO_OUTPUT}" \
-        --fileout "file:${MINIAOD_OUTPUT}"
+        --fileout "file:${MINIAOD_OUTPUT}" || return 1
     
     msg_info "Running MiniAOD step..."
-    run_cmssw12_command "cmsRun_step4_miniaod" cmsRun "${cfg_file}"
+    run_cmssw12_command "cmsRun_step4_miniaod" cmsRun "${cfg_file}" || return 1
     rm -f "${cfg_file}"
     
     if [[ ! -f "${MINIAOD_OUTPUT}" ]]; then
@@ -2496,7 +2286,6 @@ Optional:
   --ntuple-era ERA         Explicit MC era for the ntuple configuration
   --ntuple-global-tag GT   Explicit MC GlobalTag for the ntuple configuration
   --transfer-miniaod BOOL Whether transfer step should upload MiniAOD (true|false)
-  --stageout-recovery MODE Validate an existing stageout (none|validate-existing)
   --max-events N          Limit events for fast local test (default: -1 = all)
   --first-run N           First run number for GEN-SIM EventID assignment
   --first-luminosity-block N First luminosity block for GEN-SIM EventID assignment
@@ -2538,7 +2327,6 @@ FIRST_RUN=1
 FIRST_LUMINOSITY_BLOCK=1
 FIRST_EVENT=1
 N_EVENTS_IN_LUMI=0
-STAGEOUT_RECOVERY_MODE="${PROCESSING_STAGEOUT_RECOVERY:-none}"
 DETECTOR_PROFILE_ID=""
 NTUPLE_ERA=""
 NTUPLE_GLOBAL_TAG=""
@@ -2621,10 +2409,6 @@ while [[ $# -gt 0 ]]; do
             TRANSFER_MINIAOD="$2"
             shift 2
             ;;
-        --stageout-recovery)
-            STAGEOUT_RECOVERY_MODE="$2"
-            shift 2
-            ;;
         --first-run)
             FIRST_RUN="$2"
             shift 2
@@ -2693,12 +2477,6 @@ if [[ "${TRANSFER_MINIAOD}" != "true" ]] && [[ "${TRANSFER_MINIAOD}" != "false" 
     exit 1
 fi
 
-if [[ "${STAGEOUT_RECOVERY_MODE}" != "none" ]] && \
-   [[ "${STAGEOUT_RECOVERY_MODE}" != "validate-existing" ]]; then
-    msg_error "--stageout-recovery must be none or validate-existing"
-    exit 1
-fi
-
 if ! [[ "${MAX_EVENTS}" =~ ^-?[0-9]+$ ]]; then
     msg_error "--max-events must be an integer"
     exit 1
@@ -2757,11 +2535,6 @@ fi
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
 if [[ "${FULL_MC_STAGE_RUNTIME:-}" != "pythia-el8" ]]; then
     ensure_voms_proxy
-fi
-
-if [[ "${STAGEOUT_RECOVERY_MODE}" == "validate-existing" ]]; then
-    recover_existing_stageout
-    exit $?
 fi
 
 LHE_FILES=()

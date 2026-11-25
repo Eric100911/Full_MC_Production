@@ -9,8 +9,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from full_mc.io import atomic_json
 from full_mc.workers._common import publish, result
-from full_mc.workers.archive import execute as archive
-from full_mc.workers.plan import execute as plan
 
 SCRATCH = Path('/tmp/chiw')
 SCRATCH.mkdir(exist_ok=True)
@@ -61,52 +59,3 @@ class StagedPublication(unittest.TestCase):
             atomic_json(work / 'plan.json', {'total_input_events': 1, 'blocks': [
                 {'path': str(block), 'filename': block.name, 'index': 0, 'n_events': 1}]})
         return item, run
-
-    def test_plan_publishes_original_and_blocks_without_fictitious_sidecars(self):
-        item, run = self.planner()
-        with patch('full_mc.workers.plan.run', side_effect=run), \
-                patch('full_mc.workers.plan.TransferClient') as transfer:
-            outcome = plan(item, self.root / 'work')
-        self.assertEqual(transfer.return_value.copy_out.call_count, 2)
-        self.assertEqual(outcome['outputs'][0]['kind'], 'lhe-block')
-        self.assertEqual(outcome['originals'][0]['kind'], 'lhe')
-        self.assertNotIn('sidecar_url', outcome['outputs'][0])
-
-    def test_plan_reused_original_remains_reference_without_second_upload(self):
-        item, run = self.planner(retained=True)
-        with patch('full_mc.workers.plan.run', side_effect=run), \
-                patch('full_mc.workers.plan.TransferClient') as transfer:
-            outcome = plan(item, self.root / 'work')
-        self.assertEqual(transfer.return_value.copy_out.call_count, 1)
-        self.assertEqual(outcome['originals'][0]['sidecar_url'], item['inputs'][0]['sidecar_url'])
-
-    def test_source_archive_accepts_frozen_lhe_without_miniaod_gate(self):
-        item, _run = self.planner(retained=True)
-        item.update(task_id='source-archive', stage='archive')
-        item['parameters'] = {'archive_role': 'source', 'source_plan_task': 'PLAN-source'}
-        item['outputs'] = task('archive')['outputs']
-        with patch('full_mc.workers._common.TransferClient') as transfer:
-            outcome = archive(item, self.root / 'archive')
-        self.assertEqual(outcome['members'][0]['artifact_id'], 'original')
-        self.assertNotIn('staged_objects', outcome)
-        self.assertEqual(transfer.return_value.copy_out.call_count, 2)
-
-    def test_source_archive_rejects_non_original_or_unfrozen_input(self):
-        for change in ({'kind': 'hepmc'}, {'size_bytes': None}, {'events': 0}):
-            item, _run = self.planner(retained=True)
-            item.update(stage='archive')
-            item['parameters'] = {'archive_role': 'source', 'source_plan_task': 'PLAN-source'}
-            item['inputs'][0].update(change)
-            with self.assertRaisesRegex(ValueError, 'frozen original'):
-                archive(item, self.root / 'archive')
-
-    def test_source_archive_requires_frozen_plan_identity(self):
-        item, _run = self.planner(retained=True)
-        item.update(stage='archive')
-        item['parameters'] = {'archive_role': 'source'}
-        with self.assertRaisesRegex(ValueError, 'frozen source PLAN identity'):
-            archive(item, self.root / 'archive')
-
-
-if __name__ == '__main__':
-    unittest.main()

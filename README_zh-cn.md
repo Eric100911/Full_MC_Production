@@ -1,15 +1,13 @@
 # Full MC Production
 
-`mcprod` 是 CERN 与 IHEP 联合生产的入口。运行配置必须显式声明
-`"orchestration": "campaign_shards"`。生产控制器使用
-`mcprod-shard-state-v3` 记录输入清单、任务分配、结果凭据和运行状态。
+`mcprod` 是 CERN 与 IHEP 联合生产的入口。运行配置使用
+`"orchestration": "static_subdag"`。
 
-CERN 的 SOURCE 子 DAG 负责生成或读取原始 LHE、确定性分块，以及归档后回收
-原始文件。SHARD 子 DAG 在所需的 PLAN 结果被接受后即可分配处理节点。
-每个处理作业运行一次 MIX，将 HepMC 检查点发布到 IHEP，再运行所需的 MiniAOD
-探测器配置。已经验证的检查点和 MiniAOD 产物可在重试时复用。所有 SOURCE 和
-SHARD 完成后，每个输入池执行一次终端回收，删除本次运行发布的全部 CERN
-LHE 分块。
+各 SOURCE 作业生成或读取一份 LHE，在本地确定性洗牌、切块，保留尾块，
+并将分块和清单上传至 CERN EOS。所有 SOURCE 完成后，PLAN 根据清单绑定
+各物理子过程的输入，一次生成静态处理子 DAG。PROC 从 MIX 开始执行，
+依次运行 GEN-SIM、RAW、RECO 和 MiniAOD。RECLAIM 在所有 PROC 成功后
+回收暂存 LHE，并按事例数或文件大小生成交接清单。
 
 ## 准备运行
 

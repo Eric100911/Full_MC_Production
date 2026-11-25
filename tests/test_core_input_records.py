@@ -25,21 +25,6 @@ class InputRecordTests(unittest.TestCase):
             self.assertEqual(task["inputs"][0]["events"], 7)
             self.assertEqual(task["inputs"][0]["count_source"], "edmFileUtil")
 
-    def test_plan_keeps_authoritative_lhe_and_block_refs_without_sidecars(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            refs = [{"artifact_id":"lhe", "url":str(root / "x.lhe.gz"),
-                     "kind":"lhe", "events":11},
-                    {"artifact_id":"block", "url":"BLOCK:p:g:000001",
-                     "kind":"lhe-block", "events":5}]
-            task = {"stage":"plan", "runtime":"utilities-el9",
-                    "runtime_release":"r1", "inputs":refs}
-            with patch("full_mc.workers.import_module") as loader:
-                loader.return_value.execute.return_value = {"status":"ok"}
-                execute_task(task, root / "work")
-            self.assertEqual(refs[0]["events"], 11)
-            self.assertNotIn("size_bytes", refs[1])
-
     def test_jup_combined_checkpoint_has_only_merge_and_ntuple(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

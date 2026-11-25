@@ -6,6 +6,4 @@
 只适用于原运行。
 
 - [退役前的测试与操作说明](https://github.com/Eric100911/Full_MC_Production/blob/v07_00-pre1/docs/testing.md)
-- [v06_00 SHARD 设计](v06_00_campaign_shards.md)
-- [v06_01 控制器升级记录](v06_01_controller_upgrade.md)
-- [v06_01 PRE_SKIP 事件记录](v06_01_dagman_preskip_assertion_20261104.md)
+- [静态流程切换前的操作说明](https://github.com/Eric100911/Full_MC_Production/blob/de69211/docs/testing.md)

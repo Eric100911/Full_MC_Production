@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from full_mc.backends.condor import resume_run, status_run, submit_run
-from full_mc.application.staging import FUSED_STATE_SCHEMA
+from full_mc.settings import STATIC_WORKFLOW
 from full_mc.io import read_json
 
 
@@ -21,10 +21,9 @@ def response(code=0, stdout="", stderr=""):
 
 
 def run(root, schedd="schedd.example"):
-    (root / "state.json").write_text(json.dumps({"state_schema": FUSED_STATE_SCHEMA}))
     (root / "run.dag").write_text("JOB A a.sub\n", encoding="utf-8")
     (root / "run.json").write_text(json.dumps(
-        {"state_schema": FUSED_STATE_SCHEMA, "condor": {"schedd": schedd}}))
+        {"orchestration": STATIC_WORKFLOW, "condor": {"schedd": schedd}}))
     (root / "submit").mkdir()
     (root / "submit/plan.sub").write_text(
         "x509userproxy = /afs/cern.ch/user/test/proxy\n", encoding="utf-8")
@@ -92,7 +91,7 @@ class CondorContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
             payload = {
-                "state_schema": FUSED_STATE_SCHEMA,
+                "orchestration": STATIC_WORKFLOW,
                 "condor": {"schedd": "schedd.example"},
                 "run_id": "reservation-test", "runtime_release": "r1",
                 "storage": {"cern_staging": "root://eosuser.cern.ch///eos/user/c/chiw/staging",
@@ -136,8 +135,9 @@ class CondorContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
             submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
-            (root / "state.json").write_text(json.dumps({"state_schema": FUSED_STATE_SCHEMA, "status": "complete"}))
-            (root / ".complete").write_text("", encoding="utf-8")
+            (root / "results").mkdir()
+            (root / "results/RECLAIM.json").write_text('{"status":"ok"}')
+            (root / "handoff.json").write_text('{}')
             (root / "run.dag.metrics").write_text(json.dumps({
                 "dagman_id": "42", "exitcode": 0, "DagStatus": 0,
                 "dag_nodes": 28, "dag_nodes_succeeded": 28,
@@ -158,8 +158,9 @@ class CondorContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); run(root)
             submit_run(root, runner=Mock(return_value=response(stdout="submitted to cluster 42")))
-            (root / "state.json").write_text(json.dumps({"state_schema": FUSED_STATE_SCHEMA, "status": "complete"}))
-            (root / ".complete").write_text("", encoding="utf-8")
+            (root / "results").mkdir()
+            (root / "results/RECLAIM.json").write_text('{"status":"ok"}')
+            (root / "handoff.json").write_text('{}')
             (root / "run.dag.metrics").write_text(json.dumps({
                 "dagman_id": "41", "exitcode": 0, "DagStatus": 0,
                 "dag_nodes": 28, "dag_nodes_succeeded": 28,

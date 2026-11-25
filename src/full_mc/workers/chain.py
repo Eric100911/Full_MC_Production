@@ -155,5 +155,8 @@ def execute_chain(task, work_dir):
     config_path = work_dir / "chain.json"
     atomic_json(config_path, config)
     script = native_tree(task, work_dir, shower=task["stage"] == "mix")
+    options = {}
+    if task["stage"] == "miniaod":
+        options["extra_env"] = {"PROCESSING_CPUS": str(p["processing_cpus"])}
     run(task, task["runtime"], build_command(task, work_dir, script, config_path),
-        work_dir)
+        work_dir, **options)

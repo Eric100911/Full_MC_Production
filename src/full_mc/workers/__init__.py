@@ -12,12 +12,9 @@ _HYDRATE_ALL = {"merge", "ntuple", "selection", "efficiency"}
 def _hydrate_inputs(task):
     stage = task.get("stage")
     refs = task.get("inputs", [])
-    if stage == "plan":
-        selected = [ref for ref in refs if "events" not in ref]
-    elif stage in _HYDRATE_ALL:
-        selected = list(refs)
-    else:
+    if stage not in _HYDRATE_ALL:
         return
+    selected = refs
     if not selected:
         return
     client = TransferClient()

@@ -1,6 +1,6 @@
 ---
 name: cms-ihep-condor-pilot
-description: Plan and validate small Full_MC_Production v3 CERN SOURCE/SHARD pilots and their IHEP handoffs.
+description: Plan and validate small Full_MC_Production CERN SOURCE/PLAN/PROC_SUBDAG/RECLAIM pilots and their IHEP handoffs.
 ---
 
 # CMS CERN to IHEP Pilot
@@ -11,9 +11,8 @@ Use the Condor skill for live queue inspection, submission, and recovery.
 - Freeze exact counted LHE references, a positive planned event count, and a
   small processing-node count. Record expected blocks, subprocess coverage,
   detector variants, and merge target before submission.
-- Render an unsubmitted DAG with `mcprod run plan`. Inspect the SOURCE and
-  SHARD children, worker transfer configuration, and terminal cleanup.
+- Render an unsubmitted DAG with `mcprod run plan`. Inspect the SOURCE dependencies, PLAN transfer, flat PROC child DAG and RECLAIM.
 - For an authorized pilot, record the exact schedd and root cluster ID.
-  Check the HepMC checkpoint before MiniAOD and exercise selective recovery.
+  Verify the CMSSW thread and stream counts and exercise a whole-job retry.
 - Confirm terminal cleanup, export the handoff, and verify the existing
   IHEP merge and ntuple stages. Use the HepJob backend on IHEP.

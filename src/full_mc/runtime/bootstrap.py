@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zlib
 
 
 def _extract(archive_path, destination, prefix):
@@ -95,8 +97,9 @@ def write_diagnostics(task, stage_work, destination):
     """
     stage_work, destination = Path(stage_work), Path(destination)
     paths = set(stage_work.rglob("*.log"))
-    if (task.get("stage") == "lhe"
-            and task.get("parameters", {}).get("retain_helac_diagnostics") is True):
+    generation = task.get("generation", task if task.get("stage") == "lhe" else {})
+    if generation.get("parameters", {}).get("retain_helac_diagnostics") is True:
+        helac_work = stage_work / "helac" if "generation" in task else stage_work
         patterns = (
             "command_logs/*.stdout", "command_logs/*.stderr",
             "py8_onia_user.inp", "helac_forbidden_*.txt",
@@ -113,7 +116,7 @@ def write_diagnostics(task, stage_work, destination):
             "HELAC-Onia-2.7.6/PROC_HO_*/results/*.out",
         )
         for pattern in patterns:
-            paths.update(stage_work.glob(pattern))
+            paths.update(helac_work.glob(pattern))
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(destination, "w:gz", compresslevel=1) as archive:
         for path in sorted(paths):
@@ -124,17 +127,26 @@ def write_diagnostics(task, stage_work, destination):
                 archive.add(path, arcname=str(relative), recursive=False)
 
 
+def decode_task_payload(value):
+    return json.loads(zlib.decompress(base64.b64decode(value, altchars=b"-_", validate=True)))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", type=Path, required=True)
+    task_input = parser.add_mutually_exclusive_group(required=True)
+    task_input.add_argument("--task", type=Path)
+    task_input.add_argument("--task-payload")
     parser.add_argument("--release-dir", type=Path, default=Path.cwd())
     parser.add_argument("--work-dir", type=Path, default=Path.cwd() / "work")
     parser.add_argument("--result", type=Path, default=Path.cwd() / "result.json")
     parser.add_argument("--diagnostics", type=Path, default=Path.cwd() / "diagnostics.tar.gz")
+    parser.add_argument("--products", type=Path)
+    parser.add_argument("--publication-id")
     args = parser.parse_args(argv)
     if sys.version_info < (3, 9):
         parser.error("the worker bootstrap requires Python 3.9 or newer")
-    task = json.loads(args.task.read_text())
+    task = (json.loads(args.task.read_text()) if args.task
+            else decode_task_payload(args.task_payload))
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=True)
     output = args.result.resolve()
@@ -145,12 +157,21 @@ def main(argv=None):
     stage_work.mkdir()
     try:
         profiles, revision = (), None
+        if task["stage"] == "source" and task.get("generation"):
+            profiles = (task["generation"]["runtime"],)
         if task["stage"] == "processing":
             profiles = [stage["runtime"] for stage in (task["mix"], *task["variants"])]
             revision = task["core_revision"]
         core = unpack_runtime(args.release_dir, work / "runtime", task["runtime"],
                               task["runtime_release"], stage_profiles=profiles, revision=revision)
         task.setdefault("parameters", {})["core_root"] = str(core)
+        if args.products:
+            task["parameters"]["products_path"] = str(args.products.resolve())
+        if args.publication_id:
+            task["parameters"]["publication_id"] = args.publication_id
+        if task["stage"] == "reclaim":
+            task["parameters"]["plan_path"] = str((Path.cwd() / "plan.json").resolve())
+            task["parameters"]["results_dir"] = str((Path.cwd() / "results").resolve())
         if task["runtime"] == "analyzer-el9":
             task["parameters"]["analyzer_path"] = str(core / "external/NtupleAnalyzer")
         local_task = work / "task.json"
@@ -161,6 +182,16 @@ def main(argv=None):
         return outcome.returncode
     finally:
         # Return diagnostics, not scratch LHE/HepMC/ROOT payloads or package trees.
+        if args.products and not args.products.exists():
+            # ON_EXIT still transfers diagnostics after a nonzero exit.
+            if task["stage"] == "plan":
+                args.products.mkdir()
+            else:
+                args.products.write_text("{}\n")
+        if task["stage"] == "reclaim" and args.products:
+            snapshot = args.products.with_name("merge_groups.json")
+            if not snapshot.exists():
+                snapshot.write_text("{}\n")
         write_diagnostics(task, stage_work, args.diagnostics)
 
 

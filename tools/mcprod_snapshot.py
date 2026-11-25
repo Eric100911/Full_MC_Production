@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only snapshot of the recorded v3 SOURCE/SHARD production attempt."""
+"""Read-only snapshot of the recorded static production attempt."""
 from __future__ import annotations
 
 import argparse
@@ -48,11 +48,8 @@ def resolve_identity(
     run_dir = run_dir.expanduser().resolve()
     submission = read_json(run_dir / "submission.json")
     run_record = read_json(run_dir / "run.json")
-    state = read_json(run_dir / "state.json")
-
-    for record in (run_record, state):
-        if record.get("state_schema") != "mcprod-shard-state-v3":
-            raise ValueError("snapshot requires mcprod-shard-state-v3")
+    if run_record.get("orchestration") != "static_subdag":
+        raise ValueError("snapshot requires static_subdag orchestration")
     number = submission.get("current_attempt")
     if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         raise ValueError("submission.json has no valid current_attempt")
@@ -107,7 +104,6 @@ def resolve_identity(
         "dag_file": expected_dag,
         "run_record": run_record,
         "submission": submission,
-        "state": state,
         "attempt_number": number,
         "schedd": schedd,
         "cluster": cluster,
@@ -135,7 +131,6 @@ def query_queue(schedd: str, cluster: int) -> list[dict]:
 
 def build_snapshot(run_dir, *, schedd=None, cluster=None, queue_reader=query_queue):
     identity = resolve_identity(run_dir, schedd, cluster)
-    state = identity["state"]
     graph = dag_progress.parse_dag_graph(identity["dag_file"])
     planned = dag_progress.flatten_graph(graph)
     logs = dag_progress.completed_records_from_logs(planned)
@@ -151,40 +146,25 @@ def build_snapshot(run_dir, *, schedd=None, cluster=None, queue_reader=query_que
     counts = defaultdict(Counter)
     for name, node in planned.items():
         stage = node.stage
-        status = None
-        source = "state"
-        if name.startswith("SOURCE_") and node.directive == "SUBDAG":
-            stage = "source"
-            status = {"completed": "done", "skipped": "skipped"}.get(
-                state["planner"]["sources"].get(str(int(name.removeprefix("SOURCE_")))))
-        elif name.startswith("SHARD_") and node.directive == "SUBDAG":
-            stage = "shard"
-            if state["allocations"].get(name, {}).get("completed"):
-                status = "done"
-        elif name.startswith("CLEANUP_"):
-            stage = "cleanup"
-        elif name == "FINALIZE":
-            if state["status"] == "complete" and (identity["run_dir"] / ".complete").is_file():
-                status = "done"
-        if name in state["accepted"]:
-            status = "done"
-        if status is None:
-            record = records.get(name)
-            status = dag_progress.record_status(record) if record else "pending"
-            source = "DAGMan/Condor" if record else "DAG"
+        record = records.get(name)
+        status = dag_progress.record_status(record) if record else "pending"
+        source = "DAGMan/Condor" if record else "DAG"
         nodes[name] = {"stage": stage, "status": status, "source": source}
         counts[stage][status] += 1
 
     metrics = read_json(identity["run_dir"] / "run.dag.metrics", required=False)
     if metrics and str(metrics.get("dagman_id")) != str(identity["cluster"]):
         metrics = None
-    recovery_path = identity["run_dir"] / "recovery/current.json"
-    recovery = read_json(recovery_path, required=False)
-    if recovery and str(recovery.get("root_cluster_id")) != str(identity["cluster"]):
-        recovery = None
+    completion = read_json(identity["run_dir"] / "results/RECLAIM.json", required=False)
+    status = "running"
+    if metrics:
+        if metrics.get("exitcode") == 0 and completion and completion.get("status") == "ok":
+            status = "complete"
+        elif metrics.get("exitcode") != 0:
+            status = "failed"
     return {"run_id": identity["run_record"]["run_id"], "schedd": identity["schedd"],
             "root_cluster_id": identity["cluster"], "attempt": identity["attempt_number"],
-            "status": state["status"], "queue": queue, "recovery": recovery,
+            "status": status, "queue": queue,
             "root_metrics": metrics,
             "stages": dict(counts), "nodes": nodes}
 

@@ -19,7 +19,7 @@ class SimulationProfileContracts(unittest.TestCase):
 
     def spec(self, root):
         payload = {
-            "schema_version": 2, "orchestration": "campaign_shards",
+            "schema_version": 2, "orchestration": "static_subdag",
             "run_id": "profile-test",
             "runtime_release": "test-release",
             "block_events": 100,
@@ -101,7 +101,8 @@ class SimulationProfileContracts(unittest.TestCase):
             with self.subTest(profile_id=profile_id):
                 profile = profiles.require_ready(profile_id)
                 self.assertEqual(profile["compatible_pools"], [pool])
-                self.assertEqual((profile["nmc"], profile["unwevt"]), (500000, 2000))
+                stop_target = 10000000 if pool in {"pool_gg", "pool_2jpsi_cs"} else 2000
+                self.assertEqual((profile["nmc"], profile["unwevt"]), (500000, stop_target))
                 self.assertEqual(profile["planning_events_hint"], hint)
                 self.assertTrue(profile["process"])
                 self.assertEqual(set(profile["cuts"]), {

@@ -1,4 +1,4 @@
-"""Focused recovery tests for immutable records and controller state commits."""
+"""Focused recovery tests for immutable JSON records."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
@@ -8,9 +8,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from full_mc.application import shards, staging
 from full_mc.io import read_json, write_immutable_json
-from tests.test_core_shards import ShardFixture
 
 
 def fail_once(function, error):
@@ -27,9 +25,6 @@ def fail_once(function, error):
 
 
 class ImmutableRecoveryTests(unittest.TestCase):
-    def setUp(self):
-        self.fixtures = ShardFixture("runTest")
-
     def test_json_equivalent_tuple_retry_and_conflict(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
             path = Path(temporary) / "manifest.json"
@@ -43,66 +38,6 @@ class ImmutableRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "immutable record conflict"):
                 write_immutable_json(path, {"tasks": [], "dependencies": []})
             self.assertEqual(path.read_bytes(), first_bytes)
-
-    def test_source_manifest_survives_state_replace_failure_and_retry(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
-            run = self.fixtures.fixture(temporary)
-            before = (run / "state.json").read_bytes()
-            real_write = staging._write_state
-            with patch.object(staging, "_write_state",
-                              side_effect=fail_once(real_write, OSError("before replace"))):
-                with self.assertRaisesRegex(OSError, "before replace"):
-                    shards.prepare_source(run, 0)
-
-            manifest = shards._manifest_path(run, "SOURCE_000000")
-            self.assertTrue(manifest.is_file())
-            self.assertEqual((run / "state.json").read_bytes(), before)
-            frozen = manifest.read_bytes()
-
-            result = shards.prepare_source(run, 0)
-            self.assertEqual(result["exit_code"], 0)
-            self.assertEqual(manifest.read_bytes(), frozen)
-            self.assertEqual(read_json(run / "state.json")["planner"]["sources"]["0"],
-                             "admitted")
-
-    def test_shard_manifest_survives_state_replace_failure_and_retry(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
-            run = self.fixtures.fixture(temporary)
-            self.assertEqual(shards.prepare_source(run, 0)["exit_code"], 0)
-            self.fixtures.source_plan(run)
-            before = (run / "state.json").read_bytes()
-            real_write = staging._write_state
-            with patch.object(staging, "_write_state",
-                              side_effect=fail_once(real_write, OSError("before replace"))):
-                with self.assertRaisesRegex(OSError, "before replace"):
-                    shards.prepare_shard(run, "C", 0)
-
-            manifest = shards._manifest_path(run, "SHARD_C_000000")
-            self.assertTrue(manifest.is_file())
-            self.assertEqual((run / "state.json").read_bytes(), before)
-            frozen = manifest.read_bytes()
-
-            result = shards.prepare_shard(run, "C", 0)
-            self.assertEqual(result["exit_code"], 0)
-            self.assertEqual(manifest.read_bytes(), frozen)
-            self.assertIn("SHARD_C_000000", read_json(run / "state.json")["allocations"])
-
-    def test_result_receipt_replays_after_state_replace_failure(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
-            run = self.fixtures.fixture(temporary)
-            shards.prepare_source(run, 0)
-            real_write = staging._write_state
-            with patch.object(staging, "_write_state",
-                              side_effect=fail_once(real_write, OSError("before replace"))):
-                with self.assertRaisesRegex(OSError, "before replace"):
-                    self.fixtures.source_plan(run)
-
-            receipt = shards._receipt_path(run, "PLAN_000000")
-            self.assertTrue(receipt.is_file())
-            self.assertNotIn("PLAN_000000", read_json(run / "state.json")["accepted"])
-            result = shards.accept_result(run, "PLAN_000000")
-            self.assertEqual(result["status"], "accepted")
-            self.assertIn("PLAN_000000", read_json(run / "state.json")["accepted"])
 
     def test_existing_equal_record_retries_directory_sync_after_failure(self):
         with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:

@@ -36,7 +36,7 @@
         "generate g g > g g"
       ],
       "nmc": 500000,
-      "unwevt": 2000,
+      "unwevt": 10000000,
       "unwevt_semantics": "main-path-stop-target",
       "planning_events_hint": 2000,
       "cuts": {
@@ -59,7 +59,7 @@
         "generate g g > cc~(3S11) cc~(3S11)"
       ],
       "nmc": 500000,
-      "unwevt": 2000,
+      "unwevt": 10000000,
       "unwevt_semantics": "main-path-stop-target",
       "planning_events_hint": 2000,
       "cuts": {

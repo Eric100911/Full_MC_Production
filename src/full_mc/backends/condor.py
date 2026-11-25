@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List
 
 from full_mc.credentials import require_initial_proxy_lifetime
 from full_mc.io import atomic_json
+from full_mc.settings import STATIC_WORKFLOW
 from full_mc.storage.reservation import reserve_run_namespaces
 
 
@@ -60,9 +61,8 @@ def _run_paths(run_dir: str | Path) -> tuple[Path, Path, Path]:
         raise FileNotFoundError("missing DAG: %s" % dag)
     if not spec.is_file():
         raise FileNotFoundError("missing run specification: %s" % spec)
-    from full_mc.application.staging import require_schema
-    require_schema(_read_json(spec))
-    require_schema(_read_json(root / "state.json"))
+    if _read_json(spec).get("orchestration") != STATIC_WORKFLOW:
+        raise ValueError("run requires static_subdag orchestration")
     return root, dag, spec
 
 
@@ -91,8 +91,6 @@ def _assert_submittable(spec: Dict[str, Any]) -> None:
 
 def _worker_proxy_paths(root: Path) -> List[str]:
     """Read the proxy paths pinned in this run's generated worker submit files."""
-    # The shard finalizer is a DAGMan NOOP, so its generated descriptor is
-    # never submitted as a worker and does not transfer a proxy.
     submit_files = sorted(path for path in (root / "submit").glob("*.sub")
                           if path.name != "noop.sub")
     if not submit_files:
@@ -261,11 +259,11 @@ def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
     """Confirm mcprod success after the exact DAGMan proc leaves queue/history.
 
     A blank queue and a rotated/empty history scan do not prove failure. The
-    run-owned completion marker, completed controller state, and metrics tied
-    to this root cluster together provide durable success evidence.
+    transferred RECLAIM result and the metrics tied to this exact root
+    provide durable success evidence.
     """
     try:
-        state = _read_json(root / "state.json")
+        completion = _read_json(root / "results/RECLAIM.json")
         metrics = _read_json(root / "run.dag.metrics")
         metrics_cluster = str(metrics.get("dagman_id", ""))
         dag_nodes = int(metrics["dag_nodes"])
@@ -276,8 +274,8 @@ def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
     except (OSError, KeyError, TypeError, ValueError):
         return None
     if not (
-        state.get("status") == "complete"
-        and (root / ".complete").is_file()
+        completion.get("status") == "ok"
+        and (root / "handoff.json").is_file()
         and metrics_cluster == cluster
         and exit_code == 0
         and dag_status == 0
@@ -291,8 +289,7 @@ def _local_success_evidence(root: Path, cluster: str) -> Dict[str, Any] | None:
         "successful": True,
         "query": "local-evidence",
         "local_evidence": {
-            "state_complete": True,
-            "complete_marker": True,
+            "reclaim_complete": True,
             "metrics_cluster": metrics_cluster,
             "dag_status": dag_status,
             "root_exit_code": exit_code,
@@ -309,10 +306,6 @@ def _local_failed_terminal_evidence(root: Path, cluster: str) -> Dict[str, Any] 
     they are sufficient to authorize a rescue of this exact root, but never
     count as successful completion evidence.
     """
-    from full_mc.application.dagman_recovery import prepared_failure
-    prepared = prepared_failure(root, cluster)
-    if prepared is not None:
-        return prepared
     try:
         metrics = _read_json(root / "run.dag.metrics")
         metrics_cluster = str(metrics["dagman_id"])
@@ -402,12 +395,6 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     record = _load_submission(root)
     if record.get("state") in {"submitting", "unknown"}:
         raise RuntimeError("a submission attempt is still ambiguous; reconcile it before resuming")
-    from full_mc.application.dagman_recovery import prepared_failure, quiet
-    prepared = prepared_failure(root, record.get("root_cluster_id"))
-    if prepared is not None:
-        recovery = _read_json(root / "recovery/current.json")
-        quiet(root, str(record["scheduler"]),
-              set(recovery["clusters"]), runner)
     observed = status_run(root, runner=runner)
     if not observed.get("terminal") or observed.get("successful") is not False:
         raise RuntimeError("rescue resume requires a confirmed failed root DAGMan state")

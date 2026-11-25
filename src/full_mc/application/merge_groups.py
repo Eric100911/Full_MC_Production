@@ -1,9 +1,12 @@
 """Build the IHEP combined tasks from ordered MiniAOD references."""
 from copy import deepcopy
 
-from full_mc.application.ledger import sample_key
 from full_mc.planning.tasks import artifact_reference, task_manifest
 from full_mc.runtime.profiles import runtime_for_profile
+
+
+def sample_key(campaign, profile):
+    return f"{campaign}::{profile}"
 
 
 def _combined(spec, campaign, detector_profile, refs, ordinal):
@@ -41,28 +44,21 @@ def _combined(spec, campaign, detector_profile, refs, ordinal):
             "log_level": spec["log_level"], "subtasks": subtasks}
 
 
-def merge_groups(spec, state):
-    """Complete merge groups as ``(campaign, profile, ordinal, group)`` records.
 
-    Ordinals count the committed groups of one sample stream, so a retry that
-    replays this function always derives the same identity for the same group.
-    """
-    written = []
+def merge_groups(spec, samples):
+    """Build downstream tasks in campaign, detector variant and PROC order."""
+    groups = []
     for campaign in spec["campaigns"]:
-        name = campaign["name"]
-        for detector_profile in campaign["resolved_detector_variants"]:
-            variant = detector_profile["profile_id"]
-            key = sample_key(name, variant)
-            buffer = state["merge_buffers"].setdefault(key, [])
-            ordinal = int(state["merge_group_counts"].get(key, 0))
-            while buffer:
-                total, end = 0, 0
-                while end < len(buffer) and total < int(campaign["merge_events"]):
-                    total += int(buffer[end]["events"])
-                    end += 1
-                written.append((name, variant, ordinal,
-                                _combined(spec, campaign, detector_profile, buffer[:end], ordinal)))
-                del buffer[:end]
-                ordinal += 1
-            state["merge_group_counts"][key] = ordinal
-    return written
+        event_limit = campaign.get("merge_events")
+        byte_limit = campaign.get("merge_bytes")
+        for profile in campaign["resolved_detector_variants"]:
+            refs = samples.get(sample_key(campaign["name"], profile["profile_id"]), [])
+            start, ordinal, events, size = 0, 0, 0, 0
+            for end, ref in enumerate(refs, 1):
+                events += ref["events"]
+                size += ref["size_bytes"]
+                if ((event_limit and events >= event_limit) or (byte_limit and size >= byte_limit)
+                        or end == len(refs)):
+                    groups.append(_combined(spec, campaign, profile, refs[start:end], ordinal))
+                    start, ordinal, events, size = end, ordinal + 1, 0, 0
+    return groups

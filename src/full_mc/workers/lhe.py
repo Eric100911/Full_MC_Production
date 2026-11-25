@@ -6,7 +6,7 @@ results and command streams/timings in bootstrap's diagnostics.tar.gz.
 from __future__ import annotations
 
 import shutil
-from ._common import core_path, count_lhe_events, parameters, prepare, publish, result, run
+from ._common import core_path, validate_lhe, parameters, prepare, publish, result, run
 
 
 def build_command(task, work_dir):
@@ -40,7 +40,7 @@ def build_command(task, work_dir):
     return command
 
 
-def execute(task, work_dir):
+def generate(task, work_dir):
     work_dir = prepare(task, work_dir, "helac-el7")
     source = core_path(task, "common/packages/helac_package.tar.gz")
     shutil.copy2(source, work_dir / "helac_package.tar.gz")
@@ -50,13 +50,9 @@ def execute(task, work_dir):
              "1" if parameters(task).get("retain_helac_diagnostics") is True else "0"})
     p = parameters(task)
     output = work_dir / "products/lhe" / f"sample_{p['pool_name']}_{p['seed']}.lhe.gz"
-    events = count_lhe_events(output)
-    profile = p.get("generator_profile")
-    if not isinstance(profile, dict):
-        raise ValueError("HELAC task must carry its resolved generator_profile")
-    if events <= 0:
-        raise RuntimeError("HELAC produced no LHE events")
-    if (profile.get("unwevt_semantics") == "main-path-stop-target"
-            and events > int(profile["unwevt"])):
-        raise RuntimeError("main-path output exceeds its accepted-event stop target")
+    return output, validate_lhe(output)
+
+
+def execute(task, work_dir):
+    output, events = generate(task, work_dir)
     return result(task, [publish(output, task, events=events)])

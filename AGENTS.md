@@ -56,7 +56,7 @@ first use.
 - Prepare aggregation: `./mcprod analysis aggregate --run <run-dir> --prepare`
 - Offline pilot DAG: `./tests/submit_tests.sh <pilot-spec.json> <new-run-dir>`
 - Default checks: `./tests/run_all_tests.sh`
-- Fused worker regression: `PYTHONPATH=src python3 -m unittest tests.test_core_fused_production`
+- Static production regression: `PYTHONPATH=src python3 -m unittest tests.test_core_static_production`
 - LHE splitter test: `./tests/test_lhe_shuffle_split.sh`
 
 For pilot submission, monitoring, output verification, and optional MiniAOD
@@ -122,8 +122,8 @@ python3 -m compileall -q src/full_mc
 ./tests/run_all_tests.sh
 ```
 
-Inspect a generated v3 DAG for SOURCE/SHARD dependencies, processing category
-limits, and terminal cleanup before accessing a production scheduler.
+Inspect the generated DAG for SOURCE → PLAN → PROC_SUBDAG → RECLAIM,
+processing category limits, and terminal cleanup before accessing a production scheduler.
 
 ## Production Operations
 

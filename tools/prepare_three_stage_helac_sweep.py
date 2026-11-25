@@ -17,7 +17,7 @@ sys.path.insert(0, str(CORE))
 from full_mc.domain.models import Artifact, task_dict
 from full_mc.io import atomic_json, read_json, write_immutable_json
 from full_mc.local_paths import LAYOUT_MARKER, log_path, record_path
-from full_mc.planning.graph import path_text, token, worker_job_lines, write_submit_files
+from full_mc.planning.graph import log_stem, node_stem, path_text, token, worker_job_lines, worker_submit
 from full_mc.profiles import ProfileCatalog, resolve_source
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.workers._common import count_lhe_events
@@ -37,8 +37,6 @@ SCHEDULER = {
     "max_jobs_idle": "DAGMAN_MAX_JOBS_IDLE",
     "max_submits_per_interval": "DAGMAN_MAX_SUBMITS_PER_INTERVAL",
     "submit_delay": "DAGMAN_SUBMIT_DELAY",
-    "max_pre_scripts": "DAGMAN_MAX_PRE_SCRIPTS",
-    "max_post_scripts": "DAGMAN_MAX_POST_SCRIPTS",
 }
 METRICS = ("cpu_seconds", "wall_seconds", "sigma_nb", "sigma_error_nb",
            "max_weight_warnings", "stop_reason")
@@ -70,7 +68,7 @@ def _validate_profile(profile, cell):
 def plan(spec_path, output_dir):
     spec = deepcopy(read_json(spec_path))
     required = {"schema", "run_id", "core_revision", "runtime_release", "runtime_dir",
-                "schedd", "proxy_path", "output_root", "site_proof_path", "resources",
+                "schedd", "proxy_path", "output_root", "resources",
                 "scheduler", "cells"}
     if required - spec.keys():
         raise ValueError("missing spec fields: " + ", ".join(sorted(required - spec.keys())))
@@ -83,17 +81,10 @@ def plan(spec_path, output_dir):
         raise ValueError("core_revision must be a full Git SHA")
     token(spec["runtime_release"])
     token(spec["schedd"])
-    for key in ("runtime_dir", "proxy_path", "site_proof_path"):
+    for key in ("runtime_dir", "proxy_path"):
         if not Path(spec[key]).is_absolute():
             raise ValueError(f"{key} must be absolute")
         spec[key] = path_text(spec[key])
-    proof = read_json(spec["site_proof_path"])
-    expected_checks = {"mutual_exclusion", "read_after_unlock", "crash_recovery",
-                       "pre_defer", "pre_skip", "dynamic_subdag", "autorescue"}
-    if (proof.get("schema") != "cern-afs-lock-proof-v1"
-            or not {"bigbird11.cern.ch", "bigbird22.cern.ch"} <= set(proof.get("schedds", []))
-            or any(proof.get("checks", {}).get(name) is not True for name in expected_checks)):
-        raise ValueError("site proof does not establish every required CERN AFS lock check")
     output_root = spec["output_root"].rstrip("/")
     if not output_root.startswith("root://cceos.ihep.ac.cn:1094///store/"):
         raise ValueError("output_root requires the explicit IHEP triple-slash URL")
@@ -149,7 +140,7 @@ def plan(spec_path, output_dir):
             entries.append(dict(cell=cell, replica=replica, task_id=identity, pool=pool,
                                 source_id=source_id, seed=seed, profile_id=row["profile_id"],
                                 generator_profile=profile, url=url))
-    root = Path(path_text(output_dir))
+    root = Path(path_text(Path(output_dir).resolve()))
     if root.exists() and any(root.iterdir()):
         raise FileExistsError("run directory is not empty; reuse it for recovery")
     root.mkdir(parents=True, exist_ok=True)
@@ -169,7 +160,9 @@ def plan(spec_path, output_dir):
         "assumptions": {"min_m_qqp": 3.0969, "min_m_q_beam": 3.0969,
                         "planning_events_hint_is_capacity": False,
                         "nmc_is_per_iteration": True, "detector_events": 0}})
-    write_submit_files(root, controller, spec["runtime_dir"], spec["proxy_path"])
+    (root / "submit").mkdir()
+    submit = worker_submit(root, controller, spec["runtime_dir"], runtime, spec["proxy_path"], "lhe")
+    (root / "submit/lhe.sub").write_text(submit)
     settings = spec["scheduler"]
     (root / "dagman.config").write_text("".join(
         f"{name} = {settings[key]}\n" for key, name in SCHEDULER.items()))
@@ -177,6 +170,8 @@ def plan(spec_path, output_dir):
              f"MAXJOBS lhe {settings['maxjobs']['lhe']}"]
     for task in tasks:
         write_immutable_json(record_path(root, "tasks", task["task_id"]), task)
+        (root / "results" / node_stem(task["task_id"])).parent.mkdir(parents=True, exist_ok=True)
+        (root / "logs" / log_stem(task["task_id"])).parent.mkdir(parents=True, exist_ok=True)
         lines.extend(worker_job_lines(root, task, spec))
     (root / "run.dag").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"run_dir": str(root), "dag": str(root / "run.dag"),

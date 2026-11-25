@@ -34,25 +34,3 @@ def log_path(root, identity, suffix):
     if bucketed(root):
         parent /= identity_bucket(identity, FILES_PER_BUCKET // LOG_FILES_PER_TASK)
     return parent / (identity + suffix)
-
-
-def dag_path(root, identity):
-    root = Path(root)
-    parent = root / "subdags"
-    if bucketed(root):
-        # DAGMan creates variable numbers of adjacent rescue/log/submit files.
-        # Each child owns its directory; its bucket has at most 1000 children.
-        parent /= identity_bucket(identity) / identity
-    return parent / (identity + ".dag")
-
-
-def task_variables(root, identity):
-    """Macros are relative to the frozen roots in the common submit files."""
-    root = Path(root)
-    if not bucketed(root):
-        return ""
-    for path in (record_path(root, "results", identity), log_path(root, identity, ".out")):
-        path.parent.mkdir(parents=True, exist_ok=True)
-    task = record_path(root, "tasks", identity).relative_to(root / "tasks").with_suffix("")
-    logs = log_path(root, identity, ".out").relative_to(root / "logs").with_suffix("")
-    return f' task_path="{task}" log_path="{logs}"'

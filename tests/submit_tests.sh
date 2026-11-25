@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prepare or submit an explicit campaign-shard pilot with mcprod.
+# Prepare or submit an explicit static production pilot with mcprod.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

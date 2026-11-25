@@ -1,117 +1,98 @@
-"""Deterministic local splitting; remote blocks have one compact task result."""
-from __future__ import annotations
-
-import gzip
-import shutil
+"""Build the one static processing DAG from SOURCE manifests only."""
+import logging
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from full_mc.io import read_json
-from full_mc.storage.transfer import TransferClient, artifact_ref, materialize_input
-from ._common import core_path, parameters, prepare, result, run
-
-
-def build_command(task, work_dir, inputs):
-    p = parameters(task)
-    command = ["python3", str(core_path(task, "tools/plan_lhe_blocks.py")),
-               "--pool-name", str(p["pool_name"]),
-               "--primary-seed", str(p["primary_seed"]),
-               "--group-id", str(p["group_id"]),
-               "--output-dir", str(work_dir),
-               "--manifest-output-path", str(work_dir / "plan.json"),
-               "--events-per-block", str(p["events_per_block"]),
-               "--shuffle-seed", str(p["shuffle_seed"]),
-               "--block-output-dir", str(work_dir / "blocks"),
-               "--lhe-shuffle-split-bin", str(work_dir / "lhe_shuffle_split"),
-               "--log-level", "info" if task.get("log_level") == "debug" else "slim"]
-    for path in inputs:
-        command += ["--lhe-path", str(path)]
-    counts = [int(item["events"]) for item in task["inputs"]]
-    if not counts or min(counts) <= 0:
-        raise ValueError("planner requires exact positive input counts")
-    command += ["--lhe-event-counts", ",".join(map(str, counts))]
-    if int(p.get("max_events_per_plan", 0)) > 0:
-        command += ["--max-events-per-plan", str(p["max_events_per_plan"])]
-    return command
+from full_mc.domain.inventory import SourceBlock
+from full_mc.domain.streams import allocate_campaign, build_streams
+from full_mc.io import atomic_json
+from full_mc.planning.graph import (PLAN_RECORD, PROC_DAG, PROC_DIR,
+                                    log_stem, node_stem, path_text, worker_job_lines)
+from full_mc.planning.tasks import processing_tasks
+from full_mc.storage.transfer import TransferClient
+from ._common import parameters, prepare, result
 
 
+def _block_inventory(spec, urls, client):
+    pools, refs, indices = {}, {}, {}
+    if len(spec["sources"]) != len(urls):
+        raise ValueError("PLAN requires one manifest per source")
+    for index, (source, url) in enumerate(zip(spec["sources"], urls)):
+        manifest = client.read_json(url)
+        pool, source_id = source["pool"], source["source_id"]
+        actual = manifest["actual_input_events"]
+        if (manifest["pool"] != pool or manifest["source_id"] != source_id
+                or manifest["runtime_release"] != spec["runtime_release"]
+                or type(actual) is not int or actual <= 0
+                or (source.get("actual_events") is not None and actual != source["actual_events"])):
+            raise ValueError(f"SOURCE manifest disagrees with the run specification: {url}")
+        selected = min(actual, source.get("planned_events") or actual)
+        if selected != manifest["planned_events"]:
+            raise ValueError(f"SOURCE manifest selected event count disagrees: {url}")
+        stream = pools.setdefault(pool, [])
+        blocks = manifest["blocks"]
+        width = spec["block_events"]
+        if len(blocks) != (selected + width - 1) // width:
+            raise ValueError(f"SOURCE manifest block count disagrees: {url}")
+        for block_index, ref in enumerate(blocks):
+            identity = f"BLOCK:{pool}:{source_id}:{block_index:06d}"
+            block_url = f"{url.rsplit('/', 1)[0]}/blocks/block_{source_id}_{block_index:06d}.lhe.gz"
+            expected = min(width, selected - block_index * width)
+            if (ref["artifact_id"] != identity or ref["url"] != block_url
+                    or ref["events"] != expected or ref["kind"] != "lhe-block"):
+                raise ValueError(f"SOURCE manifest has an invalid block: {identity}")
+            refs[identity] = ref
+            indices[identity] = index
+            stream.append(SourceBlock(identity, pool, source_id, block_index, expected, block_url))
+    return pools, refs, indices
 
-def _original_output(task, inputs, work_dir):
-    """Return the single retained original LHE reference, if requested.
 
-    The splitter accepts multiple source inputs, but an inventory-original is a
-    source-level product. Requiring one source makes its event count and
-    provenance unambiguous.
-    """
-    p = parameters(task)
-    output = p.get("original_output")
-    if output is None:
-        return None
-    if not isinstance(output, dict):
-        raise ValueError("original_output must be an artifact reference")
-    if len(inputs) != 1 or len(task["inputs"]) != 1:
-        raise ValueError("original_output requires exactly one planner input")
-    for key in ("artifact_id", "kind", "url"):
-        if not output.get(key):
-            raise ValueError("original_output.%s is required" % key)
-    source = Path(inputs[0])
-    if source.name.endswith(".lhe.gz"):
-        retained = source
-    elif source.name.endswith(".lhe"):
-        retained = Path(work_dir) / "originals" / (source.name + ".gz")
-        retained.parent.mkdir(parents=True, exist_ok=True)
-        with source.open("rb") as incoming, gzip.open(retained, "wb") as compressed:
-            shutil.copyfileobj(incoming, compressed)
-    else:
-        raise ValueError("original LHE input must end in .lhe or .lhe.gz")
-    cap = int(p.get("original_max_bytes", 0))
-    if cap and retained.stat().st_size > cap:
-        raise RuntimeError("original LHE exceeds its byte ceiling")
-    source_ref = task["inputs"][0]
-    url = str(output["url"])
-    if url != str(source_ref["url"]):
-        TransferClient().copy_out(retained, url)
-    original = artifact_ref(retained, output["artifact_id"], output["kind"],
-                            source_ref["events"], url)
-    for key in ("generator_profile", "detector_profile_id", "detector_profile"):
-        if key in output:
-            original[key] = output[key]
-    # Fresh LHE generation already published this exact URL and its sidecar.
-    # Preserve it for later archive/reclamation without making another sidecar.
-    if url == str(source_ref["url"]) and source_ref.get("sidecar_url"):
-        original["sidecar_url"] = source_ref["sidecar_url"]
-    return original
+def _write_processing_bundle(bundle, p, pools, refs, indices):
+    spec = p["spec"]
+    submit_root = Path(p["submit_root"])
+    streams = build_streams(spec)
+    bundle.mkdir()
+    (bundle / "processing.sub").write_text(p["processing_submit"])
+    # Condor must transfer the result directory even for an empty PROC graph.
+    (bundle / "results").mkdir()
+    (bundle / "results/.keep").touch()
+    lines = [f"CONFIG {path_text(submit_root / 'dagman.config')}"]
+    processing_limit = spec["scheduler"].get("maxjobs", {}).get("processing")
+    if processing_limit is not None:
+        lines.append(f"MAXJOBS processing {processing_limit}")
+    expected, unused = [], {}
+    for campaign in spec["campaigns"]:
+        name = campaign["name"]
+        allocation = allocate_campaign(campaign, pools, streams, spec["block_events"])
+        unused[name] = leftovers = allocation["unused_blocks"]
+        for pool, identities in leftovers.items():
+            if identities:
+                logging.warning("%s: skipping %d unmatched or unallocated %s blocks",
+                                name, len(identities), pool)
+        for job in processing_tasks(spec, campaign, allocation["nodes"], refs, indices):
+            lines.extend(worker_job_lines(submit_root, job, spec))
+            identity = job["task_id"]
+            (bundle / "results" / node_stem(identity)).parent.mkdir(parents=True, exist_ok=True)
+            (bundle / "logs" / log_stem(identity)).parent.mkdir(parents=True, exist_ok=True)
+            expected.append({"task_id": job["task_id"], "campaign": name,
+                             "outputs": job["outputs"]})
+    if not expected:
+        lines.append(f"JOB EMPTY {path_text(submit_root / 'submit/noop.sub')} NOOP")
+    (bundle / PROC_DAG).write_text("\n".join(lines) + "\n")
+    atomic_json(bundle / PLAN_RECORD, {
+        "processing": expected, "unused_blocks": unused,
+        "cleanup": [ref["url"] for ref in refs.values()] + p["source_manifests"],
+    })
+    return len(expected)
 
 
 def execute(task, work_dir):
     work_dir = prepare(task, work_dir, "utilities-el9")
     p = parameters(task)
-    if int(p["events_per_block"]) <= 0:
-        raise ValueError("events_per_block must be positive")
-    inputs = [materialize_input(item, work_dir) for item in task["inputs"]]
-    run(task, "utilities-el9", [
-        "g++", "-std=c++14", "-O2", "-o", work_dir / "lhe_shuffle_split",
-        core_path(task, "lhe_generation/lhe_shuffle_split.cc")], work_dir)
-    run(task, "utilities-el9", build_command(task, work_dir, inputs), work_dir)
-    manifest = read_json(work_dir / "plan.json")
-    blocks = manifest["blocks"]
-    if not blocks or manifest["total_input_events"] != sum(
-            int(item["events"]) for item in task["inputs"]):
-        raise RuntimeError("splitter input count disagrees with authoritative inventory")
-    sizes = sum(Path(item["path"]).stat().st_size for item in blocks)
-    limit = int(p.get("max_output_bytes", 0))
-    if limit and sizes > limit:
-        raise RuntimeError("split blocks exceed the planner output byte ceiling")
-    original = _original_output(task, inputs, work_dir)
-    client = TransferClient()
-    outputs = []
-    for item in blocks:
-        url = str(p["block_output_dir"]).rstrip("/") + "/" + item["filename"]
-        client.copy_out(item["path"], url)
-        identity = f"BLOCK:{p['pool_name']}:{p['group_id']}:{int(item['index']):06d}"
-        outputs.append(artifact_ref(item["path"], identity, "lhe-block",
-                                    item["n_events"], url))
-    extra = {"actual_input_events": manifest["total_input_events"],
-             "planned_events": sum(item["events"] for item in outputs)}
-    if original is not None:
-        extra["originals"] = [original]
-    return result(task, outputs, **extra)
+    pools, refs, indices = _block_inventory(p["spec"], p["source_manifests"], TransferClient())
+    destination = Path(p.get("products_path", work_dir / PROC_DIR))
+    with TemporaryDirectory(prefix=".plan-", dir=destination.parent) as temporary:
+        bundle = Path(temporary) / PROC_DIR
+        job_count = _write_processing_bundle(bundle, p, pools, refs, indices)
+        bundle.rename(destination)
+    return result(task, [], processing_count=job_count)

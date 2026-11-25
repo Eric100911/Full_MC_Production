@@ -4,9 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -33,18 +31,6 @@ def build_parser():
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--profile", action="append")
     p.add_argument("--core", type=Path, default=CORE_ROOT)
-    recovery = commands.add_parser("recovery").add_subparsers(dest="action", required=True)
-    p = _leaf(recovery, "accept-archive-orphan",
-              "Accept one archive task with an orphan receipt and only a local_path difference")
-    p.add_argument("--run-dir", type=Path, required=True)
-    p.add_argument("--task-id", required=True)
-    p.add_argument("--confirm-no-active-writer", action="store_true", required=True,
-                   help="assert the matching archive task has no running or restartable writer")
-    p = _leaf(recovery, "prepare-rescue", "Preview or prepare per-DAG rescue and result acceptance")
-    p.add_argument("--run-dir", type=Path, required=True)
-    p.add_argument("--schedd", required=True)
-    p.add_argument("--root-cluster-id", required=True)
-    p.add_argument("--apply", action="store_true")
     runs = commands.add_parser("run").add_subparsers(dest="action", required=True)
     p = _leaf(runs, "plan", "Freeze a run and prepare its DAG without submitting")
     p.add_argument("--spec", type=Path, required=True)
@@ -86,26 +72,6 @@ def build_parser():
     p = _leaf(analysis, "worker", "Execute a prepared aggregation")
     p.add_argument("--task", type=Path, required=True)
     p.add_argument("--work-dir", type=Path, required=True)
-    internal = commands.add_parser("internal").add_subparsers(dest="action", required=True)
-    for action in ("prepare-source", "prepare-shard",
-                   "prepare-source-product", "accept-result", "complete-source", "complete-shard",
-                   "prepare-cleanup", "finalize-shards"):
-        p = _leaf(internal, action, "Run one local campaign-shard control operation")
-        p.add_argument("--run-dir", type=Path, required=True)
-        if action in ("prepare-source", "complete-source"):
-            p.add_argument("--source-index", type=int, required=True)
-        if action in ("prepare-shard", "complete-shard"):
-            p.add_argument("--campaign", required=True)
-            p.add_argument("--shard-index", type=int, required=True)
-        if action in ("prepare-source-product", "accept-result"):
-            p.add_argument("--task-id", required=True)
-        if action in ("accept-result", "complete-source", "complete-shard"):
-            p.add_argument("--return-code", type=int, required=True)
-            p.add_argument("--pre-return-code", type=int, default=0,
-                           help="DAGMan PRE exit code; -1 means no PRE script")
-        if action == "prepare-cleanup":
-            p.add_argument("--pool", required=True)
-            p.add_argument("--slot", required=True)
     p = _leaf(commands, "worker", "Execute a single staged worker task")
     p.add_argument("--task", type=Path, required=True)
     p.add_argument("--work-dir", type=Path)
@@ -143,50 +109,20 @@ def dispatch(args):
         from .runtime.packages import prepare_runtime
         destination = args.output_dir or args.workspace / "runtimes" / args.release / args.site
         return prepare_runtime(args.core, destination, args.release, args.site, profiles=args.profile)
-    if args.command == "recovery":
-        if args.action == "prepare-rescue":
-            from .application.dagman_recovery import prepare_rescue
-            result = prepare_rescue(args.run_dir, schedd=args.schedd,
-                                    root_cluster_id=args.root_cluster_id, apply=args.apply)
-            if result["state"] in {"blocked", "preparing"}:
-                result["exit_code"] = 1
-            return result
-        from .application.shards import recover_archive_orphan
-        return recover_archive_orphan(args.run_dir, args.task_id,
-                                      confirm_no_active_writer=args.confirm_no_active_writer)
     if args.command == "run":
         if args.action == "plan":
-            from .application import shards
+            from .application.production import plan_run
             spec = load_run_spec(args.spec)
             output = args.output_dir or args.workspace / "work" / spec["run_id"] / "cern"
-            return shards.plan_run(spec, output, log_level=args.log_level)
+            return plan_run(spec, output, log_level=args.log_level)
         from .backends import condor
         return {"submit": condor.submit_run, "status": condor.status_run,
                 "resume": condor.resume_run}[args.action](_run_dir(args))
-    if args.command == "internal":
-        from .application import shards
-        operation = (shards.finalize_run if args.action == "finalize-shards"
-                     else getattr(shards, args.action.replace("-", "_")))
-        if args.action in ("prepare-source", "complete-source"):
-            arguments = [args.run_dir, args.source_index]
-        elif args.action in ("prepare-shard", "complete-shard"):
-            arguments = [args.run_dir, args.campaign, args.shard_index]
-        elif args.action in ("prepare-source-product", "accept-result"):
-            arguments = [args.run_dir, args.task_id]
-        elif args.action == "prepare-cleanup":
-            arguments = [args.run_dir, args.pool, args.slot]
-        else:
-            arguments = [args.run_dir]
-        if hasattr(args, "return_code"):
-            arguments.append(args.return_code)
-        if hasattr(args, "pre_return_code"):
-            return operation(*arguments, pre_return_code=args.pre_return_code)
-        return operation(*arguments)
     if args.command == "handoff":
         from .application.handoff import export_handoff, transfer_handoff
         root = _run_dir(args)
         if args.action == "export":
-            return export_handoff(root, ready_only=True)
+            return export_handoff(root, ready_only=args.ready_only)
         config = args.site_config or args.workspace / "sites" / "ihep.json"
         return transfer_handoff(root / "handoff.json", read_json(config))
     if args.command == "batch":
@@ -245,12 +181,6 @@ def main(argv=None):
         logging.error("%s", exc)
         return 1
     print(json.dumps(result, indent=2, default=str))
-    if args.command == "recovery" and args.action == "prepare-rescue":
-        return int(result.get("exit_code", 0))
     if args.command == "worker":
         return result["exit_code"]
-    if args.command == "internal" and result.get("skip"):
-        return 99
-    if args.command == "internal" and "exit_code" in result:
-        return int(result["exit_code"])
     return 0

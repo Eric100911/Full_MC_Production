@@ -41,9 +41,9 @@ PROFILES.update({
     "cmssw12-el8": PROFILES["cmssw12-sim-el8"],
     "cmssw15-el9": PROFILES["cmssw15-ntuple-el9"],
 })
-STAGE_RUNTIME = dict(lhe="helac-el7", plan="utilities-el9", mix="pythia-el8",
+STAGE_RUNTIME = dict(lhe="helac-el7", source="utilities-el9", plan="utilities-el9", mix="pythia-el8",
     miniaod="cmssw12-sim-el8", processing="utilities-el9", merge="cmssw12-sim-el8", ntuple="cmssw15-ntuple-el9",
-    selection="analyzer-el9", efficiency="analyzer-el9", archive="utilities-el9",
+    selection="analyzer-el9", efficiency="analyzer-el9",
     reclaim="utilities-el9")
 
 

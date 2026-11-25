@@ -66,18 +66,11 @@ class SweepTest(unittest.TestCase):
             core_revision="a" * 40, runtime_release="v06_test", runtime_dir=str(self.runtime),
             schedd="bigbird11.cern.ch", proxy_path=str(self.base / "credentials/proxy"),
             output_root="root://cceos.ihep.ac.cn:1094///store/user/test/experiment_test/archive/stage1-sources",
-            site_proof_path=str(self.base / "proof.json"),
             resources={"lhe": dict(cpus=1, memory_mb=3072, disk_bytes=4_000_000_000, flavour="workday")},
             scheduler=dict(max_jobs_submitted=200, max_jobs_idle=100, max_submits_per_interval=20,
-                           submit_delay=0, max_pre_scripts=20, max_post_scripts=20, maxjobs={"lhe": 2}),
+                           submit_delay=0, maxjobs={"lhe": 2}),
             cells=[dict(cell=c, pool=p, profile_id="sweep_" + c, seeds=s)
                    for c, (p, _, _, s) in sweep.CELLS.items()])
-        atomic_json(self.base / "proof.json", {
-            "schema": "cern-afs-lock-proof-v1",
-            "schedds": ["bigbird11.cern.ch", "bigbird22.cern.ch"],
-            "checks": {name: True for name in (
-                "mutual_exclusion", "read_after_unlock", "crash_recovery",
-                "pre_defer", "pre_skip", "dynamic_subdag", "autorescue")}})
         self.spec_path = self.base / "spec.json"
         # Package content verification belongs to runtime tests; all other
         # descriptor, asset and controller validation executes here.
@@ -134,8 +127,9 @@ class SweepTest(unittest.TestCase):
         for key, name in sweep.SCHEDULER.items():
             self.assertIn(f"{name} = {self.spec['scheduler'][key]}\n", config)
         submit = (self.root / "submit/lhe.sub").read_text()
-        self.assertIn("request_cpus = 1", submit)
-        self.assertIn("$(task_path)", submit)
+        self.assertIn("request_cpus = $(cpus)", submit)
+        self.assertEqual(dag.count('cpus="1"'), 10)
+        self.assertIn("$(stem)", submit)
         manifest = read_json(self.root / "sweep-manifest.json")
         self.assertEqual(len({e["source_id"] for e in manifest["entries"]}), 10)
         for entry in manifest["entries"]:
@@ -161,7 +155,7 @@ class SweepTest(unittest.TestCase):
         mutations = [lambda s: s["cells"].pop(),
                      lambda s: s["cells"][0].update(seeds=[80000, 93001]),
                      lambda s: s["cells"][0].update(pool="pool_gg"),
-                     lambda s: s.pop("site_proof_path"),
+                     lambda s: s.pop("proxy_path"),
                      lambda s: s["resources"]["lhe"].update(cpus=2),
                      lambda s: s.update(output_root=s["output_root"].replace("1094///", "1094//"))]
         for mutate in mutations:

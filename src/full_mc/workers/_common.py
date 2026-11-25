@@ -59,7 +59,8 @@ def prepare(task, work_dir, expected_runtime):
 def run(task, runtime, command, work_dir, extra_env=None):
     env = {"WORKFLOW_LOG_LEVEL":"info" if task.get("log_level")=="debug" else "slim",
            "PROCESSING_LOG_LEVEL":"info" if task.get("log_level")=="debug" else "slim",
-           "FULL_MC_STAGE_RUNTIME":runtime}
+           "FULL_MC_STAGE_RUNTIME":runtime,
+           "TMPDIR": str(Path(work_dir).resolve() / "tmp")}
     env.update(extra_env or {})
     launch(runtime, list(map(str,command)), Path(work_dir), env=env)
 
@@ -96,10 +97,42 @@ def publish(path, task, artifact_id=None, kind=None, events=None, metadata=None)
     ref["local_path"] = str(path.resolve())
     return ref
 
+def publish_atomic(client, path, ref, task, *, events=None, metadata=None):
+    publication_id = parameters(task).get("publication_id", task_id(task))
+    size, checksum = client.copy_atomic(path, ref["url"], publication_id)
+    output = dict(ref, size_bytes=size, adler32=checksum,
+                  runtime_release=task["runtime_release"], **(metadata or {}))
+    if events is not None:
+        output["events"] = events
+    if "sidecar_url" in output:
+        record = dict(output, status="partial" if output.get("partial") else "ok",
+                      complete=True, task_id=task_id(task))
+        sidecar = Path(path).with_name(Path(path).name + ".json")
+        atomic_json(sidecar, record)
+        client.copy_atomic(sidecar, ref["sidecar_url"], publication_id)
+    return output
+
+
 def count_lhe_events(path):
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as handle:
         return sum(line.strip().startswith("<event>") or line.strip().startswith("<event ") for line in handle)
+
+def validate_lhe(path):
+    """Count events and require the final LHE closing tag."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    events, last_line = 0, ""
+    with opener(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                last_line = line
+            if line.startswith(("<event>", "<event ")):
+                events += 1
+    if not events or last_line != "</LesHouchesEvents>":
+        raise RuntimeError(f"LHE requires positive events and a closing tag: {path}")
+    return events
+
 
 def write_json(path, payload):
     atomic_json(path, payload)
