@@ -4,7 +4,7 @@
 chunks of 10,000 events using awkward jagged arrays and NumPy, and writes one JSON
 report containing per-file and cohort summaries. It supports plain and gzip LHE
 files, local paths, and `root://` URLs. A remote file is staged individually with
-`/usr/bin/xrdcp --nopbar --force` under `/tmp/chiw` and removed after parsing.
+`/usr/bin/xrdcp --nopbar --force` in the system temporary directory and removed after parsing.
 The system `xrdcp` runs with `LD_LIBRARY_PATH` and `PYTHONPATH` removed from
 its subprocess environment because the LCG-selected `xrdcp` crashed with
 SIGSEGV (exit 139) on the same input. Other environment variables, including

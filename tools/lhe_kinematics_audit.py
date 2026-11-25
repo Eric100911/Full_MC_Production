@@ -81,7 +81,7 @@ def open_input(path):
     if path.startswith("root://"):
         # Keep endpoint and triple slash path intact. Stage one file at a time.
         suffix = ".lhe.gz" if urlparse(path).path.endswith(".lhe.gz") else ".lhe"
-        with tempfile.NamedTemporaryFile(prefix="lhe-audit-", suffix=suffix, dir="/tmp/chiw", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(prefix="lhe-audit-", suffix=suffix, delete=False) as tmp:
             staged = tmp.name
         import subprocess
         xrdcp_env = os.environ.copy()

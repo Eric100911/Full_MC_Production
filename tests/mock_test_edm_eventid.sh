@@ -23,7 +23,7 @@ pass() { echo -e "${GREEN}[PASS]${NC} $1"; }
 info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
 fail() { echo -e "${RED}[FAIL]${NC} $1"; exit 1; }
 
-WORKDIR="${EDM_EVENTID_WORKDIR:-$(mktemp -d "/tmp/chiw/mock_test_edm_eventid_XXXXX")}"
+WORKDIR="${EDM_EVENTID_WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/mock_test_edm_eventid_XXXXX")}"
 KEEP_WORKDIR="${KEEP_WORKDIR:-0}"
 
 cleanup() {

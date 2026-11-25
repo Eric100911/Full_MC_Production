@@ -82,7 +82,7 @@ def main() -> int:
     run_with_retries(flaky_action, attempts=3, delays=(0, 0))
     assert attempts == [1, 2, 3]
 
-    with tempfile.TemporaryDirectory(prefix="workflow_archive_", dir="/tmp/chiw") as tmp:
+    with tempfile.TemporaryDirectory(prefix="workflow_archive_") as tmp:
         root = Path(tmp)
         log_root = root / "logs"
         populate_logs(log_root)

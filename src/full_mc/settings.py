@@ -8,6 +8,7 @@ import os
 import re
 from pathlib import Path
 
+from .credentials import requires_proxy
 from .profiles import load_catalogues, resolve_detector_variants, resolve_source
 from .storage.layout import (
     canonical_storage_location,
@@ -108,6 +109,7 @@ def _validate_scheduler_and_resources(spec):
     for stage, resource in resources.items():
         if stage not in stages or not isinstance(resource, dict):
             raise ValueError("resources must use known worker-stage objects")
+        requires_proxy(resource)
         for key in ("memory_mb", "disk_bytes"):
             if key in resource:
                 resource[key] = _integer(resource[key], f"resources.{stage}.{key}", minimum=1)

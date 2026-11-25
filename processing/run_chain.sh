@@ -2533,7 +2533,7 @@ then
 fi
 
 # Validate VOMS proxy early (needed for EOS/XRootD listing)
-if [[ "${FULL_MC_STAGE_RUNTIME:-}" != "pythia-el8" ]]; then
+if [[ "${FULL_MC_STAGE_RUNTIME:-}" != "pythia-el8" && "${FULL_MC_REQUIRES_PROXY:-true}" != "false" ]]; then
     ensure_voms_proxy
 fi
 

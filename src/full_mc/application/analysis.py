@@ -139,11 +139,12 @@ def run_aggregate_task(prepared_path, work_dir, log_level=None):
         run(task, "analyzer-el9", [
             "python3", analyzer / "merge_efficiency_shards.py", "--sample", campaign,
             "--shards-dir", attempt / "shards", "--output-dir", maps], attempt)
+        expected_maps = maps / campaign / "efficiency_maps.parquet"
+        if not expected_maps.is_file():
+            raise RuntimeError(f"efficiency aggregation did not produce {expected_maps}")
         run(task, "analyzer-el9", [
             "python3", analyzer / "build_derived_efficiency.py",
             "--input-dir", maps, "--skip-plots"], attempt)
-        if not (maps / sample / "efficiency_maps.parquet").is_file():
-            raise RuntimeError("efficiency aggregation did not produce its maps")
         archive_path = attempt / "efficiency.tar"
         with tarfile.open(archive_path, "w") as archive:
             for path in sorted(maps.rglob("*")):

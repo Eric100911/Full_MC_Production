@@ -23,7 +23,7 @@
 # This test extracts the pure helper functions
 #   normalize_remote_path, join_remote_spec, resolve_remote_target,
 #   remote_url_for_spec
-# between their function boundaries into a scratch file under /tmp/chiw/, sets
+# between their function boundaries into a scratch file under the temporary directory, sets
 # the storage environment variables the script would set, sources the scratch
 # copy, and exercises the helpers.  No HELAC build, no DAG, no network.
 #
@@ -31,8 +31,8 @@
 # --------------------
 # Set HELAC_SH_SRC to a copy of the script to test that copy instead of the
 # repository one, e.g. the pre-fix revision:
-#   git show HEAD:lhe_generation/run_helac.sh > /tmp/chiw/run_helac_prefix.sh
-#   HELAC_SH_SRC=/tmp/chiw/run_helac_prefix.sh bash tests/test_helac_remote_url.sh
+#   git show HEAD:lhe_generation/run_helac.sh > ${TMPDIR:-/tmp}/run_helac_prefix.sh
+#   HELAC_SH_SRC=${TMPDIR:-/tmp}/run_helac_prefix.sh bash tests/test_helac_remote_url.sh
 # The test must FAIL on the pre-fix revision and PASS on the fixed one.
 # ==============================================================================
 set -euo pipefail
@@ -41,7 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HELAC_SH="${HELAC_SH_SRC:-${BASE_DIR}/lhe_generation/run_helac.sh}"
 
-TMP_ROOT="/tmp/chiw"
+TMP_ROOT="${TMPDIR:-/tmp}"
 mkdir -p "${TMP_ROOT}"
 TMP_DIR="$(mktemp -d "${TMP_ROOT}/helac_remote_url_XXXXX")"
 EXTRACTED="${TMP_DIR}/run_helac_remote_url_helpers.sh"

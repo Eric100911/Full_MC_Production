@@ -52,7 +52,7 @@ class WorkerContracts(unittest.TestCase):
                 "cuts": {"min_pt_conia": 6.0, "min_pt_bonia": 4.0,
                          "min_pt_q": 0.0, "min_m_qqp": 3.0969,
                          "min_m_q_beam": 3.0969}}}}
-        command = lhe_command(task, Path("/tmp/chiw/task"))
+        command = lhe_command(task, Path("/tmp/mcprod-test/task"))
         self.assertIn("--pool", command)
         self.assertIn("--process", command)
         self.assertNotIn("--workdir", command)
@@ -65,14 +65,14 @@ class WorkerContracts(unittest.TestCase):
 
     def test_stage_runtime_mismatch_is_rejected_before_execution(self):
         with self.assertRaisesRegex(ValueError, "requires runtime"):
-            execute_task({"stage": "lhe", "runtime": "utilities-el9"}, "/tmp/chiw/no-run")
+            execute_task({"stage": "lhe", "runtime": "utilities-el9"}, "/tmp/mcprod-test/no-run")
 
     def test_native_miniaod_command_stops_before_stageout(self):
         task = {"stage": "miniaod", "task_id": "J_JOB000001_BLOCK000002",
                 "parameters": {"analysis": "JJP", "campaign": "JJP_DPS1",
                 "edm_event_id": {"first_luminosity_block": 42}}}
-        command = chain_command(task, Path("/tmp/chiw/w"), Path("/native/run_chain.sh"),
-                                Path("/tmp/chiw/w/chain.json"))
+        command = chain_command(task, Path("/tmp/mcprod-test/w"), Path("/native/run_chain.sh"),
+                                Path("/tmp/mcprod-test/w/chain.json"))
         self.assertEqual(command[command.index("--skip-to") + 1], "gensim")
         self.assertEqual(command[command.index("--stop-at") + 1], "miniaod")
         self.assertEqual(command[command.index("--cleanup") + 1], "false")
@@ -117,8 +117,8 @@ class WorkerContracts(unittest.TestCase):
     def test_raw_ntuple_is_the_only_analyzer_input(self):
         task = {"stage": "efficiency", "parameters": {
             "campaign": "JJP_DPS1", "analysis": "JJP", "merge_group": "g1"}}
-        command = analysis_command(task, Path("/tmp/chiw/raw.root"), Path("/tmp/chiw/w"))
-        self.assertEqual(command[command.index("--input-files") + 1], "/tmp/chiw/raw.root")
+        command = analysis_command(task, Path("/tmp/mcprod-test/raw.root"), Path("/tmp/mcprod-test/w"))
+        self.assertEqual(command[command.index("--input-files") + 1], "/tmp/mcprod-test/raw.root")
         self.assertNotIn("hadd", command)
         self.assertIn("--skip-plots", command)
 
@@ -135,9 +135,10 @@ class WorkerContracts(unittest.TestCase):
             self.assertIn("--cleanenv", argv)
 
     def test_run_profile_defaults_x509_cert_dir_to_cvmfs_ca(self):
-        with patch.dict("os.environ", {"X509_USER_PROXY": "/afs/proxy"}, clear=True), \
+        with tempfile.TemporaryDirectory() as scratch, \
+                patch.dict("os.environ", {"X509_USER_PROXY": "/afs/proxy"}, clear=True), \
                 patch("full_mc.runtime.profiles.subprocess.run") as run:
-            run_profile("utilities-el9", ["xrdcp", "x", "y"], cwd=Path("/tmp/chiw/w"))
+            run_profile("utilities-el9", ["xrdcp", "x", "y"], cwd=Path(scratch))
         argv = run.call_args.args[0]
         self.assertIn("X509_CERT_DIR=" + GRID_CA_DIR, argv)
 

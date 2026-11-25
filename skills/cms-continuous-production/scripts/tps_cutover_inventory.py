@@ -36,7 +36,7 @@ CACHE.mkdir(parents=True, exist_ok=True)
 
 MAX_WORKERS = int(os.environ.get("INV_WORKERS", "8"))
 TIMEOUT = int(os.environ.get("INV_TIMEOUT", "60"))
-TMPDIR = Path(os.environ.get("INV_TMP", "/tmp/chiw"))
+TMPDIR = Path(os.environ.get("INV_TMP") or tempfile.gettempdir())
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 # Derived from the coordinator manifest in main(); read by worker functions.

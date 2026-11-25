@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -15,9 +16,10 @@ from full_mc.application.merge_groups import merge_groups, sample_key
 from full_mc.application.production import plan_run
 from full_mc.backends.hepjob import prepare_batch
 from full_mc.io import atomic_json, read_json
-from full_mc.planning.graph import PLAN_RECORD, PROC_DAG, node_stem
+from full_mc.planning.graph import PLAN_RECORD, PROC_DAG, RESULTS_BUNDLE, node_stem
 from full_mc.runtime.bootstrap import decode_task_payload
 from full_mc.runtime.packages import CMSSW15_RUNTIME
+from full_mc.runtime.reclaim_bundle import pack
 from full_mc.storage.transfer import TransferClient, artifact_ready, file_checksum
 from full_mc.workers import chain, execute_task, processing, reclaim, source
 from tests.generate_synthetic_lhe import generate
@@ -26,7 +28,7 @@ from tests.mcprod_fixtures import run_spec_fixture
 
 class StaticProduction(unittest.TestCase):
     def setUp(self):
-        scratch = tempfile.TemporaryDirectory(dir="/tmp/chiw")
+        scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
         self.spec_path, self.run = run_spec_fixture(self.root)
@@ -34,8 +36,10 @@ class StaticProduction(unittest.TestCase):
     def prepare(self, spec):
         atomic_json(self.spec_path, spec)
         with patch("full_mc.application.production.resolve_proxy_path",
-                   return_value=str(self.root / "proxy")):
+                   return_value=str(self.root / "proxy")), \
+                patch("full_mc.application.production.ensure_valid_proxy") as check:
             plan_run(self.spec_path, self.run)
+            check.assert_called_once_with(self.root / "proxy")
 
     def task(self, identity):
         return read_json(self.run / "tasks" / f"{node_stem(identity)}.json")
@@ -136,7 +140,16 @@ class StaticProduction(unittest.TestCase):
             self.assertIn(f"PARENT SOURCE_{i:06d} CHILD PLAN", root)
         self.assertIn("PARENT PLAN CHILD PROC_SUBDAG", root)
         self.assertIn("PARENT PROC_SUBDAG CHILD RECLAIM", root)
-        self.assertNotIn("SCRIPT", root)
+        scripts = [line for line in root.splitlines() if line.startswith("SCRIPT ")]
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("SCRIPT PRE RECLAIM", scripts[0])
+        self.assertIn(" -m full_mc.runtime.reclaim_bundle ", scripts[0])
+        reclaim_submit = (self.run / "submit/reclaim.sub").read_text()
+        inputs = next(line for line in reclaim_submit.splitlines() if line.startswith("transfer_input_files"))
+        inputs = inputs.split(" = ", 1)[1].split(",")
+        self.assertIn(str(self.run / "proc" / PLAN_RECORD), inputs)
+        self.assertIn(str(self.run / "proc" / RESULTS_BUNDLE), inputs)
+        self.assertNotIn(str(self.run / "proc/results"), inputs)
         self.assertFalse((self.run / "proc").exists())
         submit = (self.run / "submit/plan.sub").read_text()
         self.assertIn("universe = vanilla", submit)
@@ -208,6 +221,9 @@ class StaticProduction(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 execute_task(task, self.root / "reclaim-early")
             remove.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "missing or empty PROC result"):
+            pack(result_dir.parent)
+        self.assertFalse((result_dir.parent / RESULTS_BUNDLE).exists())
         mini_paths = []
         for job in plan["processing"]:
             count = 2 if job["task_id"].endswith("000002") else 5
@@ -227,6 +243,26 @@ class StaticProduction(unittest.TestCase):
             atomic_json(result_dir / f"{node_stem(job['task_id'])}.json",
                         dict(task_id=job["task_id"], stage="processing", status="ok",
                              runtime_release=task["runtime_release"], outputs=outputs))
+        pack(result_dir.parent)
+        bundle = result_dir.parent / RESULTS_BUNDLE
+        sandbox = self.root / "worker-transfer"
+        sandbox.mkdir()
+        shutil.copy2(result_dir.parent / PLAN_RECORD, sandbox)
+        task["parameters"].update(plan_path=str(sandbox / PLAN_RECORD),
+                                  results_dir=str(sandbox / "results"))
+        missing = f"results/{node_stem(plan['processing'][0]['task_id'])}.json"
+        with tarfile.open(bundle, "r:gz") as archive, \
+                tarfile.open(sandbox / RESULTS_BUNDLE, "w:gz") as incomplete:
+            for member in archive.getmembers():
+                if member.name != missing:
+                    incoming = archive.extractfile(member) if member.isfile() else None
+                    incomplete.addfile(member, incoming)
+        with patch.object(reclaim, "remove_many") as remove:
+            with self.assertRaisesRegex(FileNotFoundError, "missing PROC result from"):
+                execute_task(task, self.root / "reclaim-incomplete-bundle")
+            remove.assert_not_called()
+        shutil.copy2(bundle, sandbox / RESULTS_BUNDLE)
+        self.assertFalse((sandbox / "results").exists())
         mini_paths[0].write_bytes(b"corrupt")
         with patch.object(reclaim, "remove_many") as remove:
             with self.assertRaisesRegex(RuntimeError, "cannot verify EOS MiniAODs"):
@@ -235,6 +271,9 @@ class StaticProduction(unittest.TestCase):
         mini_paths[0].write_bytes(b"product")
         with patch.object(reclaim, "remove_many", side_effect=lambda urls, **_: dict.fromkeys(urls, "removed")) as remove:
             outcome = execute_task(task, self.root / "reclaim-worker")
+        unpacked = self.root / "reclaim-worker/results"
+        self.assertTrue(all((unpacked / f"{node_stem(job['task_id'])}.json").is_file()
+                            for job in plan["processing"]))
         self.assertEqual(outcome["reclaimed_count"], 9)
         self.assertEqual(remove.call_args.args[0], plan["cleanup"])
         atomic_json(self.run / "results/RECLAIM.json", outcome)
@@ -259,7 +298,8 @@ class StaticProduction(unittest.TestCase):
         receiver = {"git_revision": handoff["core_revision"], "source_dirty": False,
                     "profiles": ["cmssw12-sim-el8", "cmssw15-ntuple-el9", "analyzer-el9"],
                     "bundles": {"cmssw15-ntuple-el9": CMSSW15_RUNTIME}}
-        with patch("full_mc.backends.hepjob.validate_runtime_release", return_value=receiver):
+        with patch("full_mc.backends.hepjob.validate_runtime_release", return_value=receiver), \
+                patch("full_mc.backends.hepjob.ensure_valid_proxy"):
             batch = prepare_batch(ihep / "handoff.json", self.root / "batch",
                                   proxy=str(self.root / "proxy"), runtime_dir=self.root / "ihep-runtime")
         self.assertEqual(len(batch["jobs"]), 4)
@@ -343,7 +383,7 @@ run_cmssw12_command() {
 
 class AtomicUpload(unittest.TestCase):
     def test_verified_replace_and_failures_clean_up_exact_temporary(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "output"
             path.write_bytes(b"payload")
             target = "root://cceos.ihep.ac.cn:1094///store/test/file.root"

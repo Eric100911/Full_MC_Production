@@ -5,12 +5,14 @@ from pathlib import Path
 import re
 import zlib
 
+from full_mc.credentials import requires_proxy
 from full_mc.local_paths import FILES_PER_BUCKET, LOG_FILES_PER_TASK, identity_bucket
 from full_mc.runtime.profiles import STAGE_RUNTIME
 
 PROC_DIR = "proc"
 PROC_DAG = "processing.dag"
 PLAN_RECORD = "plan.json"
+RESULTS_BUNDLE = "results_bundle.tar.gz"
 CATEGORIES = {"source": "lhe", "plan": "lhe_planning",
               "processing": "processing", "reclaim": "lhe_coordination"}
 
@@ -46,6 +48,11 @@ def _task_payload(task):
     return base64.urlsafe_b64encode(zlib.compress(encoded, level=1)).decode("ascii")
 
 
+def stage_requires_proxy(spec, stage):
+    resource = "lhe" if stage == "source" else stage
+    return requires_proxy(spec.get("resources", {}).get(resource, {}))
+
+
 def worker_submit(root, core, runtime, descriptor, proxy, stage, extra_profiles=()):
     root, core, runtime = map(Path, (root, core, runtime))
     profiles = {STAGE_RUNTIME[stage], *extra_profiles}
@@ -63,7 +70,7 @@ def worker_submit(root, core, runtime, descriptor, proxy, stage, extra_profiles=
         outputs.append(PROC_DIR)
         extra_args += f" --products {PROC_DIR}"
     if stage == "reclaim":
-        inputs.extend((root / PROC_DIR / PLAN_RECORD, root / PROC_DIR / "results"))
+        inputs.extend((root / PROC_DIR / PLAN_RECORD, root / PROC_DIR / RESULTS_BUNDLE))
         for filename in ("handoff.json", "merge_groups.json"):
             outputs.append(filename)
             remaps.append(f"{filename}={path_text(root)}/{filename}")
@@ -82,7 +89,8 @@ def worker_submit(root, core, runtime, descriptor, proxy, stage, extra_profiles=
         "transfer_executable = False", f"transfer_input_files = {transfer_inputs}",
         "transfer_output_files = " + ",".join(outputs),
         'transfer_output_remaps = "' + ";".join(remaps) + '"',
-        "use_x509userproxy = True", "x509userproxy = " + path_text(proxy),
+        "use_x509userproxy = False" if proxy is None else "use_x509userproxy = True",
+        *([] if proxy is None else ["x509userproxy = " + path_text(proxy)]),
         "getenv = False", "request_cpus = $(cpus)", "request_memory = $(memory)",
         "request_disk = $(disk)", '+JobFlavour = "$(flavour)"',
         f"output = {path_text(base / 'logs')}/$(log_stem).out",
@@ -136,4 +144,8 @@ def root_dag(root, spec, sources, plan, reclaim):
     # stated independently, and PLAN still waits for all SOURCE jobs.
     lines.extend(f"PARENT {task['task_id']} CHILD PLAN" for task in sources)
     lines.extend(("PARENT PLAN CHILD PROC_SUBDAG", "PARENT PROC_SUBDAG CHILD RECLAIM"))
+    python_path = path_text(Path(spec["core_root"]) / "src")
+    proc_dir = path_text(root / PROC_DIR)
+    lines.append(f"SCRIPT PRE RECLAIM /usr/bin/env PYTHONPATH={python_path} "
+                 f"/usr/bin/python3 -m full_mc.runtime.reclaim_bundle {proc_dir}")
     return "\n".join(lines) + "\n"

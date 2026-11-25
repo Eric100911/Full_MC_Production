@@ -46,7 +46,7 @@ def audit_job(job):
     remote_manifest = (f"{IH_REPO}/handoffs_{batch}/"
                        f"coord_manifest_{job['campaign']}_{job['job_index']}.json")
     env = (f"INV_COORD={remote_manifest} INV_WORK={WORK} INV_WORKERS=8 "
-           f"INV_TIMEOUT=60 INV_TMP=/tmp/chiw "
+           f"INV_TIMEOUT=60 "
            f"X509_USER_PROXY={PROXY}")
     inner = f"cd {IH_REPO} && {env} python3 {INVENTORY}"
     r = subprocess.run(SSH + [inner], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

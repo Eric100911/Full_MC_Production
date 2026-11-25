@@ -24,7 +24,7 @@ class Snapshot(unittest.TestCase):
         (root / "processing.dag").write_text("JOB PROC_C_JOB000000_BLOCK000000 processing.sub\n")
 
     def test_counts_use_dag_and_live_workers(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
             before = sorted(root.iterdir())
@@ -39,7 +39,7 @@ class Snapshot(unittest.TestCase):
             self.assertEqual(sorted(root.iterdir()), before)
 
     def test_queue_failure_preserves_local_records_and_reports_error(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
             reader = Mock(side_effect=OSError("schedd unavailable"))

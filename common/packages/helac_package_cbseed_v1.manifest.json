@@ -4,7 +4,7 @@
   "input_package_sha256": "addacf1aeff27bc928ef3c272d9082bce4d9938bd444df5d56a0117e2ece9241",
   "nested_tarball_sha256": "00beff995474bd980ca077b31242aeeaeadf113c2f0e4dfa4bff44ec45f9290a",
   "outer_package_sha256": "407a62f3bdc29774f9537a8326a69e6665dd1c17a02d5c952e242a7d3cd55760",
-  "output_package": "/tmp/chiw/helac_cbseed_v1/helac_package.tar.gz",
+  "output_package": "common/packages/helac_package_cbseed_v1.tar.gz",
   "patch_anchor": "INTEGER::beam1_pdf,beam2_pdf",
   "patch_include": "INCLUDE \"../../../src/RANDA_init.inc\"",
   "patch_inserted": true,

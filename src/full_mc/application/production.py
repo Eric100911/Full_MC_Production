@@ -4,11 +4,11 @@ import logging
 from pathlib import Path
 
 from full_mc.application.result_validation import validate_source_inventory
-from full_mc.credentials import resolve_proxy_path
+from full_mc.credentials import ensure_valid_proxy, resolve_proxy_path
 from full_mc.domain.identity import shuffle_seed
 from full_mc.io import atomic_json
 from full_mc.planning.graph import (CATEGORIES, log_stem, node_stem, path_text, root_dag,
-                                    token, worker_submit, write_dagman_config)
+                                    stage_requires_proxy, token, worker_submit, write_dagman_config)
 from full_mc.planning.tasks import artifact_reference, staging_root, task_manifest
 from full_mc.runtime.packages import validate_runtime_release
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
@@ -88,12 +88,18 @@ def plan_run(spec_path, output_dir, log_level=None):
     root = Path(output_dir).resolve()
     if root.exists() and any(root.iterdir()):
         raise FileExistsError("run directory is not empty")
-    proxy = Path(resolve_proxy_path()).resolve()
+    proxy = None
+    if any(stage_requires_proxy(spec, stage) for stage in CATEGORIES):
+        proxy = Path(resolve_proxy_path()).resolve()
+        ensure_valid_proxy(proxy)
     path_text(root)
     submits = {}
     for stage in CATEGORIES:
         profiles = processing_profiles if stage == "processing" else source_profiles if stage == "source" else ()
-        submits[stage] = worker_submit(root, core, runtime_dir, runtime, proxy, stage, profiles)
+        stage_proxy = proxy if stage_requires_proxy(spec, stage) else None
+        if stage_proxy is None:
+            logging.info("Skipping X.509 proxy check for local stage %s", stage)
+        submits[stage] = worker_submit(root, core, runtime_dir, runtime, stage_proxy, stage, profiles)
     sources = [_source_task(spec, index, source) for index, source in enumerate(spec["sources"])]
     plan = task_manifest(spec, "PLAN", "plan", [], [], {
         "spec": spec, "submit_root": str(root), "processing_submit": submits.pop("processing"),

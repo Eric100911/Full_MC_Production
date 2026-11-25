@@ -156,9 +156,7 @@ def dispatch(args):
         logging.getLogger().setLevel(task.get("log_level", "info").upper())
         root = args.work_dir
         if root is None:
-            scratch = Path("/tmp/chiw")
-            scratch.mkdir(parents=True, exist_ok=True)
-            root = Path(tempfile.mkdtemp(prefix="mcprod-worker-", dir=scratch))
+            root = Path(tempfile.mkdtemp(prefix="mcprod-worker-"))
         root.mkdir(parents=True, exist_ok=True)
         result = execute_task(task, root)
         output = args.result or task.get("parameters", {}).get("result_path") or root / "result.json"

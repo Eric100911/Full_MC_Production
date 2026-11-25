@@ -180,11 +180,9 @@ def _package_tpsonia2mumu_source(core, destination):
 def _build_cmssw15_runtime(core, destination):
     from .bootstrap import _extract
 
-    scratch = Path("/tmp/chiw")
-    scratch.mkdir(exist_ok=True)
     helpers = core / "processing/cmssw_helpers"
     profile = "cmssw15-ntuple-el9"
-    with tempfile.TemporaryDirectory(dir=scratch, prefix="mcprod-cmssw15-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mcprod-cmssw15-") as temporary:
         build = Path(temporary)
         project = build / CMSSW15_PROJECT
         source = build / CMSSW15_SOURCE_PACKAGE

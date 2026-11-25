@@ -69,7 +69,7 @@ def run_native_command(root, retain, exit_code):
 
 class HelacDiagnostics(unittest.TestCase):
     def setUp(self):
-        scratch = Path("/tmp/chiw")
+        scratch = Path(tempfile.gettempdir())
         scratch.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="helac-diag-", dir=scratch)
         self.addCleanup(self.temporary.cleanup)

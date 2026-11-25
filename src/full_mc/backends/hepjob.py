@@ -6,6 +6,7 @@ ID and exact task membership.  Submission is serial; it does not imply that sche
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -14,11 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List
 
-from full_mc.credentials import require_initial_proxy_lifetime
+from full_mc.credentials import ensure_valid_proxy, requires_proxy
 from full_mc.io import atomic_json as _atomic_json
 from full_mc.runtime.packages import CMSSW15_RUNTIME, validate_runtime_release
 from full_mc.settings import CORE_ROOT, LOG_LEVELS
 
+
+LOGGER = logging.getLogger(__name__)
 
 SCHEMA = "full-mc-ihep-batch-v2"
 _SCHEMAS = {"full-mc-ihep-batch-v1", SCHEMA}
@@ -82,10 +85,16 @@ def _combined_tasks(handoff: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         }
 
 
-def _write_worker(path, task_path, core_root, proxy, job_logs):
+def _write_worker(path, task_path, core_root, proxy, job_logs, *, needs_proxy):
     source = shlex.quote(str(proxy)) if proxy else '"${X509_USER_PROXY:?missing proxy}"'
     command = shlex.join(["python3", str(Path(core_root) / "mcprod"), "batch", "worker",
                           "--task", str(task_path)])
+    credentials = (
+        "proxy_source=" + source + "\n"
+        "mkdir credentials\n"
+        'install -m 600 "$proxy_source" credentials/x509_user_proxy\n'
+        'export X509_USER_PROXY="$PWD/credentials/x509_user_proxy"\n'
+    ) if needs_proxy else "unset X509_USER_PROXY\n"
     text = (
         "#!/bin/bash\nset -euo pipefail\n"
         "job_logs=" + shlex.quote(str(job_logs)) + "\n"
@@ -125,18 +134,18 @@ finish() {
     if ! archive_logs "$rc"; then
         printf 'HepJob diagnostics could not be archived in %s (worker exit %s)\n' "$log_dir" "$rc" >&2
     fi
+    cd /
+    rm -rf -- "$job_scratch" || true
     exit "$rc"
 }
 
 """
-        "mkdir -p /tmp/chiw\n"
-        "job_scratch=$(mktemp -d /tmp/chiw/mcprod-ihep.XXXXXX)\n"
+        'scratch_base="${TMPDIR:-/tmp}/${USER:-$(id -un)}"\n'
+        'mkdir -p "$scratch_base"\n'
+        'job_scratch=$(mktemp -d "$scratch_base/mcprod-ihep.XXXXXX")\n'
         "trap 'finish \"$?\"' EXIT\n"
-        "proxy_source=" + source + "\n"
         'cd "$job_scratch"\n'
-        "mkdir credentials\n"
-        'install -m 600 "$proxy_source" credentials/x509_user_proxy\n'
-        'export X509_USER_PROXY="$PWD/credentials/x509_user_proxy"\n'
+        + credentials
         + command + ' --work-dir "$job_scratch/worker"\n'
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +189,23 @@ def _runtime_for_handoff(handoff, runtime_dir):
     return Path(runtime_dir).resolve() / "controller/core"
 
 
+def _job_requires_proxy(combined):
+    required = []
+    for stage, task in combined["subtasks"].items():
+        if requires_proxy(task):
+            required.append(stage)
+        else:
+            LOGGER.info("Skipping X.509 proxy check for local stage %s", stage)
+    return bool(required)
+
+
+def _proxy_source(proxy):
+    source = str(proxy or os.environ.get("X509_USER_PROXY", ""))
+    if not source or not Path(source).is_absolute():
+        raise RuntimeError("X.509 proxy source must be an absolute path")
+    return source
+
+
 def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str = None, core_root: str | Path = CORE_ROOT,
                   runtime_dir: str | Path | None = None, group: str = "cms", walltime: str = "mid", memory_mb: int = 0,
                   log_level: str = None) -> Dict[str, Any]:
@@ -192,15 +218,18 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
     root = Path(workspace).resolve()
     if (root / "batch_manifest.json").exists():
         raise FileExistsError("batch already exists; use its existing manifest")
-    root.mkdir(parents=True, exist_ok=True)
     safe_nodes = tuple(handoff.get("ihep_safe_nodes", SAFE_NTUPLE_NODES))
     if not safe_nodes or any(not isinstance(node, str) or not node for node in safe_nodes):
         raise ValueError("ihep_safe_nodes must be a nonempty list of hostnames")
     request_cpus = int(handoff.get("ihep_request_cpus", 1))
     if request_cpus <= 0:
         raise ValueError("ihep_request_cpus must be positive")
+    combined_tasks = [(task, _job_requires_proxy(task)) for task in _combined_tasks(handoff)]
+    if any(needs_proxy for _, needs_proxy in combined_tasks):
+        ensure_valid_proxy(_proxy_source(proxy))
+    root.mkdir(parents=True, exist_ok=True)
     jobs: List[Dict[str, Any]] = []
-    for index, combined in enumerate(_combined_tasks(handoff)):
+    for index, (combined, needs_proxy) in enumerate(combined_tasks):
         task_path = root / "tasks" / ("%04d.json" % index)
         combined["checkpoint_dir"] = str(root / "checkpoints" / ("%04d" % index))
         if pinned_core:
@@ -214,9 +243,10 @@ def prepare_batch(handoff_path: str | Path, workspace: str | Path, *, proxy: str
             subtask.setdefault("parameters", {})["core_root"] = str(effective_core)
         _atomic_json(task_path, combined)
         wrapper = root / "wrappers" / ("%04d.sh" % index)
-        _write_worker(wrapper, task_path, effective_core, proxy, root / "logs" / ("%04d" % index))
+        _write_worker(wrapper, task_path, effective_core, proxy,
+                      root / "logs" / ("%04d" % index), needs_proxy=needs_proxy)
         jobs.append({"job_id": None, "index": index, "state": "prepared", "task_path": str(task_path),
-                     "wrapper": str(wrapper), "task_ids": combined.get("task_membership", [combined["task_id"]]),
+                     "wrapper": str(wrapper), "requires_proxy": needs_proxy, "task_ids": combined.get("task_membership", [combined["task_id"]]),
                      "node": safe_nodes[index % len(safe_nodes)] + ".ihep.ac.cn"})
     run_id = str(handoff.get("run_id") or Path(handoff_path).resolve().parent.name)
     manifest = {"schema": SCHEMA, "created_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
@@ -269,6 +299,9 @@ def _worker_proxy_paths(manifest: Dict[str, Any]) -> List[str]:
     for job in manifest["jobs"]:
         if job.get("state") != "prepared":
             continue
+        if not requires_proxy(job):
+            LOGGER.info("Skipping X.509 proxy check for local job %s", job["index"])
+            continue
         wrapper = Path(job["wrapper"])
         assignments = [line.removeprefix("proxy_source=")
                        for line in wrapper.read_text(encoding="utf-8").splitlines()
@@ -276,7 +309,7 @@ def _worker_proxy_paths(manifest: Dict[str, Any]) -> List[str]:
         if len(assignments) != 1:
             raise RuntimeError(f"cannot identify X.509 proxy source in {wrapper}")
         if assignments[0] == '"${X509_USER_PROXY:?missing proxy}"':
-            source = os.environ.get("X509_USER_PROXY", "")
+            source = _proxy_source(None)
         else:
             try:
                 values = shlex.split(assignments[0])
@@ -295,13 +328,13 @@ def submit_batch(manifest_path: str | Path, runner: Callable[..., Any] = subproc
     manifest = _read(path)
     if manifest.get("schema") not in _SCHEMAS:
         raise ValueError("unsupported batch manifest")
-    for proxy_path in _worker_proxy_paths(manifest):
-        require_initial_proxy_lifetime(proxy_path)
     return _submit_prepared_batch(path, manifest, runner)
 
 
 def _submit_prepared_batch(path: Path, manifest: Dict[str, Any], runner) -> Dict[str, Any]:
-    """Submit prepared jobs without rechecking credentials during recovery."""
+    """Check credentials before submitting any prepared or recovered job."""
+    for proxy_path in _worker_proxy_paths(manifest):
+        ensure_valid_proxy(proxy_path)
     for job in manifest["jobs"]:
         if job.get("state") != "prepared":
             continue
@@ -441,5 +474,4 @@ def resume_batch(manifest_path: str | Path,
             previous = str(job.get("job_id"))
             job.update(state="prepared", recovery_of=previous, job_id=None,
                        recovery_eligible=False, reconciliation_required=False)
-    _atomic_json(path, manifest)
     return _submit_prepared_batch(path, manifest, runner)

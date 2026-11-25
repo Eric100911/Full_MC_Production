@@ -82,7 +82,9 @@ two CPUs. `resources.processing.disk_bytes` defaults to an estimated
 8,128,000,000 bytes. A smaller positive request logs a warning. LHE
 SOURCE jobs use one CPU with 3072 MB of memory by default.
 
-RECLAIM reads each successful PROC result, verifies the published EOS
+After PROC_SUBDAG completes, DAGMan packs its exact result records into
+`proc/results_bundle.tar.gz` on the submit host. RECLAIM reads the
+transferred results, verifies the published EOS
 MiniAODs, and groups them in processing order. After deleting the run's
 staged LHE blocks and manifests it transfers `handoff.json` and
 `merge_groups.json`. Merge groups reach the first configured threshold,
@@ -90,8 +92,9 @@ staged LHE blocks and manifests it transfers `handoff.json` and
 The last group can contain fewer events or bytes.
 
 `run status`, `run submit`, and `run resume` take `--run <run-dir-or-id>`.
-Before initial submission, `mcprod` checks that the pinned proxy has more
-than 48 hours remaining and reserves the three configured storage paths.
+Preparation, submission and rescue resume check that the pinned proxy
+has more than 48 hours remaining. Initial submission reserves the three
+configured storage paths.
 Submission records the exact schedd and root DAGMan cluster ID.
 
 ### Resuming a stopped CERN run
@@ -157,11 +160,12 @@ Inspect or reconcile a prepared batch using its manifest:
 ./mcprod batch resume --manifest /path/to/batch/batch_manifest.json
 ```
 
-`batch submit` checks the proxy source recorded in each prepared worker wrapper
-before submitting any HepJob jobs. Each distinct proxy must have more than
-48 hours remaining; `batch resume` does not repeat this check. When a wrapper
-uses `X509_USER_PROXY`, set that variable to the intended proxy before the
-initial `batch submit`.
+Batch preparation and each submission, including recovery, require more
+than 48 hours on each proxy used by the jobs. Set `X509_USER_PROXY` before
+preparation and submission when no explicit proxy is supplied. A stage
+defaults to `requires_proxy: true`. Set it to `false` for stages with local
+inputs and outputs that never use grid services. For IHEP set it on each
+applicable subtask. For CERN use the corresponding stage under `resources`.
 
 An ambiguous HepJob submission is retained as an unresolved attempt. Reconcile
 the exact recorded job before resubmitting.

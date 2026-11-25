@@ -2,13 +2,13 @@
 from __future__ import annotations
 import shlex
 import subprocess
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from full_mc.runtime.profiles import run_profile
 from full_mc.storage.transfer import _remote_parts, is_remote, local_path
 
 UTILITIES_PROFILE = "utilities-el9"
-DEFAULT_WORK_DIR = Path("/tmp/chiw/mcprod-reclaim")
 # Removal of a namespace root would delete objects this run never staged.
 BROAD_REMOVALS = ("/", "/store", "/eos")
 # A single argv element is capped near 128 KiB (MAX_ARG_STRLEN) and this script
@@ -107,7 +107,6 @@ def remove_many(targets, *, runner=None, work_dir=None):
         value = str(target)
         if value not in order:
             order.append(value)
-    work_dir = Path(work_dir or DEFAULT_WORK_DIR)
     dispositions = {}
     remote = []
     for index, url in enumerate(order):
@@ -116,5 +115,11 @@ def remove_many(targets, *, runner=None, work_dir=None):
         else:
             dispositions[url] = _remove_local(url)
     if remote:
-        dispositions.update(_remove_remote(remote, runner=runner, work_dir=work_dir))
+        if work_dir is None:
+            with TemporaryDirectory(prefix="mcprod-reclaim-") as scratch:
+                dispositions.update(_remove_remote(remote, runner=runner, work_dir=scratch))
+        else:
+            work_dir = Path(work_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            dispositions.update(_remove_remote(remote, runner=runner, work_dir=work_dir))
     return {url: dispositions[url] for url in order}

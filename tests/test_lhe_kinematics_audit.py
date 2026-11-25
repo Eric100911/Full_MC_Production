@@ -139,7 +139,6 @@ class KinematicsAuditTest(unittest.TestCase):
             import pylhe
         except ImportError:
             self.skipTest("LCG pylhe environment required")
-        os.makedirs("/tmp/chiw", exist_ok=True)
         def fake_xrdcp(command, check, env):
             self.assertEqual(command[:3], ["/usr/bin/xrdcp", "--nopbar", "--force"])
             self.assertTrue(check)

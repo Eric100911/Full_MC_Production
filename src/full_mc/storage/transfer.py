@@ -25,10 +25,8 @@ def _remote_parts(url):
     return f"root://{parsed.netloc}/", "/" + parsed.path.lstrip("/")
 
 def _transfer_scratch():
-    root = Path(os.environ.get("_CONDOR_SCRATCH_DIR") or "/tmp/chiw")
-    scratch = root / "mcprod-transfer"
-    scratch.mkdir(parents=True, exist_ok=True)
-    return scratch
+    return tempfile.TemporaryDirectory(prefix="mcprod-transfer-",
+                                       dir=os.environ.get("_CONDOR_SCRATCH_DIR"))
 
 
 class TransferClient:
@@ -40,7 +38,6 @@ class TransferClient:
             result = self.runner(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         else:
             from full_mc.runtime.profiles import run_profile
-            scratch = _transfer_scratch()
             # ``xrdfs`` receives a remote endpoint followed by remote LFN
             # arguments (which are conventionally rooted at /store or /eos),
             # so none of its positional paths are host paths to bind.  For
@@ -55,9 +52,9 @@ class TransferClient:
                     path = local_path(text)
                     if path.parent.exists():
                         binds.append(str(path.resolve().parent))
-            result = run_profile("utilities-el9", command, cwd=scratch, check=False,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 bind_paths=binds)
+            with _transfer_scratch() as scratch:
+                result = run_profile("utilities-el9", command, cwd=scratch, check=False,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, bind_paths=binds)
         if result.returncode:
             if "3011" in result.stderr or "No such file" in result.stderr:
                 raise FileNotFoundError(result.stderr)
@@ -123,8 +120,7 @@ class TransferClient:
             except FileExistsError:
                 pass
             return
-        Path("/tmp/chiw").mkdir(exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir="/tmp/chiw",
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8",
                                          prefix="mcprod-marker-", delete=False) as handle:
             handle.write(encoded)
             temporary = Path(handle.name)
@@ -231,7 +227,7 @@ class TransferClient:
     def read_json(self, url):
         if not is_remote(url):
             return json.loads(local_path(url).read_text())
-        with tempfile.TemporaryDirectory(prefix="record-", dir=_transfer_scratch()) as tmp:
+        with _transfer_scratch() as tmp:
             path = self.copy_in(url, Path(tmp)/"record.json")
             return json.loads(path.read_text())
 

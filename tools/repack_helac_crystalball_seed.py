@@ -15,7 +15,7 @@ the unmodified upstream ``src/RANDA_init.inc`` and of every produced artifact.
 
 Usage:
   python3 tools/repack_helac_crystalball_seed.py
-  python3 tools/repack_helac_crystalball_seed.py --output-dir /tmp/chiw/helac_cbseed_v1
+  python3 tools/repack_helac_crystalball_seed.py --output-dir "${TMPDIR:-/tmp}/helac_cbseed_v1"
   python3 tools/repack_helac_crystalball_seed.py --check \
       --package common/packages/helac_package_cbseed_v1.tar.gz \
       --manifest common/packages/helac_package_cbseed_v1.manifest.json
@@ -36,8 +36,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_PACKAGE = "common/packages/helac_package_cbseed_v1.tar.gz"
-DEFAULT_OUTPUT_DIR = "/tmp/chiw/helac_cbseed_v1"
-SCRATCH_ROOT = "/tmp/chiw"
+DEFAULT_OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "helac_cbseed_v1")
 
 OUTER_HELAC_MEMBER = "HELAC-Onia-2.7.6.tar.gz"
 OUTER_HEPMC_MEMBER = "hepmc2.06.11.tgz"
@@ -294,8 +293,7 @@ def load_manifest(path: str) -> Dict[str, object]:
 
 
 def make_scratch_dir() -> str:
-    os.makedirs(SCRATCH_ROOT, exist_ok=True)
-    return tempfile.mkdtemp(prefix="helac_cbseed_", dir=SCRATCH_ROOT)
+    return tempfile.mkdtemp(prefix="helac_cbseed_")
 
 
 # --------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Submit-host X.509 credential resolution for CERN DAGMan runs."""
+"""Shared X.509 credential resolution and validation."""
 from __future__ import annotations
 
 import os
@@ -73,8 +73,8 @@ def resolve_proxy_path(*, environ: Mapping[str, str] | None = None,
                        + detail)
 
 
-def require_initial_proxy_lifetime(proxy_path: str | Path, *, runner=subprocess.run) -> int:
-    """Require more than 48 hours on the exact proxy used for initial submission."""
+def ensure_valid_proxy(proxy_path: str | Path, *, runner=subprocess.run) -> int:
+    """Require more than 48 hours on the proxy pinned for the job."""
     path = str(proxy_path)
     try:
         result = runner(["voms-proxy-info", "--file", path, "--timeleft"],
@@ -90,6 +90,14 @@ def require_initial_proxy_lifetime(proxy_path: str | Path, *, runner=subprocess.
     seconds = int(value)
     if seconds <= MIN_INITIAL_PROXY_TIME_LEFT_SECONDS:
         raise RuntimeError(f"X.509 proxy at {path} has {seconds}s remaining; "
-                           f"initial submission requires more than "
+                           f"submission requires more than "
                            f"{MIN_INITIAL_PROXY_TIME_LEFT_SECONDS}s (48h)")
     return seconds
+
+
+def requires_proxy(stage):
+    """A stage only opts out when it explicitly declares a local workflow."""
+    value = stage.get("requires_proxy", True)
+    if type(value) is not bool:
+        raise ValueError("requires_proxy must be a boolean")
+    return value

@@ -47,7 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WORKDIR=$(mktemp -d /tmp/chiw/chain_test_XXXXX)
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/chain_test_XXXXX")
 RESULT_FILE="${WORKDIR}/resource_summary.txt"
 
 echo "Test directory: ${WORKDIR}"

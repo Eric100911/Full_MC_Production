@@ -1,7 +1,7 @@
 """Frozen task manifests and exact artifact references."""
 from copy import deepcopy
 
-from full_mc.planning.graph import token
+from full_mc.planning.graph import stage_requires_proxy, token
 from full_mc.runtime.profiles import STAGE_RUNTIME, runtime_for_profile
 
 
@@ -63,6 +63,8 @@ def processing_tasks(spec, campaign, nodes, refs, source_indices):
                 detector_profile_id=variant, detector_profile=deepcopy(profile))
             mini = task_manifest(spec, "MINIAOD_" + detector_identity, "miniaod", [hepmc], [product], detector_parameters)
             product["sidecar_url"] = product["url"] + ".json"
+            if not stage_requires_proxy(spec, "processing"):
+                mini["requires_proxy"] = False
             variants.append(mini)
         outputs = [hepmc] + [mini["outputs"][0] for mini in variants]
         processing = task_manifest(spec, "PROC_" + identity, "processing", inputs, outputs, {})

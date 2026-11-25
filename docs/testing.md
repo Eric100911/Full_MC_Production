@@ -57,9 +57,9 @@ matching clean runtime. Verify the ntuple bundle and pin CMSSW15 jobs to the
 AVX2-safe hosts in the HepJob reference. Verify the merged count with
 `edmCopyPickMerge` output, then reconcile it with the ntuple count.
 
-`mcprod batch submit` checks every distinct proxy source in the prepared worker
-wrappers before submitting the first HepJob job. Each proxy certificate must
-have more than 48 hours remaining. `batch resume` does not repeat this check.
+IHEP batch preparation, submission and recovery check the proxy for every
+job that requires it. Each distinct proxy must have more than 48 hours
+remaining.
 
 For newly prepared batches, look under
 `<batch-dir>/logs/<job-index>/attempt-<number>/` on shared IHEP storage. The

@@ -169,7 +169,7 @@ def main():
     parser.add_argument("--set2", nargs="+", default=[], help="Second set of files")
     args = parser.parse_args()
 
-    workdir = tempfile.mkdtemp(prefix="ycheck_", dir="/tmp/chiw")
+    workdir = tempfile.mkdtemp(prefix="ycheck_")
     all_results = []
 
     for set_label, urls in [("SET 1", args.set1), ("SET 2", args.set2)]:

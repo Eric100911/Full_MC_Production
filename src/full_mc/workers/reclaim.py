@@ -1,11 +1,13 @@
 """Assemble downstream merge inputs and delete the exact staged LHE objects."""
+import logging
 from pathlib import Path
 
 from full_mc.application.handoff import make_handoff, merge_snapshot
 from full_mc.application.merge_groups import merge_groups, sample_key
 from full_mc.io import atomic_json, read_json
-from full_mc.planning.graph import node_stem
+from full_mc.planning.graph import RESULTS_BUNDLE, node_stem
 from full_mc.planning.tasks import staging_root
+from full_mc.runtime.reclaim_bundle import unpack
 from full_mc.storage.reclaim import remove_many
 from full_mc.storage.layout import canonical_storage_location, storage_location_is_within
 from ._common import parameters, prepare, result
@@ -16,10 +18,15 @@ def execute(task, work_dir):
     p = parameters(task)
     spec = p["spec"]
     plan = read_json(p["plan_path"])
+    results = Path(p["results_dir"])
+    bundle = results.with_name(RESULTS_BUNDLE)
+    if bundle.is_file():
+        results = unpack(bundle, work_dir / "results", plan)
+        logging.info("Unpacked %d PROC results from %s", len(plan["processing"]), bundle.name)
     samples = {}
     for job in plan["processing"]:
         identity = job["task_id"]
-        output = read_json(Path(p["results_dir"]) / f"{node_stem(identity)}.json")
+        output = read_json(results / f"{node_stem(identity)}.json")
         if (output.get("task_id") != identity or output.get("status") != "ok"
                 or output.get("runtime_release") != task["runtime_release"]
                 or output.get("stage") != "processing"

@@ -16,6 +16,7 @@ local cache with xrdcp.
 from __future__ import annotations
 
 import argparse
+import tempfile
 import csv
 import json
 import subprocess
@@ -36,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-dir",
-        default="/tmp/chiw/phase2_shower_review_manifests",
+        default=str(Path(tempfile.gettempdir()) / "phase2_shower_review_manifests"),
         help="Local cache for copied remote processing manifests",
     )
     parser.add_argument(

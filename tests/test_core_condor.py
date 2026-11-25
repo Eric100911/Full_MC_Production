@@ -31,7 +31,7 @@ def run(root, schedd="schedd.example"):
 
 class CondorContracts(unittest.TestCase):
     def setUp(self):
-        proxy_check = patch("full_mc.backends.condor.require_initial_proxy_lifetime",
+        proxy_check = patch("full_mc.backends.condor.ensure_valid_proxy",
                             return_value=172801)
         proxy_check.start()
         self.addCleanup(proxy_check.stop)
@@ -225,8 +225,7 @@ class CondorContracts(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("condor_submit_dag"), "HTCondor is unavailable")
     def test_offline_nested_submit_files_do_not_inherit_a_root_rescue_number(self):
-        Path("/tmp/chiw").mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "steps").mkdir()
             (root / "run.dag").write_text(

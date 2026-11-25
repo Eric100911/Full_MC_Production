@@ -80,6 +80,12 @@ class AggregationContracts(unittest.TestCase):
                     prepare_aggregate(handoff, root / "aggregation.json")
 
     def test_worker_merges_selected_inputs_and_all_shards_with_log_level(self):
+        self._run_worker_aggregation()
+
+    def test_worker_rejects_an_unexpected_sample_directory_before_publishing(self):
+        self._run_worker_aggregation(wrong_sample=True)
+
+    def _run_worker_aggregation(self, wrong_sample=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             selected = root / "selected.root"
@@ -112,8 +118,11 @@ class AggregationContracts(unittest.TestCase):
             def fake_run(run_task, runtime, command, work_dir):
                 calls.append((run_task, runtime, list(map(str, command))))
                 if "merge_efficiency_shards.py" in str(command):
-                    output_dir = (Path(work_dir) / "efficiency"
-                                  / "JJP_DPS1::run3_2022_legacy_premix_v1")
+                    args = list(command)
+                    output = Path(args[args.index("--output-dir") + 1])
+                    if wrong_sample:
+                        args[args.index("--sample") + 1] = "wrong-sample"
+                    output_dir = output / args[args.index("--sample") + 1]
                     output_dir.mkdir(parents=True)
                     (output_dir / "efficiency_maps.parquet").write_bytes(b"maps")
 
@@ -132,8 +141,16 @@ class AggregationContracts(unittest.TestCase):
                       side_effect=fake_materialize),
                 patch("full_mc.application.analysis.run", side_effect=fake_run),
                 patch("full_mc.application.analysis.publish",
-                      side_effect=fake_publish),
+                      side_effect=fake_publish) as publish,
             ):
+                if wrong_sample:
+                    with self.assertRaisesRegex(RuntimeError, r"JJP_DPS1/efficiency_maps\.parquet"):
+                        run_aggregate_task(task_path, root / "work", log_level="warning")
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(calls[1][2][calls[1][2].index("--sample") + 1], "JJP_DPS1")
+                    self.assertEqual(list((root / "work").rglob("efficiency.tar")), [])
+                    publish.assert_not_called()
+                    return
                 outcome = run_aggregate_task(task_path, root / "work",
                                               log_level="warning")
 
@@ -142,7 +159,7 @@ class AggregationContracts(unittest.TestCase):
             self.assertEqual(len(calls), 3)
             self.assertTrue(all(call[0]["log_level"] == "warning" for call in calls))
             self.assertIn("selected-inputs.json", calls[0][2][2])
-            self.assertIn("--sample", calls[1][2])
+            self.assertEqual(calls[1][2][calls[1][2].index("--sample") + 1], "JJP_DPS1")
             self.assertIn("--skip-plots", calls[2][2])
             self.assertEqual(read_json(root / "work" / "result.json")["status"], "ok")
 
@@ -174,8 +191,9 @@ class BatchLoggingContracts(unittest.TestCase):
                                stage: {"task_id": stage, "stage": stage}
                                for stage in ("merge", "ntuple", "selection", "efficiency")
                            }}])):
-                batch = prepare_batch(root / "handoff.json", root / "batch",
-                                      proxy="/proxy", log_level="error")
+                with patch("full_mc.backends.hepjob.ensure_valid_proxy"):
+                    batch = prepare_batch(root / "handoff.json", root / "batch",
+                                          proxy="/proxy", log_level="error")
             prepared = read_json(batch["jobs"][0]["task_path"])
             self.assertEqual(prepared["log_level"], "error")
             self.assertEqual({subtask["log_level"]

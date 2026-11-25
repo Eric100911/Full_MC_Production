@@ -37,7 +37,7 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-TMP_ROOT = Path("/tmp/chiw")
+TMP_ROOT = Path(tempfile.gettempdir())
 
 sys.path.insert(0, str(BASE_DIR))
 

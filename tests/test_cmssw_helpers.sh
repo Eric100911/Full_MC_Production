@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HELPERS_DIR="${BASE_DIR}/processing/cmssw_helpers"
-TEST_ROOT="$(mktemp -d /tmp/chiw/cmssw_helpers.XXXXXX)"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cmssw_helpers.XXXXXX")"
 
 cleanup() {
     rm -rf "${TEST_ROOT}"

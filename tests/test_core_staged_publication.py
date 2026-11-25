@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from full_mc.io import atomic_json
 from full_mc.workers._common import publish, result
 
-SCRATCH = Path('/tmp/chiw')
+SCRATCH = Path(tempfile.gettempdir())
 SCRATCH.mkdir(exist_ok=True)
 
 

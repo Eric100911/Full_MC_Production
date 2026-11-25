@@ -26,7 +26,7 @@ def fail_once(function, error):
 
 class ImmutableRecoveryTests(unittest.TestCase):
     def test_json_equivalent_tuple_retry_and_conflict(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "manifest.json"
             initial = {"tasks": [{"id": "A"}], "dependencies": [("A", "B")]}
             write_immutable_json(path, initial)
@@ -40,7 +40,7 @@ class ImmutableRecoveryTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), first_bytes)
 
     def test_existing_equal_record_retries_directory_sync_after_failure(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "receipt.json"
             payload = {"task_id": "PLAN_000000", "outputs": []}
             real_sync = __import__("full_mc.io", fromlist=["_sync_directory"])._sync_directory
@@ -62,7 +62,7 @@ class ImmutableRecoveryTests(unittest.TestCase):
                 write_immutable_json(path, payload)
 
     def test_parent_directory_sync_failure_precedes_publish_and_retries(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "new" / "ledger" / "record.json"
             real_sync = __import__("full_mc.io", fromlist=["_sync_directory"])._sync_directory
             failed = False
@@ -83,7 +83,7 @@ class ImmutableRecoveryTests(unittest.TestCase):
             self.assertEqual(read_json(path), {"schema": "probe"})
 
     def test_concurrent_different_writers_never_replace_the_winner(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/chiw") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "shared.json"
             barrier = threading.Barrier(2)
 

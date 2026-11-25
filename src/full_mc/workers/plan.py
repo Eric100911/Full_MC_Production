@@ -53,7 +53,7 @@ def _write_processing_bundle(bundle, p, pools, refs, indices):
     streams = build_streams(spec)
     bundle.mkdir()
     (bundle / "processing.sub").write_text(p["processing_submit"])
-    # Condor must transfer the result directory even for an empty PROC graph.
+    # Keep a submit-side results directory when there are no PROC jobs.
     (bundle / "results").mkdir()
     (bundle / "results/.keep").touch()
     lines = [f"CONFIG {path_text(submit_root / 'dagman.config')}"]

@@ -77,7 +77,7 @@ class IhepContracts(unittest.TestCase):
         proxy_env = patch.dict(os.environ, {"X509_USER_PROXY": "/tmp/test-proxy"})
         proxy_env.start()
         self.addCleanup(proxy_env.stop)
-        proxy_check = patch("full_mc.backends.hepjob.require_initial_proxy_lifetime",
+        proxy_check = patch("full_mc.backends.hepjob.ensure_valid_proxy",
                             return_value=172801)
         proxy_check.start()
         self.addCleanup(proxy_check.stop)
@@ -94,7 +94,14 @@ class IhepContracts(unittest.TestCase):
                 wrapper = Path(job["wrapper"])
                 subprocess.run(["bash", "-n", str(wrapper)], check=True)
                 text = wrapper.read_text()
-                self.assertIn("mktemp -d /tmp/chiw/", text)
+                self.assertIn('mktemp -d "$scratch_base/mcprod-ihep.XXXXXX"', text)
+                self.assertIn('${TMPDIR:-/tmp}', text)
+                scratch_lines = [line for line in text.splitlines()
+                                 if line.startswith(("scratch_base=", "job_scratch="))]
+                self.assertEqual(scratch_lines, [
+                    'scratch_base="${TMPDIR:-/tmp}/${USER:-$(id -un)}"',
+                    'job_scratch=$(mktemp -d "$scratch_base/mcprod-ihep.XXXXXX")',
+                ])
                 self.assertIn("credentials/x509_user_proxy", text)
                 self.assertNotIn("x509up_u", text)
                 self.assertIn("proxy_source='/proxy path'", text)
@@ -102,6 +109,63 @@ class IhepContracts(unittest.TestCase):
             self.assertEqual(len(checkpoints), 12)
             with self.assertRaises(FileExistsError):
                 prepare_batch(root / "handoff.json", root / "batch")
+
+    def test_proxy_required_by_default_blocks_preparation_and_submission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            handoff_path = handoff(root)
+            runner = Mock()
+            with patch("full_mc.backends.hepjob.ensure_valid_proxy",
+                       side_effect=RuntimeError("proxy expired")) as check:
+                with self.assertRaisesRegex(RuntimeError, "proxy expired"):
+                    prepare_batch(handoff_path, root / "batch", proxy="/test-proxy")
+                check.assert_called_once_with("/test-proxy")
+            self.assertFalse((root / "batch").exists())
+
+            batch = prepare_batch(handoff_path, root / "batch", proxy="/test-proxy")
+            with patch("full_mc.backends.hepjob.ensure_valid_proxy",
+                       side_effect=RuntimeError("proxy expired")) as check:
+                with self.assertRaisesRegex(RuntimeError, "proxy expired"):
+                    submit_batch(batch["manifest_path"], runner=runner)
+                check.assert_called_once_with("/test-proxy")
+            runner.assert_not_called()
+            self.assertEqual(read_json(batch["manifest_path"])["jobs"][0]["state"], "prepared")
+
+    def test_explicit_local_stages_prepare_and_submit_without_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            handoff_path = handoff(root)
+            payload = read_json(handoff_path)
+            for stage in payload["tasks"]:
+                stage["requires_proxy"] = False
+            atomic_json(handoff_path, payload)
+            with patch.dict(os.environ, {"X509_USER_PROXY": ""}), \
+                    patch("full_mc.backends.hepjob.ensure_valid_proxy") as check, \
+                    self.assertLogs("full_mc.backends.hepjob", level="INFO") as logs:
+                batch = prepare_batch(handoff_path, root / "batch")
+                completed = Mock(returncode=0, stdout="submitted to cluster 27", stderr="")
+                submitted = submit_batch(batch["manifest_path"], runner=Mock(return_value=completed))
+            self.assertFalse(batch["jobs"][0]["requires_proxy"])
+            self.assertNotIn("credentials/x509_user_proxy", Path(batch["jobs"][0]["wrapper"]).read_text())
+            self.assertEqual(submitted["jobs"][0]["state"], "submitted")
+            self.assertIn("Skipping X.509 proxy check for local stage merge", " ".join(logs.output))
+            check.assert_not_called()
+
+    def test_worker_default_scratch_follows_tmpdir(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task_path = root / "task.json"
+            atomic_json(task_path, {"task_id": "dummy", "stage": "merge"})
+            tmpdir = root / "user-scratch"
+            tmpdir.mkdir()
+            with patch.dict(os.environ, {"TMPDIR": str(tmpdir), "USER": "another-user"}), \
+                    patch.object(tempfile, "tempdir", None), \
+                    patch("full_mc.workers.execute_task", return_value={
+                        "task_id": "dummy", "stage": "merge", "status": "ok"}) as worker:
+                dispatch(build_parser().parse_args(["worker", "--task", str(task_path)]))
+            scratch = worker.call_args.args[1]
+            self.assertEqual(scratch.parent, tmpdir)
+            self.assertTrue(scratch.name.startswith("mcprod-worker-"))
 
     def test_ambiguous_attempt_is_not_resubmitted(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -139,12 +203,21 @@ class IhepContracts(unittest.TestCase):
             logs = Path(command[command.index("-e") + 1]).parent
             attempt = command[command.index("-argu") + 1]
 
+            tmpdir = root / "job-temp"
+            scratch_base = tmpdir / "another-user"
+            scratch_base.mkdir(parents=True)
+            keep = scratch_base / "keep"
+            keep.touch()
+            job_env = dict(os.environ, TMPDIR=str(tmpdir), USER="another-user")
             for rc in (42, 0):
                 with self.subTest(rc=rc):
                     execution = subprocess.run([command[1], attempt], text=True, capture_output=True,
-                                               env=dict(os.environ, TEST_WORKER_RC=str(rc)))
+                                               env=dict(job_env, TEST_WORKER_RC=str(rc)))
                     self.assertEqual(execution.returncode, rc, execution.stderr)
-                    self.addCleanup(shutil.rmtree, execution.stdout.strip(), ignore_errors=True)
+                    scratch = Path(execution.stdout.strip())
+                    self.assertEqual(scratch.parent, scratch_base)
+                    self.assertFalse(scratch.exists())
+                    self.assertTrue(keep.is_file())
                     destination = Path(execution.stderr.removeprefix("HepJob diagnostics: ").strip())
                     self.assertEqual(destination.parent, logs)
                     with tarfile.open(destination) as diagnostics:
@@ -163,7 +236,7 @@ class IhepContracts(unittest.TestCase):
 
             no_destination = subprocess.run(
                 [command[1], "attempt-002"], text=True, capture_output=True,
-                env=dict(os.environ, TEST_WORKER_RC="42"))
+                env=dict(job_env, TEST_WORKER_RC="42"))
             self.addCleanup(shutil.rmtree, no_destination.stdout.strip(), ignore_errors=True)
             self.assertEqual(no_destination.returncode, 42)
             self.assertIn("HepJob diagnostics could not be archived", no_destination.stderr)

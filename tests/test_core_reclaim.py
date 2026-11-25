@@ -14,7 +14,7 @@ STAGING = "root://eosuser.cern.ch///eos/user/c/chiw/staging/run-1"
 
 class ReclaimStorage(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(dir="/tmp/chiw")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.work = self.root / "work"

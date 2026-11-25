@@ -5,7 +5,7 @@ Examples:
   python3 tools/helac_trial_report.py \
     --job bigbird17.cern.ch:9571100 \
     --config 9571100=generated/.../LHE_SPS_G_nmc1e7_unwevt1e5.json \
-    --archive 9571100=/tmp/chiw/9571100.tar.gz
+    --archive 9571100=/path/to/9571100.tar.gz
 
 The tool is read-only apart from a temporary extraction directory used for a
 supplied diagnostic archive.  A live job is read through ``condor_ssh_to_job``

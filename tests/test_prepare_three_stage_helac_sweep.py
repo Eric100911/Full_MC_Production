@@ -25,7 +25,7 @@ from tools import prepare_three_stage_helac_sweep as sweep
 
 class SweepTest(unittest.TestCase):
     def setUp(self):
-        scratch = Path("/tmp/chiw")
+        scratch = Path(tempfile.gettempdir())
         scratch.mkdir(exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="helac-sweep-test-", dir=scratch)
         self.addCleanup(self.temporary.cleanup)

@@ -107,7 +107,7 @@ verified command so the same discovery is not repeated.
   shell or approved unsandboxed command with the same proxy and executable.
 - Run `cmsenv` only from a valid CMSSW project area, normally its `src`
   directory.
-- Put scratch files under `/tmp/chiw/`. Keep generated DAG bundles on AFS or
+- Use `TMPDIR` or the system temporary directory for scratch. Keep generated DAG bundles on AFS or
   another submit-visible persistent filesystem.
 
 ## Testing Expectations

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 
+from full_mc.credentials import requires_proxy
 from full_mc.io import read_json, atomic_json
 from full_mc.storage.transfer import materialize_input
 from ._common import batch_runtime_asset, core_path, count_lhe_events, parameters, run
@@ -158,5 +159,7 @@ def execute_chain(task, work_dir):
     options = {}
     if task["stage"] == "miniaod":
         options["extra_env"] = {"PROCESSING_CPUS": str(p["processing_cpus"])}
+    if not requires_proxy(task):
+        options.setdefault("extra_env", {})["FULL_MC_REQUIRES_PROXY"] = "false"
     run(task, task["runtime"], build_command(task, work_dir, script, config_path),
         work_dir, **options)

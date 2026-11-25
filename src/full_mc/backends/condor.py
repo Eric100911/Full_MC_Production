@@ -8,6 +8,7 @@ it is never retried automatically.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from full_mc.credentials import require_initial_proxy_lifetime
+from full_mc.credentials import ensure_valid_proxy
 from full_mc.io import atomic_json
 from full_mc.settings import STATIC_WORKFLOW
 from full_mc.storage.reservation import reserve_run_namespaces
@@ -89,20 +90,27 @@ def _assert_submittable(spec: Dict[str, Any]) -> None:
         raise RuntimeError("refusing scheduler submission from a dirty runtime source")
 
 
-def _worker_proxy_paths(root: Path) -> List[str]:
-    """Read the proxy paths pinned in this run's generated worker submit files."""
+def _check_worker_proxies(root: Path) -> None:
+    """Validate every distinct proxy pinned in the root and frozen PROC submits."""
     submit_files = sorted(path for path in (root / "submit").glob("*.sub")
                           if path.name != "noop.sub")
     if not submit_files:
-        raise RuntimeError("run has no worker submit files with a pinned X.509 proxy")
-    paths = set()
-    for submit_file in submit_files:
-        matches = re.findall(r"(?im)^[ \t]*x509userproxy[ \t]*=[ \t]*(\S+)[ \t]*$",
-                             submit_file.read_text(encoding="utf-8"))
+        raise RuntimeError("run has no worker submit files")
+    templates = {path.stem: path.read_text(encoding="utf-8") for path in submit_files}
+    plan_task = root / "tasks/PLAN.json"
+    if plan_task.is_file():
+        templates["processing"] = _read_json(plan_task)["parameters"]["processing_submit"]
+    proxies = set()
+    for stage, template in templates.items():
+        if re.search(r"(?im)^\s*use_x509userproxy\s*=\s*false\s*$", template):
+            logging.info("Skipping X.509 proxy check for local stage %s", stage)
+            continue
+        matches = re.findall(r"(?im)^\s*x509userproxy\s*=\s*(\S+)\s*$", template)
         if len(matches) != 1 or not Path(matches[0]).is_absolute():
-            raise RuntimeError(f"invalid pinned X.509 proxy in {submit_file}")
-        paths.add(matches[0])
-    return sorted(paths)
+            raise RuntimeError(f"invalid pinned X.509 proxy in {stage}.sub")
+        proxies.add(matches[0])
+    for proxy in sorted(proxies):
+        ensure_valid_proxy(proxy)
 
 
 def _run(command: List[str], runner: Callable[..., Any], *, cwd: Path,
@@ -198,8 +206,7 @@ def submit_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     spec_bytes = spec_path.read_bytes()
     spec = _read_json(spec_path)
     _assert_submittable(spec)
-    for proxy_path in _worker_proxy_paths(root):
-        require_initial_proxy_lifetime(proxy_path)
+    _check_worker_proxies(root)
     # Ownership is established before the durable Condor attempt record and
     # before invoking condor_submit_dag.  A failed reservation therefore cannot
     # leave an ambiguous scheduler submission behind.
@@ -404,6 +411,7 @@ def resume_run(run_dir: str | Path, runner: Callable[..., Any] = subprocess.run)
     rescue_match = _RESCUE.match(rescue.name)
     if rescue_match is None:
         raise ValueError("invalid rescue filename: %s" % rescue.name)
+    _check_worker_proxies(root)
     scheduler = str(observed["scheduler"])
     # DAGMan passes -DoRescueFrom to every SUBDAG.  A newly prepared child has
     # no rescue file, so each DAG must instead select its own latest rescue.
